@@ -5602,14 +5602,14 @@ fn render_trend_panel(
 }
 
 /// Number of distinct event kinds tracked for heatmap rows.
-const HEATMAP_EVENT_KINDS: usize = 11;
+const HEATMAP_EVENT_KINDS: usize = 12;
 
 /// Event kind labels for heatmap Y-axis (abbreviated).
 const HEATMAP_KIND_LABELS: [&str; HEATMAP_EVENT_KINDS] = [
-    "TlSt", "TlEn", "Send", "Recv", "RGnt", "RRel", "AReg", "HTTP", "Hlth", "SvUp", "SvDn",
+    "TlSt", "TlEn", "Send", "Recv", "RGnt", "RRel", "AReg", "HTTP", "Hlth", "GSeg", "SvUp", "SvDn",
 ];
 
-/// Map a `MailEventKind` to its heatmap row index (0..10).
+/// Map a `MailEventKind` to its heatmap row index (0..11).
 const fn heatmap_kind_index(kind: MailEventKind) -> usize {
     match kind {
         MailEventKind::ToolCallStart => 0,
@@ -5621,8 +5621,9 @@ const fn heatmap_kind_index(kind: MailEventKind) -> usize {
         MailEventKind::AgentRegistered => 6,
         MailEventKind::HttpRequest => 7,
         MailEventKind::HealthPulse => 8,
-        MailEventKind::ServerStarted => 9,
-        MailEventKind::ServerShutdown => 10,
+        MailEventKind::GitSegfaultRetry => 9,
+        MailEventKind::ServerStarted => 10,
+        MailEventKind::ServerShutdown => 11,
     }
 }
 
@@ -8324,6 +8325,7 @@ mod tests {
             MailEventKind::AgentRegistered,
             MailEventKind::HttpRequest,
             MailEventKind::HealthPulse,
+            MailEventKind::GitSegfaultRetry,
             MailEventKind::ServerStarted,
             MailEventKind::ServerShutdown,
         ];

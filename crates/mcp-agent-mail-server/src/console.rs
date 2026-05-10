@@ -5,6 +5,8 @@
 
 use ftui::PackedRgba;
 use serde_json::Value;
+use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -61,6 +63,9 @@ pub fn mask_sensitive_value(_original: &str) -> String {
 #[must_use]
 pub fn sanitize_known_value(key: &str, value: &str) -> Option<String> {
     let lower = key.to_ascii_lowercase();
+    if lower == "am_git_binary" || lower == "git_binary" || lower.ends_with("_git_binary") {
+        return basename_for_absolute_path(value);
+    }
     let is_database_url = lower == "database_url" || lower.ends_with("database_url");
     let is_redis_url =
         lower == "redis_url" || lower.ends_with("redis_url") || lower.contains("redis_url");
@@ -180,6 +185,56 @@ pub fn duration_style(ms: u64) -> DurationStyle {
 // Startup banner (br-1m6a.1)
 // ──────────────────────────────────────────────────────────────────────
 
+pub const STARTUP_STATE_JSON_BEGIN: &str = "--- BEGIN STARTUP STATE (JSON) ---";
+pub const STARTUP_STATE_JSON_END: &str = "--- END STARTUP STATE (JSON) ---";
+
+/// Database counts exposed in the startup-state JSON block.
+///
+/// `None` is rendered as JSON `null` so a failed observability query is not
+/// confused with a genuine zero count.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartupStateStats {
+    pub projects: Option<u64>,
+    pub agents: Option<u64>,
+    pub messages: Option<u64>,
+    pub file_reservations: Option<u64>,
+    pub contact_links: Option<u64>,
+}
+
+/// Structured startup state rendered as parseable JSON inside the banner.
+#[derive(Debug, Clone, Copy)]
+pub struct StartupStateJson<'a> {
+    pub endpoint: &'a str,
+    pub web_ui: Option<&'a str>,
+    pub uptime: &'a str,
+    pub environment: &'a str,
+    pub auth_enabled: bool,
+    pub tools_log_enabled: bool,
+    pub log_tool_calls_enabled: bool,
+    pub stats: StartupStateStats,
+    pub storage_root: &'a str,
+    pub database_url: Option<&'a str>,
+    pub http_bearer_token: Option<&'a str>,
+    pub am_git_binary: Option<&'a str>,
+}
+
+/// Rendering controls for the startup-state JSON block.
+#[derive(Debug, Clone, Copy)]
+pub struct StartupJsonRenderOptions {
+    pub enabled: bool,
+    pub use_ansi: bool,
+}
+
+impl StartupJsonRenderOptions {
+    #[must_use]
+    pub fn from_environment() -> Self {
+        Self {
+            enabled: !startup_banner_json_disabled_from_env(),
+            use_ansi: std::io::stdout().is_terminal(),
+        }
+    }
+}
+
 /// Parameters for the startup banner.
 pub struct BannerParams<'a> {
     pub app_environment: &'a str,
@@ -197,12 +252,23 @@ pub struct BannerParams<'a> {
     pub messages: u64,
     pub file_reservations: u64,
     pub contact_links: u64,
+    pub startup_state_json: Option<StartupStateJson<'a>>,
 }
 
 /// Render the full startup banner as a vector of ANSI-colored lines.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
+    render_startup_banner_with_options(params, StartupJsonRenderOptions::from_environment())
+}
+
+/// Render the startup banner with explicit JSON rendering controls.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn render_startup_banner_with_options(
+    params: &BannerParams<'_>,
+    startup_json_options: StartupJsonRenderOptions,
+) -> Vec<String> {
     let mut lines = Vec::with_capacity(32);
     let primary = theme::primary_bold();
     let secondary = theme::secondary_bold();
@@ -235,6 +301,8 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     let database_display =
         mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&database_url)
             .map_or(database_url.clone(), |p| p.display().to_string());
+    let endpoint_display = mask_url_token_query(params.endpoint);
+    let web_ui_display = mask_url_token_query(params.web_ui_url);
 
     let logo_lines = [
         "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓",
@@ -265,15 +333,16 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     ));
     lines.push(format!(
         "{secondary}│{RESET} {accent}Endpoint:{RESET} {}",
-        params.endpoint
+        endpoint_display
     ));
     lines.push(format!(
         "{secondary}│{RESET} {link}Web UI:{RESET} {}",
-        params.web_ui_url
+        web_ui_display
     ));
     if let Some(remote) = params.remote_url {
+        let remote_display = mask_url_token_query(remote);
         lines.push(format!(
-            "{secondary}│{RESET} {success}Remote:{RESET} {remote}"
+            "{secondary}│{RESET} {success}Remote:{RESET} {remote_display}"
         ));
     }
     lines.push(format!(
@@ -324,11 +393,189 @@ pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
     lines.push(format!(
         "{secondary}╰─────────────────────────────────────────────────────────────────────╯{RESET}"
     ));
+    if let Some(startup_state) = params.startup_state_json
+        && startup_json_options.enabled
+    {
+        lines.extend(render_startup_state_json_section(
+            &startup_state,
+            startup_json_options.use_ansi,
+        ));
+    }
     lines.push(format!(
         "{warning}Tip:{RESET} interactive layout keys available via '?'"
     ));
     lines.push(String::new());
     lines
+}
+
+#[must_use]
+pub fn build_startup_state_json(state: &StartupStateJson<'_>) -> Value {
+    let mut root = serde_json::Map::with_capacity(12);
+    root.insert(
+        "endpoint".to_string(),
+        Value::String(mask_url_token_query(state.endpoint)),
+    );
+    root.insert(
+        "web_ui".to_string(),
+        state
+            .web_ui
+            .map_or(Value::Null, |url| Value::String(mask_url_token_query(url))),
+    );
+    root.insert(
+        "uptime".to_string(),
+        Value::String(state.uptime.to_string()),
+    );
+    root.insert(
+        "environment".to_string(),
+        Value::String(state.environment.to_string()),
+    );
+    root.insert("auth_enabled".to_string(), Value::Bool(state.auth_enabled));
+    root.insert(
+        "tools_log_enabled".to_string(),
+        Value::Bool(state.tools_log_enabled),
+    );
+    root.insert(
+        "log_tool_calls_enabled".to_string(),
+        Value::Bool(state.log_tool_calls_enabled),
+    );
+
+    let mut stats_map = serde_json::Map::with_capacity(5);
+    stats_map.insert(
+        "projects".to_string(),
+        option_u64_to_json(state.stats.projects),
+    );
+    stats_map.insert("agents".to_string(), option_u64_to_json(state.stats.agents));
+    stats_map.insert(
+        "messages".to_string(),
+        option_u64_to_json(state.stats.messages),
+    );
+    stats_map.insert(
+        "file_reservations".to_string(),
+        option_u64_to_json(state.stats.file_reservations),
+    );
+    stats_map.insert(
+        "contact_links".to_string(),
+        option_u64_to_json(state.stats.contact_links),
+    );
+    root.insert("stats".to_string(), Value::Object(stats_map));
+    root.insert(
+        "storage_root".to_string(),
+        Value::String(display_storage_root_for_json(state.storage_root)),
+    );
+
+    let mut runtime = serde_json::Map::new();
+    if let Some(database_url) = state.database_url {
+        runtime.insert(
+            "database_url".to_string(),
+            Value::String(database_url.to_string()),
+        );
+    }
+    if let Some(token) = state.http_bearer_token {
+        runtime.insert(
+            "http_bearer_token".to_string(),
+            Value::String(token.to_string()),
+        );
+    }
+    if let Some(git_binary) = state.am_git_binary {
+        runtime.insert(
+            "am_git_binary".to_string(),
+            Value::String(git_binary.to_string()),
+        );
+    }
+    if !runtime.is_empty() {
+        root.insert("runtime".to_string(), Value::Object(runtime));
+    }
+
+    mask_json(&Value::Object(root))
+}
+
+#[must_use]
+pub fn render_startup_state_json_section(
+    state: &StartupStateJson<'_>,
+    use_ansi: bool,
+) -> Vec<String> {
+    let value = build_startup_state_json(state);
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    let mut lines = Vec::with_capacity(pretty.lines().count() + 2);
+    lines.push(STARTUP_STATE_JSON_BEGIN.to_string());
+    for line in pretty.lines() {
+        if use_ansi {
+            lines.push(colorize_json_line(line));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines.push(STARTUP_STATE_JSON_END.to_string());
+    lines
+}
+
+fn startup_banner_json_disabled_from_env() -> bool {
+    std::env::var("AM_BANNER_JSON_DISABLED").is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn option_u64_to_json(value: Option<u64>) -> Value {
+    value.map_or(Value::Null, Value::from)
+}
+
+fn display_storage_root_for_json(storage_root: &str) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && let Some(rest) = strip_display_path_prefix(storage_root, &home)
+    {
+        return format!("~{rest}");
+    }
+    if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME")
+        && let Some(rest) = strip_display_path_prefix(storage_root, &xdg_data_home)
+    {
+        return format!("<XDG_DATA_HOME>{rest}");
+    }
+    storage_root.to_string()
+}
+
+fn strip_display_path_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let prefix = prefix.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if prefix.is_empty() {
+        return None;
+    }
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn mask_url_token_query(url: &str) -> String {
+    let Some((prefix, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let redacted_query = query
+        .split('&')
+        .map(|part| {
+            let Some((key, value)) = part.split_once('=') else {
+                return part.to_string();
+            };
+            if is_sensitive_key(key) {
+                format!("{key}={MASK_REDACTED}")
+            } else {
+                format!("{key}={value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{prefix}?{redacted_query}")
+}
+
+fn basename_for_absolute_path(value: &str) -> Option<String> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(std::string::ToString::to_string)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2731,6 +2978,43 @@ impl Default for ConsoleCommandPalette {
 mod tests {
     use super::*;
 
+    fn test_startup_state() -> StartupStateJson<'static> {
+        StartupStateJson {
+            endpoint: "http://127.0.0.1:8765/mcp/",
+            web_ui: Some("http://127.0.0.1:8765/mail?token=secret123"),
+            uptime: "2026-05-09T09:00:00+00:00",
+            environment: "dev",
+            auth_enabled: true,
+            tools_log_enabled: true,
+            log_tool_calls_enabled: true,
+            stats: StartupStateStats {
+                projects: Some(3),
+                agents: Some(5),
+                messages: Some(42),
+                file_reservations: Some(2),
+                contact_links: Some(1),
+            },
+            storage_root: "/tmp/storage",
+            database_url: Some("postgres://user:pass@localhost/db"),
+            http_bearer_token: Some("secret123"),
+            am_git_binary: Some("/usr/local/bin/git-2.50.x"),
+        }
+    }
+
+    fn extract_startup_json_from_lines(lines: &[String]) -> String {
+        let joined = lines.join("\n");
+        let stripped = strip_ansi_content(&joined);
+        let start = stripped
+            .find(STARTUP_STATE_JSON_BEGIN)
+            .expect("startup json begin marker");
+        let after_start = start + STARTUP_STATE_JSON_BEGIN.len();
+        let end = stripped[after_start..]
+            .find(STARTUP_STATE_JSON_END)
+            .map(|idx| after_start + idx)
+            .expect("startup json end marker");
+        stripped[after_start..end].trim().to_string()
+    }
+
     // ── Masking tests ──
 
     #[test]
@@ -2918,6 +3202,7 @@ mod tests {
             messages: 42,
             file_reservations: 2,
             contact_links: 1,
+            startup_state_json: None,
         };
         let lines = render_startup_banner(&params);
         let joined = lines.join("\n");
@@ -2967,12 +3252,229 @@ mod tests {
             messages: 0,
             file_reservations: 0,
             contact_links: 0,
+            startup_state_json: None,
         };
         let lines = render_startup_banner(&params);
         let joined = lines.join("\n");
         assert!(joined.contains("Tool logs:"));
         assert!(joined.contains("Tool panels:"));
         assert!(!joined.contains("Rich Logging ENABLED"));
+    }
+
+    #[test]
+    fn banner_json_emits_all_required_keys() {
+        let value = build_startup_state_json(&test_startup_state());
+
+        for key in [
+            "endpoint",
+            "web_ui",
+            "uptime",
+            "environment",
+            "auth_enabled",
+            "tools_log_enabled",
+            "log_tool_calls_enabled",
+            "stats",
+            "storage_root",
+        ] {
+            assert!(value.get(key).is_some(), "missing key: {key}");
+        }
+
+        let stats = value
+            .get("stats")
+            .and_then(Value::as_object)
+            .expect("stats object");
+        for key in [
+            "projects",
+            "agents",
+            "messages",
+            "file_reservations",
+            "contact_links",
+        ] {
+            assert!(stats.get(key).is_some(), "missing stats key: {key}");
+        }
+    }
+
+    #[test]
+    fn banner_json_parses_as_valid_json_after_ansi_strip() {
+        let lines = render_startup_state_json_section(&test_startup_state(), true);
+        let json = extract_startup_json_from_lines(&lines);
+        let parsed: Value = serde_json::from_str(&json).expect("startup json parses");
+
+        assert_eq!(parsed["endpoint"], "http://127.0.0.1:8765/mcp/");
+        assert_eq!(parsed["stats"]["messages"], 42);
+    }
+
+    #[test]
+    fn banner_json_masks_bearer_token() {
+        let rendered = serde_json::to_string(&build_startup_state_json(&test_startup_state()))
+            .expect("serialize startup json");
+
+        assert!(!rendered.contains("secret123"));
+        assert!(rendered.contains(MASK_REDACTED));
+    }
+
+    #[test]
+    fn banner_json_masks_sensitive_endpoint_query_values() {
+        let mut state = test_startup_state();
+        state.endpoint = "http://127.0.0.1:8765/mcp?access_token=endpoint-secret&mode=stdio";
+        let value = build_startup_state_json(&state);
+
+        assert_eq!(
+            value["endpoint"],
+            "http://127.0.0.1:8765/mcp?access_token=<redacted>&mode=stdio"
+        );
+        let rendered = serde_json::to_string(&value).expect("serialize startup json");
+        assert!(!rendered.contains("endpoint-secret"));
+    }
+
+    #[test]
+    fn banner_json_masks_database_url_userinfo() {
+        let value = build_startup_state_json(&test_startup_state());
+        let database_url = value["runtime"]["database_url"]
+            .as_str()
+            .expect("database url string");
+
+        assert_eq!(database_url, "postgres://user:<redacted>@localhost/db");
+    }
+
+    #[test]
+    fn banner_json_masks_am_git_binary_absolute_path() {
+        let value = build_startup_state_json(&test_startup_state());
+        let am_git_binary = value["runtime"]["am_git_binary"]
+            .as_str()
+            .expect("git binary string");
+
+        assert_eq!(am_git_binary, "git-2.50.x");
+    }
+
+    #[test]
+    fn banner_json_keys_deterministic_ordering() {
+        let first = serde_json::to_string_pretty(&build_startup_state_json(&test_startup_state()))
+            .expect("serialize first startup json");
+        let second = serde_json::to_string_pretty(&build_startup_state_json(&test_startup_state()))
+            .expect("serialize second startup json");
+
+        assert_eq!(first, second);
+        let endpoint_idx = first.find("\"endpoint\"").expect("endpoint key");
+        let web_ui_idx = first.find("\"web_ui\"").expect("web_ui key");
+        assert!(
+            endpoint_idx < web_ui_idx,
+            "required keys should preserve insertion order: {first}"
+        );
+    }
+
+    #[test]
+    fn banner_json_disabled_option_skips_section() {
+        let params = BannerParams {
+            app_environment: "development",
+            endpoint: "http://localhost:8765/mcp",
+            database_url: "/tmp/test.db",
+            storage_root: "/tmp/storage",
+            auth_enabled: true,
+            tools_log_enabled: true,
+            tool_calls_log_enabled: true,
+            console_theme: "Cyberpunk Aurora",
+            web_ui_url: "http://localhost:8765/mail",
+            remote_url: None,
+            projects: 3,
+            agents: 5,
+            messages: 42,
+            file_reservations: 2,
+            contact_links: 1,
+            startup_state_json: Some(test_startup_state()),
+        };
+        let lines = render_startup_banner_with_options(
+            &params,
+            StartupJsonRenderOptions {
+                enabled: false,
+                use_ansi: false,
+            },
+        );
+        let joined = lines.join("\n");
+
+        assert!(!joined.contains(STARTUP_STATE_JSON_BEGIN));
+        assert!(!joined.contains(STARTUP_STATE_JSON_END));
+    }
+
+    #[test]
+    fn startup_banner_masks_sensitive_url_query_values() {
+        let params = BannerParams {
+            app_environment: "development",
+            endpoint: "http://localhost:8765/mcp?access_token=endpoint-secret&mode=stdio",
+            database_url: "/tmp/test.db",
+            storage_root: "/tmp/storage",
+            auth_enabled: true,
+            tools_log_enabled: true,
+            tool_calls_log_enabled: true,
+            console_theme: "Cyberpunk Aurora",
+            web_ui_url: "http://localhost:8765/mail?token=web-secret&view=thread",
+            remote_url: Some("http://100.64.0.1:8765/mail?bearer=remote-secret"),
+            projects: 3,
+            agents: 5,
+            messages: 42,
+            file_reservations: 2,
+            contact_links: 1,
+            startup_state_json: None,
+        };
+        let lines = render_startup_banner_with_options(
+            &params,
+            StartupJsonRenderOptions {
+                enabled: false,
+                use_ansi: false,
+            },
+        );
+        let joined = lines.join("\n");
+
+        assert!(!joined.contains("endpoint-secret"));
+        assert!(!joined.contains("web-secret"));
+        assert!(!joined.contains("remote-secret"));
+        assert!(joined.contains("access_token=<redacted>&mode=stdio"));
+        assert!(joined.contains("token=<redacted>&view=thread"));
+        assert!(joined.contains("bearer=<redacted>"));
+    }
+
+    #[test]
+    fn banner_json_uses_active_theme_for_highlighting() {
+        let state = test_startup_state();
+        let highlighted = render_startup_state_json_section(&state, true).join("\n");
+        let plain = render_startup_state_json_section(&state, false).join("\n");
+
+        assert!(highlighted.contains("\x1b["));
+        assert_eq!(plain, strip_ansi_content(&plain));
+    }
+
+    #[test]
+    fn banner_json_plain_when_no_tty() {
+        let lines = render_startup_state_json_section(&test_startup_state(), false);
+        let joined = lines.join("\n");
+
+        assert_eq!(joined, strip_ansi_content(&joined));
+    }
+
+    #[test]
+    fn banner_json_failed_count_query_emits_null() {
+        let mut state = test_startup_state();
+        state.stats.projects = None;
+        let value = build_startup_state_json(&state);
+
+        assert!(value["stats"]["projects"].is_null());
+        assert_eq!(value["stats"]["agents"], 5);
+    }
+
+    #[test]
+    fn banner_json_path_prefix_compaction_requires_component_boundary() {
+        assert_eq!(
+            strip_display_path_prefix("/home/alice/mail", "/home/alice"),
+            Some("/mail")
+        );
+        assert_eq!(
+            strip_display_path_prefix("/home/alice", "/home/alice/"),
+            Some("")
+        );
+        assert_eq!(
+            strip_display_path_prefix("/home/alice-mail", "/home/alice"),
+            None
+        );
     }
 
     // ── Tool call panel tests ──

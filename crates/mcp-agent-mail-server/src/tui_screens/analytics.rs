@@ -20,6 +20,7 @@ use mcp_agent_mail_core::{
     AnomalyAlert, AnomalyKind, AnomalySeverity, InsightCard, InsightFeed, build_insight_feed,
     quick_insight_feed,
 };
+use std::collections::BTreeMap;
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -54,6 +55,15 @@ const ANALYTICS_VIZ_BAND_HEIGHT_PERCENT: u16 = 34;
 const ANALYTICS_LIGHT_HEADER_MIX: f32 = 0.18;
 const ANALYTICS_LIGHT_ODD_ROW_MIX: f32 = 0.11;
 const ANALYTICS_VIZ_TILE_MIN_WIDTH: u16 = 16;
+const ANALYTICS_TOPOLOGY_EVENT_LIMIT: usize = 512;
+const ANALYTICS_TOPOLOGY_HOTSPOT_LIMIT: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalyticsTopologyHotspot {
+    label: String,
+    heat_score: u64,
+    edge_count: u64,
+}
 
 #[derive(Debug, Clone, Default)]
 struct AnalyticsVizSnapshot {
@@ -68,6 +78,9 @@ struct AnalyticsVizSnapshot {
     top_call_tools: Vec<(String, f64)>,
     top_latency_tools: Vec<(String, f64)>,
     sparkline: Vec<f64>,
+    topology_nodes: usize,
+    topology_edges: usize,
+    topology_hotspots: Vec<AnalyticsTopologyHotspot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,17 +281,20 @@ impl AnalyticsScreen {
 
     fn refresh_from_state(&mut self, state: &TuiSharedState) {
         let runtime_metrics = mcp_agent_mail_tools::tool_metrics_snapshot_full();
-        let runtime_has_live_signal = runtime_metrics_have_signal(&runtime_metrics);
+        let runtime_metrics_have_live_signal = runtime_metrics_have_signal(&runtime_metrics);
+        let candidate_snapshot = build_runtime_viz_snapshot_from_metrics(
+            state,
+            &runtime_metrics,
+            !runtime_metrics_have_live_signal,
+        );
+        let runtime_has_live_signal =
+            runtime_metrics_have_live_signal || analytics_viz_has_live_signal(&candidate_snapshot);
         let runtime_preserved_previous =
             !runtime_has_live_signal && analytics_viz_has_live_signal(&self.cached_viz);
         let runtime_snapshot = if runtime_preserved_previous {
             self.cached_viz.clone()
         } else {
-            build_runtime_viz_snapshot_from_metrics(
-                state,
-                &runtime_metrics,
-                !runtime_has_live_signal,
-            )
+            candidate_snapshot
         };
         self.refresh_feed(
             state,
@@ -793,6 +809,196 @@ fn runtime_metrics_have_signal(snapshots: &[mcp_agent_mail_tools::MetricsSnapsho
         .any(|entry| entry.calls > 0 || entry.errors > 0 || entry.latency.is_some())
 }
 
+#[derive(Debug, Clone, Default)]
+struct RuntimeTopologyNode {
+    label: String,
+    heat_score: u64,
+    edge_count: u64,
+}
+
+fn analytics_topology_key(kind: &str, value: &str) -> String {
+    let value = if value.trim().is_empty() {
+        "unknown"
+    } else {
+        value.trim()
+    };
+    format!("{kind}:{value}")
+}
+
+fn record_analytics_topology_node(
+    nodes: &mut BTreeMap<String, RuntimeTopologyNode>,
+    kind: &str,
+    value: &str,
+    heat_score: u64,
+) -> String {
+    let key = analytics_topology_key(kind, value);
+    let entry = nodes
+        .entry(key.clone())
+        .or_insert_with(|| RuntimeTopologyNode {
+            label: key.clone(),
+            heat_score: 0,
+            edge_count: 0,
+        });
+    entry.heat_score = entry.heat_score.saturating_add(heat_score);
+    key
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_analytics_topology_edge(
+    nodes: &mut BTreeMap<String, RuntimeTopologyNode>,
+    edges: &mut BTreeMap<String, u64>,
+    from_kind: &str,
+    from_value: &str,
+    to_kind: &str,
+    to_value: &str,
+    edge_kind: &str,
+    weight: u64,
+) {
+    let weight = weight.max(1);
+    let from_key = record_analytics_topology_node(nodes, from_kind, from_value, weight);
+    let to_key = record_analytics_topology_node(nodes, to_kind, to_value, weight);
+    let edge_key = format!("{from_key}->{edge_kind}->{to_key}");
+    let edge_weight = edges.entry(edge_key).or_default();
+    *edge_weight = edge_weight.saturating_add(weight);
+    if let Some(node) = nodes.get_mut(&from_key) {
+        node.edge_count = node.edge_count.saturating_add(1);
+    }
+    if let Some(node) = nodes.get_mut(&to_key) {
+        node.edge_count = node.edge_count.saturating_add(1);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_runtime_topology_from_events(
+    events: &[crate::tui_events::MailEvent],
+) -> (usize, usize, Vec<AnalyticsTopologyHotspot>) {
+    use crate::tui_events::MailEvent;
+
+    let mut nodes = BTreeMap::new();
+    let mut edges = BTreeMap::new();
+
+    for event in events {
+        match event {
+            MailEvent::MessageSent {
+                from,
+                to,
+                thread_id,
+                project,
+                ..
+            }
+            | MailEvent::MessageReceived {
+                from,
+                to,
+                thread_id,
+                project,
+                ..
+            } => {
+                record_analytics_topology_edge(
+                    &mut nodes,
+                    &mut edges,
+                    "project",
+                    project,
+                    "thread",
+                    thread_id,
+                    "contains_thread",
+                    1,
+                );
+                record_analytics_topology_edge(
+                    &mut nodes,
+                    &mut edges,
+                    "agent",
+                    from,
+                    "thread",
+                    thread_id,
+                    "sent_messages",
+                    1,
+                );
+                for recipient in to {
+                    record_analytics_topology_edge(
+                        &mut nodes,
+                        &mut edges,
+                        "thread",
+                        thread_id,
+                        "agent",
+                        recipient,
+                        "delivered_messages",
+                        1,
+                    );
+                }
+            }
+            MailEvent::ReservationGranted {
+                agent,
+                paths,
+                project,
+                ..
+            } => {
+                for path in paths {
+                    record_analytics_topology_edge(
+                        &mut nodes,
+                        &mut edges,
+                        "agent",
+                        agent,
+                        "reservation",
+                        path,
+                        "holds_reservation",
+                        1,
+                    );
+                    record_analytics_topology_edge(
+                        &mut nodes,
+                        &mut edges,
+                        "project",
+                        project,
+                        "reservation",
+                        path,
+                        "tracks_reservation",
+                        1,
+                    );
+                }
+            }
+            MailEvent::ReservationReleased { agent, paths, .. } => {
+                record_analytics_topology_node(&mut nodes, "agent", agent, 1);
+                for path in paths {
+                    record_analytics_topology_node(&mut nodes, "reservation", path, 1);
+                }
+            }
+            MailEvent::AgentRegistered { name, project, .. } => {
+                record_analytics_topology_edge(
+                    &mut nodes,
+                    &mut edges,
+                    "project",
+                    project,
+                    "agent",
+                    name,
+                    "has_agent",
+                    1,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let node_count = nodes.len();
+    let mut hotspots = nodes.into_values().collect::<Vec<_>>();
+    hotspots.sort_by(|left, right| {
+        right
+            .heat_score
+            .cmp(&left.heat_score)
+            .then_with(|| right.edge_count.cmp(&left.edge_count))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    let hotspots = hotspots
+        .into_iter()
+        .take(ANALYTICS_TOPOLOGY_HOTSPOT_LIMIT)
+        .map(|node| AnalyticsTopologyHotspot {
+            label: node.label,
+            heat_score: node.heat_score,
+            edge_count: node.edge_count,
+        })
+        .collect::<Vec<_>>();
+
+    (node_count, edges.len(), hotspots)
+}
+
 fn analytics_viz_has_live_signal(snapshot: &AnalyticsVizSnapshot) -> bool {
     snapshot.total_calls > 0
         || snapshot.total_errors > 0
@@ -801,6 +1007,8 @@ fn analytics_viz_has_live_signal(snapshot: &AnalyticsVizSnapshot) -> bool {
         || snapshot.avg_latency_ms > 0.0
         || snapshot.p95_latency_ms > 0.0
         || snapshot.p99_latency_ms > 0.0
+        || snapshot.topology_nodes > 0
+        || snapshot.topology_edges > 0
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -903,6 +1111,9 @@ fn build_runtime_viz_snapshot_from_metrics(
         sparkline = vec![0.0];
     }
 
+    let (topology_nodes, topology_edges, topology_hotspots) =
+        build_runtime_topology_from_events(&state.recent_events(ANALYTICS_TOPOLOGY_EVENT_LIMIT));
+
     AnalyticsVizSnapshot {
         total_calls,
         total_errors,
@@ -915,6 +1126,9 @@ fn build_runtime_viz_snapshot_from_metrics(
         top_call_tools,
         top_latency_tools,
         sparkline,
+        topology_nodes,
+        topology_edges,
+        topology_hotspots,
     }
 }
 
@@ -971,6 +1185,29 @@ fn build_runtime_insight_feed_from_snapshot(snapshot: &AnalyticsVizSnapshot) -> 
             ),
             suggested_action: "Open top latency tools and compare with recent throughput."
                 .to_string(),
+        });
+    }
+
+    if let Some(hotspot) = snapshot.topology_hotspots.first() {
+        let severity = if hotspot.heat_score >= 12 {
+            AnomalySeverity::Medium
+        } else {
+            AnomalySeverity::Low
+        };
+        alerts.push(AnomalyAlert {
+            kind: AnomalyKind::ReservationConflicts,
+            severity,
+            score: (hotspot.heat_score as f64 / 20.0).clamp(0.12, 0.85),
+            current_value: hotspot.heat_score as f64,
+            threshold: 6.0,
+            baseline_value: Some(snapshot.topology_edges as f64),
+            explanation: format!(
+                "swarm topology hotspot {} with {} edges across {} nodes / {} edges",
+                hotspot.label, hotspot.edge_count, snapshot.topology_nodes, snapshot.topology_edges
+            ),
+            suggested_action:
+                "Use Analytics and Reservations views to inspect the hottest coordination point."
+                    .to_string(),
         });
     }
 
@@ -1921,8 +2158,12 @@ fn render_runtime_viz_fallback(
     }
     if inner.height < 5 {
         Paragraph::new(format!(
-            "calls:{}  err:{}  p95:{:.1}ms",
-            snapshot.total_calls, snapshot.total_errors, snapshot.p95_latency_ms
+            "calls:{}  err:{}  p95:{:.1}ms  topology:{}/{}",
+            snapshot.total_calls,
+            snapshot.total_errors,
+            snapshot.p95_latency_ms,
+            snapshot.topology_nodes,
+            snapshot.topology_edges
         ))
         .style(crate::tui_theme::text_hint(&tp))
         .render(inner, frame);
@@ -1931,7 +2172,7 @@ fn render_runtime_viz_fallback(
 
     if inner.height < 10 {
         let compact = format!(
-            "calls:{}  errors:{}  avg:{:.1}ms  p95:{:.1}ms  p99:{:.1}ms  tools:{} active / {} slow  persisted:{}",
+            "calls:{}  errors:{}  avg:{:.1}ms  p95:{:.1}ms  p99:{:.1}ms  tools:{} active / {} slow  persisted:{}  topology:{}/{}",
             snapshot.total_calls,
             snapshot.total_errors,
             snapshot.avg_latency_ms,
@@ -1939,7 +2180,9 @@ fn render_runtime_viz_fallback(
             snapshot.p99_latency_ms,
             snapshot.active_tools,
             snapshot.slow_tools,
-            snapshot.persisted_samples
+            snapshot.persisted_samples,
+            snapshot.topology_nodes,
+            snapshot.topology_edges
         );
         let compact_area = Rect::new(inner.x, inner.y, inner.width, 1);
         Paragraph::new(compact)
@@ -2023,8 +2266,11 @@ fn render_runtime_viz_fallback(
             tile4,
             "Coverage",
             &format!(
-                "{} active · {} slow · {} persisted",
-                snapshot.active_tools, snapshot.slow_tools, snapshot.persisted_samples
+                "{} active · {} slow · topo {}/{}",
+                snapshot.active_tools,
+                snapshot.slow_tools,
+                snapshot.topology_nodes,
+                snapshot.topology_edges
             ),
             tp.metric_messages,
         );
@@ -2035,14 +2281,16 @@ fn render_runtime_viz_fallback(
             0.0
         };
         let compact = format!(
-            "calls:{} err:{:.2}% avg:{:.1}ms p95:{:.1}ms active:{} slow:{} persisted:{}",
+            "calls:{} err:{:.2}% avg:{:.1}ms p95:{:.1}ms active:{} slow:{} persisted:{} topology:{}/{}",
             snapshot.total_calls,
             error_rate,
             snapshot.avg_latency_ms,
             snapshot.p95_latency_ms,
             snapshot.active_tools,
             snapshot.slow_tools,
-            snapshot.persisted_samples
+            snapshot.persisted_samples,
+            snapshot.topology_nodes,
+            snapshot.topology_edges
         );
         Paragraph::new(compact)
             .style(crate::tui_theme::text_hint(&tp))
@@ -2187,6 +2435,20 @@ fn render_runtime_viz_fallback(
                 sort_mode.label(),
                 focus.label()
             ));
+            if let Some(hotspot) = snapshot.topology_hotspots.first() {
+                lines.push(format!(
+                    "swarm topology: {} nodes / {} edges; hot {} score {}",
+                    snapshot.topology_nodes,
+                    snapshot.topology_edges,
+                    hotspot.label,
+                    hotspot.heat_score
+                ));
+            } else if snapshot.topology_nodes > 0 || snapshot.topology_edges > 0 {
+                lines.push(format!(
+                    "swarm topology: {} nodes / {} edges",
+                    snapshot.topology_nodes, snapshot.topology_edges
+                ));
+            }
             if let Some((name, value)) = snapshot.top_latency_tools.first() {
                 lines.push(format!("hottest tool: {name} @ {value:.1}ms p95"));
             }
@@ -2322,6 +2584,8 @@ impl MailScreen for AnalyticsScreen {
         let runtime_has_signal = runtime_snapshot.total_calls > 0
             || runtime_snapshot.total_errors > 0
             || runtime_snapshot.persisted_samples > 0
+            || runtime_snapshot.topology_nodes > 0
+            || runtime_snapshot.topology_edges > 0
             || !runtime_snapshot.sparkline.is_empty()
                 && runtime_snapshot
                     .sparkline
@@ -3404,6 +3668,9 @@ mod tests {
             ],
             top_latency_tools: vec![("dispatch".to_string(), 41.7), ("sqlite".to_string(), 28.4)],
             sparkline: vec![5.0, 8.0, 13.0, 21.0, 34.0],
+            topology_nodes: 0,
+            topology_edges: 0,
+            topology_hotspots: Vec::new(),
         };
 
         let mut pool = ftui::GraphemePool::new();
@@ -3417,6 +3684,99 @@ mod tests {
             occurrences, 1,
             "runtime viz latency track should render once per frame when top viz band is visible"
         );
+    }
+
+    #[test]
+    fn runtime_viz_snapshot_summarizes_swarm_topology_without_message_content() {
+        reset_tool_metrics();
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        assert!(state.push_event(crate::tui_events::MailEvent::message_sent(
+            1,
+            "BlueLake",
+            vec!["RedFox".to_string()],
+            "SECRET_SUBJECT",
+            "thread-hot",
+            "project-alpha",
+            "SECRET_BODY",
+        )));
+        assert!(
+            state.push_event(crate::tui_events::MailEvent::message_received(
+                2,
+                "BlueLake",
+                vec!["RedFox".to_string()],
+                "SECRET_SUBJECT",
+                "thread-hot",
+                "project-alpha",
+                "SECRET_BODY",
+            ))
+        );
+        assert!(
+            state.push_event(crate::tui_events::MailEvent::reservation_granted(
+                "BlueLake",
+                vec!["src/hot.rs".to_string()],
+                true,
+                3600,
+                "project-alpha",
+            ))
+        );
+
+        let snapshot = build_runtime_viz_snapshot_from_metrics(&state, &[], false);
+
+        assert!(snapshot.topology_nodes >= 4, "{snapshot:?}");
+        assert!(snapshot.topology_edges >= 4, "{snapshot:?}");
+        assert!(
+            snapshot
+                .topology_hotspots
+                .iter()
+                .any(|hotspot| hotspot.label == "agent:BlueLake"),
+            "{snapshot:?}"
+        );
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("SECRET_SUBJECT"));
+        assert!(!debug.contains("SECRET_BODY"));
+    }
+
+    #[test]
+    fn analytics_screen_renders_swarm_topology_smoke_without_message_content() {
+        let mut screen = AnalyticsScreen::new();
+        screen.feed = InsightFeed {
+            cards: vec![sample_card("topology", AnomalySeverity::Medium, 0.72)],
+            alerts_processed: 1,
+            cards_produced: 1,
+        };
+        screen.cached_viz = AnalyticsVizSnapshot {
+            total_calls: 8,
+            total_errors: 0,
+            active_tools: 2,
+            slow_tools: 0,
+            avg_latency_ms: 7.5,
+            p95_latency_ms: 18.0,
+            p99_latency_ms: 22.0,
+            persisted_samples: 0,
+            top_call_tools: vec![("send_message".to_string(), 5.0)],
+            top_latency_tools: vec![("file_reservation_paths".to_string(), 18.0)],
+            sparkline: vec![3.0, 5.0, 8.0],
+            topology_nodes: 5,
+            topology_edges: 6,
+            topology_hotspots: vec![AnalyticsTopologyHotspot {
+                label: "agent:BlueLake".to_string(),
+                heat_score: 9,
+                edge_count: 4,
+            }],
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(180, 40, &mut pool);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.view(&mut frame, Rect::new(0, 0, 180, 40), &state);
+        let text = frame_text(&frame);
+
+        assert!(text.contains("swarm topology"), "{text}");
+        assert!(text.contains("agent:BlueLake"), "{text}");
+        assert!(!text.contains("SECRET_SUBJECT"));
+        assert!(!text.contains("SECRET_BODY"));
     }
 
     #[test]

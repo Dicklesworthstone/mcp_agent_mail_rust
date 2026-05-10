@@ -12,7 +12,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ftui::Frame;
 use ftui::layout::Rect;
 use ftui::render::frame::HitId;
 use ftui::text::display_width;
@@ -26,12 +25,14 @@ use ftui::widgets::notification_queue::NotificationStack;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::toast::{ToastId, ToastPosition};
 use ftui::widgets::{NotificationQueue, QueueConfig, Toast, ToastIcon};
+use ftui::{Buffer, BufferDiff, Frame};
 use ftui::{
     Event, KeyCode, KeyEventKind, Modifiers, MouseButton, MouseEventKind, PackedRgba, Style,
 };
 use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
+use ftui_render::budget::DegradationLevel;
 use ftui_runtime::program::{Cmd, Model};
 use ftui_runtime::subscription::Subscription;
 use ftui_runtime::tick_strategy::ScreenTickDispatch;
@@ -40,17 +41,32 @@ use mcp_agent_mail_db::DbPoolConfig;
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
 use crate::tui_bridge::{RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiSharedState};
 use crate::tui_compose::{ComposeAction, ComposePanel, ComposeState};
+use crate::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState as TuiDiffFrameState};
 use crate::tui_events::{EventSeverity, MailEvent};
 use crate::tui_focus::{FocusManager, FocusTarget, focus_graph_for_screen, focus_ring_for_screen};
 use crate::tui_macro::{MacroEngine, PlaybackMode, PlaybackState, action_ids as macro_ids};
 use crate::tui_screens::{
-    ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg, agents::AgentsScreen,
-    analytics::AnalyticsScreen, archive_browser::ArchiveBrowserScreen, atc::AtcScreen,
-    attachments::AttachmentExplorerScreen, contacts::ContactsScreen, dashboard::DashboardScreen,
-    explorer::MailExplorerScreen, messages::MessageBrowserScreen, projects::ProjectsScreen,
-    reservations::ReservationsScreen, screen_from_jump_key, screen_meta,
-    search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
-    timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
+    ALL_SCREEN_IDS, DeepLinkTarget, MailScreen, MailScreenId, MailScreenMsg,
+    agents::AgentsScreen,
+    analytics::AnalyticsScreen,
+    archive_browser::ArchiveBrowserScreen,
+    atc::AtcScreen,
+    attachments::AttachmentExplorerScreen,
+    contacts::ContactsScreen,
+    dashboard::DashboardScreen,
+    explorer::MailExplorerScreen,
+    messages::MessageBrowserScreen,
+    projects::ProjectsScreen,
+    reservations::ReservationsScreen,
+    screen_from_jump_key, screen_meta,
+    search::SearchCockpitScreen,
+    system_health::{
+        GitSegfaultRetryToastSeverity, GitSegfaultRetryToastState, SystemHealthScreen,
+        git_segfault_retry_toast_handler,
+    },
+    threads::ThreadExplorerScreen,
+    timeline::TimelineScreen,
+    tool_metrics::ToolMetricsScreen,
 };
 use crate::tui_widgets::{
     AmbientEffectRenderer, AmbientHealthInput, AmbientMode, AmbientRenderTelemetry,
@@ -92,6 +108,11 @@ const AMBIENT_HEALTH_LOOKBACK_EVENTS: usize = 256;
 const CONTRAST_GUARD_SAFETY_SCAN_TICK_DIVISOR: u64 = 20;
 /// Max events published into the per-tick shared batch consumed by screens.
 const SHARED_TICK_EVENT_BATCH_LIMIT: usize = 512;
+const TUI_DIFF_TRACE_TARGET: &str = "mcp_agent_mail::tui::diff";
+const TUI_DIFF_DEFAULT_SAFE_MODE: bool = true;
+const TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY: u32 = 64;
+const TUI_DIFF_DEFAULT_AUTO_FLIP_THRESHOLD: u32 = 3;
+const TUI_DIFF_FRAME_BUDGET_MS: f64 = 16.6;
 
 /// Nearby (adjacent) inactive screens tick every Nth frame.
 const NEARBY_SCREEN_TICK_DIVISOR: u64 = 3;
@@ -234,6 +255,93 @@ fn screen_tick_divisor(screen: MailScreenId, active: MailScreenId, urgent_bypass
         divisor = divisor.min(URGENT_BYPASS_SCREEN_TICK_DIVISOR);
     }
     divisor.max(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiDiffSettings {
+    safe_mode: bool,
+    full_diff_audit_every: u32,
+    audit_auto_flip_threshold: u32,
+}
+
+impl Default for TuiDiffSettings {
+    fn default() -> Self {
+        Self {
+            safe_mode: TUI_DIFF_DEFAULT_SAFE_MODE,
+            full_diff_audit_every: TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY,
+            audit_auto_flip_threshold: TUI_DIFF_DEFAULT_AUTO_FLIP_THRESHOLD,
+        }
+    }
+}
+
+impl TuiDiffSettings {
+    fn from_env() -> Self {
+        Self::from_sources(
+            std::env::var("AM_TUI_DIFF_SAFE_MODE").ok().as_deref(),
+            std::env::var("AM_TUI_FULL_DIFF_AUDIT_EVERY")
+                .ok()
+                .as_deref(),
+            std::env::var("AM_TUI_DIFF_AUDIT_AUTO_FLIP_THRESHOLD")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_sources(
+        safe_mode: Option<&str>,
+        full_diff_audit_every: Option<&str>,
+        audit_auto_flip_threshold: Option<&str>,
+    ) -> Self {
+        Self {
+            safe_mode: parse_tui_diff_bool(safe_mode, TUI_DIFF_DEFAULT_SAFE_MODE),
+            full_diff_audit_every: parse_tui_diff_u32(
+                full_diff_audit_every,
+                TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY,
+                1,
+                10_000,
+            ),
+            audit_auto_flip_threshold: parse_tui_diff_u32(
+                audit_auto_flip_threshold,
+                TUI_DIFF_DEFAULT_AUTO_FLIP_THRESHOLD,
+                1,
+                100,
+            ),
+        }
+    }
+}
+
+fn parse_tui_diff_bool(raw: Option<&str>, default: bool) -> bool {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn parse_tui_diff_u32(raw: Option<&str>, default: u32, min: u32, max: u32) -> u32 {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+const fn diff_action_label(action: DiffAction) -> &'static str {
+    match action {
+        DiffAction::Incremental => "incremental",
+        DiffAction::Full => "full",
+        DiffAction::Deferred => "deferred",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TuiDiffFrameDecision {
+    state: TuiDiffFrameState,
+    action: DiffAction,
+    shadow_action: DiffAction,
+    safe_mode: bool,
+    first_frame: bool,
 }
 
 fn command_palette_theme_style() -> PaletteStyle {
@@ -1262,6 +1370,30 @@ pub struct MailAppModel {
     ambient_last_render_tick: Cell<Option<u64>>,
     /// Total ambient render invocations for regression diagnostics.
     ambient_render_invocations: Cell<u64>,
+    /// App-level Bayesian diff strategy consumed in shadow-safe mode.
+    diff_strategy: RefCell<BayesianDiffStrategy>,
+    /// When true, observe strategy decisions but render through the full safe path.
+    diff_strategy_safe_mode: Cell<bool>,
+    /// Full-diff audit cadence in rendered frames.
+    diff_full_diff_audit_every: u32,
+    /// Rendered frame counter for audit cadence.
+    diff_full_diff_audit_counter: Cell<u32>,
+    /// Consecutive mismatch threshold before safe mode is forced on.
+    diff_audit_auto_flip_threshold: u32,
+    /// Consecutive full-diff audit mismatches.
+    diff_consecutive_audit_mismatches: Cell<u32>,
+    /// Last rendered frame retained for periodic dirty-tracking audits.
+    diff_last_audit_buffer: RefCell<Option<Buffer>>,
+    /// Last observed changed-cell ratio used as the next frame's evidence.
+    diff_last_change_ratio: Cell<f64>,
+    /// Resize signal waiting to be consumed by the next diff decision.
+    diff_resize_pending: Cell<bool>,
+    /// One-shot startup guard: the first rendered frame always takes the full path.
+    diff_first_frame_pending: Cell<bool>,
+    /// Last action applied by the app-level strategy.
+    diff_last_action: Cell<DiffAction>,
+    /// Count of degraded deferred decisions for diagnostics.
+    diff_deferred_frames: Cell<u64>,
     /// Cached summary of recent event severities for ambient health heuristics.
     ambient_signal_summary: Cell<AmbientEventSignalSummary>,
     /// Total events seen when `ambient_signal_summary` was last refreshed.
@@ -1296,6 +1428,10 @@ pub struct MailAppModel {
     toast_severity: ToastSeverityThreshold,
     /// Runtime mute flag for toast generation.
     toast_muted: bool,
+    /// Per-category toggle for git 2.51.0 segfault retry warnings.
+    git_segfault_toast_enabled: bool,
+    /// Session state for git segfault retry toast suppression/escalation.
+    git_segfault_retry_toasts: GitSegfaultRetryToastState,
     /// Per-severity auto-dismiss durations (seconds).
     toast_info_dismiss_secs: u64,
     toast_warn_dismiss_secs: u64,
@@ -1400,6 +1536,7 @@ impl MailAppModel {
         }
 
         let (action_tx, action_rx) = std::sync::mpsc::channel();
+        let diff_settings = TuiDiffSettings::from_env();
 
         Self {
             state,
@@ -1415,6 +1552,18 @@ impl MailAppModel {
             ambient_last_telemetry: Cell::new(AmbientRenderTelemetry::default()),
             ambient_last_render_tick: Cell::new(None),
             ambient_render_invocations: Cell::new(0),
+            diff_strategy: RefCell::new(BayesianDiffStrategy::new()),
+            diff_strategy_safe_mode: Cell::new(diff_settings.safe_mode),
+            diff_full_diff_audit_every: diff_settings.full_diff_audit_every,
+            diff_full_diff_audit_counter: Cell::new(0),
+            diff_audit_auto_flip_threshold: diff_settings.audit_auto_flip_threshold,
+            diff_consecutive_audit_mismatches: Cell::new(0),
+            diff_last_audit_buffer: RefCell::new(None),
+            diff_last_change_ratio: Cell::new(0.0),
+            diff_resize_pending: Cell::new(false),
+            diff_first_frame_pending: Cell::new(true),
+            diff_last_action: Cell::new(DiffAction::Full),
+            diff_deferred_frames: Cell::new(0),
             ambient_signal_summary: Cell::new(AmbientEventSignalSummary::default()),
             ambient_signal_total_pushed: Cell::new(0),
             hint_ranker,
@@ -1436,6 +1585,8 @@ impl MailAppModel {
             warned_reservations: HashSet::new(),
             toast_severity: ToastSeverityThreshold::from_env(),
             toast_muted: false,
+            git_segfault_toast_enabled: true,
+            git_segfault_retry_toasts: GitSegfaultRetryToastState::default(),
             toast_info_dismiss_secs: 5,
             toast_warn_dismiss_secs: 8,
             toast_error_dismiss_secs: 15,
@@ -1490,6 +1641,7 @@ impl MailAppModel {
         model.coach_hints.enabled = config.tui_coach_hints_enabled;
         model.toast_severity = ToastSeverityThreshold::from_config(config);
         model.toast_muted = !config.tui_toast_enabled;
+        model.git_segfault_toast_enabled = config.tui_git_segfault_toast_enabled;
         model.toast_info_dismiss_secs = config.tui_toast_info_dismiss_secs.max(1);
         model.toast_warn_dismiss_secs = config.tui_toast_warn_dismiss_secs.max(1);
         model.toast_error_dismiss_secs = config.tui_toast_error_dismiss_secs.max(1);
@@ -1609,6 +1761,7 @@ impl MailAppModel {
 
     fn queue_resize_event(&mut self, width: u16, height: u16) {
         let dims = (width, height);
+        self.diff_resize_pending.set(true);
         if self.last_dispatched_resize == Some(dims) || self.pending_resize == Some(dims) {
             return;
         }
@@ -2505,6 +2658,233 @@ impl MailAppModel {
         self.ambient_last_telemetry.get()
     }
 
+    fn begin_diff_frame(&self) -> TuiDiffFrameDecision {
+        let state = TuiDiffFrameState {
+            change_ratio: self.diff_last_change_ratio.get(),
+            is_resize: self.diff_resize_pending.replace(false),
+            budget_remaining_ms: TUI_DIFF_FRAME_BUDGET_MS,
+            error_count: self
+                .screen_panics
+                .borrow()
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
+        };
+        let shadow_action = self.diff_strategy.borrow_mut().observe(&state);
+        let safe_mode = self.diff_strategy_safe_mode.get();
+        let first_frame = self.diff_first_frame_pending.replace(false);
+        let action = if safe_mode || first_frame || state.is_resize {
+            DiffAction::Full
+        } else {
+            shadow_action
+        };
+        self.diff_last_action.set(action);
+        tracing::debug!(
+            target: TUI_DIFF_TRACE_TARGET,
+            name = "frame_decision_start",
+            change_ratio = state.change_ratio,
+            is_resize = state.is_resize,
+            budget_remaining_ms = state.budget_remaining_ms,
+            error_count = state.error_count,
+            action = diff_action_label(action),
+            shadow_action = diff_action_label(shadow_action),
+            safe_mode,
+            first_frame,
+            "frame_decision_start",
+        );
+        TuiDiffFrameDecision {
+            state,
+            action,
+            shadow_action,
+            safe_mode,
+            first_frame,
+        }
+    }
+
+    fn apply_diff_frame_decision(&self, decision: TuiDiffFrameDecision, frame: &mut Frame<'_>) {
+        match decision.action {
+            DiffAction::Incremental => {}
+            DiffAction::Full => self.request_contrast_guard_pass(),
+            DiffAction::Deferred => {
+                self.diff_deferred_frames
+                    .set(self.diff_deferred_frames.get().saturating_add(1));
+                frame.set_degradation(DegradationLevel::EssentialOnly);
+            }
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn diff_changed_cell_estimate(buffer: &Buffer) -> (usize, usize, f64) {
+        let total_cells = usize::from(buffer.width()).saturating_mul(usize::from(buffer.height()));
+        if total_cells == 0 {
+            return (0, 0, 0.0);
+        }
+        let span_stats = buffer.dirty_span_stats();
+        let changed_cells = if span_stats.span_coverage_cells > 0 {
+            span_stats.span_coverage_cells
+        } else {
+            buffer
+                .dirty_row_count()
+                .saturating_mul(usize::from(buffer.width()))
+        };
+        let ratio = (changed_cells.min(total_cells) as f64) / (total_cells as f64);
+        (changed_cells, total_cells, ratio)
+    }
+
+    fn audit_diff_frame(
+        &self,
+        buffer: &Buffer,
+        changed_cells: usize,
+        compute_full_diff: bool,
+    ) -> Option<(usize, bool)> {
+        let mut last = self.diff_last_audit_buffer.borrow_mut();
+        let full_diff_cells = if compute_full_diff {
+            last.as_ref()
+                .filter(|previous| {
+                    previous.width() == buffer.width() && previous.height() == buffer.height()
+                })
+                .map(|previous| BufferDiff::compute(previous, buffer).len())
+        } else {
+            None
+        };
+
+        match last.as_mut() {
+            Some(previous)
+                if previous.width() == buffer.width() && previous.height() == buffer.height() =>
+            {
+                previous.clone_from(buffer);
+            }
+            _ => {
+                *last = Some(buffer.clone());
+            }
+        }
+
+        full_diff_cells.map(|cells| (cells, cells > changed_cells))
+    }
+
+    fn full_diff_cells_against_previous_frame(&self, buffer: &Buffer) -> Option<usize> {
+        self.diff_last_audit_buffer
+            .borrow()
+            .as_ref()
+            .filter(|previous| {
+                previous.width() == buffer.width() && previous.height() == buffer.height()
+            })
+            .map(|previous| BufferDiff::compute(previous, buffer).len())
+    }
+
+    fn finish_diff_frame(
+        &self,
+        decision: TuiDiffFrameDecision,
+        frame: &Frame<'_>,
+        elapsed: Duration,
+    ) {
+        let (dirty_changed_cells, total_cells, dirty_change_ratio) =
+            Self::diff_changed_cell_estimate(&frame.buffer);
+        let audit_counter = self.diff_full_diff_audit_counter.get().wrapping_add(1);
+        self.diff_full_diff_audit_counter.set(audit_counter);
+        let audit_every = self.diff_full_diff_audit_every.max(1);
+        let audit_due = audit_counter.is_multiple_of(audit_every);
+        let broad_dirty_estimate = total_cells > 0 && dirty_changed_cells >= total_cells;
+        let broad_dirty_full_diff = if broad_dirty_estimate && !audit_due {
+            self.full_diff_cells_against_previous_frame(&frame.buffer)
+        } else {
+            None
+        };
+        let full_diff_audit = self.audit_diff_frame(&frame.buffer, dirty_changed_cells, audit_due);
+        let changed_cells = full_diff_audit
+            .map(|(cells, _)| cells)
+            .or(broad_dirty_full_diff)
+            .unwrap_or(dirty_changed_cells);
+        let change_ratio = if total_cells == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                (changed_cells.min(total_cells) as f64) / (total_cells as f64)
+            }
+        };
+        self.diff_last_change_ratio.set(change_ratio);
+
+        let audit = full_diff_audit;
+        let audit_mismatch = audit.is_some_and(|(_, mismatch)| mismatch);
+        if audit_mismatch {
+            let mismatches = self
+                .diff_consecutive_audit_mismatches
+                .get()
+                .saturating_add(1);
+            self.diff_consecutive_audit_mismatches.set(mismatches);
+            tracing::warn!(
+                target: TUI_DIFF_TRACE_TARGET,
+                name = "frame_audit_mismatch",
+                action = diff_action_label(decision.action),
+                consecutive_mismatches = mismatches,
+                dirty_changed_cells,
+                full_diff_cells = audit.map_or(0, |(cells, _)| cells),
+                "frame_audit_mismatch",
+            );
+            if mismatches >= self.diff_audit_auto_flip_threshold {
+                self.diff_strategy_safe_mode.set(true);
+                tracing::warn!(
+                    target: TUI_DIFF_TRACE_TARGET,
+                    name = "diff_strategy_safe_mode_flipped",
+                    threshold = self.diff_audit_auto_flip_threshold,
+                    "diff_strategy_safe_mode_flipped",
+                );
+            }
+        } else if audit_due {
+            self.diff_consecutive_audit_mismatches.set(0);
+        }
+
+        let duration_ms = elapsed.as_secs_f64() * 1_000.0;
+        let within_budget = duration_ms <= TUI_DIFF_FRAME_BUDGET_MS;
+        tracing::debug!(
+            target: TUI_DIFF_TRACE_TARGET,
+            name = "frame_completed",
+            action = diff_action_label(decision.action),
+            duration_ms,
+            within_budget,
+            changed_cells,
+            dirty_changed_cells,
+            total_cells,
+            audit_due,
+            audit_mismatch,
+            "frame_completed",
+        );
+        mcp_agent_mail_core::evidence_ledger().record(
+            "tui.diff_strategy.outcome",
+            serde_json::json!({
+                "frame_state": {
+                    "change_ratio": decision.state.change_ratio,
+                    "is_resize": decision.state.is_resize,
+                    "budget_remaining_ms": decision.state.budget_remaining_ms,
+                    "error_count": decision.state.error_count,
+                },
+                "action": diff_action_label(decision.action),
+                "shadow_action": diff_action_label(decision.shadow_action),
+                "safe_mode": decision.safe_mode,
+                "first_frame": decision.first_frame,
+                "duration_ms": duration_ms,
+                "within_budget": within_budget,
+                "changed_cells": changed_cells,
+                "dirty_changed_cells": dirty_changed_cells,
+                "total_cells": total_cells,
+                "change_ratio": change_ratio,
+                "dirty_change_ratio": dirty_change_ratio,
+                "audit_due": audit_due,
+                "audit_full_diff_cells": audit.map(|(cells, _)| cells),
+                "audit_mismatch": audit_mismatch,
+            }),
+            if within_budget {
+                "within_budget"
+            } else {
+                "over_budget"
+            },
+            Some(format!("action={}", diff_action_label(decision.action))),
+            if within_budget { 1.0 } else { 0.5 },
+            "bayesian_tui_v1",
+        );
+    }
+
     fn persist_palette_usage(&mut self) {
         if !self.palette_usage_dirty {
             return;
@@ -2730,6 +3110,22 @@ impl MailAppModel {
         } else {
             toast
         }
+    }
+
+    fn git_segfault_retry_toast(
+        &self,
+        severity: GitSegfaultRetryToastSeverity,
+        message: String,
+    ) -> Option<Toast> {
+        let (icon, color) = match severity {
+            GitSegfaultRetryToastSeverity::Warning => (ToastIcon::Warning, toast_color_warning()),
+            GitSegfaultRetryToastSeverity::Error => (ToastIcon::Error, toast_color_error()),
+        };
+        self.toast_severity.allows(icon).then(|| {
+            Toast::new(message)
+                .icon(icon)
+                .style(Style::default().fg(color))
+        })
     }
 
     fn tick_toast_animation_state(&mut self) {
@@ -3795,6 +4191,19 @@ impl MailAppModel {
                 _ => {}
             }
 
+            let git_retry_toasts = git_segfault_retry_toast_handler(
+                &mut self.git_segfault_retry_toasts,
+                event,
+                Instant::now(),
+                !self.toast_muted,
+                self.git_segfault_toast_enabled,
+            );
+            for toast in git_retry_toasts {
+                if let Some(toast) = self.git_segfault_retry_toast(toast.severity, toast.message) {
+                    self.notifications.notify(self.apply_toast_policy(toast));
+                }
+            }
+
             if !self.toast_muted
                 && let Some(toast) = safe_toast_for_event(event, self.toast_severity)
             {
@@ -4456,6 +4865,9 @@ impl Model for MailAppModel {
         // The app renders its own caret/highlight treatment in widgets. Keep the
         // terminal cursor hidden to prevent visible cursor trails during refresh.
         frame.cursor_visible = false;
+        let diff_frame_started = Instant::now();
+        let diff_decision = self.begin_diff_frame();
+        self.apply_diff_frame_decision(diff_decision, frame);
 
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let chrome = tui_chrome::chrome_layout(area);
@@ -4827,6 +5239,7 @@ impl Model for MailAppModel {
                 crate::tui_screens::screen_meta(active_screen).title,
             );
         }
+        self.finish_diff_frame(diff_decision, frame, diff_frame_started.elapsed());
 
         // Signal first paint only after the full frame has rendered successfully.
         // Waking deferred workers at view-start lets heavy startup work contend
@@ -7148,6 +7561,330 @@ mod tests {
             "screen render should not observe first-paint latch before render completes"
         );
         assert!(model.state.first_paint_seen());
+    }
+
+    #[test]
+    fn tui_diff_settings_default_to_safe_shadow_mode() {
+        let settings = TuiDiffSettings::from_sources(None, None, None);
+
+        assert!(settings.safe_mode);
+        assert_eq!(
+            settings.full_diff_audit_every,
+            TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY
+        );
+        assert_eq!(
+            settings.audit_auto_flip_threshold,
+            TUI_DIFF_DEFAULT_AUTO_FLIP_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn tui_diff_settings_parse_and_clamp_env_sources() {
+        let settings = TuiDiffSettings::from_sources(Some("false"), Some("0"), Some("999"));
+
+        assert!(!settings.safe_mode);
+        assert_eq!(settings.full_diff_audit_every, 1);
+        assert_eq!(settings.audit_auto_flip_threshold, 100);
+    }
+
+    #[test]
+    fn tui_bayes_safe_mode_renders_full_but_observes() {
+        let model = test_model();
+
+        let decision = model.begin_diff_frame();
+
+        assert!(decision.safe_mode);
+        assert!(decision.first_frame);
+        assert_eq!(decision.action, DiffAction::Full);
+        assert_eq!(decision.shadow_action, DiffAction::Incremental);
+    }
+
+    #[test]
+    fn tui_bayes_first_frame_forces_full_when_safe_mode_disabled() {
+        let model = test_model();
+        model.diff_strategy_safe_mode.set(false);
+
+        let decision = model.begin_diff_frame();
+
+        assert!(decision.first_frame);
+        assert_eq!(decision.action, DiffAction::Full);
+        assert_eq!(decision.shadow_action, DiffAction::Incremental);
+    }
+
+    #[test]
+    fn tui_bayes_resize_triggers_full_when_safe_mode_disabled() {
+        let model = test_model();
+        model.diff_strategy_safe_mode.set(false);
+        model.diff_first_frame_pending.set(false);
+        model.diff_resize_pending.set(true);
+
+        let decision = model.begin_diff_frame();
+
+        assert!(decision.state.is_resize);
+        assert_eq!(decision.action, DiffAction::Full);
+    }
+
+    #[test]
+    fn tui_bayes_stable_uses_incremental_when_enabled() {
+        let model = test_model();
+        model.diff_strategy_safe_mode.set(false);
+        model.diff_first_frame_pending.set(false);
+        let mut incremental = 0;
+
+        for _ in 0..10 {
+            model.diff_last_change_ratio.set(0.01);
+            if model.begin_diff_frame().action == DiffAction::Incremental {
+                incremental += 1;
+            }
+        }
+
+        assert!(
+            incremental >= 8,
+            "stable frames should mostly choose incremental, got {incremental}"
+        );
+    }
+
+    #[test]
+    fn tui_bayes_deferred_uses_degraded_frame_instead_of_blank_skip() {
+        let model = test_model();
+        let state = TuiDiffFrameState {
+            change_ratio: 1.0,
+            is_resize: false,
+            budget_remaining_ms: 0.0,
+            error_count: u32::MAX,
+        };
+        let decision = TuiDiffFrameDecision {
+            state,
+            action: DiffAction::Deferred,
+            shadow_action: DiffAction::Deferred,
+            safe_mode: false,
+            first_frame: false,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 24, &mut pool);
+
+        model.apply_diff_frame_decision(decision, &mut frame);
+
+        assert_eq!(frame.degradation, DegradationLevel::EssentialOnly);
+        assert_eq!(model.diff_deferred_frames.get(), 1);
+    }
+
+    #[test]
+    fn tui_bayes_outcome_records_render_change_ratio() {
+        let model = test_model();
+        let decision = model.begin_diff_frame();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(20, 4, &mut pool);
+        Paragraph::new("changed").render(Rect::new(0, 0, 8, 1), &mut frame);
+
+        model.finish_diff_frame(decision, &frame, Duration::from_millis(1));
+
+        assert!(model.diff_last_change_ratio.get() > 0.0);
+        assert_eq!(model.diff_full_diff_audit_counter.get(), 1);
+    }
+
+    fn render_diff_trace_frame(index: usize, frame: &mut Frame<'_>) {
+        let phase = if index > 0 && index % 127 == 0 {
+            "resize"
+        } else if index % 32 == 0 {
+            "bursty"
+        } else {
+            "stable"
+        };
+        if phase == "stable" {
+            let body = format!("stable frame {:02}", index % 5);
+            Paragraph::new(body).render(Rect::new(0, 0, 18, 1), frame);
+            return;
+        }
+        let body = format!(
+            "synthetic diff trace\nframe={index:04}\nphase={phase}\ncell={}",
+            (index.saturating_mul(37)) % 997
+        );
+        Paragraph::new(body).render(Rect::new(0, 0, 48, 4), frame);
+    }
+
+    #[test]
+    fn tui_bayes_1000_frame_trace_matches_full_baseline() {
+        const FRAME_COUNT: usize = 1_000;
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 24;
+
+        let strategy_model = test_model();
+        strategy_model.diff_strategy_safe_mode.set(false);
+        let baseline_model = test_model();
+        let mut non_full_actions = 0usize;
+        let mut within_budget = 0usize;
+        let mut resize_full_actions = 0usize;
+
+        for index in 0..FRAME_COUNT {
+            let resize_frame = index > 0 && index % 127 == 0;
+            if resize_frame {
+                strategy_model.diff_resize_pending.set(true);
+                baseline_model.diff_resize_pending.set(true);
+            }
+
+            let mut strategy_pool = ftui::GraphemePool::new();
+            let mut strategy_frame = Frame::new(WIDTH, HEIGHT, &mut strategy_pool);
+            let started = Instant::now();
+            let strategy_decision = strategy_model.begin_diff_frame();
+            strategy_model.apply_diff_frame_decision(strategy_decision, &mut strategy_frame);
+            render_diff_trace_frame(index, &mut strategy_frame);
+            let elapsed = started.elapsed();
+            strategy_model.finish_diff_frame(strategy_decision, &strategy_frame, elapsed);
+
+            let mut baseline_pool = ftui::GraphemePool::new();
+            let mut baseline_frame = Frame::new(WIDTH, HEIGHT, &mut baseline_pool);
+            let baseline_started = Instant::now();
+            let baseline_decision = baseline_model.begin_diff_frame();
+            baseline_model.apply_diff_frame_decision(baseline_decision, &mut baseline_frame);
+            render_diff_trace_frame(index, &mut baseline_frame);
+            baseline_model.finish_diff_frame(
+                baseline_decision,
+                &baseline_frame,
+                baseline_started.elapsed(),
+            );
+
+            assert_eq!(
+                baseline_decision.action,
+                DiffAction::Full,
+                "safe baseline should always render through Full"
+            );
+            assert_eq!(
+                BufferDiff::compute(&baseline_frame.buffer, &strategy_frame.buffer).len(),
+                0,
+                "frame {index} differed from full baseline"
+            );
+
+            if strategy_decision.action != DiffAction::Full {
+                non_full_actions += 1;
+            }
+            if resize_frame && strategy_decision.action == DiffAction::Full {
+                resize_full_actions += 1;
+            }
+            if elapsed.as_secs_f64() * 1_000.0 <= TUI_DIFF_FRAME_BUDGET_MS {
+                within_budget += 1;
+            }
+        }
+
+        assert_eq!(strategy_model.diff_full_diff_audit_counter.get(), 1_000);
+        assert_eq!(strategy_model.diff_consecutive_audit_mismatches.get(), 0);
+        assert!(
+            non_full_actions > 0,
+            "strategy-enabled trace should take at least one non-Full path"
+        );
+        assert!(
+            resize_full_actions > 0,
+            "resize frames should trigger Full path"
+        );
+        assert!(
+            within_budget >= 950,
+            "{within_budget}/{FRAME_COUNT} frames completed within the 16.6ms budget"
+        );
+    }
+
+    #[test]
+    fn tui_bayes_audit_auto_flips_after_mismatch_threshold() {
+        let mut model = test_model();
+        model.diff_strategy_safe_mode.set(false);
+        model.diff_full_diff_audit_every = 1;
+        model.diff_audit_auto_flip_threshold = 2;
+        let state = TuiDiffFrameState {
+            change_ratio: 0.01,
+            is_resize: false,
+            budget_remaining_ms: TUI_DIFF_FRAME_BUDGET_MS,
+            error_count: 0,
+        };
+        let decision = TuiDiffFrameDecision {
+            state,
+            action: DiffAction::Incremental,
+            shadow_action: DiffAction::Incremental,
+            safe_mode: false,
+            first_frame: false,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut previous = Frame::new(20, 4, &mut pool);
+        Paragraph::new("previous").render(Rect::new(0, 0, 8, 1), &mut previous);
+        *model.diff_last_audit_buffer.borrow_mut() = Some(previous.buffer.clone());
+
+        for label in ["miss one", "miss two"] {
+            let mut frame = Frame::new(20, 4, &mut pool);
+            Paragraph::new(label).render(Rect::new(0, 0, 8, 1), &mut frame);
+            frame.buffer.clear_dirty();
+            model.finish_diff_frame(decision, &frame, Duration::from_millis(1));
+        }
+
+        assert!(model.diff_strategy_safe_mode.get());
+        assert_eq!(model.diff_consecutive_audit_mismatches.get(), 2);
+    }
+
+    #[test]
+    fn tui_bayes_audit_cadence_skips_full_diff_until_due() {
+        let model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut previous = Frame::new(20, 4, &mut pool);
+        Paragraph::new("previous").render(Rect::new(0, 0, 8, 1), &mut previous);
+        *model.diff_last_audit_buffer.borrow_mut() = Some(previous.buffer.clone());
+
+        let mut first = Frame::new(20, 4, &mut pool);
+        Paragraph::new("miss one").render(Rect::new(0, 0, 8, 1), &mut first);
+        first.buffer.clear_dirty();
+        assert_eq!(model.audit_diff_frame(&first.buffer, 0, false), None);
+
+        let mut second = Frame::new(20, 4, &mut pool);
+        Paragraph::new("miss two").render(Rect::new(0, 0, 8, 1), &mut second);
+        second.buffer.clear_dirty();
+        assert_eq!(model.audit_diff_frame(&second.buffer, 0, false), None);
+
+        let mut due = Frame::new(20, 4, &mut pool);
+        Paragraph::new("miss three").render(Rect::new(0, 0, 10, 1), &mut due);
+        due.buffer.clear_dirty();
+        let audit = model
+            .audit_diff_frame(&due.buffer, 0, true)
+            .expect("full audit should run when cadence is due");
+
+        assert!(
+            audit.0 > 0,
+            "full audit should compare against the immediately preceding frame"
+        );
+        assert!(audit.1);
+    }
+
+    #[test]
+    fn tui_bayes_audit_match_resets_mismatch_counter() {
+        let mut model = test_model();
+        model.diff_strategy_safe_mode.set(false);
+        model.diff_full_diff_audit_every = 1;
+        model.diff_audit_auto_flip_threshold = 2;
+        let state = TuiDiffFrameState {
+            change_ratio: 0.01,
+            is_resize: false,
+            budget_remaining_ms: TUI_DIFF_FRAME_BUDGET_MS,
+            error_count: 0,
+        };
+        let decision = TuiDiffFrameDecision {
+            state,
+            action: DiffAction::Incremental,
+            shadow_action: DiffAction::Incremental,
+            safe_mode: false,
+            first_frame: false,
+        };
+        let mut pool = ftui::GraphemePool::new();
+        let mut previous = Frame::new(20, 4, &mut pool);
+        Paragraph::new("previous").render(Rect::new(0, 0, 8, 1), &mut previous);
+        *model.diff_last_audit_buffer.borrow_mut() = Some(previous.buffer.clone());
+
+        let mut missed = Frame::new(20, 4, &mut pool);
+        Paragraph::new("missed").render(Rect::new(0, 0, 8, 1), &mut missed);
+        missed.buffer.clear_dirty();
+        model.finish_diff_frame(decision, &missed, Duration::from_millis(1));
+        assert_eq!(model.diff_consecutive_audit_mismatches.get(), 1);
+
+        let mut matching = Frame::new(20, 4, &mut pool);
+        Paragraph::new("matching dirty").render(Rect::new(0, 0, 14, 1), &mut matching);
+        model.finish_diff_frame(decision, &matching, Duration::from_millis(1));
+
+        assert!(!model.diff_strategy_safe_mode.get());
+        assert_eq!(model.diff_consecutive_audit_mismatches.get(), 0);
     }
 
     #[test]
@@ -10589,6 +11326,7 @@ first body
             tui_toast_info_dismiss_secs: 7,
             tui_toast_warn_dismiss_secs: 11,
             tui_toast_error_dismiss_secs: 19,
+            tui_git_segfault_toast_enabled: false,
             ..Config::default()
         };
         let state = TuiSharedState::new(&config);
@@ -10598,6 +11336,7 @@ first body
         assert_eq!(model.toast_info_dismiss_secs, 7);
         assert_eq!(model.toast_warn_dismiss_secs, 11);
         assert_eq!(model.toast_error_dismiss_secs, 19);
+        assert!(!model.git_segfault_toast_enabled);
         assert_eq!(model.notifications.config().max_visible, 6);
         assert_eq!(
             model.notifications.config().position,
@@ -10924,6 +11663,65 @@ first body
             toast.is_none(),
             "All toasts should be blocked at Off severity"
         );
+    }
+
+    #[test]
+    fn git_segfault_retry_event_queues_first_warning_toast() {
+        let mut model = test_model();
+        assert!(model.state.push_event(MailEvent::git_segfault_retry(
+            "git_segfault_retry_attempt",
+            "data-projects-foo",
+            1,
+            Some(11),
+            false,
+        )));
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 1);
+        let toast = model
+            .notifications
+            .visible_mut()
+            .first()
+            .expect("visible toast");
+        assert_eq!(toast.content.icon, Some(ToastIcon::Warning));
+        assert_eq!(
+            toast.content.message,
+            "git 2.51.0 segfault retried on data-projects-foo. Set AM_GIT_BINARY or upgrade git to stop seeing this."
+        );
+    }
+
+    #[test]
+    fn git_segfault_retry_category_toggle_suppresses_only_retry_toast() {
+        let mut model = test_model();
+        model.git_segfault_toast_enabled = false;
+        assert!(model.state.push_event(MailEvent::git_segfault_retry(
+            "git_segfault_retry_attempt",
+            "data-projects-foo",
+            1,
+            Some(11),
+            false,
+        )));
+        assert!(model.state.push_event(MailEvent::http_request(
+            "GET",
+            "/mcp/",
+            503,
+            5,
+            "127.0.0.1"
+        )));
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        model.notifications.tick(Duration::from_millis(16));
+        assert_eq!(model.notifications.visible_count(), 1);
+        let toast = model
+            .notifications
+            .visible_mut()
+            .first()
+            .expect("visible toast");
+        assert_eq!(toast.content.icon, Some(ToastIcon::Error));
+        assert_eq!(toast.content.message, "HTTP 503 on /mcp/");
     }
 
     // ── Reservation expiry tracker tests ────────────────────────────

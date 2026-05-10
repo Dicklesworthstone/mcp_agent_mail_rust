@@ -2760,7 +2760,7 @@ fn spawn_tui_readiness_warmup(
     if let Err(error) = std::thread::Builder::new()
         .name("tui-readiness-warmup".into())
         .spawn(move || {
-            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check_quick(&config));
+            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check(&config));
         })
     {
         handle_tui_readiness_warmup_result(
@@ -2786,6 +2786,12 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 
     // Safe to acquire now -- probes have confirmed we are the sole owner.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+
+    readiness_check(config).map_err(|error| {
+        std::io::Error::other(format!(
+            "Database readiness warmup failed before starting HTTP background workers: {error}"
+        ))
+    })?;
 
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
@@ -4473,12 +4479,11 @@ impl AtcExecutorMode {
 }
 
 fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bool {
-    // File-backed mailbox DBs still are not safe for durable ATC experience
-    // writes. Even through the canonical SQLite path, the current mixed-runtime
-    // stack can destabilize the main mailbox file. Keep durable ATC writes
-    // limited to in-memory pools until ATC state is moved to an isolated
-    // canonical store.
-    pool.sqlite_path() == ":memory:"
+    // Rollout remains governed by AM_ATC_WRITE_MODE and executor mode. Once an
+    // operator opts in, both in-memory tests and file-backed mailboxes use the
+    // DB crate's canonical ATC helpers, which keep the learning rows on the
+    // SQLite side of the archive/index split without adding Git write churn.
+    !pool.sqlite_path().trim().is_empty()
 }
 
 fn atc_durable_experience_store_enabled(
@@ -4946,9 +4951,7 @@ fn append_atc_experience_for_effect(
     effect: &atc::AtcEffectPlan,
 ) -> Result<ExperienceRow, String> {
     if !atc_durable_experience_store_writable(pool) {
-        return Err(
-            "ATC durable experience store is disabled for file-backed mailboxes".to_string(),
-        );
+        return Err("ATC durable experience store is disabled by runtime gate".to_string());
     }
 
     let started_at = Instant::now();
@@ -6767,6 +6770,22 @@ fn emit_tui_event(event: tui_events::MailEvent) {
     }
 }
 
+/// Bridge git SIGSEGV retry tracing events into the TUI event ring.
+///
+/// This is intentionally narrow: callers pass already-redacted repo slugs so
+/// the TUI never receives raw filesystem paths from tracing fields.
+pub fn emit_git_segfault_retry_trace_event(
+    name: impl Into<String>,
+    repo_slug: impl Into<String>,
+    attempt_n: u32,
+    signal: Option<i32>,
+    exhausted: bool,
+) {
+    emit_tui_event(tui_events::MailEvent::git_segfault_retry(
+        name, repo_slug, attempt_n, signal, exhausted,
+    ));
+}
+
 /// Asynchronous version of [`emit_tui_event`] that uses non-blocking retry.
 ///
 /// No-op when TUI mode is not active.
@@ -7130,6 +7149,7 @@ struct StartupDashboard {
     remote_url: Option<String>,
     transport_mode: String,
     app_environment: String,
+    started_at_iso: String,
     auth_enabled: bool,
     database_url: String,
     storage_root: String,
@@ -7232,7 +7252,8 @@ impl StartupDashboard {
             remote_url,
             transport_mode,
             app_environment: config.app_environment.to_string(),
-            auth_enabled: config.http_bearer_token.is_some(),
+            started_at_iso: chrono::Utc::now().to_rfc3339(),
+            auth_enabled: config.http_bearer_token.is_some() || config.http_jwt_enabled,
             database_url: config.database_url.clone(),
             storage_root: config.storage_root.display().to_string(),
             console_layout: Mutex::new(console_layout),
@@ -7277,6 +7298,7 @@ impl StartupDashboard {
 
     fn emit_startup_showcase(&self, config: &mcp_agent_mail_core::Config) {
         let stats = lock_mutex(&self.db_stats);
+        let am_git_binary = std::env::var("AM_GIT_BINARY").ok();
         let params = console::BannerParams {
             app_environment: &self.app_environment,
             endpoint: &self.endpoint,
@@ -7293,6 +7315,26 @@ impl StartupDashboard {
             messages: stats.messages,
             file_reservations: stats.file_reservations,
             contact_links: stats.contact_links,
+            startup_state_json: Some(console::StartupStateJson {
+                endpoint: &self.endpoint,
+                web_ui: Some(&self.web_ui),
+                uptime: &self.started_at_iso,
+                environment: &self.app_environment,
+                auth_enabled: self.auth_enabled,
+                tools_log_enabled: config.tools_log_enabled,
+                log_tool_calls_enabled: config.log_tool_calls_enabled,
+                stats: console::StartupStateStats {
+                    projects: Some(stats.projects),
+                    agents: Some(stats.agents),
+                    messages: Some(stats.messages),
+                    file_reservations: Some(stats.file_reservations),
+                    contact_links: Some(stats.contact_links),
+                },
+                storage_root: &self.storage_root,
+                database_url: Some(&self.database_url),
+                http_bearer_token: config.http_bearer_token.as_deref(),
+                am_git_binary: am_git_binary.as_deref(),
+            }),
         };
         drop(stats);
         for line in console::render_startup_banner(&params) {
@@ -17016,7 +17058,7 @@ first body
     }
 
     #[test]
-    fn atc_durable_experience_store_is_disabled_for_file_backed_mailboxes() {
+    fn atc_durable_experience_store_tracks_executor_mode_for_file_backed_mailboxes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("atc-file-backed.sqlite3");
         let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig {
@@ -17028,12 +17070,12 @@ first body
         })
         .expect("create file-backed pool");
 
-        assert!(!atc_durable_experience_store_writable(&pool));
-        assert!(!atc_durable_experience_store_enabled(
+        assert!(atc_durable_experience_store_writable(&pool));
+        assert!(atc_durable_experience_store_enabled(
             AtcExecutorMode::Live,
             Some(&pool),
         ));
-        assert!(!atc_durable_experience_store_enabled(
+        assert!(atc_durable_experience_store_enabled(
             AtcExecutorMode::Canary,
             Some(&pool),
         ));
@@ -17431,14 +17473,9 @@ first body
     }
 
     #[test]
-    fn conflict_reservation_resolution_is_noop_on_file_backed_mailboxes() {
-        // Mirrors `capture_atc_execution_result_is_noop_on_file_backed_mailboxes`:
-        // `resolve_conflict_experiences_on_reservation_event` also checks
-        // `atc_durable_experience_store_writable`, which is gated off for
-        // file-backed pools while ATC state migrates to an isolated store.
-        // The pre-existing open experience must therefore remain visible
-        // instead of being transitioned to `Resolved`. When the gate flips,
-        // restore the resolution assertion.
+    fn conflict_reservation_resolution_updates_file_backed_mailboxes() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("conflict-resolution-file-backed.db");
@@ -17451,11 +17488,7 @@ first body
         })
         .expect("create file-backed pool");
 
-        assert!(
-            !atc_durable_experience_store_writable(&pool),
-            "file-backed ATC writes are intentionally gated off right now; \
-             if this assert flips, re-enable the resolution assertion below",
-        );
+        assert!(atc_durable_experience_store_writable(&pool));
 
         let row = ExperienceRow {
             experience_id: 0,
@@ -17490,7 +17523,7 @@ first body
             context: None,
         };
 
-        block_on(mcp_agent_mail_db::queries::append_atc_experience(
+        let stored = block_on(mcp_agent_mail_db::queries::append_atc_experience(
             &cx, &pool, &row,
         ))
         .into_result()
@@ -17505,37 +17538,49 @@ first body
             serde_json::json!({ "signal": "grant" }),
         );
 
-        // The resolution is gated off, so the Executed experience is still
-        // visible to `fetch_open_atc_experiences` (which filters to
-        // `executed`/`open`) — that is the no-op contract.
-        let remaining = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+        let open = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
             &cx,
             &pool,
             Some("AlphaAgent"),
             10,
         ))
         .into_result()
-        .expect("fetch remaining open experiences");
-        assert_eq!(
-            remaining.len(),
-            1,
-            "file-backed resolve must stay a no-op while the gate is off; got {remaining:?}",
+        .expect("fetch open experiences after resolution");
+        assert!(
+            open.is_empty(),
+            "file-backed conflict resolution should remove the row from open/executed lookup; got {open:?}",
         );
-        assert_eq!(remaining[0].state, ExperienceState::Executed);
+
+        let verify =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open canonical verification connection");
+        let rows = verify
+            .query_sync(
+                "SELECT state, outcome_json FROM atc_experiences WHERE experience_id = ?",
+                &[Value::BigInt(
+                    i64::try_from(stored.experience_id).expect("experience id"),
+                )],
+            )
+            .expect("query resolved conflict experience");
+        let state = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("state").ok());
+        let outcome = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("outcome_json").ok())
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+        assert_eq!(state.as_deref(), Some("resolved"));
+        assert_eq!(
+            outcome
+                .as_ref()
+                .and_then(|value| value.get("label"))
+                .and_then(serde_json::Value::as_str),
+            Some("reservation_granted")
+        );
     }
 
     #[test]
-    fn capture_atc_execution_result_is_noop_on_file_backed_mailboxes() {
-        // File-backed ATC writes are currently disabled by
-        // `atc_durable_experience_store_writable`, which now returns true
-        // only for `:memory:` pools while the ATC state migration to an
-        // isolated canonical store is in flight. Verify that
-        // `capture_atc_execution_result` correctly short-circuits on a
-        // file-backed pool so the planned-but-not-transitioned experience
-        // stays in `Planned` and `fetch_open_atc_experiences` (which
-        // filters to `executed`/`open`) returns an empty set. When the
-        // migration lands and the writable-gate re-enables file-backed
-        // pools, this test should flip back to asserting the transition.
+    fn capture_atc_execution_result_updates_file_backed_mailboxes() {
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("capture-file-backed.db");
@@ -17548,11 +17593,7 @@ first body
         })
         .expect("create file-backed pool");
 
-        assert!(
-            !atc_durable_experience_store_writable(&pool),
-            "file-backed ATC writes are intentionally gated off right now; \
-             if this assert flips, re-enable the transition assertions below",
-        );
+        assert!(atc_durable_experience_store_writable(&pool));
 
         let row = ExperienceRow {
             experience_id: 0,
@@ -17601,9 +17642,6 @@ first body
             1_700_000_000_004_100,
         );
 
-        // `fetch_open_atc_experiences` filters to `executed`/`open`, so a
-        // short-circuited capture (experience still in `Planned`) surfaces
-        // as an empty result set. That's the no-op contract we're asserting.
         let open = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
             &cx,
             &pool,
@@ -17612,9 +17650,16 @@ first body
         ))
         .into_result()
         .expect("fetch open experiences");
-        assert!(
-            open.is_empty(),
-            "file-backed capture must be a no-op while the gate is off; got {open:?}",
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].state, ExperienceState::Executed);
+        assert_eq!(
+            open[0]
+                .context
+                .as_ref()
+                .and_then(|value| value.get("execution"))
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("executed")
         );
     }
 

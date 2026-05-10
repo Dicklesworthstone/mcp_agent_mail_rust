@@ -2001,7 +2001,8 @@ impl MailScreen for TimelineScreen {
 // Filter cycling
 // ──────────────────────────────────────────────────────────────────────
 
-/// Cycle kind filter: empty → Tool → Message → Http → Reservation → Health → Lifecycle → clear.
+/// Cycle kind filter:
+/// empty → Tool → Message → Http → Reservation → Health → Git retry → Lifecycle → clear.
 fn cycle_kind_filter(filter: &mut HashSet<MailEventKind>) {
     if filter.is_empty() {
         filter.insert(MailEventKind::ToolCallStart);
@@ -2021,6 +2022,9 @@ fn cycle_kind_filter(filter: &mut HashSet<MailEventKind>) {
         filter.clear();
         filter.insert(MailEventKind::HealthPulse);
     } else if filter.contains(&MailEventKind::HealthPulse) {
+        filter.clear();
+        filter.insert(MailEventKind::GitSegfaultRetry);
+    } else if filter.contains(&MailEventKind::GitSegfaultRetry) {
         filter.clear();
         filter.insert(MailEventKind::AgentRegistered);
         filter.insert(MailEventKind::ServerStarted);
@@ -2065,6 +2069,7 @@ const fn event_kind_token(kind: MailEventKind) -> &'static str {
         MailEventKind::AgentRegistered => "agent_registered",
         MailEventKind::HttpRequest => "http_request",
         MailEventKind::HealthPulse => "health_pulse",
+        MailEventKind::GitSegfaultRetry => "git_segfault_retry",
         MailEventKind::ServerStarted => "server_started",
         MailEventKind::ServerShutdown => "server_shutdown",
     }
@@ -2081,6 +2086,7 @@ fn parse_event_kind_token(token: &str) -> Option<MailEventKind> {
         "agent_registered" => Some(MailEventKind::AgentRegistered),
         "http_request" => Some(MailEventKind::HttpRequest),
         "health_pulse" => Some(MailEventKind::HealthPulse),
+        "git_segfault_retry" => Some(MailEventKind::GitSegfaultRetry),
         "server_started" => Some(MailEventKind::ServerStarted),
         "server_shutdown" => Some(MailEventKind::ServerShutdown),
         _ => None,
@@ -3193,7 +3199,10 @@ mod tests {
         // Reservation → Health
         cycle_kind_filter(&mut filter);
         assert!(filter.contains(&MailEventKind::HealthPulse));
-        // Health → Lifecycle
+        // Health → Git retry
+        cycle_kind_filter(&mut filter);
+        assert!(filter.contains(&MailEventKind::GitSegfaultRetry));
+        // Git retry → Lifecycle
         cycle_kind_filter(&mut filter);
         assert!(filter.contains(&MailEventKind::AgentRegistered));
         // Lifecycle → clear
@@ -4936,6 +4945,10 @@ mod tests {
         assert_eq!(
             parse_event_kind_token(event_kind_token(MailEventKind::MessageSent)),
             Some(MailEventKind::MessageSent)
+        );
+        assert_eq!(
+            parse_event_kind_token(event_kind_token(MailEventKind::GitSegfaultRetry)),
+            Some(MailEventKind::GitSegfaultRetry)
         );
         assert_eq!(
             parse_event_source_token(event_source_token(EventSource::Reservations)),

@@ -4632,7 +4632,7 @@ impl ChartDataProvider for ResourceProvider {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Number of distinct [`MailEventKind`] variants.
-const EVENT_KIND_COUNT: usize = 11;
+const EVENT_KIND_COUNT: usize = 12;
 
 /// All event kinds in a fixed order for consistent heatmap row assignment.
 const EVENT_KINDS: [MailEventKind; EVENT_KIND_COUNT] = [
@@ -4645,6 +4645,7 @@ const EVENT_KINDS: [MailEventKind; EVENT_KIND_COUNT] = [
     MailEventKind::AgentRegistered,
     MailEventKind::HttpRequest,
     MailEventKind::HealthPulse,
+    MailEventKind::GitSegfaultRetry,
     MailEventKind::ServerStarted,
     MailEventKind::ServerShutdown,
 ];
@@ -4660,6 +4661,7 @@ const EVENT_KIND_LABELS: [&str; EVENT_KIND_COUNT] = [
     "AgentReg",
     "HTTP",
     "Health",
+    "GitSegv",
     "SrvStart",
     "SrvStop",
 ];
