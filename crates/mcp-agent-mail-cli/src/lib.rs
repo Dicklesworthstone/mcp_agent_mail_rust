@@ -141,6 +141,7 @@ struct AgentStartReport {
     agent: AgentStartIdentity,
     runtime: AgentStartRuntime,
     readiness: AgentStartReadiness,
+    checks: Vec<AgentStartCheck>,
     commands: BTreeMap<&'static str, String>,
     next_actions: Vec<AgentStartAction>,
     notes: Vec<&'static str>,
@@ -149,6 +150,7 @@ struct AgentStartReport {
 #[derive(Debug, Serialize)]
 struct AgentStartProject {
     key: String,
+    slug: String,
     source: &'static str,
     absolute: bool,
     exists: bool,
@@ -191,6 +193,14 @@ struct AgentStartAction {
     priority: u8,
     command: String,
     reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartCheck {
+    id: &'static str,
+    status: &'static str,
+    detail: String,
+    command: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -27313,6 +27323,156 @@ mod tests {
         assert_eq!(
             agent_start_http_url("127.0.0.1", "8765", "/custom/path"),
             "http://127.0.0.1:8765/custom/path/"
+        );
+    }
+
+    fn agent_start_report_check<'a>(report: &'a AgentStartReport, id: &str) -> &'a AgentStartCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .unwrap_or_else(|| panic!("missing agent start check {id}"))
+    }
+
+    #[test]
+    fn agent_start_report_includes_onboarding_checks_for_ready_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().display().to_string();
+        let db_path = temp.path().join("mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = temp.path().join("storage").display().to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                ("HTTP_HOST", "0.0.0.0"),
+                ("HTTP_PORT", "8765"),
+                ("HTTP_PATH", "mcp"),
+                ("HTTP_BEARER_TOKEN", "test-token"),
+            ],
+            || {
+                let report = build_agent_start_report(
+                    Some(project.clone()),
+                    Some("BlueLake".to_string()),
+                    "codex-cli".to_string(),
+                    Some("gpt-5".to_string()),
+                )
+                .expect("agent start report");
+
+                assert_eq!(
+                    report.project.slug,
+                    resolve_project_identity(&project).slug,
+                    "project slug should match canonical identity resolution"
+                );
+                assert_eq!(report.runtime.http_url, "http://127.0.0.1:8765/mcp/");
+                assert_eq!(
+                    agent_start_report_check(&report, "project_path").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "project_slug").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "agent_identity").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "mcp_endpoint").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "robot_status").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "inbox_readiness").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "reservation_readiness").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "contact_policy").status,
+                    "warn"
+                );
+                assert!(
+                    agent_start_report_check(&report, "contact_policy")
+                        .command
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("am contacts list"),
+                    "contact check should include a concrete inspection command"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn agent_start_report_flags_missing_agent_and_relative_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("mailbox.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = temp.path().join("storage").display().to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                ("AGENT_MAIL_AGENT", ""),
+                ("AGENT_NAME", ""),
+            ],
+            || {
+                let report = build_agent_start_report(
+                    Some("relative-project".to_string()),
+                    None,
+                    "codex-cli".to_string(),
+                    None,
+                )
+                .expect("agent start report");
+
+                assert_eq!(
+                    agent_start_report_check(&report, "project_path").status,
+                    "fail"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "agent_identity").status,
+                    "fail"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "robot_status").status,
+                    "fail"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "inbox_readiness").status,
+                    "fail"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "reservation_readiness").status,
+                    "fail"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "contact_policy").status,
+                    "fail"
+                );
+                assert!(
+                    agent_start_report_check(&report, "contact_policy")
+                        .command
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("am macros start-session"),
+                    "contact failure should point at identity setup"
+                );
+                assert!(
+                    report
+                        .next_actions
+                        .iter()
+                        .any(|action| action.id == "register_agent"),
+                    "missing identity should produce a registration action"
+                );
+            },
         );
     }
 
@@ -56689,6 +56849,8 @@ fn build_agent_start_report(
     let project_path = Path::new(&project_key);
     let project_absolute = project_path.is_absolute();
     let project_exists = project_path.exists();
+    let project_identity = resolve_project_identity(&project_key);
+    let project_slug = project_identity.slug;
     let agent_ready = agent_name.is_some();
     let project_ready = project_absolute && project_exists;
 
@@ -56705,6 +56867,15 @@ fn build_agent_start_report(
     commands.insert(
         "status",
         scoped_agent_command("am status", &project_key, agent_name.as_deref(), " --json"),
+    );
+    commands.insert(
+        "robot_status",
+        scoped_agent_command(
+            "am robot status",
+            &project_key,
+            agent_name.as_deref(),
+            " --format json",
+        ),
     );
     commands.insert(
         "urgent_inbox",
@@ -56795,12 +56966,151 @@ fn build_agent_start_report(
         reason: "Reservations should be checked before editing shared files.",
     });
 
+    let checks = vec![
+        agent_start_check(
+            "project_path",
+            if project_ready { "pass" } else { "fail" },
+            if project_ready {
+                format!("Project path is an existing absolute path ({project_key}).")
+            } else if project_absolute {
+                format!("Project path is absolute but does not exist ({project_key}).")
+            } else {
+                format!("Project key is not absolute ({project_key}).")
+            },
+            (!project_ready).then(|| {
+                next_actions
+                    .first()
+                    .map(|action| action.command.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "am agent start --project {} --json",
+                            shell_arg(&project_key)
+                        )
+                    })
+            }),
+        ),
+        agent_start_check(
+            "project_slug",
+            if project_ready { "pass" } else { "warn" },
+            format!("Resolved project slug: {project_slug}."),
+            None,
+        ),
+        agent_start_check(
+            "agent_identity",
+            if agent_ready { "pass" } else { "fail" },
+            agent_name
+                .as_ref()
+                .map(|name| format!("Agent identity is available as {name}."))
+                .unwrap_or_else(|| {
+                    "No agent name found from --agent, AGENT_MAIL_AGENT, or AGENT_NAME.".to_string()
+                }),
+            (!agent_ready).then(|| {
+                commands
+                    .get("register")
+                    .cloned()
+                    .expect("register command should be populated")
+            }),
+        ),
+        agent_start_check(
+            "mcp_endpoint",
+            "pass",
+            if auth_enabled {
+                format!("HTTP MCP endpoint is {http_url}; authentication is configured.")
+            } else {
+                format!("HTTP MCP endpoint is {http_url}; authentication is not configured.")
+            },
+            Some("am doctor health".to_string()),
+        ),
+        agent_start_check(
+            "robot_status",
+            if project_ready && agent_ready {
+                "pass"
+            } else {
+                "fail"
+            },
+            if project_ready && agent_ready {
+                "Robot status command is scoped to an existing project and agent.".to_string()
+            } else {
+                "Robot status needs both an existing absolute project and an agent name."
+                    .to_string()
+            },
+            Some(
+                commands
+                    .get("robot_status")
+                    .cloned()
+                    .expect("robot status command should be populated"),
+            ),
+        ),
+        agent_start_check(
+            "inbox_readiness",
+            if project_ready && agent_ready {
+                "pass"
+            } else {
+                "fail"
+            },
+            if project_ready && agent_ready {
+                "Inbox command is scoped to an existing project and agent.".to_string()
+            } else {
+                "Inbox command needs both an existing absolute project and an agent name."
+                    .to_string()
+            },
+            Some(
+                commands
+                    .get("urgent_inbox")
+                    .cloned()
+                    .expect("urgent inbox command should be populated"),
+            ),
+        ),
+        agent_start_check(
+            "reservation_readiness",
+            if project_ready && agent_ready {
+                "pass"
+            } else {
+                "fail"
+            },
+            if project_ready && agent_ready {
+                "Reservation check command is scoped and ready.".to_string()
+            } else {
+                "Reservation checks need both an existing absolute project and an agent name."
+                    .to_string()
+            },
+            Some(
+                commands
+                    .get("reservations")
+                    .cloned()
+                    .expect("reservations command should be populated"),
+            ),
+        ),
+        agent_start_check(
+            "contact_policy",
+            if agent_ready { "warn" } else { "fail" },
+            if let Some(name) = agent_name.as_deref() {
+                format!(
+                    "Contact policy is not mutated here; inspect it for {name} before cross-agent messaging."
+                )
+            } else {
+                "Contact policy cannot be inspected until an agent name is available.".to_string()
+            },
+            agent_name
+                .as_deref()
+                .map(|name| {
+                    format!(
+                        "am contacts list --project {} --agent {} --format json",
+                        shell_arg(&project_key),
+                        shell_arg(name)
+                    )
+                })
+                .or_else(|| commands.get("register").cloned()),
+        ),
+    ];
+
     Ok(AgentStartReport {
         schema_version: "am.agent_start.v1",
         tool: "am",
         version: env!("CARGO_PKG_VERSION"),
         project: AgentStartProject {
             key: project_key,
+            slug: project_slug,
             source: project_source,
             absolute: project_absolute,
             exists: project_exists,
@@ -56830,6 +57140,7 @@ fn build_agent_start_report(
             can_check_inbox: project_ready && agent_ready,
             should_register_first: !agent_ready,
         },
+        checks,
         commands,
         next_actions,
         notes: vec![
@@ -56838,6 +57149,20 @@ fn build_agent_start_report(
             "Use JSON for automation and TOON when token budget matters.",
         ],
     })
+}
+
+fn agent_start_check(
+    id: &'static str,
+    status: &'static str,
+    detail: String,
+    command: Option<String>,
+) -> AgentStartCheck {
+    AgentStartCheck {
+        id,
+        status,
+        detail,
+        command,
+    }
 }
 
 fn detect_agent_project(project: Option<String>) -> CliResult<(String, &'static str)> {
@@ -56931,6 +57256,7 @@ fn shell_arg(value: &str) -> String {
 fn render_agent_start_report(report: &AgentStartReport) {
     output::section("Agent Start Cockpit:");
     output::kv("Project", &report.project.key);
+    output::kv("Project slug", &report.project.slug);
     output::kv("Project source", report.project.source);
     output::kv(
         "Project ready",
@@ -56960,6 +57286,18 @@ fn render_agent_start_report(report: &AgentStartReport) {
         },
     );
     output::kv("Schema", report.schema_version);
+    ftui_runtime::ftui_println!("");
+
+    let mut checks = output::CliTable::new(vec!["CHECK", "STATUS", "DETAIL", "COMMAND"]);
+    for check in &report.checks {
+        checks.add_row(vec![
+            check.id.to_string(),
+            check.status.to_string(),
+            check.detail.clone(),
+            check.command.clone().unwrap_or_default(),
+        ]);
+    }
+    checks.render();
     ftui_runtime::ftui_println!("");
 
     let mut table = output::CliTable::new(vec!["PRIORITY", "ACTION", "COMMAND"]);
