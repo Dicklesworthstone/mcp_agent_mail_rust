@@ -911,7 +911,7 @@ mod tests {
         let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
 
         // Manually write the backup (as if mutate's step 4 had completed).
-        let started_at_ns: u128 = 12345_000_000;
+        let started_at_ns: u128 = 12_345_000_000;
         let backup_dir = run_dir
             .join("backups")
             .join(format!("seq_{:026}", started_at_ns));
@@ -970,7 +970,7 @@ mod tests {
         let run_id = "2026-05-10T07-00-00Z__crashdryrun";
         let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
 
-        let started_at_ns: u128 = 99999_000_000;
+        let started_at_ns: u128 = 99_999_000_000;
         let backup_dir = run_dir
             .join("backups")
             .join(format!("seq_{:026}", started_at_ns));
