@@ -427,14 +427,37 @@ struct PathProbe {
     error: Option<String>,
 }
 
+/// Project input for the Git ref-integrity health sweep.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
-struct GitRefIntegrityProjectTarget {
+pub struct GitRefIntegrityProjectTarget {
     slug: String,
     path: PathBuf,
 }
 
+impl GitRefIntegrityProjectTarget {
+    #[must_use]
+    pub fn new(slug: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            slug: slug.into(),
+            path: path.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-struct GitRefIntegrityProjectSummary {
+#[doc(hidden)]
+pub struct GitRefIntegrityProjectSummary {
     slug: String,
     last_sweep_ts: Option<DateTime<Utc>>,
     finding_count: usize,
@@ -445,8 +468,46 @@ struct GitRefIntegrityProjectSummary {
     error: Option<String>,
 }
 
+impl GitRefIntegrityProjectSummary {
+    #[must_use]
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
+    #[must_use]
+    pub const fn finding_count(&self) -> usize {
+        self.finding_count
+    }
+
+    #[must_use]
+    pub const fn protected_count(&self) -> usize {
+        self.protected_count
+    }
+
+    #[must_use]
+    pub const fn safe_to_prune_count(&self) -> usize {
+        self.safe_to_prune_count
+    }
+
+    #[must_use]
+    pub const fn ask_user_count(&self) -> usize {
+        self.ask_user_count
+    }
+
+    #[must_use]
+    pub const fn classification_label(&self) -> &'static str {
+        self.classification.label()
+    }
+
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-struct GitRefIntegritySweepState {
+#[doc(hidden)]
+pub struct GitRefIntegritySweepState {
     enabled: bool,
     interval_seconds: u64,
     batch_size: usize,
@@ -458,6 +519,63 @@ struct GitRefIntegritySweepState {
     checked_at: Option<DateTime<Utc>>,
     am_git_binary_set: bool,
     projects: Vec<GitRefIntegrityProjectSummary>,
+}
+
+impl GitRefIntegritySweepState {
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn interval_seconds(&self) -> u64 {
+        self.interval_seconds
+    }
+
+    #[must_use]
+    pub const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    #[must_use]
+    pub const fn cursor_index(&self) -> usize {
+        self.cursor_index
+    }
+
+    #[must_use]
+    pub const fn next_cursor_index(&self) -> usize {
+        self.next_cursor_index
+    }
+
+    #[must_use]
+    pub const fn total_projects(&self) -> usize {
+        self.total_projects
+    }
+
+    #[must_use]
+    pub const fn projects_scanned(&self) -> usize {
+        self.projects_scanned
+    }
+
+    #[must_use]
+    pub const fn total_findings(&self) -> usize {
+        self.total_findings
+    }
+
+    #[must_use]
+    pub fn checked_at(&self) -> Option<DateTime<Utc>> {
+        self.checked_at
+    }
+
+    #[must_use]
+    pub fn level_label(&self) -> &'static str {
+        self.level().label()
+    }
+
+    #[must_use]
+    pub fn projects(&self) -> &[GitRefIntegrityProjectSummary] {
+        &self.projects
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -472,9 +590,30 @@ struct GitRefSweepDismissalsFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct GitRefSweepDismissalEntry {
+#[doc(hidden)]
+pub struct GitRefSweepDismissalEntry {
     project_slug: String,
     ref_kind: String,
+}
+
+impl GitRefSweepDismissalEntry {
+    #[must_use]
+    pub fn new(project_slug: impl Into<String>, ref_kind: impl Into<String>) -> Self {
+        Self {
+            project_slug: project_slug.into(),
+            ref_kind: ref_kind.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn project_slug(&self) -> &str {
+        &self.project_slug
+    }
+
+    #[must_use]
+    pub fn ref_kind(&self) -> &str {
+        &self.ref_kind
+    }
 }
 
 impl GitRefIntegritySweepState {
@@ -496,7 +635,8 @@ impl GitRefIntegritySweepState {
         }
     }
 
-    fn banner(&self) -> Option<String> {
+    #[must_use]
+    pub fn banner(&self) -> Option<String> {
         if !self.enabled || self.total_findings == 0 || self.am_git_binary_set {
             return None;
         }
@@ -3090,7 +3230,10 @@ fn git_ref_visible_findings<'a>(
         .collect()
 }
 
-fn git_ref_integrity_sweep(
+/// Run one bounded Git ref-integrity health-sweep cycle.
+#[doc(hidden)]
+#[must_use]
+pub fn git_ref_integrity_sweep(
     targets: &[GitRefIntegrityProjectTarget],
     cursor_index: usize,
     batch_size: usize,
