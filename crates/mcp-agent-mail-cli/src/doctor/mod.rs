@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capabilities;
+pub mod fixers;
 pub mod mutate;
 pub mod robot_docs;
 pub mod runs;
