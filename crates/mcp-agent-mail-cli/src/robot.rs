@@ -4075,6 +4075,137 @@ fn build_status_with_snapshot_cache(
     Ok((data, actions))
 }
 
+fn status_health_from_recovery(
+    recovery: Option<&RecoveryStatus>,
+    anomalies: &[AnomalyCard],
+) -> String {
+    if let Some(recovery) = recovery {
+        match recovery.mode.as_str() {
+            "recovering" => return "recovering".to_string(),
+            "corrupt" => return "error".to_string(),
+            "degraded_read_only" => return "degraded".to_string(),
+            _ => {}
+        }
+    }
+
+    if anomalies.iter().any(|a| a.severity == "error") {
+        "error".to_string()
+    } else if anomalies.is_empty() {
+        "ok".to_string()
+    } else {
+        "degraded".to_string()
+    }
+}
+
+fn recovery_fallback_project_slug(project_flag: Option<&str>) -> String {
+    let project_key = resolved_project_flag_or_env(project_flag)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| normalize_project_lookup_path(&path))
+        })
+        .unwrap_or_else(|| "unknown-project".to_string());
+    mcp_agent_mail_core::resolve_project_identity(&project_key).slug
+}
+
+fn build_recovery_only_status(
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+    source_error: &CliError,
+) -> Option<(StatusData, Vec<String>, String, Option<String>)> {
+    let recovery = build_recovery_status_for_robot()?;
+    if recovery.mode == "healthy" {
+        return None;
+    }
+
+    let project_slug = recovery_fallback_project_slug(project_flag);
+    let agent_name = resolved_agent_flag_or_env(agent_flag);
+    let now_us = mcp_agent_mail_db::now_micros();
+    let recommendations = build_status_recommendations(
+        &project_slug,
+        agent_name.as_deref(),
+        0,
+        0,
+        &[],
+        Some(&recovery),
+        now_us,
+    );
+    let actions = recommendations
+        .iter()
+        .map(|recommendation| recommendation.safe_command.clone())
+        .fold(Vec::new(), |mut acc, action| {
+            if !acc.contains(&action) {
+                acc.push(action);
+            }
+            acc
+        });
+    let source_error = redact_recommendation_text(&source_error.to_string());
+    let anomalies = vec![AnomalyCard {
+        severity: if recovery.mode == "corrupt" {
+            "error".to_string()
+        } else {
+            "warn".to_string()
+        },
+        confidence: if recovery.mode == "corrupt" { 1.0 } else { 0.9 },
+        category: "mailbox_recovery".to_string(),
+        headline: "Mailbox recovery state detected".to_string(),
+        rationale: format!(
+            "robot status could not read the live SQLite index ({source_error}); surfaced a recovery-only status snapshot"
+        ),
+        remediation: recovery.next_action.clone(),
+    }];
+    let health = status_health_from_recovery(Some(&recovery), &anomalies);
+    let data = StatusData {
+        health,
+        unread: 0,
+        urgent: 0,
+        ack_required: 0,
+        ack_overdue: 0,
+        active_reservations: 0,
+        reservations_expiring_soon: 0,
+        active_agents: 0,
+        recent_messages: 0,
+        my_reservations: vec![],
+        top_threads: vec![],
+        anomalies,
+        recommendations,
+        recovery: Some(recovery),
+    };
+
+    Some((data, actions, project_slug, agent_name))
+}
+
+fn render_status_output(
+    cmd_name: &str,
+    format: OutputFormat,
+    data: StatusData,
+    project_slug: Option<String>,
+    agent_name: Option<String>,
+    actions: Vec<String>,
+    mut phase: TailLatencyPhaseRecorder,
+) -> Result<String, CliError> {
+    let mut env = RobotEnvelope::new(cmd_name, format, data);
+    env._meta.project = project_slug;
+    env._meta.agent = agent_name.clone();
+    if agent_name.is_none() {
+        env = env.with_alert(
+            "info",
+            "Agent not detected — inbox/reservation sections omitted. Use --agent to specify.",
+            Some("am robot status --agent <NAME>".to_string()),
+        );
+    }
+    for a in actions {
+        env = env.with_action(&a);
+    }
+    let anomalies = env.data.anomalies.clone();
+    env = append_status_anomaly_alerts(env, &anomalies);
+    env = env.with_diagnostics(phase.snapshot("pre_render"));
+    let output = format_output(&env, format)?;
+    phase.mark("render_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(output)
+}
+
 // ── Inbox command implementation ────────────────────────────────────────────
 
 /// Inbox result with entries and generated alerts/actions.
@@ -10316,38 +10447,56 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Status => {
             let mut phase = TailLatencyPhaseRecorder::new("robot_status");
             phase.mark("queue_wait");
-            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            phase.mark("scope_resolution");
+            match resolve_robot_scope(args.project.as_deref(), args.agent.as_deref()) {
+                Ok(scope) => {
+                    phase.mark("scope_resolution");
 
-            let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
-            let agent = scope.agent.clone();
-            let (data, actions) = build_status_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                agent,
-                Some(&mut phase),
-            )?;
-            let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(scope.project_slug);
-            env._meta.agent = agent_name.clone();
-            if agent_name.is_none() {
-                env = env.with_alert(
-                    "info",
-                    "Agent not detected — inbox/reservation sections omitted. Use --agent to specify.",
-                    Some("am robot status --agent <NAME>".to_string()),
-                );
+                    let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
+                    let agent = scope.agent.clone();
+                    let (data, actions) = build_status_with_snapshot_cache(
+                        scope.conn(),
+                        scope.project_id,
+                        &scope.project_slug,
+                        agent,
+                        Some(&mut phase),
+                    )?;
+                    render_status_output(
+                        cmd_name,
+                        format,
+                        data,
+                        Some(scope.project_slug),
+                        agent_name,
+                        actions,
+                        phase,
+                    )?
+                }
+                Err(error) => {
+                    if let Some((data, actions, project_slug, agent_name)) =
+                        build_recovery_only_status(
+                            args.project.as_deref(),
+                            args.agent.as_deref(),
+                            &error,
+                        )
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "robot status emitted recovery-only snapshot after scope resolution failed"
+                        );
+                        phase.mark("scope_recovery_fallback");
+                        render_status_output(
+                            cmd_name,
+                            format,
+                            data,
+                            Some(project_slug),
+                            agent_name,
+                            actions,
+                            phase,
+                        )?
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
-            for a in actions {
-                env = env.with_action(&a);
-            }
-            let anomalies = env.data.anomalies.clone();
-            env = append_status_anomaly_alerts(env, &anomalies);
-            env = env.with_diagnostics(phase.snapshot("pre_render"));
-            let output = format_output(&env, format)?;
-            phase.mark("render_serialization");
-            emit_tail_latency_evidence(&phase.finish("ok"));
-            output
         }
         RobotSubcommand::Inbox {
             urgent,

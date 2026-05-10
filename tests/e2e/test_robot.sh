@@ -183,6 +183,22 @@ run_robot() {
     echo "$output"
 }
 
+run_robot_with_mailbox() {
+    local database_url="$1"
+    local storage_root="$2"
+    local project="$3"
+    local subcommand="$4"
+    shift 4
+    local agent_args=()
+    if [ -n "${ROBOT_AGENT:-}" ]; then
+        agent_args=(--agent "${ROBOT_AGENT}")
+    fi
+    local output
+    output=$(DATABASE_URL="${database_url}" STORAGE_ROOT="${storage_root}" \
+        AM_INTERFACE_MODE=cli am robot --project "${project}" "${agent_args[@]}" "$subcommand" "$@" 2>&1) || true
+    echo "$output"
+}
+
 run_robot_timed() {
     local case_id="$1"
     shift
@@ -240,6 +256,30 @@ if echo "$STATUS_OUT" | jq -e '.health' >/dev/null 2>&1; then
     e2e_pass "status: health section present"
 else
     e2e_skip "status: health section (may be empty)"
+fi
+
+e2e_case_banner "robot status -> damaged mailbox recovery recommendation"
+DAMAGED_DB_PATH="${WORK}/damaged.sqlite3"
+DAMAGED_STORAGE_ROOT="${WORK}/damaged_storage_root"
+DAMAGED_PROJECT_PATH="${WORK}/damaged_project"
+mkdir -p "${DAMAGED_STORAGE_ROOT}" "${DAMAGED_PROJECT_PATH}"
+printf '%s\n' "not a sqlite database" > "${DAMAGED_DB_PATH}"
+DAMAGED_STATUS_OUT="$(run_robot_with_mailbox "sqlite:///${DAMAGED_DB_PATH}" "${DAMAGED_STORAGE_ROOT}" "${DAMAGED_PROJECT_PATH}" status --format json)"
+e2e_save_artifact "case_status_damaged_mailbox.json" "$DAMAGED_STATUS_OUT"
+assert_valid_json "status_damaged_mailbox" "$DAMAGED_STATUS_OUT" && assert_envelope "status_damaged_mailbox" "$DAMAGED_STATUS_OUT"
+if echo "$DAMAGED_STATUS_OUT" | jq -e '
+    .health == "error"
+    and .recovery.mode == "corrupt"
+    and (.recommendations | any(
+        .category == "mailbox_recovery"
+        and .safe_command == "am doctor check --json"
+        and (.evidence | startswith("robot://status/recovery?mode=corrupt"))
+    ))
+    and (._actions | index("am doctor check --json"))
+' >/dev/null 2>&1; then
+    e2e_pass "status_damaged_mailbox: recovery recommendation with proof link present"
+else
+    e2e_fail "status_damaged_mailbox: missing recovery recommendation with proof link"
 fi
 
 e2e_case_banner "robot inbox -> actionable inbox"
