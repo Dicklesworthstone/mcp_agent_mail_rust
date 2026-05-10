@@ -207,6 +207,8 @@ pub(crate) struct DetectedAnomaly {
     pub(crate) confidence: f64,
     pub(crate) headline: String,
     pub(crate) rationale: String,
+    pub(crate) safe_command: Option<String>,
+    pub(crate) evidence: Option<String>,
 }
 
 // ── Memoization cache types (br-legjy.5.1) ─────────────────────────
@@ -834,6 +836,11 @@ impl DashboardScreen {
                 confidence: 0.95,
                 headline: format!("{} messages awaiting acknowledgement", db.ack_pending),
                 rationale: "High ack backlog may indicate stalled agents".into(),
+                safe_command: Some("am robot inbox --all --ack-overdue".to_string()),
+                evidence: Some(format!(
+                    "robot://dashboard/ack-pending?count={}",
+                    db.ack_pending
+                )),
             });
         } else if db.ack_pending >= ACK_PENDING_WARN {
             out.push(DetectedAnomaly {
@@ -841,6 +848,36 @@ impl DashboardScreen {
                 confidence: 0.7,
                 headline: format!("{} ack-pending messages", db.ack_pending),
                 rationale: "Monitor for growing backlog".into(),
+                safe_command: Some("am robot inbox --all --ack-overdue".to_string()),
+                evidence: Some(format!(
+                    "robot://dashboard/ack-pending?count={}",
+                    db.ack_pending
+                )),
+            });
+        }
+
+        let now_us = unix_epoch_micros_now().unwrap_or(db.timestamp_micros);
+        let expiring_reservations = db
+            .reservation_snapshots
+            .iter()
+            .filter(|reservation| {
+                !reservation.is_released()
+                    && reservation.expires_ts >= now_us
+                    && reservation.expires_ts.saturating_sub(now_us)
+                        <= RESERVATION_SOON_THRESHOLD_MICROS
+            })
+            .count();
+        if expiring_reservations > 0 {
+            out.push(DetectedAnomaly {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.88,
+                headline: format!("{expiring_reservations} reservation(s) expire within 5m"),
+                rationale: "Renew active work or release stale leases before coordination drifts"
+                    .to_string(),
+                safe_command: Some("am robot reservations --expiring 5".to_string()),
+                evidence: Some(format!(
+                    "robot://dashboard/reservations-expiring?count={expiring_reservations}"
+                )),
             });
         }
 
@@ -856,6 +893,11 @@ impl DashboardScreen {
                         "{} of {} requests failed",
                         counters.status_5xx, counters.total
                     ),
+                    safe_command: Some("am robot health --format json".to_string()),
+                    evidence: Some(format!(
+                        "robot://dashboard/http-5xx?failed={}&total={}",
+                        counters.status_5xx, counters.total
+                    )),
                 });
             } else if err_rate >= ERROR_RATE_WARN {
                 out.push(DetectedAnomaly {
@@ -863,6 +905,11 @@ impl DashboardScreen {
                     confidence: 0.8,
                     headline: format!("Elevated 5xx rate {:.1}%", err_rate * 100.0),
                     rationale: "Server errors above threshold".into(),
+                    safe_command: Some("am robot health --format json".to_string()),
+                    evidence: Some(format!(
+                        "robot://dashboard/http-5xx?failed={}&total={}",
+                        counters.status_5xx, counters.total
+                    )),
                 });
             }
         }
@@ -874,6 +921,12 @@ impl DashboardScreen {
                 confidence: 0.85,
                 headline: format!("Event ring {}% full", ring.fill_pct()),
                 rationale: format!("{} events dropped", ring.total_drops()),
+                safe_command: Some("am robot timeline --format json".to_string()),
+                evidence: Some(format!(
+                    "robot://dashboard/event-ring?fill_pct={}&drops={}",
+                    ring.fill_pct(),
+                    ring.total_drops()
+                )),
             });
         }
 
@@ -888,6 +941,11 @@ impl DashboardScreen {
                 ),
                 rationale: "DB summary counters and reservation detail snapshots diverged"
                     .to_string(),
+                safe_command: Some("am robot reservations --all --format json".to_string()),
+                evidence: Some(format!(
+                    "robot://dashboard/reservation-divergence?counter={}&rows=0",
+                    db.file_reservations
+                )),
             });
         }
 
@@ -2660,7 +2718,16 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
         };
         let card_area = Rect::new(x, area.y, w, area.height);
         let accent = anomaly.severity.color();
-        let card = AnomalyCard::new(anomaly.severity, anomaly.confidence, &anomaly.headline)
+        let mut next_steps = Vec::new();
+        if let Some(command) = anomaly.safe_command.as_deref() {
+            next_steps.push(format!("Run: {command}"));
+        }
+        if let Some(evidence) = anomaly.evidence.as_deref() {
+            next_steps.push(format!("Evidence: {evidence}"));
+        }
+        let next_step_refs = next_steps.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let mut card = AnomalyCard::new(anomaly.severity, anomaly.confidence, &anomaly.headline)
             .rationale(&anomaly.rationale)
             .selected(i == 0)
             .block(
@@ -2677,6 +2744,9 @@ fn render_anomaly_rail(frame: &mut Frame<'_>, area: Rect, anomalies: &[DetectedA
                             .bg(crate::tui_theme::lerp_color(tp.panel_bg, accent, 0.08)),
                     ),
             );
+        if !next_step_refs.is_empty() {
+            card = card.next_steps(&next_step_refs);
+        }
         card.render(card_area, frame);
     }
 }
@@ -7796,6 +7866,92 @@ mod tests {
                 .iter()
                 .any(|anomaly| anomaly.headline == "7 active reservations but no reservation rows"),
             "expected divergence anomaly to be emitted"
+        );
+    }
+
+    #[test]
+    fn detect_anomalies_adds_operator_recommendation_proof_links() {
+        let screen = DashboardScreen::new();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let anomalies = screen.detect_anomalies_from_samples(
+            crate::tui_bridge::RequestCounters {
+                total: 0,
+                status_2xx: 0,
+                status_4xx: 0,
+                status_5xx: 0,
+                latency_total_ms: 0,
+            },
+            &DbStatSnapshot {
+                ack_pending: ACK_PENDING_WARN,
+                reservation_snapshots: vec![ReservationSnapshot {
+                    id: 1,
+                    project_slug: "demo".to_string(),
+                    agent_name: "CobaltBay".to_string(),
+                    path_pattern: "crates/**".to_string(),
+                    exclusive: true,
+                    granted_ts: now_us,
+                    expires_ts: now_us + RESERVATION_SOON_THRESHOLD_MICROS / 2,
+                    released_ts: None,
+                }],
+                timestamp_micros: now_us,
+                ..Default::default()
+            },
+            crate::tui_events::EventRingStats {
+                capacity: 0,
+                len: 0,
+                total_pushed: 0,
+                dropped_overflow: 0,
+                contention_drops: 0,
+                sampled_drops: 0,
+                next_seq: 0,
+            },
+        );
+
+        assert!(
+            anomalies.iter().any(|anomaly| {
+                anomaly.safe_command.as_deref() == Some("am robot inbox --all --ack-overdue")
+                    && anomaly
+                        .evidence
+                        .as_deref()
+                        .is_some_and(|evidence| evidence.contains("ack-pending"))
+            }),
+            "{anomalies:?}"
+        );
+        assert!(
+            anomalies.iter().any(|anomaly| {
+                anomaly.safe_command.as_deref() == Some("am robot reservations --expiring 5")
+                    && anomaly
+                        .evidence
+                        .as_deref()
+                        .is_some_and(|evidence| evidence.contains("reservations-expiring"))
+            }),
+            "{anomalies:?}"
+        );
+    }
+
+    #[test]
+    fn anomaly_rail_renders_recommendation_command_and_evidence() {
+        let anomalies = vec![DetectedAnomaly {
+            severity: AnomalySeverity::Medium,
+            confidence: 0.88,
+            headline: "2 reservation(s) expire within 5m".to_string(),
+            rationale: "Renew active work or release stale leases".to_string(),
+            safe_command: Some("am robot reservations --expiring 5".to_string()),
+            evidence: Some("robot://dashboard/reservations-expiring?count=2".to_string()),
+        }];
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 10, &mut pool);
+
+        render_anomaly_rail(&mut frame, Rect::new(0, 0, 120, 10), &anomalies);
+        let text = frame_text(&frame);
+
+        assert!(
+            text.contains("am robot reservations --expiring 5"),
+            "{text}"
+        );
+        assert!(
+            text.contains("robot://dashboard/reservations-expiring"),
+            "{text}"
         );
     }
 

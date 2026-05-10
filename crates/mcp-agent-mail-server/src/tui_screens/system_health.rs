@@ -50,6 +50,7 @@ const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
 const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
 const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+const RECOMMENDATION_EXPIRING_RESERVATION_US: i64 = 5 * 60 * 1_000_000;
 const GIT_REF_INTEGRITY_VISIBLE_PROJECTS: usize = 3;
 const HEALTH_SWEEP_DATA_DIR_NAME: &str = "mcp-agent-mail";
 const GIT_REF_SWEEP_CURSOR_FILE_NAME: &str = "sweep_cursor.json";
@@ -390,6 +391,16 @@ struct ProbeLine {
     remediation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct OperatorRecommendationCard {
+    severity: AnomalySeverity,
+    confidence: f64,
+    action: String,
+    reason: String,
+    evidence: String,
+    safe_command: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ProbeAuthKind {
     #[default]
@@ -517,6 +528,7 @@ struct DiagnosticsSnapshot {
     tcp_error: Option<String>,
     path_probes: Vec<PathProbe>,
     lines: Vec<ProbeLine>,
+    operator_recommendations: Vec<OperatorRecommendationCard>,
     atc: crate::AtcOperatorSnapshot,
     atc_canary: Option<AtcCanaryReportSummary>,
     agent_attention_count: usize,
@@ -1699,6 +1711,7 @@ impl SystemHealthScreen {
             confidence: f64,
             title: String,
             rationale: Option<String>,
+            next_steps: Vec<String>,
         }
 
         let mut findings: Vec<FindingCard> = Vec::new();
@@ -1708,6 +1721,7 @@ impl SystemHealthScreen {
                 confidence: 0.95,
                 title: "TCP connection failed".to_string(),
                 rationale: Some(err.clone()),
+                next_steps: Vec::new(),
             });
         }
         if let Some(banner) = snap.git_ref_integrity.banner() {
@@ -1716,6 +1730,7 @@ impl SystemHealthScreen {
                 confidence: 0.9,
                 title: "Git ref integrity findings".to_string(),
                 rationale: Some(banner),
+                next_steps: Vec::new(),
             });
         }
         for line in &snap.lines {
@@ -1729,6 +1744,19 @@ impl SystemHealthScreen {
                 confidence: 0.8,
                 title: line.detail.clone(),
                 rationale: line.remediation.clone(),
+                next_steps: Vec::new(),
+            });
+        }
+        for recommendation in &snap.operator_recommendations {
+            findings.push(FindingCard {
+                severity: recommendation.severity,
+                confidence: recommendation.confidence,
+                title: format!("Recommended: {}", recommendation.action),
+                rationale: Some(recommendation.reason.clone()),
+                next_steps: vec![
+                    format!("Run: {}", recommendation.safe_command),
+                    format!("Evidence: {}", recommendation.evidence),
+                ],
             });
         }
 
@@ -1801,6 +1829,7 @@ impl SystemHealthScreen {
                     confidence: 0.6,
                     title: format!("{hidden} more findings"),
                     rationale: Some("Enlarge this pane to view all diagnostics.".to_string()),
+                    next_steps: Vec::new(),
                 });
                 cards
             }
@@ -1822,6 +1851,14 @@ impl SystemHealthScreen {
                 AnomalyCard::new(card_data.severity, card_data.confidence, &card_data.title);
             if let Some(rationale) = card_data.rationale.as_deref() {
                 card = card.rationale(rationale);
+            }
+            let next_step_refs = card_data
+                .next_steps
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if !next_step_refs.is_empty() {
+                card = card.next_steps(&next_step_refs);
             }
             card.render(card_area, frame);
             y_offset = y_offset.saturating_add(current_h);
@@ -2414,6 +2451,93 @@ fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {
     });
 }
 
+fn build_system_health_recommendations(
+    db_snapshot: Option<&crate::tui_events::DbStatSnapshot>,
+    snap: &DiagnosticsSnapshot,
+) -> Vec<OperatorRecommendationCard> {
+    let mut recommendations = Vec::new();
+
+    if let Some(error) = &snap.tcp_error {
+        recommendations.push(OperatorRecommendationCard {
+            severity: AnomalySeverity::Critical,
+            confidence: 0.95,
+            action: "Inspect MCP endpoint reachability".to_string(),
+            reason: error.clone(),
+            evidence: format!("system-health://tcp?endpoint={}", snap.endpoint),
+            safe_command: "am robot health --format json".to_string(),
+        });
+    }
+
+    if let Some(db) = db_snapshot {
+        if db.ack_pending > 0 {
+            recommendations.push(OperatorRecommendationCard {
+                severity: if db.ack_pending >= 5 {
+                    AnomalySeverity::High
+                } else {
+                    AnomalySeverity::Medium
+                },
+                confidence: 0.9,
+                action: "Review ack-required messages".to_string(),
+                reason: format!("{} message(s) are awaiting acknowledgement", db.ack_pending),
+                evidence: format!("system-health://ack-pending?count={}", db.ack_pending),
+                safe_command: "am robot inbox --all --ack-overdue".to_string(),
+            });
+        }
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        let expiring = db
+            .reservation_snapshots
+            .iter()
+            .filter(|reservation| {
+                !reservation.is_released()
+                    && reservation.expires_ts >= now_us
+                    && reservation.expires_ts.saturating_sub(now_us)
+                        <= RECOMMENDATION_EXPIRING_RESERVATION_US
+            })
+            .count();
+        if expiring > 0 {
+            recommendations.push(OperatorRecommendationCard {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.88,
+                action: "Renew or release expiring reservations".to_string(),
+                reason: format!("{expiring} active reservation(s) expire within 5 minutes"),
+                evidence: format!("system-health://reservations-expiring?count={expiring}"),
+                safe_command: "am robot reservations --expiring 5".to_string(),
+            });
+        }
+    }
+
+    if let Some(canary) = &snap.atc_canary
+        && canary.verdict != "canary_passed"
+    {
+        recommendations.push(OperatorRecommendationCard {
+            severity: if canary.verdict == "disable_live" {
+                AnomalySeverity::Critical
+            } else {
+                AnomalySeverity::Medium
+            },
+            confidence: 0.92,
+            action: "Inspect ATC canary verdict".to_string(),
+            reason: canary.recommendation.clone(),
+            evidence: canary.artifact_path.clone(),
+            safe_command: "am robot atc --format json".to_string(),
+        });
+    }
+
+    if let Some(banner) = snap.git_ref_integrity.banner() {
+        recommendations.push(OperatorRecommendationCard {
+            severity: AnomalySeverity::Medium,
+            confidence: 0.9,
+            action: "Dry-run orphan ref cleanup".to_string(),
+            reason: banner,
+            evidence: "system-health://git-ref-integrity".to_string(),
+            safe_command: "am doctor fix-orphan-refs --all --dry-run".to_string(),
+        });
+    }
+
+    recommendations
+}
+
 fn run_diagnostics(
     state: &TuiSharedState,
     tailscale_ip: Option<&str>,
@@ -2567,6 +2691,7 @@ fn run_diagnostics(
     add_base_path_findings(&mut out);
     add_auth_findings(&mut out);
     add_atc_findings(&mut out);
+    out.operator_recommendations = build_system_health_recommendations(db_snapshot.as_ref(), &out);
 
     out
 }
@@ -5525,6 +5650,70 @@ reason = "manual prune"
         assert!(
             text.contains("hidden"),
             "expected single-slot overflow annotation, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn system_health_recommendations_render_safe_command_and_evidence() {
+        let mut snap = DiagnosticsSnapshot::default();
+        snap.operator_recommendations
+            .push(OperatorRecommendationCard {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.9,
+                action: "Review ack-required messages".to_string(),
+                reason: "3 message(s) are awaiting acknowledgement".to_string(),
+                evidence: "system-health://ack-pending?count=3".to_string(),
+                safe_command: "am robot inbox --all --ack-overdue".to_string(),
+            });
+        let screen = test_screen(DiagnosticsSnapshot::default());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 7, &mut pool);
+        screen.render_anomaly_cards(&mut frame, Rect::new(0, 0, 120, 7), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("Recommended: Review ack"), "{text}");
+        assert!(
+            text.contains("am robot inbox --all --ack-overdue"),
+            "{text}"
+        );
+        assert!(text.contains("system-health://ack-pending"), "{text}");
+    }
+
+    #[test]
+    fn system_health_recommendations_from_db_stats_include_proof_links() {
+        let now_us = mcp_agent_mail_db::now_micros();
+        let db = crate::tui_events::DbStatSnapshot {
+            ack_pending: 3,
+            reservation_snapshots: vec![crate::tui_events::ReservationSnapshot {
+                id: 7,
+                project_slug: "demo".to_string(),
+                agent_name: "CobaltBay".to_string(),
+                path_pattern: "crates/**".to_string(),
+                exclusive: true,
+                granted_ts: now_us,
+                expires_ts: now_us + RECOMMENDATION_EXPIRING_RESERVATION_US / 2,
+                released_ts: None,
+            }],
+            timestamp_micros: now_us,
+            ..Default::default()
+        };
+        let recommendations =
+            build_system_health_recommendations(Some(&db), &DiagnosticsSnapshot::default());
+
+        assert!(
+            recommendations.iter().any(|recommendation| {
+                recommendation.safe_command == "am robot inbox --all --ack-overdue"
+                    && recommendation.evidence.contains("ack-pending")
+            }),
+            "{recommendations:?}"
+        );
+        assert!(
+            recommendations.iter().any(|recommendation| {
+                recommendation.safe_command == "am robot reservations --expiring 5"
+                    && recommendation.evidence.contains("reservations-expiring")
+            }),
+            "{recommendations:?}"
         );
     }
 
