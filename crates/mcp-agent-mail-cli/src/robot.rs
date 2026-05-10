@@ -1097,6 +1097,8 @@ pub struct AnomalyCard {
     pub headline: String,
     pub rationale: String,
     pub remediation: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub playbooks: Vec<ReservationPlaybook>,
 }
 
 /// Ranked operator next action with machine-checkable proof context.
@@ -3918,6 +3920,7 @@ fn build_status_with_phase(
             headline: format!("{ack_overdue} message(s) pending ack > 30 minutes"),
             rationale: "Messages with ack_required=true have been waiting beyond the 30-minute SLA threshold".to_string(),
             remediation: "am robot inbox --ack-overdue".to_string(),
+            playbooks: vec![],
         });
     }
     if reservations_expiring_soon > 0 {
@@ -3931,6 +3934,7 @@ fn build_status_with_phase(
             rationale: "File reservations are about to expire which may cause edit conflicts"
                 .to_string(),
             remediation: "am robot reservations --expiring=5".to_string(),
+            playbooks: vec![],
         });
     }
 
@@ -4153,6 +4157,7 @@ fn build_recovery_only_status(
             "robot status could not read the live SQLite index ({source_error}); surfaced a recovery-only status snapshot"
         ),
         remediation: recovery.next_action.clone(),
+        playbooks: vec![],
     }];
     let health = status_health_from_recovery(Some(&recovery), &anomalies);
     let data = StatusData {
@@ -5873,24 +5878,24 @@ struct ReservationConflict {
 
 /// One reservation holder referenced by an advisory playbook.
 #[derive(Debug, Clone, Serialize)]
-struct ReservationPlaybookHolder {
-    agent: String,
-    path: String,
+pub struct ReservationPlaybookHolder {
+    pub agent: String,
+    pub path: String,
 }
 
 /// Advisory coordination plan for reservation contention.
 #[derive(Debug, Clone, Serialize)]
-struct ReservationPlaybook {
-    id: String,
-    kind: String,
-    severity: String,
-    confidence: f64,
-    title: String,
-    summary: String,
-    holders: Vec<ReservationPlaybookHolder>,
-    safe_command: String,
-    suggested_subject: String,
-    suggested_body: String,
+pub struct ReservationPlaybook {
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub confidence: f64,
+    pub title: String,
+    pub summary: String,
+    pub holders: Vec<ReservationPlaybookHolder>,
+    pub safe_command: String,
+    pub suggested_subject: String,
+    pub suggested_body: String,
 }
 
 /// Full reservations response data.
@@ -6130,11 +6135,13 @@ fn build_reservations(
     // Build actions
     let mut actions = Vec::new();
     if let Some((_, ref agent_name)) = agent {
+        let project_arg = robot_shell_arg(project_slug);
+        let agent_arg = robot_shell_arg(agent_name);
         for entry in &scoped_expiring_soon {
             if entry.agent.as_deref() == Some(agent_name.as_str()) {
+                let path_arg = robot_shell_arg(&entry.path);
                 actions.push(format!(
-                    "am file_reservations renew {project_slug} {agent_name} --paths {} --extend-seconds 3600",
-                    entry.path
+                    "am file_reservations renew {project_arg} {agent_arg} --paths {path_arg} --extend-seconds 3600"
                 ));
             }
         }
@@ -6633,11 +6640,13 @@ fn build_overview_with_snapshot_cache(
 fn build_analytics(
     conn: &DbConn,
     project_id: i64,
+    project_slug: &str,
     agent: Option<(i64, String)>,
 ) -> Result<Vec<AnomalyCard>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let mut anomalies = Vec::new();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
 
     // Check for ack SLA violations (>1h old unacked)
     let ack_overdue: i64 = conn
@@ -6664,64 +6673,38 @@ fn build_analytics(
             rationale: "Messages requiring acknowledgement have been pending over 1 hour"
                 .to_string(),
             remediation: "am robot inbox --ack-overdue".to_string(),
+            playbooks: vec![],
         });
     }
 
     // Check for reservation conflicts
-    let active_reservation_join_fr1 =
-        active_reservation_release_join_sql(has_release_ledger, "fr1", "rr1");
-    let active_reservation_join_fr2 =
-        active_reservation_release_join_sql(has_release_ledger, "fr2", "rr2");
-    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_predicate_fr1 = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr1",
-        "rr1",
-    );
-    let active_reservation_predicate_fr2 = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr2",
-        "rr2",
-    );
-    let conflict_rows = conn
-        .query_sync(
-            &format!(
-                "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2
-                 FROM file_reservations fr1{active_reservation_join_fr1}
-                 JOIN file_reservations fr2 ON fr1.id < fr2.id
-                   AND fr1.project_id = fr2.project_id
-                   AND fr1.agent_id != fr2.agent_id
-                 {active_reservation_join_fr2}
-                 WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
-                   AND ({active_reservation_predicate_fr1}) AND ({active_reservation_predicate_fr2})
-                   AND fr1.expires_ts > ? AND fr2.expires_ts > ?"
-            ),
-            &[
-                Value::BigInt(project_id),
-                Value::BigInt(now_us),
-                Value::BigInt(now_us),
-            ],
-        )
-        .map_err(|e| CliError::Other(format!("analytics conflicts query failed: {e}")))?;
-    let mut conflict_count = 0;
-    for row in &conflict_rows {
-        let p1: String = row.get_named("p1").unwrap_or_default();
-        let p2: String = row.get_named("p2").unwrap_or_default();
-        if glob_matches(&p1, &p2) || glob_matches(&p2, &p1) || p1 == p2 {
-            conflict_count += 1;
-        }
-    }
+    let (reservation_data, _) = build_reservations(
+        conn,
+        project_id,
+        project_slug,
+        agent.clone(),
+        true,
+        false,
+        Some(10),
+    )?;
+    let conflict_count = reservation_data.conflicts.len();
     if conflict_count > 0 {
+        let remediation = reservation_data.playbooks.first().map_or_else(
+            || "am robot reservations --conflicts".to_string(),
+            |playbook| playbook.safe_command.clone(),
+        );
+        let rationale = reservation_data.playbooks.first().map_or_else(
+            || "Multiple agents hold exclusive reservations on overlapping paths".to_string(),
+            |playbook| playbook.summary.clone(),
+        );
         anomalies.push(AnomalyCard {
             severity: "error".to_string(),
             confidence: 1.0,
             category: "reservation_conflict".to_string(),
             headline: format!("{conflict_count} reservation conflict(s) detected"),
-            rationale: "Multiple agents hold exclusive reservations on overlapping paths"
-                .to_string(),
-            remediation: "am robot reservations --conflicts".to_string(),
+            rationale,
+            remediation,
+            playbooks: reservation_data.playbooks,
         });
     }
 
@@ -6778,6 +6761,7 @@ fn build_analytics(
             rationale: "Reservations nearing expiry may cause unprotected concurrent edits"
                 .to_string(),
             remediation: "am robot reservations --expiring=10".to_string(),
+            playbooks: vec![],
         });
     }
 
@@ -6808,6 +6792,7 @@ fn build_analytics(
             headline: format!("{} agent(s) idle >24h", idle_names.len()),
             rationale: format!("Agents inactive: {}", idle_names.join(", ")),
             remediation: "am robot agents".to_string(),
+            playbooks: vec![],
         });
     }
 
@@ -6827,6 +6812,7 @@ fn build_analytics(
                         entry.errors, entry.calls, entry.name
                     ),
                     remediation: "am robot metrics".to_string(),
+                    playbooks: vec![],
                 });
             }
         }
@@ -11176,7 +11162,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Analytics => {
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            let anomalies = build_analytics(scope.conn(), scope.project_id, scope.agent.clone())?;
+            let anomalies = build_analytics(
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
+                scope.agent.clone(),
+            )?;
             let config = mcp_agent_mail_core::Config::from_env();
             let topology = build_swarm_topology(
                 scope.conn(),
@@ -13252,6 +13243,7 @@ mod tests {
             headline: "5 messages overdue".into(),
             rationale: "Pending >1h".into(),
             remediation: "am robot inbox --ack-overdue".into(),
+            playbooks: vec![],
         };
         let v: Value = serde_json::to_value(&card).unwrap();
         assert_eq!(v["severity"], "error");
@@ -13272,6 +13264,7 @@ mod tests {
                 headline: "3 reservations expiring".into(),
                 rationale: "TTL < 15 min".into(),
                 remediation: "Renew reservations".into(),
+                playbooks: vec![],
             },
             AnomalyCard {
                 severity: "info".into(),
@@ -13280,6 +13273,7 @@ mod tests {
                 headline: "2 agents inactive".into(),
                 rationale: "No activity >1h".into(),
                 remediation: "Check agent status".into(),
+                playbooks: vec![],
             },
         ];
         let json = serde_json::to_string(&cards).unwrap();
@@ -13378,6 +13372,7 @@ mod tests {
                         headline: "10 overdue".into(),
                         rationale: "Pending >1h".into(),
                         remediation: "Acknowledge them".into(),
+                        playbooks: vec![],
                     },
                     AnomalyCard {
                         severity: "warn".into(),
@@ -13386,6 +13381,7 @@ mod tests {
                         headline: "2 expiring".into(),
                         rationale: "TTL < 15m".into(),
                         remediation: "Renew".into(),
+                        playbooks: vec![],
                     },
                 ],
             },
@@ -13802,6 +13798,7 @@ mod tests {
                 headline: "2 acks overdue".into(),
                 rationale: "Pending acknowledgements".into(),
                 remediation: "am mail ack".into(),
+                playbooks: vec![],
             }],
             recommendations: vec![],
             recovery: None,
@@ -14615,6 +14612,7 @@ mod tests {
             headline: "2 acks overdue".into(),
             rationale: "Pending acknowledgements".into(),
             remediation: "am robot inbox --ack-overdue".into(),
+            playbooks: vec![],
         }];
         let status = StatusData {
             health: "ok".into(),
@@ -18389,6 +18387,66 @@ mod tests {
     }
 
     #[test]
+    fn build_reservations_quotes_expiring_renew_actions() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'docs/my file.md', 1, 'b', 0, ?, NULL)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                now_us + 300_000_000,
+            )],
+        )
+        .expect("insert expiring reservation");
+
+        let (_data, actions) = build_reservations(
+            &conn,
+            1,
+            "/tmp/project with space",
+            Some((2, "Bob".to_string())),
+            false,
+            false,
+            Some(10),
+        )
+        .expect("build reservations");
+
+        assert_eq!(
+            actions,
+            vec![
+                "am file_reservations renew '/tmp/project with space' Bob --paths 'docs/my file.md' --extend-seconds 3600"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_reservations_omits_expired_conflict_playbooks() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+            ],
+        )
+        .expect("insert expired reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, true, false, Some(10))
+            .expect("build reservations");
+
+        assert!(data.all_active.is_empty());
+        assert!(data.conflicts.is_empty());
+        assert!(data.playbooks.is_empty());
+    }
+
+    #[test]
     fn build_analytics_handles_release_ledger_conflict_query() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
@@ -18413,7 +18471,7 @@ mod tests {
         )
         .expect("insert conflicting reservations");
 
-        let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
+        let anomalies = build_analytics(&conn, 1, "proj", None).expect("build analytics");
         let reservation_conflict = anomalies
             .iter()
             .find(|anomaly| anomaly.category == "reservation_conflict")
@@ -18424,6 +18482,15 @@ mod tests {
                 .contains("1 reservation conflict"),
             "unexpected anomaly headline: {}",
             reservation_conflict.headline
+        );
+        assert_eq!(reservation_conflict.playbooks.len(), 1);
+        assert_eq!(
+            reservation_conflict.playbooks[0].safe_command,
+            "am robot reservations --project proj --conflicts --all"
+        );
+        assert_eq!(
+            reservation_conflict.remediation,
+            "am robot reservations --project proj --conflicts --all"
         );
     }
 
@@ -18446,7 +18513,7 @@ mod tests {
         conn.query_sync("DELETE FROM agents WHERE id = 1", &[])
             .expect("delete holder agent row");
 
-        let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
+        let anomalies = build_analytics(&conn, 1, "proj", None).expect("build analytics");
         let reservation_conflict = anomalies
             .iter()
             .find(|anomaly| anomaly.category == "reservation_conflict")
@@ -18457,6 +18524,41 @@ mod tests {
                 .contains("1 reservation conflict"),
             "unexpected anomaly headline: {}",
             reservation_conflict.headline
+        );
+        assert_eq!(reservation_conflict.playbooks.len(), 1);
+        assert!(
+            reservation_conflict.playbooks[0]
+                .summary
+                .contains("[unknown-agent-1]"),
+            "playbook should retain orphaned holder identity: {:?}",
+            reservation_conflict.playbooks[0]
+        );
+    }
+
+    #[test]
+    fn build_analytics_omits_expired_reservation_conflicts() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 1_000_000),
+            ],
+        )
+        .expect("insert expired conflicting reservations");
+
+        let anomalies = build_analytics(&conn, 1, "proj", None).expect("build analytics");
+
+        assert!(
+            !anomalies
+                .iter()
+                .any(|anomaly| anomaly.category == "reservation_conflict"),
+            "expired reservations must not emit conflict playbooks: {anomalies:?}"
         );
     }
 

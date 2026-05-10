@@ -287,6 +287,28 @@ const fn reservation_exclusive_cell_label(exclusive: bool) -> &'static str {
     if exclusive { "Yes" } else { "No" }
 }
 
+fn reservation_patterns_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || mcp_agent_mail_core::pattern_overlap::patterns_overlap(left, right)
+        || mcp_agent_mail_core::pattern_overlap::patterns_overlap(right, left)
+}
+
+fn reservation_shell_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn reservation_conflict_safe_command(project: &str) -> String {
+    let project = reservation_shell_arg(project);
+    format!("am robot reservations --project {project} --conflicts --all")
+}
+
 pub struct ReservationsScreen {
     table_state: TableState,
     /// All tracked reservations keyed by composite key.
@@ -780,6 +802,52 @@ impl ReservationsScreen {
         (active, exclusive, shared, expired)
     }
 
+    fn reservation_conflict_peers(&self, selected_key: &str) -> Vec<&ActiveReservation> {
+        let Some(selected) = self.reservations.get(selected_key) else {
+            return Vec::new();
+        };
+        if selected.released || !selected.exclusive || selected.remaining_secs() == 0 {
+            return Vec::new();
+        }
+
+        let mut peers: Vec<_> = self
+            .reservations
+            .iter()
+            .filter_map(|(key, peer)| {
+                if key == selected_key
+                    || peer.released
+                    || !peer.exclusive
+                    || peer.remaining_secs() == 0
+                    || peer.project != selected.project
+                    || peer.agent == selected.agent
+                {
+                    return None;
+                }
+                reservation_patterns_overlap(&selected.path_pattern, &peer.path_pattern)
+                    .then_some(peer)
+            })
+            .collect();
+        peers.sort_by(|left, right| {
+            super::cmp_ci(&left.agent, &right.agent)
+                .then(left.path_pattern.cmp(&right.path_pattern))
+        });
+        peers
+    }
+
+    fn reservation_conflict_summary(&self, selected_key: &str) -> Option<String> {
+        let peers = self.reservation_conflict_peers(selected_key);
+        let first = peers.first()?;
+        let extra = peers.len().saturating_sub(1);
+        Some(if extra == 0 {
+            format!("{} overlaps `{}`", first.agent, first.path_pattern)
+        } else {
+            format!(
+                "{} overlaps `{}` (+{} more)",
+                first.agent, first.path_pattern, extra
+            )
+        })
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     /// Render the detail panel for the selected reservation.
     fn render_reservation_detail_panel(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -861,6 +929,20 @@ impl ReservationsScreen {
             lines.push(("Status".into(), "Expired".into(), Some(tp.severity_error)));
         } else {
             lines.push(("Status".into(), "Active".into(), Some(tp.activity_active)));
+        }
+
+        if let Some(summary) = self.reservation_conflict_summary(key) {
+            lines.push(("Conflict".into(), summary, Some(tp.severity_warn)));
+            lines.push((
+                "Playbook".into(),
+                "Coordinate holders before editing overlapping paths".into(),
+                Some(tp.severity_warn),
+            ));
+            lines.push((
+                "Command".into(),
+                reservation_conflict_safe_command(&res.project),
+                Some(tp.text_muted),
+            ));
         }
 
         render_kv_lines(
@@ -3128,6 +3210,77 @@ mod tests {
         assert_eq!(excl, 1);
         assert_eq!(shared, 1);
         assert_eq!(expired, 0);
+    }
+
+    #[test]
+    fn selected_detail_conflict_summary_uses_active_exclusive_overlaps_only() {
+        let mut screen = ReservationsScreen::new();
+        let now = chrono::Utc::now().timestamp_micros();
+        let active_granted = now - 60_000_000;
+        let expired_granted = now - 7_200_000_000;
+
+        let selected = ActiveReservation {
+            reservation_id: Some(1),
+            agent: "Alice".to_string(),
+            path_pattern: "src/auth/**".to_string(),
+            exclusive: true,
+            granted_ts: active_granted,
+            ttl_s: 3_600,
+            project: "proj".to_string(),
+            released: false,
+        };
+        let overlapping = ActiveReservation {
+            reservation_id: Some(2),
+            agent: "Bob".to_string(),
+            path_pattern: "src/auth/jwt.rs".to_string(),
+            exclusive: true,
+            granted_ts: active_granted,
+            ttl_s: 3_600,
+            project: "proj".to_string(),
+            released: false,
+        };
+        let expired_overlap = ActiveReservation {
+            reservation_id: Some(3),
+            agent: "ExpiredHolder".to_string(),
+            path_pattern: "src/auth/session.rs".to_string(),
+            exclusive: true,
+            granted_ts: expired_granted,
+            ttl_s: 60,
+            project: "proj".to_string(),
+            released: false,
+        };
+        let shared_overlap = ActiveReservation {
+            reservation_id: Some(4),
+            agent: "SharedHolder".to_string(),
+            path_pattern: "src/auth/*.rs".to_string(),
+            exclusive: false,
+            granted_ts: active_granted,
+            ttl_s: 3_600,
+            project: "proj".to_string(),
+            released: false,
+        };
+
+        let selected_key = selected.key();
+        for reservation in [selected, overlapping, expired_overlap, shared_overlap] {
+            screen.reservations.insert(reservation.key(), reservation);
+        }
+
+        let summary = screen
+            .reservation_conflict_summary(&selected_key)
+            .expect("selected reservation should have an active conflict summary");
+
+        assert!(summary.contains("Bob"));
+        assert!(summary.contains("src/auth/jwt.rs"));
+        assert!(!summary.contains("ExpiredHolder"));
+        assert!(!summary.contains("SharedHolder"));
+        assert_eq!(
+            reservation_conflict_safe_command("proj"),
+            "am robot reservations --project proj --conflicts --all"
+        );
+        assert_eq!(
+            reservation_conflict_safe_command("/tmp/project with space"),
+            "am robot reservations --project '/tmp/project with space' --conflicts --all"
+        );
     }
 
     #[test]

@@ -180,6 +180,7 @@ fn analytics_envelope() -> RobotEnvelope<AnalyticsGoldenData> {
                     "Two agents are converging on the same hot thread and reservation surface."
                         .to_string(),
                 remediation: "am robot reservations --conflicts".to_string(),
+                playbooks: vec![],
             }],
             topology: SwarmTopologySummary {
                 coverage: SwarmTopologyCoverage {
