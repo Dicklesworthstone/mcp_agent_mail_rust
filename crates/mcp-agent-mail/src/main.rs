@@ -13,8 +13,14 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::config::{ConfigSource, InterfaceMode, env_value};
 use mcp_agent_mail_server::startup_checks::{self, PortStatus};
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, fmt};
 
 /// Runtime interface mode selector for the `mcp-agent-mail` binary.
 ///
@@ -156,6 +162,186 @@ fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool) -> EnvFilter {
         }
     }
     filter
+}
+
+const GIT_LOCKED_TRACE_TARGET: &str = "mcp_agent_mail::git_locked";
+const GUARD_SEGFAULT_TRACE_TARGET: &str = "mcp_agent_mail::guard::segfault_retry";
+
+#[derive(Debug, Eq, PartialEq)]
+struct GitSegfaultRetryTraceEvent {
+    name: &'static str,
+    repo_slug: String,
+    attempt_n: u32,
+    signal: Option<i32>,
+    exhausted: bool,
+}
+
+impl GitSegfaultRetryTraceEvent {
+    fn from_event(event: &Event<'_>) -> Option<Self> {
+        let target = event.metadata().target();
+        if target != GIT_LOCKED_TRACE_TARGET && target != GUARD_SEGFAULT_TRACE_TARGET {
+            return None;
+        }
+
+        let mut fields = GitSegfaultRetryTraceFields::default();
+        event.record(&mut fields);
+        git_segfault_retry_trace_event_from_fields(target, &fields)
+    }
+}
+
+#[derive(Default)]
+struct GitSegfaultRetryTraceFields {
+    message: Option<String>,
+    repo: Option<String>,
+    attempt: Option<u64>,
+    signal: Option<i64>,
+}
+
+impl GitSegfaultRetryTraceFields {
+    fn record_string(&mut self, field: &Field, value: &str) {
+        let normalized = normalize_trace_field(value);
+        match field.name() {
+            "message" => self.message = Some(normalized),
+            "repo" => self.repo = Some(normalized),
+            _ => {}
+        }
+    }
+
+    fn record_int(&mut self, field: &Field, value: i64) {
+        match field.name() {
+            "attempt" => {
+                self.attempt = u64::try_from(value).ok();
+            }
+            "signal" => self.signal = Some(value),
+            _ => {}
+        }
+    }
+}
+
+impl Visit for GitSegfaultRetryTraceFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let value = format!("{value:?}");
+        match field.name() {
+            "message" | "repo" => self.record_string(field, &value),
+            "attempt" | "signal" => {
+                if let Ok(value) = normalize_trace_field(&value).parse::<i64>() {
+                    self.record_int(field, value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.record_string(field, value);
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.record_int(field, value);
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "attempt" {
+            self.attempt = Some(value);
+        }
+    }
+}
+
+struct GitSegfaultRetryTuiLayer;
+
+impl<S> Layer<S> for GitSegfaultRetryTuiLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if let Some(event) = GitSegfaultRetryTraceEvent::from_event(event) {
+            mcp_agent_mail_server::emit_git_segfault_retry_trace_event(
+                event.name,
+                event.repo_slug,
+                event.attempt_n,
+                event.signal,
+                event.exhausted,
+            );
+        }
+    }
+}
+
+fn git_segfault_retry_trace_event_from_fields(
+    target: &str,
+    fields: &GitSegfaultRetryTraceFields,
+) -> Option<GitSegfaultRetryTraceEvent> {
+    let message = fields.message.as_deref()?;
+    let exhausted = match (target, message) {
+        (GIT_LOCKED_TRACE_TARGET, "git_segfault_retry_attempt")
+        | (GUARD_SEGFAULT_TRACE_TARGET, "guard_git_segfault_retry") => false,
+        (GIT_LOCKED_TRACE_TARGET, "git_segfault_retry_exhausted")
+        | (GUARD_SEGFAULT_TRACE_TARGET, "guard_git_segfault_retry_exhausted") => true,
+        _ => return None,
+    };
+    let name = if exhausted {
+        "git_segfault_retry_exhausted"
+    } else {
+        "git_segfault_retry_attempt"
+    };
+    let repo_slug = fields
+        .repo
+        .as_deref()
+        .map_or_else(|| "pre-commit-guard".to_string(), git_repo_slug);
+    let attempt_n = fields
+        .attempt
+        .and_then(|attempt| u32::try_from(attempt).ok())
+        .map_or(0, |attempt| attempt.saturating_add(1));
+    let signal = fields.signal.and_then(|signal| i32::try_from(signal).ok());
+
+    Some(GitSegfaultRetryTraceEvent {
+        name,
+        repo_slug,
+        attempt_n,
+        signal,
+        exhausted,
+    })
+}
+
+fn normalize_trace_field(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn git_repo_slug(repo: &str) -> String {
+    let mut slug = String::with_capacity(repo.len());
+    let mut previous_dash = true;
+
+    for ch in repo.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '_' | '.') {
+            ch
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if !previous_dash {
+                slug.push(next);
+                previous_dash = true;
+            }
+        } else {
+            slug.push(next);
+            previous_dash = false;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "unknown-repo".to_string()
+    } else {
+        slug
+    }
 }
 
 #[derive(Parser)]
@@ -490,10 +676,13 @@ fn main() {
         && config.tui_enabled
         && std::io::stdout().is_terminal();
     let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui);
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
+        .with_filter(filter);
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(GitSegfaultRetryTuiLayer)
         .init();
 
     if cli.verbose {
@@ -754,6 +943,69 @@ mod tests {
         assert!(directives.contains(&"execute_statement_dispatch=error"));
         assert!(directives.contains(&"mvcc=warn"));
         assert!(directives.contains(&"checkpoint=warn"));
+    }
+
+    #[test]
+    fn git_segfault_trace_decoder_handles_core_attempt() {
+        let fields = GitSegfaultRetryTraceFields {
+            message: Some("git_segfault_retry_attempt".to_string()),
+            repo: Some("/data/projects/example repo/.git".to_string()),
+            attempt: Some(0),
+            signal: Some(11),
+        };
+
+        assert_eq!(
+            git_segfault_retry_trace_event_from_fields(GIT_LOCKED_TRACE_TARGET, &fields),
+            Some(GitSegfaultRetryTraceEvent {
+                name: "git_segfault_retry_attempt",
+                repo_slug: "data-projects-example-repo-.git".to_string(),
+                attempt_n: 1,
+                signal: Some(11),
+                exhausted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn git_segfault_trace_decoder_handles_core_exhausted() {
+        let fields = GitSegfaultRetryTraceFields {
+            message: Some("git_segfault_retry_exhausted".to_string()),
+            repo: Some("/home/ubuntu/.mcp_agent_mail_git_mailbox_repo".to_string()),
+            attempt: None,
+            signal: None,
+        };
+
+        assert_eq!(
+            git_segfault_retry_trace_event_from_fields(GIT_LOCKED_TRACE_TARGET, &fields),
+            Some(GitSegfaultRetryTraceEvent {
+                name: "git_segfault_retry_exhausted",
+                repo_slug: "home-ubuntu-.mcp_agent_mail_git_mailbox_repo".to_string(),
+                attempt_n: 0,
+                signal: None,
+                exhausted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn git_segfault_trace_decoder_handles_guard_attempt_without_repo() {
+        let fields = GitSegfaultRetryTraceFields {
+            message: Some("guard_git_segfault_retry".to_string()),
+            repo: None,
+            attempt: Some(2),
+            signal: None,
+        };
+
+        assert_eq!(
+            git_segfault_retry_trace_event_from_fields(GUARD_SEGFAULT_TRACE_TARGET, &fields),
+            Some(GitSegfaultRetryTraceEvent {
+                name: "git_segfault_retry_attempt",
+                repo_slug: "pre-commit-guard".to_string(),
+                attempt_n: 3,
+                signal: None,
+                exhausted: false,
+            })
+        );
     }
 
     #[test]

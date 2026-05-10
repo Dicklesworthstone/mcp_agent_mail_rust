@@ -165,11 +165,6 @@ pub enum MutateError {
     Unsupported(&'static str),
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let h = Sha256::digest(bytes);
-    format!("sha256:{:x}", h)
-}
-
 /// G-OOM fix (Gemini round 2): streaming SHA-256 over the file's bytes
 /// without loading the entire file into memory. Returns the empty-file
 /// hash if the path doesn't exist.
@@ -312,19 +307,35 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::
     Ok(())
 }
 
-/// Compute the backup path for a target.
+/// Compute the backup path for a target, sequenced by `started_at_ns`.
 ///
 /// G1 fix (Gemini round 2): when `path` is absolute and outside `repo_root`,
 /// `strip_prefix` returns Err and `PathBuf::join(absolute)` drops the base —
 /// so naive `run_dir.join("backups").join(rel)` returned the live target itself.
 /// We now encode out-of-repo paths under a sentinel `__abs__/` subdirectory.
-pub(crate) fn backup_path_for(run_dir: &Path, repo_root: &Path, path: &Path) -> PathBuf {
-    let backups = run_dir.join("backups");
+///
+/// Pass-4 multi-mutation fix (caught by property test): without sequencing,
+/// two mutations to the same path within one run share a backup path and the
+/// second overwrites the first. Undo then restores the wrong content. We now
+/// scope every mutation's backup under `backups/<started_at_ns>/`, so each
+/// mutation has its own backup directory. Undo finds the per-mutation backup
+/// via the recorded `started_at_ns`. `started_at_ns` is monotonically
+/// increasing per `MutateContext.start`, so two mutations cannot collide.
+pub(crate) fn backup_path_for(
+    run_dir: &Path,
+    repo_root: &Path,
+    path: &Path,
+    started_at_ns: u128,
+) -> PathBuf {
+    // Zero-padded sequence so lexicographic order matches numerical order
+    // (useful for ls/debug). 26 digits covers 10^26 ns ≈ 3 trillion years.
+    let seq = format!("seq_{:026}", started_at_ns);
+    let backups = run_dir.join("backups").join(&seq);
     if let Ok(rel) = path.strip_prefix(repo_root) {
         return backups.join(rel);
     }
     // Outside repo_root — encode the absolute path as a "rooted" relative
-    // path under backups/__abs__/. Strip a leading `/` so PathBuf::join
+    // path under backups/<seq>/__abs__/. Strip a leading `/` so PathBuf::join
     // doesn't drop the prefix.
     let abs_str = path.to_string_lossy();
     let trimmed = abs_str.trim_start_matches('/');
@@ -477,7 +488,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // `rel` value used in actions.jsonl stays the original path semantics
     // — for absolute paths, undo's `target.join(absolute)` recovers the
     // absolute path (PathBuf::join's same semantics that broke backup).
-    let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path);
+    let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
     if !ctx.dry_run && path.exists() {
         copy_verbatim_with_perms(path, &backup_path)?;
@@ -528,17 +539,46 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
+            // G-Lock-Rename-Dest fix (Gemini round 2): also acquire an
+            // advisory lock on the destination basename. The source's
+            // per-path lock (already held above) protects concurrent
+            // mutations of `path`; without locking the destination too,
+            // two concurrent renames-to-same-quarantine paths would race
+            // (one would see destination missing, one would see it exist
+            // — the loser's rename either succeeds (clobber) or fails).
+            // Note we hold this lock for the lifetime of `to_lock_file`.
+            let to_basename = to
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "_root_".to_string());
+            let to_lock_path = to
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!(".{}.doctor-lock", to_basename));
+            let to_lock_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&to_lock_path)?;
+            if to_lock_file.try_lock_exclusive().is_err() {
+                return Err(MutateError::LockHeld(to.clone()));
+            }
             // G3 fix (Gemini round 2): refuse if the destination already
             // exists. POSIX `fs::rename` overwrites silently, which would
             // permanently destroy the existing file at `to` — direct
             // violation of AGENTS.md RULE 1 (no file deletion). The
             // appropriate response is to either pick a different
             // quarantine name OR refuse with exit-4 / RenameClobberRefused.
+            // The check happens AFTER acquiring the destination lock so
+            // a concurrent rename-to-same-dest can't race past it.
             if fs::symlink_metadata(&to).is_ok() {
+                let _ = FileExt::unlock(&to_lock_file);
                 return Err(MutateError::RenameDestinationExists(to.clone()));
             }
             fs::rename(path, &to)?;
             rename_to_record = Some(to.to_string_lossy().into_owned());
+            let _ = FileExt::unlock(&to_lock_file);
             Ok(())
         }
         Op::Chmod { mode } => {
@@ -884,13 +924,17 @@ mod tests {
         let repo_root = PathBuf::from("/repo");
         let in_repo = PathBuf::from("/repo/.config/x");
         let out_of_repo = PathBuf::from("/home/user/.config/x");
+        let started_at_ns = 42;
+        let seq = "seq_00000000000000000000000042";
         assert_eq!(
-            backup_path_for(&run_dir, &repo_root, &in_repo),
-            PathBuf::from("/tmp/run-dir/backups/.config/x"),
+            backup_path_for(&run_dir, &repo_root, &in_repo, started_at_ns),
+            PathBuf::from("/tmp/run-dir/backups")
+                .join(seq)
+                .join(".config/x"),
         );
-        let bp = backup_path_for(&run_dir, &repo_root, &out_of_repo);
+        let bp = backup_path_for(&run_dir, &repo_root, &out_of_repo, started_at_ns);
         assert!(
-            bp.starts_with(run_dir.join("backups/__abs__")),
+            bp.starts_with(run_dir.join("backups").join(seq).join("__abs__")),
             "expected __abs__/ encoding, got: {bp:?}"
         );
         assert!(

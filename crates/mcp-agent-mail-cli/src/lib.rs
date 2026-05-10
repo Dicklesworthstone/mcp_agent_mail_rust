@@ -5539,10 +5539,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_triage(&target, quick)
         }
-        DoctorCommand::Explain {
-            finding_id,
-            format,
-        } => {
+        DoctorCommand::Explain { finding_id, format } => {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_explain(&target, &finding_id, format)
         }
@@ -14558,10 +14555,24 @@ fn handle_bench(
     let mut seed_report = None;
     let mut temp_workspace: Option<tempfile::TempDir> = None;
     if needs_seeded_db {
-        let workspace = tempfile::tempdir()
-            .map_err(|err| CliError::Other(format!("failed to create temp workspace: {err}")))?;
-        let db_path = workspace.path().join("bench.sqlite3");
-        let storage_root = workspace.path().join("archive");
+        let workspace_override = std::env::var_os("AM_BENCH_WORKSPACE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let workspace_path = if let Some(path) = workspace_override {
+            std::fs::create_dir_all(&path).map_err(|err| {
+                CliError::Other(format!("failed to create bench workspace: {err}"))
+            })?;
+            path
+        } else {
+            let workspace = tempfile::tempdir().map_err(|err| {
+                CliError::Other(format!("failed to create temp workspace: {err}"))
+            })?;
+            let path = workspace.path().to_path_buf();
+            temp_workspace = Some(workspace);
+            path
+        };
+        let db_path = workspace_path.join("bench.sqlite3");
+        let storage_root = workspace_path.join("archive");
         std::fs::create_dir_all(&storage_root).map_err(|err| {
             CliError::Other(format!("failed to create bench archive root: {err}"))
         })?;
@@ -14575,7 +14586,6 @@ fn handle_bench(
             storage_root.to_string_lossy().into_owned(),
         );
         seed_report = Some(report);
-        temp_workspace = Some(workspace);
     }
 
     let condition_context = bench::BenchConditionContext {

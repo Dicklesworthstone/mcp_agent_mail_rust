@@ -46,12 +46,21 @@ struct StoredAction {
     /// post-fix, undo refuses to clobber their changes.
     #[serde(default)]
     after_hash: String,
+    /// Pass-4 fix: when the same file is mutated multiple times in one run,
+    /// each mutation gets its own backup at `backups/seq_<started_at_ns>/<rel>`.
+    /// Undo uses this to find the correct per-mutation backup.
+    #[serde(default)]
+    started_at_ns: u128,
     #[serde(default)]
     rename_to: Option<String>,
     #[serde(default)]
     before_mode: Option<u32>,
     #[serde(default)]
     ok: bool,
+}
+
+fn per_mutation_backup_dir(backups_dir: &Path, started_at_ns: u128) -> PathBuf {
+    backups_dir.join(format!("seq_{:026}", started_at_ns))
 }
 
 /// Resolve `<run_id>` argument: literal id OR `latest` (read symlink).
@@ -111,6 +120,7 @@ pub fn run_undo(
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)?;
     if !dry_run && lock_file.try_lock_exclusive().is_err() {
         return Err(std::io::Error::new(
@@ -148,7 +158,15 @@ pub fn run_undo(
         }
 
         let target_file = target.join(&action.path);
-        let backup_file = backups_dir.join(&action.path);
+        // Pass-4 fix: read the per-mutation backup at
+        // `backups/seq_<started_at_ns>/<rel>`. If `started_at_ns == 0`
+        // (legacy actions.jsonl from pre-pass-4 runs), fall back to the
+        // old flat layout `backups/<rel>`.
+        let backup_file = if action.started_at_ns == 0 {
+            backups_dir.join(&action.path)
+        } else {
+            per_mutation_backup_dir(&backups_dir, action.started_at_ns).join(&action.path)
+        };
 
         match action.op.as_str() {
             "WriteFile" | "AppendFile" | "Chmod" => {
@@ -242,21 +260,21 @@ pub fn run_undo(
                     // `fs::read` follows symlinks, which would let an attacker
                     // redirect undo to overwrite arbitrary files.
                     let meta = fs::symlink_metadata(&target_file).ok();
-                    if let Some(m) = meta.as_ref() {
-                        if m.file_type().is_symlink() {
-                            let msg = format!(
-                                "target {} is a symlink; refusing to follow (G2 symlink-attack defense)",
-                                action.path
-                            );
-                            if strict {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    msg,
-                                ));
-                            }
-                            summary.failures.push(msg);
-                            continue;
+                    if let Some(m) = meta.as_ref()
+                        && m.file_type().is_symlink()
+                    {
+                        let msg = format!(
+                            "target {} is a symlink; refusing to follow (G2 symlink-attack defense)",
+                            action.path
+                        );
+                        if strict {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                msg,
+                            ));
                         }
+                        summary.failures.push(msg);
+                        continue;
                     }
                     match fs::read(&target_file) {
                         Ok(bytes) => {
@@ -828,6 +846,7 @@ mod tests {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .unwrap();
         use fs2::FileExt;
