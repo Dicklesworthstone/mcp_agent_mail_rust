@@ -13014,11 +13014,39 @@ mod tests {
         assert!(!toon.is_empty());
     }
 
+    fn planner_search_result_row(
+        id: i64,
+        title: &str,
+        score: f64,
+        created_ts: i64,
+        thread_id: &str,
+        from_agent: &str,
+    ) -> mcp_agent_mail_db::search_planner::SearchResult {
+        use mcp_agent_mail_db::search_planner::{DocKind, SearchResult as PlannerSearchResult};
+
+        PlannerSearchResult {
+            doc_kind: DocKind::Message,
+            id,
+            project_id: Some(1),
+            title: title.into(),
+            body: "body".into(),
+            score: Some(score),
+            importance: Some("normal".into()),
+            ack_required: Some(false),
+            created_ts: Some(created_ts),
+            thread_id: Some(thread_id.into()),
+            from_agent: Some(from_agent.into()),
+            reason_codes: vec![],
+            score_factors: vec![],
+            redacted: false,
+            redaction_reason: None,
+            ..PlannerSearchResult::default()
+        }
+    }
+
     #[test]
     fn collect_search_rows_with_runner_pages_until_kind_matches_fill_limit() {
-        use mcp_agent_mail_db::search_planner::{
-            DocKind, SearchQuery, SearchResponse, SearchResult as PlannerSearchResult,
-        };
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_search_kind_paging.sqlite3");
@@ -13053,42 +13081,8 @@ mod tests {
             match query.cursor.as_deref() {
                 None => Ok(SearchResponse {
                     results: vec![
-                        PlannerSearchResult {
-                            doc_kind: DocKind::Message,
-                            id: 10,
-                            project_id: Some(1),
-                            title: "first".into(),
-                            body: "body".into(),
-                            score: Some(0.9),
-                            importance: Some("normal".into()),
-                            ack_required: Some(false),
-                            created_ts: Some(100),
-                            thread_id: Some("th-1".into()),
-                            from_agent: Some("Alpha".into()),
-                            reason_codes: vec![],
-                            score_factors: vec![],
-                            redacted: false,
-                            redaction_reason: None,
-                            ..PlannerSearchResult::default()
-                        },
-                        PlannerSearchResult {
-                            doc_kind: DocKind::Message,
-                            id: 20,
-                            project_id: Some(1),
-                            title: "second".into(),
-                            body: "body".into(),
-                            score: Some(0.8),
-                            importance: Some("normal".into()),
-                            ack_required: Some(false),
-                            created_ts: Some(200),
-                            thread_id: Some("th-2".into()),
-                            from_agent: Some("Beta".into()),
-                            reason_codes: vec![],
-                            score_factors: vec![],
-                            redacted: false,
-                            redaction_reason: None,
-                            ..PlannerSearchResult::default()
-                        },
+                        planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
+                        planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
                     ],
                     next_cursor: Some("cursor-2".into()),
                     explain: None,
@@ -13097,24 +13091,9 @@ mod tests {
                     audit: vec![],
                 }),
                 Some("cursor-2") => Ok(SearchResponse {
-                    results: vec![PlannerSearchResult {
-                        doc_kind: DocKind::Message,
-                        id: 30,
-                        project_id: Some(1),
-                        title: "third".into(),
-                        body: "body".into(),
-                        score: Some(0.7),
-                        importance: Some("normal".into()),
-                        ack_required: Some(false),
-                        created_ts: Some(300),
-                        thread_id: Some("th-3".into()),
-                        from_agent: Some("Gamma".into()),
-                        reason_codes: vec![],
-                        score_factors: vec![],
-                        redacted: false,
-                        redaction_reason: None,
-                        ..PlannerSearchResult::default()
-                    }],
+                    results: vec![planner_search_result_row(
+                        30, "third", 0.7, 300, "th-3", "Gamma",
+                    )],
                     next_cursor: None,
                     explain: None,
                     assistance: None,
@@ -13142,9 +13121,7 @@ mod tests {
 
     #[test]
     fn collect_search_rows_with_runner_suppresses_cursor_when_filter_overflows_page() {
-        use mcp_agent_mail_db::search_planner::{
-            DocKind, SearchQuery, SearchResponse, SearchResult as PlannerSearchResult,
-        };
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir
@@ -13185,78 +13162,10 @@ mod tests {
             );
             Ok(SearchResponse {
                 results: vec![
-                    PlannerSearchResult {
-                        doc_kind: DocKind::Message,
-                        id: 10,
-                        project_id: Some(1),
-                        title: "first".into(),
-                        body: "body".into(),
-                        score: Some(0.9),
-                        importance: Some("normal".into()),
-                        ack_required: Some(false),
-                        created_ts: Some(100),
-                        thread_id: Some("th-1".into()),
-                        from_agent: Some("Alpha".into()),
-                        reason_codes: vec![],
-                        score_factors: vec![],
-                        redacted: false,
-                        redaction_reason: None,
-                        ..PlannerSearchResult::default()
-                    },
-                    PlannerSearchResult {
-                        doc_kind: DocKind::Message,
-                        id: 20,
-                        project_id: Some(1),
-                        title: "second".into(),
-                        body: "body".into(),
-                        score: Some(0.8),
-                        importance: Some("normal".into()),
-                        ack_required: Some(false),
-                        created_ts: Some(200),
-                        thread_id: Some("th-2".into()),
-                        from_agent: Some("Beta".into()),
-                        reason_codes: vec![],
-                        score_factors: vec![],
-                        redacted: false,
-                        redaction_reason: None,
-                        ..PlannerSearchResult::default()
-                    },
-                    PlannerSearchResult {
-                        doc_kind: DocKind::Message,
-                        id: 30,
-                        project_id: Some(1),
-                        title: "third".into(),
-                        body: "body".into(),
-                        score: Some(0.7),
-                        importance: Some("normal".into()),
-                        ack_required: Some(false),
-                        created_ts: Some(300),
-                        thread_id: Some("th-3".into()),
-                        from_agent: Some("Gamma".into()),
-                        reason_codes: vec![],
-                        score_factors: vec![],
-                        redacted: false,
-                        redaction_reason: None,
-                        ..PlannerSearchResult::default()
-                    },
-                    PlannerSearchResult {
-                        doc_kind: DocKind::Message,
-                        id: 40,
-                        project_id: Some(1),
-                        title: "fourth".into(),
-                        body: "body".into(),
-                        score: Some(0.6),
-                        importance: Some("normal".into()),
-                        ack_required: Some(false),
-                        created_ts: Some(400),
-                        thread_id: Some("th-4".into()),
-                        from_agent: Some("Delta".into()),
-                        reason_codes: vec![],
-                        score_factors: vec![],
-                        redacted: false,
-                        redaction_reason: None,
-                        ..PlannerSearchResult::default()
-                    },
+                    planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
+                    planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
+                    planner_search_result_row(30, "third", 0.7, 300, "th-3", "Gamma"),
+                    planner_search_result_row(40, "fourth", 0.6, 400, "th-4", "Delta"),
                 ],
                 next_cursor: Some("cursor-after-page".into()),
                 explain: None,
