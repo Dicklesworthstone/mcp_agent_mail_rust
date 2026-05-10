@@ -80,7 +80,7 @@ mod integrity_guard;
 mod mail_ui;
 pub mod maintenance;
 mod markdown;
-mod retention;
+pub mod retention;
 pub mod startup_checks;
 pub mod static_export;
 mod static_files;

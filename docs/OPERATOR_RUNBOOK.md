@@ -534,12 +534,26 @@ mv "$SROOT/projects/<slug>/.git/index.lock" \
 # Check disk usage (adjust path to your STORAGE_ROOT)
 du -sh "${STORAGE_ROOT:-${XDG_DATA_HOME:-~/.local/share}/mcp-agent-mail/git_mailbox_repo}/"
 
-# Clean old archives
-# (retention system handles this automatically if enabled)
+# Inventory proof artifacts before cleanup
+am doctor artifacts --json | jq '{totals, disk, largest_roots, warnings}'
+
+# Archive reviewed artifacts manually; am doctor artifacts never deletes
+tar -C <parent> -czf /tmp/<root>.tgz <root>
+mkdir -p <storage-root>/doctor/archive-quarantine/manual
+mv <reviewed-stale-root> <storage-root>/doctor/archive-quarantine/manual/
 
 # Adjust thresholds
 DISK_SPACE_WARNING_MB=200 DISK_SPACE_CRITICAL_MB=50 am serve-http
 ```
+
+`am doctor artifacts` is the safe retention governor for proof artifacts:
+it reports repo test/perf/e2e roots, CLI failure artifacts, refactor ledgers,
+doctor reports, forensic bundles, quarantine roots, recovery backups, and
+per-project attachment roots. The command is read-only. It includes retention
+classes, byte/file totals, the largest exact roots, disk pressure state, and
+manual remediation guidance. Cleanup remains an operator action: archive or
+quarantine reviewed evidence only after preserving anything needed for a
+postmortem, regression proof, release gate, or user-facing support thread.
 
 ### Deployment Validation (`verify-live`)
 

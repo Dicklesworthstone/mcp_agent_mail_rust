@@ -2067,6 +2067,20 @@ pub enum DoctorCommand {
         json: bool,
     },
 
+    /// Inventory test, perf, forensic, and e2e artifact roots without deleting anything.
+    #[command(name = "artifacts")]
+    Artifacts {
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Number of largest roots to include in the summary.
+        #[arg(long, default_value_t = 5)]
+        largest: usize,
+    },
+
     /// Print the agent-facing contract: detectors, fixers, exit codes,
     /// env vars, run-artifact schema. JSON only.
     ///
@@ -5561,6 +5575,11 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             format,
         } => handle_doctor_fix_orphan_refs(project, all, apply, force, format),
         DoctorCommand::PackArchive { json } => handle_doctor_pack_archive(json),
+        DoctorCommand::Artifacts {
+            format,
+            json,
+            largest,
+        } => handle_doctor_artifacts(format, json, largest),
         DoctorCommand::Capabilities { format } => doctor::handle_capabilities(format),
         DoctorCommand::RobotDocs => doctor::handle_robot_docs(),
         DoctorCommand::Undo {
@@ -5677,6 +5696,82 @@ fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
     } else {
         Err(CliError::Other("maintenance failed".into()))
     }
+}
+
+fn handle_doctor_artifacts(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+    largest: usize,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
+    let config = Config::from_env();
+    let repo_root = std::env::current_dir()?;
+    let report =
+        mcp_agent_mail_server::retention::artifact_retention_report(&config, &repo_root, largest);
+
+    output::emit_output(&report, fmt, || {
+        output::section("Artifact Retention Report:");
+        output::kv("Repository", &report.repo_root);
+        output::kv("Storage root", &report.storage_root);
+        output::kv(
+            "Roots",
+            &format!(
+                "{} existing / {} reported",
+                report.totals.roots_existing, report.totals.roots_reported
+            ),
+        );
+        output::kv("Total size", &format_bytes(report.totals.total_bytes));
+        output::kv("Total files", &report.totals.total_files.to_string());
+        output::kv("Disk pressure", &report.disk.pressure);
+        if let Some(free_bytes) = report.disk.effective_free_bytes {
+            output::kv("Effective free", &format_bytes(free_bytes));
+        }
+
+        ftui_runtime::ftui_println!("");
+        output::section("  Largest Roots:");
+        if report.largest_roots.is_empty() {
+            output::emit_empty(fmt, "No artifact roots with files were found.");
+        } else {
+            let mut table = output::CliTable::new(vec!["ROOT", "CLASS", "SIZE", "FILES", "PATH"]);
+            for root in &report.largest_roots {
+                table.add_row(vec![
+                    root.name.clone(),
+                    root.retention_class.clone(),
+                    format_bytes(root.bytes),
+                    root.files.to_string(),
+                    root.path.clone(),
+                ]);
+            }
+            table.render();
+        }
+
+        if !report.warnings.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("  Warnings:");
+            for warning in &report.warnings {
+                output::warn(&format!(
+                    "[{}] {}: {}",
+                    warning.severity, warning.code, warning.detail
+                ));
+                for root in &warning.largest_roots {
+                    ftui_runtime::ftui_println!(
+                        "    largest_root={} bytes={} path={}",
+                        root.name,
+                        root.bytes,
+                        root.path
+                    );
+                }
+                ftui_runtime::ftui_println!("    remediation={}", warning.safe_remediation);
+            }
+        }
+
+        ftui_runtime::ftui_println!("");
+        output::section("  Safety:");
+        for remediation in &report.safe_remediation {
+            ftui_runtime::ftui_println!("  - {remediation}");
+        }
+    });
+    Ok(())
 }
 
 fn handle_guard(action: GuardCommand) -> CliResult<()> {
@@ -35122,6 +35217,35 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(json);
             }
             _ => panic!("expected Doctor Fix"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_artifacts() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "artifacts",
+            "--format",
+            "json",
+            "--largest",
+            "3",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Artifacts {
+                        format,
+                        json,
+                        largest,
+                    },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Json));
+                assert!(!json);
+                assert_eq!(largest, 3);
+            }
+            _ => panic!("expected Doctor Artifacts"),
         }
     }
 

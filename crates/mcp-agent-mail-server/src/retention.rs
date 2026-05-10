@@ -12,10 +12,15 @@
 #![forbid(unsafe_code)]
 
 use mcp_agent_mail_core::Config;
-use std::path::Path;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
+
+const ARTIFACT_REPORT_SCHEMA_VERSION: u32 = 1;
+const LARGE_ARTIFACT_ROOT_WARN_BYTES: u64 = 512 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
 /// Global shutdown flag for the retention worker.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -184,6 +189,404 @@ struct RetentionReport {
     total_attachment_bytes: u64,
     total_inbox_count: u64,
     warnings: usize,
+}
+
+/// Read-only artifact retention inventory for operator-facing doctor output.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactRetentionReport {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub repo_root: String,
+    pub storage_root: String,
+    pub totals: ArtifactRetentionTotals,
+    pub disk: ArtifactDiskReport,
+    pub roots: Vec<ArtifactRootReport>,
+    pub largest_roots: Vec<ArtifactRootReport>,
+    pub warnings: Vec<ArtifactRetentionWarning>,
+    pub safe_remediation: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactRetentionTotals {
+    pub roots_reported: usize,
+    pub roots_existing: usize,
+    pub total_bytes: u64,
+    pub total_files: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactDiskReport {
+    pub pressure: String,
+    pub effective_free_bytes: Option<u64>,
+    pub storage_probe_path: String,
+    pub db_probe_path: Option<String>,
+    pub warning_threshold_bytes: u64,
+    pub critical_threshold_bytes: u64,
+    pub fatal_threshold_bytes: u64,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactRootReport {
+    pub name: String,
+    pub path: String,
+    pub retention_class: String,
+    pub review_after_days: u64,
+    pub delete_after_days: Option<u64>,
+    pub bytes: u64,
+    pub files: u64,
+    pub exists: bool,
+    pub scan_error: Option<String>,
+    pub safe_remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactRetentionWarning {
+    pub severity: String,
+    pub code: String,
+    pub detail: String,
+    pub largest_roots: Vec<ArtifactRootReport>,
+    pub safe_remediation: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectoryStats {
+    bytes: u64,
+    files: u64,
+}
+
+impl DirectoryStats {
+    const fn empty() -> Self {
+        Self { bytes: 0, files: 0 }
+    }
+}
+
+/// Build a read-only artifact retention report for repository and mailbox roots.
+#[must_use]
+pub fn artifact_retention_report(
+    config: &Config,
+    repo_root: &Path,
+    largest_limit: usize,
+) -> ArtifactRetentionReport {
+    let mut roots = Vec::new();
+    push_repo_artifact_roots(&mut roots, repo_root);
+    push_storage_artifact_roots(&mut roots, &config.storage_root);
+
+    let totals = ArtifactRetentionTotals {
+        roots_reported: roots.len(),
+        roots_existing: roots.iter().filter(|root| root.exists).count(),
+        total_bytes: roots
+            .iter()
+            .fold(0u64, |total, root| total.saturating_add(root.bytes)),
+        total_files: roots
+            .iter()
+            .fold(0u64, |total, root| total.saturating_add(root.files)),
+    };
+
+    let mut largest_roots: Vec<ArtifactRootReport> = roots
+        .iter()
+        .filter(|root| root.exists && root.bytes > 0)
+        .cloned()
+        .collect();
+    largest_roots.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    largest_roots.truncate(largest_limit.max(1));
+
+    let disk_sample = mcp_agent_mail_core::disk::sample_disk(config);
+    let disk = ArtifactDiskReport {
+        pressure: disk_sample.pressure.label().to_string(),
+        effective_free_bytes: disk_sample.effective_free_bytes,
+        storage_probe_path: disk_sample.storage_probe_path.display().to_string(),
+        db_probe_path: disk_sample
+            .db_probe_path
+            .map(|path| path.display().to_string()),
+        warning_threshold_bytes: config.disk_space_warning_mb.saturating_mul(MIB),
+        critical_threshold_bytes: config.disk_space_critical_mb.saturating_mul(MIB),
+        fatal_threshold_bytes: config.disk_space_fatal_mb.saturating_mul(MIB),
+        errors: disk_sample.errors,
+    };
+
+    let warnings = artifact_retention_warnings(&totals, &disk, &largest_roots);
+
+    ArtifactRetentionReport {
+        schema_version: ARTIFACT_REPORT_SCHEMA_VERSION,
+        generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        repo_root: repo_root.display().to_string(),
+        storage_root: config.storage_root.display().to_string(),
+        totals,
+        disk,
+        roots,
+        largest_roots,
+        warnings,
+        safe_remediation: vec![
+            "No automatic deletion is performed by am doctor artifacts.".to_string(),
+            "Archive a root before cleanup, for example: tar -C <parent> -czf /tmp/<root>.tgz <root>".to_string(),
+            "After review, manually move stale evidence into a quarantine directory instead of deleting it.".to_string(),
+        ],
+    }
+}
+
+fn push_repo_artifact_roots(roots: &mut Vec<ArtifactRootReport>, repo_root: &Path) {
+    push_artifact_root(
+        roots,
+        "tests_artifacts",
+        repo_root.join("tests").join("artifacts"),
+        "test_evidence",
+        14,
+        None,
+        "Compress or move reviewed test evidence only after failure triage is complete.",
+    );
+    push_artifact_root(
+        roots,
+        "cli_test_artifacts",
+        repo_root
+            .join("crates")
+            .join("mcp-agent-mail-cli")
+            .join("tests")
+            .join("artifacts"),
+        "test_evidence",
+        14,
+        None,
+        "Keep recent CLI proof artifacts; compress stale runs after the owning test is stable.",
+    );
+    push_artifact_root(
+        roots,
+        "refactor_artifacts",
+        repo_root.join("refactor").join("artifacts"),
+        "refactor_evidence",
+        30,
+        None,
+        "Summarize durable findings in docs before moving old refactor ledgers to quarantine.",
+    );
+    push_artifact_root(
+        roots,
+        "docs_perf",
+        repo_root.join("docs").join("perf"),
+        "published_perf_evidence",
+        90,
+        None,
+        "Treat committed performance evidence as long-lived; compress superseded raw bundles only.",
+    );
+    push_artifact_root(
+        roots,
+        "server_forensics",
+        repo_root
+            .join("crates")
+            .join("mcp-agent-mail-server")
+            .join("doctor")
+            .join("forensics"),
+        "forensic_evidence",
+        90,
+        None,
+        "Preserve forensic bundles until the incident and follow-up issue are closed.",
+    );
+}
+
+fn push_storage_artifact_roots(roots: &mut Vec<ArtifactRootReport>, storage_root: &Path) {
+    let doctor_root = storage_root.join("doctor");
+    push_artifact_root(
+        roots,
+        "doctor_reports",
+        doctor_root.join("reports"),
+        "doctor_evidence",
+        30,
+        None,
+        "Keep the latest reports and archive older runs after incident review.",
+    );
+    push_artifact_root(
+        roots,
+        "doctor_forensics",
+        doctor_root.join("forensics"),
+        "forensic_evidence",
+        90,
+        None,
+        "Archive forensic bundles before manual quarantine; never discard active incident evidence.",
+    );
+    push_artifact_root(
+        roots,
+        "doctor_archive_quarantine",
+        doctor_root.join("archive-quarantine"),
+        "quarantine_evidence",
+        90,
+        None,
+        "Inspect quarantine entries, then archive or move them only with operator approval.",
+    );
+    push_artifact_root(
+        roots,
+        "doctor_quarantine",
+        doctor_root.join("quarantine"),
+        "quarantine_evidence",
+        90,
+        None,
+        "Inspect quarantine entries, then archive or move them only with operator approval.",
+    );
+    push_artifact_root(
+        roots,
+        "storage_backups",
+        storage_root.join("backups"),
+        "recovery_backup",
+        90,
+        None,
+        "Retain backups through the recovery window; archive older verified-good backups manually.",
+    );
+    push_project_attachment_roots(roots, storage_root);
+}
+
+fn push_project_attachment_roots(roots: &mut Vec<ArtifactRootReport>, storage_root: &Path) {
+    let projects_root = storage_root.join("projects");
+    if !is_real_directory(&projects_root) {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(projects_root) else {
+        return;
+    };
+    let mut project_dirs: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                Some(entry.path())
+            } else {
+                None
+            }
+        })
+        .collect();
+    project_dirs.sort();
+
+    for project_dir in project_dirs {
+        let Some(slug) = project_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let attachments_dir = project_dir.join("attachments");
+        if attachments_dir.exists() {
+            push_artifact_root(
+                roots,
+                &format!("project_attachments:{slug}"),
+                attachments_dir,
+                "mail_attachment_evidence",
+                90,
+                None,
+                "Attachments are message evidence; archive externally before any manual pruning.",
+            );
+        }
+    }
+}
+
+fn push_artifact_root(
+    roots: &mut Vec<ArtifactRootReport>,
+    name: &str,
+    path: PathBuf,
+    retention_class: &str,
+    review_after_days: u64,
+    delete_after_days: Option<u64>,
+    safe_remediation: &str,
+) {
+    roots.push(scan_artifact_root(
+        name,
+        path,
+        retention_class,
+        review_after_days,
+        delete_after_days,
+        safe_remediation,
+    ));
+}
+
+fn scan_artifact_root(
+    name: &str,
+    path: PathBuf,
+    retention_class: &str,
+    review_after_days: u64,
+    delete_after_days: Option<u64>,
+    safe_remediation: &str,
+) -> ArtifactRootReport {
+    let metadata = std::fs::symlink_metadata(&path);
+    let exists = metadata.is_ok();
+    let scan_error = match metadata {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Some("root is a symlink; skipped for safety".to_string())
+        }
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            Some("root exists but is not a directory; skipped".to_string())
+        }
+        Ok(_) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!("metadata error: {err}")),
+    };
+    let stats = if scan_error.is_none() {
+        dir_stats(&path)
+    } else {
+        DirectoryStats::empty()
+    };
+
+    ArtifactRootReport {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        retention_class: retention_class.to_string(),
+        review_after_days,
+        delete_after_days,
+        bytes: stats.bytes,
+        files: stats.files,
+        exists,
+        scan_error,
+        safe_remediation: safe_remediation.to_string(),
+    }
+}
+
+fn artifact_retention_warnings(
+    totals: &ArtifactRetentionTotals,
+    disk: &ArtifactDiskReport,
+    largest_roots: &[ArtifactRootReport],
+) -> Vec<ArtifactRetentionWarning> {
+    let mut warnings = Vec::new();
+    let top_roots: Vec<ArtifactRootReport> = largest_roots.iter().take(3).cloned().collect();
+
+    if disk.pressure != "ok" {
+        warnings.push(ArtifactRetentionWarning {
+            severity: disk.pressure.clone(),
+            code: "disk_pressure".to_string(),
+            detail: format!(
+                "disk pressure is {}; artifact roots total {} bytes across {} files",
+                disk.pressure, totals.total_bytes, totals.total_files
+            ),
+            largest_roots: top_roots,
+            safe_remediation: "Archive the listed largest roots, verify the archive, then manually move stale evidence to quarantine. am doctor artifacts does not delete.".to_string(),
+        });
+    } else if let Some(free_bytes) = disk.effective_free_bytes {
+        let near_warning_threshold = disk.warning_threshold_bytes > 0
+            && free_bytes < disk.warning_threshold_bytes.saturating_mul(2);
+        if near_warning_threshold && totals.total_bytes > 0 {
+            warnings.push(ArtifactRetentionWarning {
+                severity: "warning".to_string(),
+                code: "approaching_disk_warning_threshold".to_string(),
+                detail: format!(
+                    "{} bytes free is within 2x the warning threshold; artifact roots account for {} bytes",
+                    free_bytes, totals.total_bytes
+                ),
+                largest_roots: top_roots,
+                safe_remediation: "Compress or externalize the listed roots before running large swarm or e2e jobs.".to_string(),
+            });
+        }
+    }
+
+    if let Some(root) = largest_roots
+        .iter()
+        .find(|root| root.bytes >= LARGE_ARTIFACT_ROOT_WARN_BYTES)
+    {
+        warnings.push(ArtifactRetentionWarning {
+            severity: "info".to_string(),
+            code: "large_artifact_root".to_string(),
+            detail: format!("{} is {} bytes at {}", root.name, root.bytes, root.path),
+            largest_roots: vec![root.clone()],
+            safe_remediation: root.safe_remediation.clone(),
+        });
+    }
+
+    warnings
 }
 
 /// Run a single retention/quota report cycle.
@@ -360,11 +763,15 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 
 /// Recursively compute total size of a directory in bytes.
 fn dir_size(path: &Path) -> u64 {
+    dir_stats(path).bytes
+}
+
+fn dir_stats(path: &Path) -> DirectoryStats {
     if !is_real_directory(path) {
-        return 0;
+        return DirectoryStats::empty();
     }
 
-    let mut total = 0u64;
+    let mut stats = DirectoryStats::empty();
     let mut stack = vec![path.to_path_buf()];
 
     while let Some(current) = stack.pop() {
@@ -379,14 +786,17 @@ fn dir_size(path: &Path) -> u64 {
 
                 let p = entry.path();
                 if ft.is_file() {
-                    total = total.saturating_add(entry.metadata().map_or(0, |m| m.len()));
+                    stats.bytes = stats
+                        .bytes
+                        .saturating_add(entry.metadata().map_or(0, |m| m.len()));
+                    stats.files = stats.files.saturating_add(1);
                 } else if ft.is_dir() {
                     stack.push(p);
                 }
             }
         }
     }
-    total
+    stats
 }
 
 /// Count .md files recursively under agents/*/inbox/.
@@ -877,5 +1287,114 @@ mod tests {
 
         let report = run_retention_cycle(&config).unwrap();
         assert_eq!(report.projects_scanned, 3);
+    }
+
+    #[test]
+    fn artifact_retention_report_inventories_roots_without_deleting() {
+        let repo = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        let test_artifacts = repo.path().join("tests").join("artifacts").join("perf");
+        let cli_artifacts = repo
+            .path()
+            .join("crates")
+            .join("mcp-agent-mail-cli")
+            .join("tests")
+            .join("artifacts");
+        let doctor_reports = storage.path().join("doctor").join("reports");
+        let attachments = storage
+            .path()
+            .join("projects")
+            .join("demo-project")
+            .join("attachments");
+        std::fs::create_dir_all(&test_artifacts).unwrap();
+        std::fs::create_dir_all(&cli_artifacts).unwrap();
+        std::fs::create_dir_all(&doctor_reports).unwrap();
+        std::fs::create_dir_all(&attachments).unwrap();
+
+        let perf_report = test_artifacts.join("report.json");
+        let cli_report = cli_artifacts.join("failure_context.json");
+        let doctor_report = doctor_reports.join("doctor.json");
+        let attachment = attachments.join("payload.bin");
+        std::fs::write(&perf_report, "perf").unwrap();
+        std::fs::write(&cli_report, "cli").unwrap();
+        std::fs::write(&doctor_report, "doctor").unwrap();
+        std::fs::write(&attachment, vec![0u8; 16]).unwrap();
+
+        let mut config = Config::default();
+        config.storage_root = storage.path().to_path_buf();
+        let report = artifact_retention_report(&config, repo.path(), 4);
+
+        assert_eq!(report.schema_version, ARTIFACT_REPORT_SCHEMA_VERSION);
+        assert!(report.totals.total_bytes >= 29);
+        assert!(report.totals.total_files >= 4);
+        assert!(
+            report
+                .roots
+                .iter()
+                .any(|root| root.name == "tests_artifacts"
+                    && root.retention_class == "test_evidence"
+                    && root.bytes == 4)
+        );
+        assert!(
+            report
+                .roots
+                .iter()
+                .any(|root| root.name == "project_attachments:demo-project"
+                    && root.retention_class == "mail_attachment_evidence"
+                    && root.bytes == 16)
+        );
+
+        assert!(
+            perf_report.exists(),
+            "inventory must not delete perf report"
+        );
+        assert!(
+            cli_report.exists(),
+            "inventory must not delete failure context"
+        );
+        assert!(
+            doctor_report.exists(),
+            "inventory must not delete doctor report"
+        );
+        assert!(attachment.exists(), "inventory must not delete attachment");
+        assert!(
+            report
+                .safe_remediation
+                .iter()
+                .any(|line| line.contains("No automatic deletion"))
+        );
+    }
+
+    #[test]
+    fn artifact_retention_report_limits_largest_roots() {
+        let repo = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("tests").join("artifacts")).unwrap();
+        std::fs::create_dir_all(repo.path().join("refactor").join("artifacts")).unwrap();
+        std::fs::write(
+            repo.path()
+                .join("tests")
+                .join("artifacts")
+                .join("small.json"),
+            vec![0u8; 3],
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path()
+                .join("refactor")
+                .join("artifacts")
+                .join("large.md"),
+            vec![0u8; 9],
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.storage_root = storage.path().to_path_buf();
+        let report = artifact_retention_report(&config, repo.path(), 1);
+
+        assert_eq!(report.largest_roots.len(), 1);
+        assert_eq!(report.largest_roots[0].name, "refactor_artifacts");
+        assert_eq!(report.largest_roots[0].bytes, 9);
     }
 }
