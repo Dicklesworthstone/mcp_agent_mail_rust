@@ -27360,13 +27360,22 @@ mod tests {
         let db_path = temp.path().join("mailbox.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         let storage_root = temp.path().join("storage").display().to_string();
+        let port = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused loopback port");
+            listener
+                .local_addr()
+                .expect("local addr")
+                .port()
+                .to_string()
+        };
 
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", db_url.as_str()),
                 ("STORAGE_ROOT", storage_root.as_str()),
-                ("HTTP_HOST", "0.0.0.0"),
-                ("HTTP_PORT", "8765"),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", port.as_str()),
                 ("HTTP_PATH", "mcp"),
                 ("HTTP_BEARER_TOKEN", "test-token"),
             ],
@@ -27384,7 +27393,10 @@ mod tests {
                     resolve_project_identity(&project).slug,
                     "project slug should match canonical identity resolution"
                 );
-                assert_eq!(report.runtime.http_url, "http://127.0.0.1:8765/mcp/");
+                assert_eq!(
+                    report.runtime.http_url,
+                    format!("http://127.0.0.1:{port}/mcp/")
+                );
                 assert_eq!(
                     agent_start_report_check(&report, "project_path").status,
                     "pass"
@@ -27399,7 +27411,13 @@ mod tests {
                 );
                 assert_eq!(
                     agent_start_report_check(&report, "mcp_endpoint").status,
-                    "pass"
+                    "fail"
+                );
+                assert!(
+                    agent_start_report_check(&report, "mcp_endpoint")
+                        .detail
+                        .contains("no listener is present"),
+                    "MCP endpoint check should flag a stale or absent listener"
                 );
                 assert_eq!(
                     agent_start_report_check(&report, "robot_status").status,
@@ -27411,6 +27429,10 @@ mod tests {
                 );
                 assert_eq!(
                     agent_start_report_check(&report, "reservation_readiness").status,
+                    "pass"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "reservation_conflicts").status,
                     "pass"
                 );
                 assert_eq!(
@@ -27470,6 +27492,10 @@ mod tests {
                 );
                 assert_eq!(
                     agent_start_report_check(&report, "reservation_readiness").status,
+                    "fail"
+                );
+                assert_eq!(
+                    agent_start_report_check(&report, "reservation_conflicts").status,
                     "fail"
                 );
                 assert_eq!(
@@ -56862,7 +56888,8 @@ fn build_agent_start_report(
     let database_url = config.database_url.clone();
     let storage_root = config.storage_root.display().to_string();
     let http_host = config.http_host.clone();
-    let http_port = config.http_port.to_string();
+    let http_port_number = config.http_port;
+    let http_port = http_port_number.to_string();
     let http_path = config.http_path.clone();
     let http_url = agent_start_http_url(&http_host, &http_port, &http_path);
     let bearer_token_configured = config.http_bearer_token.is_some();
@@ -56989,7 +57016,7 @@ fn build_agent_start_report(
         reason: "Reservations should be checked before editing shared files.",
     });
 
-    let checks = vec![
+    let mut checks = vec![
         agent_start_check(
             "project_path",
             if project_ready { "pass" } else { "fail" },
@@ -57034,16 +57061,7 @@ fn build_agent_start_report(
                     .expect("register command should be populated")
             }),
         ),
-        agent_start_check(
-            "mcp_endpoint",
-            "pass",
-            if auth_enabled {
-                format!("HTTP MCP endpoint is {http_url}; authentication is configured.")
-            } else {
-                format!("HTTP MCP endpoint is {http_url}; authentication is not configured.")
-            },
-            Some("am doctor health".to_string()),
-        ),
+        agent_start_mcp_endpoint_check(&http_host, http_port_number, &http_url, auth_enabled),
         agent_start_check(
             "robot_status",
             if project_ready && agent_ready {
@@ -57126,6 +57144,16 @@ fn build_agent_start_report(
                 .or_else(|| commands.get("register").cloned()),
         ),
     ];
+    checks.push(agent_start_reservation_conflicts_check(
+        &database_url,
+        &project_key,
+        agent_name.as_deref(),
+        project_ready,
+        commands
+            .get("reservations")
+            .cloned()
+            .expect("reservations command should be populated"),
+    ));
 
     Ok(AgentStartReport {
         schema_version: "am.agent_start.v1",
@@ -57174,6 +57202,159 @@ fn build_agent_start_report(
             "Use JSON for automation and TOON when token budget matters.",
         ],
     })
+}
+
+fn agent_start_mcp_endpoint_check(
+    http_host: &str,
+    http_port: u16,
+    http_url: &str,
+    auth_enabled: bool,
+) -> AgentStartCheck {
+    let auth_detail = if auth_enabled {
+        "authentication is configured"
+    } else {
+        "authentication is not configured"
+    };
+    match mcp_agent_mail_server::startup_checks::check_port_status(http_host, http_port) {
+        mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer => agent_start_check(
+            "mcp_endpoint",
+            "pass",
+            format!(
+                "HTTP MCP endpoint is {http_url}; Agent Mail listener is reachable and {auth_detail}."
+            ),
+            Some("am doctor health".to_string()),
+        ),
+        mcp_agent_mail_server::startup_checks::PortStatus::Free => agent_start_check(
+            "mcp_endpoint",
+            "fail",
+            format!(
+                "HTTP MCP endpoint is {http_url}, but no listener is present on {http_host}:{http_port}."
+            ),
+            Some("am doctor health".to_string()),
+        ),
+        mcp_agent_mail_server::startup_checks::PortStatus::OtherProcess { description } => {
+            agent_start_check(
+                "mcp_endpoint",
+                "fail",
+                format!(
+                    "HTTP MCP endpoint is {http_url}, but the port is occupied by another process: {description}."
+                ),
+                Some("am doctor health".to_string()),
+            )
+        }
+        mcp_agent_mail_server::startup_checks::PortStatus::Error { message, .. } => {
+            agent_start_check(
+                "mcp_endpoint",
+                "warn",
+                format!(
+                    "HTTP MCP endpoint is {http_url}, but listener status could not be verified: {message}."
+                ),
+                Some("am doctor health".to_string()),
+            )
+        }
+    }
+}
+
+fn agent_start_reservation_conflicts_check(
+    database_url: &str,
+    project_key: &str,
+    agent_name: Option<&str>,
+    project_ready: bool,
+    reservations_command: String,
+) -> AgentStartCheck {
+    if !project_ready || agent_name.is_none() {
+        return agent_start_check(
+            "reservation_conflicts",
+            "fail",
+            "Reservation conflicts cannot be inspected until an existing absolute project and agent name are available.".to_string(),
+            Some(reservations_command),
+        );
+    }
+
+    match agent_start_active_reservation_conflict_examples(database_url, project_key, agent_name) {
+        Ok(examples) if examples.is_empty() => agent_start_check(
+            "reservation_conflicts",
+            "pass",
+            "No active exclusive reservations held by other agents were found for this project."
+                .to_string(),
+            Some(reservations_command),
+        ),
+        Ok(examples) => agent_start_check(
+            "reservation_conflicts",
+            "warn",
+            format!(
+                "Active exclusive reservations held by other agents: {}.",
+                examples.join("; ")
+            ),
+            Some(reservations_command),
+        ),
+        Err(message) => agent_start_check(
+            "reservation_conflicts",
+            "warn",
+            format!("Could not inspect active reservation conflicts: {message}."),
+            Some(reservations_command),
+        ),
+    }
+}
+
+fn agent_start_active_reservation_conflict_examples(
+    database_url: &str,
+    project_key: &str,
+    agent_name: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|error| format!("bad database URL: {error}"))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    if path != ":memory:" && !Path::new(&path).exists() {
+        return Ok(Vec::new());
+    }
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&path)
+        .map_err(|error| truncate_doctor_command(&error.to_string()))?;
+    let Some(project) = resolve_project_for_cli_best_effort(&conn, project_key)
+        .map_err(|error| truncate_doctor_command(&error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let agent_id = agent_name.and_then(|name| {
+        crate::context::resolve_agent(&conn, project.id, name)
+            .ok()
+            .map(|agent| agent.id)
+    });
+    let active_reservation_predicate = active_reservation_predicate_sql("fr");
+    let mut sql = format!(
+        "SELECT fr.path_pattern, COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name \
+         FROM file_reservations fr \
+         LEFT JOIN agents a ON a.id = fr.agent_id \
+         WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
+           AND fr.expires_ts > ? AND fr.\"exclusive\" = 1"
+    );
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+    let mut params = vec![
+        sqlmodel_core::Value::BigInt(project.id),
+        sqlmodel_core::Value::BigInt(now_us),
+    ];
+    if let Some(agent_id) = agent_id {
+        sql.push_str(" AND fr.agent_id != ?");
+        params.push(sqlmodel_core::Value::BigInt(agent_id));
+    }
+    sql.push_str(" ORDER BY fr.expires_ts ASC LIMIT 3");
+
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|error| format!("query failed: {error}"))?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let agent: String = row.get_named("agent_name").unwrap_or_default();
+            let pattern: String = row.get_named("path_pattern").unwrap_or_default();
+            format!("{agent} on {pattern}")
+        })
+        .collect())
 }
 
 async fn apply_agent_start_fix(report: &AgentStartReport) -> CliResult<AgentStartFixReport> {

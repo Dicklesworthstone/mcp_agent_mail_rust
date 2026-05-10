@@ -193,6 +193,20 @@ fn run_am_hermetic(env: &[(String, String)], cwd: Option<&Path>, args: &[&str]) 
     cmd.output().expect("spawn hermetic am")
 }
 
+fn unused_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused loopback port");
+    listener.local_addr().expect("local addr").port()
+}
+
+fn json_check<'a>(value: &'a Value, id: &str) -> &'a Value {
+    value["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("missing check {id}"))
+}
+
 fn init_cli_schema(db_path: &Path) {
     let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open sqlite db");
@@ -848,6 +862,118 @@ fn agent_start_fix_blocks_without_safe_prerequisites() {
             .as_str()
             .is_some_and(|reason| reason.contains("existing absolute path")),
         "blocked fix should explain the project preflight failure"
+    );
+}
+
+#[test]
+fn agent_start_json_reports_stale_mcp_endpoint() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().display().to_string();
+    let port = unused_loopback_port().to_string();
+    let mut env_vars = env.base_env();
+    env_vars.retain(|(key, _)| key != "HTTP_PORT");
+    env_vars.push(("HTTP_PORT".to_string(), port.clone()));
+
+    let out = run_am(
+        &env_vars,
+        Some(env.tmp.path()),
+        &[
+            "agent",
+            "start",
+            "--project",
+            &project,
+            "--agent",
+            "BlueLake",
+            "--json",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agent_start_stale_mcp_endpoint",
+            &["agent", "start", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let mcp_check = json_check(&value, "mcp_endpoint");
+    let expected_url = format!("http://127.0.0.1:{port}/mcp/");
+    assert_eq!(mcp_check["status"].as_str(), Some("fail"));
+    assert!(
+        mcp_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no listener is present")),
+        "stale endpoint check should explain the missing listener"
+    );
+    assert_eq!(mcp_check["command"].as_str(), Some("am doctor health"));
+    assert_eq!(
+        value["runtime"]["http_url"].as_str(),
+        Some(expected_url.as_str())
+    );
+}
+
+#[test]
+fn agent_start_json_reports_active_reservation_conflicts() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let project_root = env.tmp.path().join("agent-conflict-project");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let project_key = project_root.display().to_string();
+    insert_project(&conn, 1, "agent-conflict-project", &project_key);
+    insert_agent(&conn, 1, 1, "BlueLake", "codex-cli", "gpt-5");
+    insert_agent(&conn, 2, 1, "GreenCastle", "codex-cli", "gpt-5");
+    let far_future = mcp_agent_mail_db::timestamps::now_micros() + 3_600_000_000;
+    insert_file_reservation(&conn, 1, 1, 2, "src/**", true, far_future);
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "agent",
+            "start",
+            "--project",
+            &project_key,
+            "--agent",
+            "BlueLake",
+            "--json",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agent_start_reservation_conflicts",
+            &["agent", "start", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let reservation_check = json_check(&value, "reservation_conflicts");
+    assert_eq!(reservation_check["status"].as_str(), Some("warn"));
+    assert!(
+        reservation_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("GreenCastle on src/**")),
+        "reservation conflict detail should name the holder and pattern"
+    );
+    assert!(
+        reservation_check["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("am reservations --project")),
+        "reservation conflict check should include the inspection command"
     );
 }
 
