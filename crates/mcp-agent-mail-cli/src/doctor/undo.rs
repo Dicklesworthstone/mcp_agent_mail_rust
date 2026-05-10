@@ -921,6 +921,154 @@ mod tests {
     }
 
     #[test]
+    fn pass5_g_crash_window_recovery() {
+        // Pass-5 G-Crash-Window: simulate a crash mid-mutation by writing
+        // ONLY the pending line (no completed line). Run undo: must
+        // recognize the crash-window and restore from backup.
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("crash.txt");
+        std::fs::write(&target, b"original\n").unwrap();
+        let run_id = "2026-05-10T07-00-00Z__crashwindow";
+        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+
+        // Manually write the backup (as if mutate's step 4 had completed).
+        let started_at_ns: u128 = 12345_000_000;
+        let backup_dir = run_dir
+            .join("backups")
+            .join(format!("seq_{:026}", started_at_ns));
+        fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("crash.txt"), b"original\n").unwrap();
+
+        // Manually write a "pending" actions.jsonl line (as if mutate had
+        // recorded its intent before crashing).
+        let pending = serde_json::json!({
+            "path": "crash.txt",
+            "op": "WriteFile",
+            "before_hash": format!("sha256:{:x}", Sha256::digest(b"original\n")),
+            "after_hash": "",
+            "started_at_ns": started_at_ns,
+            "finished_at_ns": 0,
+            "run_id": run_id,
+            "fixer_id": "test-fixer",
+            "ok": false,
+            "phase": "pending",
+            "before_mode": 0o644,
+        });
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        f.write_all(serde_json::to_string(&pending).unwrap().as_bytes())
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        drop(f);
+
+        // Simulate the post-crash state: file was mutated but completion
+        // never logged.
+        std::fs::write(&target, b"halfway through mutation\n").unwrap();
+
+        // Run undo. It should detect the crash-window and restore.
+        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(
+            summary.actions_replayed, 1,
+            "crash-window recovery should count as 1 replay"
+        );
+        // File restored byte-identical to original.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "crash-window restore must produce byte-identical original"
+        );
+    }
+
+    #[test]
+    fn pass5_g_crash_window_dry_run_does_not_restore() {
+        // Same setup as above, but dry_run=true. Must NOT restore.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("crash.txt");
+        std::fs::write(&target, b"original\n").unwrap();
+        let run_id = "2026-05-10T07-00-00Z__crashdryrun";
+        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+
+        let started_at_ns: u128 = 99999_000_000;
+        let backup_dir = run_dir
+            .join("backups")
+            .join(format!("seq_{:026}", started_at_ns));
+        fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("crash.txt"), b"original\n").unwrap();
+
+        let pending = serde_json::json!({
+            "path": "crash.txt",
+            "op": "WriteFile",
+            "before_hash": format!("sha256:{:x}", Sha256::digest(b"original\n")),
+            "after_hash": "",
+            "started_at_ns": started_at_ns,
+            "finished_at_ns": 0,
+            "run_id": run_id,
+            "fixer_id": "test-fixer",
+            "ok": false,
+            "phase": "pending",
+        });
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        f.write_all(serde_json::to_string(&pending).unwrap().as_bytes())
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        drop(f);
+
+        std::fs::write(&target, b"halfway through mutation\n").unwrap();
+
+        let _ = run_undo(td.path(), run_id, true, true).unwrap();
+        // Dry-run must not write.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "halfway through mutation\n",
+            "dry-run must not restore"
+        );
+    }
+
+    #[test]
+    fn pass5_completed_line_supersedes_pending_line() {
+        // Pass-5: when both pending and completed exist for the same
+        // started_at_ns, the completed line wins (standard undo path,
+        // not crash-window).
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("normal.txt");
+        std::fs::write(&target, b"v0").unwrap();
+        let run_id = "2026-05-10T07-00-00Z__normalundo";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"v1".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        // Verify both pending + completed exist in actions.jsonl.
+        let actions = std::fs::read_to_string(
+            td.path()
+                .join(".doctor")
+                .join("runs")
+                .join(run_id)
+                .join("actions.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(actions.lines().count(), 2);
+        // Run undo. Should restore via the standard completed-line path.
+        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0");
+    }
+
+    #[test]
     fn undo_h5_concurrent_undo_blocks() {
         // H5 fix: per-run-id flock prevents concurrent undo invocations.
         // Acquire the lock manually first; the run_undo call should refuse.

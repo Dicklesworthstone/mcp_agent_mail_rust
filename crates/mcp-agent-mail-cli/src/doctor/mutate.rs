@@ -832,8 +832,17 @@ mod tests {
                 .join("actions.jsonl"),
         )
         .unwrap();
-        let line = actions.lines().next().unwrap();
-        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        // Pass-5 G-Crash-Window: actions.jsonl now contains TWO lines per
+        // mutation (pending, then completed). Filter to the completed line.
+        let lines: Vec<serde_json::Value> = actions
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // First line should be pending, second completed.
+        assert_eq!(lines.len(), 2, "expected 2 lines (pending + completed)");
+        assert_eq!(lines[0]["phase"], "pending");
+        let v = &lines[1];
+        assert_eq!(v["phase"], "completed");
         assert_eq!(v["op"], "WriteFile");
         assert!(v["before_hash"].as_str().unwrap().starts_with("sha256:"));
         assert!(v["after_hash"].as_str().unwrap().starts_with("sha256:"));
@@ -999,7 +1008,15 @@ mod tests {
                 .join("actions.jsonl"),
         )
         .unwrap();
-        let v: serde_json::Value = serde_json::from_str(actions.lines().next().unwrap()).unwrap();
+        // Pass-5 G-Crash-Window: filter to the completed line (pending is first).
+        let lines: Vec<serde_json::Value> = actions
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let v = lines
+            .iter()
+            .find(|l| l["phase"] == "completed")
+            .expect("completed line");
         assert_eq!(v["op"], "Chmod");
         // before_mode was 0o644 = 33188 (decimal), after_mode 0o600 = 33152
         assert_eq!(v["after_mode"].as_u64(), Some(0o600));
