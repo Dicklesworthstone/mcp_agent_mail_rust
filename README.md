@@ -91,7 +91,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 17 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | Search V3 via frankensearch with lexical, semantic, and hybrid routing |
+| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing are controlled by the hybrid feature flag (`feature = "hybrid"`). |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -870,6 +870,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `DATABASE_URL` | `sqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
 | `AM_CACHE_PROFILE` | `balanced` | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB` | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
+| `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
 | `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer a per-run `STORAGE_ROOT` instead. |
 | `LOG_LEVEL` | `info` | Minimum log level |
@@ -996,7 +997,7 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Write-behind cache** with dual-indexed ReadCache and deferred touch batching (30s flush)
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
-- **Search V3 via frankensearch** with lexical/semantic/hybrid routing and unified diagnostics
+- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate, with portable/no-default builds retaining the deterministic lexical path.
 - **Conformance testing** against the Python reference implementation plus Rust-native extensions
 - **Advisory file reservations** with symmetric fnmatch, archive reading, and rename handling
 - **`#![forbid(unsafe_code)]`** across all crates
@@ -1089,7 +1090,7 @@ The important boundary is this: Git stores the durable human-auditable artifacts
 
 1. A resource read, robot command, TUI view, or web request asks for mailbox or tooling state.
 2. The server resolves scope: project, agent, product, thread, search query, or tooling view.
-3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical, semantic, or hybrid route.
+3. For direct state, SQLite answers immediately. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is enabled.
 4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
 
 That consistency comes from a shared DB + archive + metrics pipeline. The TUI, web UI, robot CLI, and MCP resources are separate renderers over the same underlying state.
@@ -1101,10 +1102,10 @@ That consistency comes from a shared DB + archive + metrics pipeline. The TUI, w
 Search V3 is not an afterthought bolted onto mailbox rows. It is a dedicated query path with shared planning and diagnostics:
 
 - Queries are normalized, classified, and routed through a unified search service.
-- Lexical, semantic, and hybrid modes share the same top-level contract and diagnostics surface.
+- Lexical mode provides the baseline contract and diagnostics surface; semantic and hybrid modes extend that contract when the `hybrid` feature is enabled.
 - Candidate budgeting and fusion keep broad natural-language queries from exploding while preserving exact-match strength for identifiers and short phrases.
 - The same search path serves MCP tools, `am mail search`, `am robot search`, TUI search, and web UI search routes.
-- Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is the Search V3 path, not ad-hoc direct SQL fallback.
+- Empty or non-searchable queries route through a deterministic SQL plan before Search V3 candidate retrieval. Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is Search V3 plus that deterministic SQL plan, not a hidden FTS fallback.
 
 The dedicated `mcp-agent-mail-search-core` crate exists specifically so search planning and backends can evolve without entangling the rest of the mailbox stack.
 
@@ -1263,7 +1264,9 @@ These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which record
 | `am lint` | 457ms | < 1000ms |
 | `am typecheck` | 399ms | < 800ms |
 
-#### Search V3 Frankensearch Lexical Baselines (2026-02-18)
+#### Search V3 frankensearch lexical-tier baselines (2026-02-18)
+
+Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion are controlled by the `hybrid` feature.
 
 | Corpus size | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 |
 |-------------|--------------|--------------|--------------|------------|

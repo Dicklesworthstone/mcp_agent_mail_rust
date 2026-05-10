@@ -1741,12 +1741,34 @@ fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHeal
     }
 }
 
+#[cfg(feature = "hybrid")]
+fn build_two_tier_indexing_health_from_context() -> TwoTierIndexingHealth {
+    let ctx = get_two_tier_context();
+    let config = ctx.config();
+    let mut metrics = TwoTierMetrics::default();
+    metrics.record_init(ctx.init_metrics().clone());
+
+    TwoTierIndexingHealth {
+        availability: ctx.availability().to_string(),
+        total_docs: 0,
+        quality_doc_count: 0,
+        quality_coverage_ratio: 0.0,
+        quality_coverage_percent: 0.0,
+        fast_dimension: config.fast_dimension,
+        quality_dimension: config.quality_dimension,
+        metrics: metrics.snapshot(),
+    }
+}
+
 /// Snapshot current two-tier index health, including quality coverage.
 #[cfg(feature = "hybrid")]
 #[must_use]
 pub fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
-    let bridge = get_two_tier_bridge()?;
-    Some(build_two_tier_indexing_health(&bridge))
+    Some(
+        get_two_tier_bridge().map_or_else(build_two_tier_indexing_health_from_context, |bridge| {
+            build_two_tier_indexing_health(&bridge)
+        }),
+    )
 }
 
 #[cfg(not(feature = "hybrid"))]
@@ -6718,6 +6740,21 @@ mod tests {
         assert_eq!(health.fast_dimension, config.fast_dimension);
         assert_eq!(health.quality_dimension, config.quality_dimension);
         assert!(!health.availability.is_empty());
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn two_tier_indexing_health_from_context_reports_availability_without_docs() {
+        let health = build_two_tier_indexing_health_from_context();
+
+        assert!(!health.availability.is_empty());
+        assert_eq!(health.total_docs, 0);
+        assert_eq!(health.quality_doc_count, 0);
+        assert!(health.quality_coverage_ratio.abs() < f32::EPSILON);
+        assert!(health.quality_coverage_percent.abs() < f32::EPSILON);
+        assert!(health.fast_dimension > 0);
+        assert!(health.quality_dimension > 0);
+        assert!(health.metrics.init.is_some());
     }
 
     #[cfg(feature = "hybrid")]

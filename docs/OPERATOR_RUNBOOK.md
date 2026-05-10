@@ -259,6 +259,7 @@ is used in hot paths.
 | `DATABASE_POOL_TIMEOUT`        | `15` (seconds)        | Pool acquisition timeout         |
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
+| `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
 | `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run `PRAGMA quick_check` at boot |
 | `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity check    |
 

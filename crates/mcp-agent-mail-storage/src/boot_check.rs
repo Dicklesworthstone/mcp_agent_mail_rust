@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::recovery::detect_missing_refs;
 
-const TARGET: &str = "mcp_agent_mail::boot_check";
+const TARGET: &str = "mcp_agent_mail::archive::boot_check";
 const CALLER: &str = "startup.boot_check";
 const GIT_VERSION: &str = "libgit2";
 const ARCHIVE_ROOT_LABEL: &str = "archive-root";
@@ -22,27 +22,27 @@ const ARCHIVE_ROOT_LABEL: &str = "archive-root";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootCheckMode {
+    Off,
     Warn,
-    Abort,
-    AutoRepair,
+    Enforce,
 }
 
 impl BootCheckMode {
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
             "warn" => Some(Self::Warn),
-            "abort" => Some(Self::Abort),
-            "auto_repair" | "auto-repair" => Some(Self::AutoRepair),
+            "enforce" => Some(Self::Enforce),
             _ => None,
         }
     }
 
     const fn observability_label(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Warn => "warn",
-            Self::Abort => "abort",
-            Self::AutoRepair => "auto_repair",
+            Self::Enforce => "enforce",
         }
     }
 }
@@ -59,9 +59,6 @@ pub struct BootCheckFinding {
 pub enum BootCheckFindingKind {
     RepoBroken,
     OrphanRefs(Vec<String>),
-    DanglingBranch(String),
-    ConfigCorrupt(String),
-    AutoRepaired { actions: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -73,7 +70,6 @@ pub struct BootCheckReport {
     pub duration_ms: u64,
     pub total_projects: u32,
     pub findings: Vec<BootCheckFinding>,
-    pub auto_repaired_count: u32,
 }
 
 impl BootCheckReport {
@@ -84,7 +80,7 @@ impl BootCheckReport {
 
     #[must_use]
     pub fn should_abort(&self) -> bool {
-        self.mode == BootCheckMode::Abort && self.has_findings()
+        self.mode == BootCheckMode::Enforce && self.has_findings()
     }
 }
 
@@ -102,12 +98,15 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
     let timer = Instant::now();
     let repo_slug = mcp_agent_mail_core::slugify(&root.display().to_string());
     let args_hash = boot_check_args_hash(root, mode);
-    let candidates = archive_repo_candidates(root);
+    let candidates = if mode == BootCheckMode::Off {
+        Vec::new()
+    } else {
+        archive_repo_candidates(root)
+    };
     let total_projects = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
 
     tracing::info!(
         target: TARGET,
-        root = %root.display(),
         repo_slug = %repo_slug,
         caller = CALLER,
         args_hash = %args_hash,
@@ -115,39 +114,22 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
         outcome = "success",
         git_version = GIT_VERSION,
         mode = mode.observability_label(),
-        total_projects,
         "boot_check_started"
     );
 
     let mut findings = Vec::new();
     for candidate in &candidates {
         if let Some(finding) = check_candidate(candidate) {
-            tracing::warn!(
-                target: TARGET,
-                root = %root.display(),
-                repo_slug = %repo_slug,
-                caller = CALLER,
-                args_hash = %args_hash,
-                duration_ms = 0_u64,
-                outcome = "degraded",
-                git_version = GIT_VERSION,
-                mode = mode.observability_label(),
-                project = %finding.project,
-                kind = finding.kind.label(),
-                detail = %finding.detail,
-                "boot_check_finding"
-            );
             findings.push(finding);
         }
     }
 
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let duration_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let should_abort = mode == BootCheckMode::Abort && !findings.is_empty();
+    let should_abort = mode == BootCheckMode::Enforce && !findings.is_empty();
 
     tracing::info!(
         target: TARGET,
-        root = %root.display(),
         repo_slug = %repo_slug,
         caller = CALLER,
         args_hash = %args_hash,
@@ -159,29 +141,10 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
         },
         git_version = GIT_VERSION,
         mode = mode.observability_label(),
-        total_projects,
         findings_count = findings.len(),
-        auto_repaired_count = 0_u32,
         degraded = !findings.is_empty(),
-        "boot_check_completed"
+        "boot_check_result"
     );
-
-    if should_abort {
-        tracing::error!(
-            target: TARGET,
-            root = %root.display(),
-            repo_slug = %repo_slug,
-            caller = CALLER,
-            args_hash = %args_hash,
-            duration_ms,
-            outcome = "error",
-            git_version = GIT_VERSION,
-            mode = mode.observability_label(),
-            total_projects,
-            findings_count = findings.len(),
-            "boot_check_aborted"
-        );
-    }
 
     BootCheckReport {
         mode,
@@ -191,19 +154,6 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
         duration_ms,
         total_projects,
         findings,
-        auto_repaired_count: 0,
-    }
-}
-
-impl BootCheckFindingKind {
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::RepoBroken => "repo_broken",
-            Self::OrphanRefs(_) => "orphan_refs",
-            Self::DanglingBranch(_) => "dangling_branch",
-            Self::ConfigCorrupt(_) => "config_corrupt",
-            Self::AutoRepaired { .. } => "auto_repaired",
-        }
     }
 }
 
@@ -332,16 +282,15 @@ mod tests {
 
     #[test]
     fn boot_check_mode_parse_accepts_documented_values() {
+        assert_eq!(BootCheckMode::parse("off"), Some(BootCheckMode::Off));
         assert_eq!(BootCheckMode::parse("warn"), Some(BootCheckMode::Warn));
-        assert_eq!(BootCheckMode::parse("abort"), Some(BootCheckMode::Abort));
         assert_eq!(
-            BootCheckMode::parse("auto_repair"),
-            Some(BootCheckMode::AutoRepair)
+            BootCheckMode::parse("enforce"),
+            Some(BootCheckMode::Enforce)
         );
-        assert_eq!(
-            BootCheckMode::parse("auto-repair"),
-            Some(BootCheckMode::AutoRepair)
-        );
+        assert_eq!(BootCheckMode::parse("abort"), None);
+        assert_eq!(BootCheckMode::parse("auto_repair"), None);
+        assert_eq!(BootCheckMode::parse("auto-repair"), None);
         assert_eq!(BootCheckMode::parse("other"), None);
     }
 
@@ -350,7 +299,7 @@ mod tests {
         let first = boot_check_args_hash(Path::new("/data/projects/demo"), BootCheckMode::Warn);
         let second = boot_check_args_hash(Path::new("/data/projects/demo"), BootCheckMode::Warn);
         let different_mode =
-            boot_check_args_hash(Path::new("/data/projects/demo"), BootCheckMode::Abort);
+            boot_check_args_hash(Path::new("/data/projects/demo"), BootCheckMode::Enforce);
 
         assert_eq!(first, second);
         assert_ne!(first, different_mode);
@@ -400,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn preflight_abort_mode_reports_abort_when_findings_exist() {
+    fn preflight_off_mode_skips_scan() {
         let tmp = TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
         std::fs::write(
@@ -409,7 +358,24 @@ mod tests {
         )
         .unwrap();
 
-        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Abort);
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Off);
+
+        assert_eq!(report.total_projects, 0);
+        assert!(report.findings.is_empty());
+        assert!(!report.should_abort());
+    }
+
+    #[test]
+    fn preflight_enforce_mode_reports_abort_when_findings_exist() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git/refs/heads/broken"),
+            "cafebabecafebabecafebabecafebabecafebabe\n",
+        )
+        .unwrap();
+
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Enforce);
 
         assert!(report.has_findings());
         assert!(report.should_abort());

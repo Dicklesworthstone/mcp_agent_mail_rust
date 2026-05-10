@@ -93,6 +93,20 @@ hybrid = ["semantic"]
 default. Semantic search, reranking, and hybrid fusion are opt-in to avoid
 pulling heavy ONNX dependencies for minimal deployments.
 
+### Feature flags and deployment modes
+
+The historical design above used Tantivy-specific feature names. The live
+frankensearch-backed implementation keeps the same deployment boundary: lexical
+search is the baseline tier, and semantic/hybrid retrieval is compiled through
+the crate `feature = "hybrid"` gate. Current default workspace builds include
+that local no-Tokio hybrid stack, while portable and no-default-feature builds
+retain the lighter lexical path.
+
+Runtime knobs such as `AM_SEARCH_ENGINE=hybrid` only select a hybrid execution
+route when the binary was built with the `hybrid` feature. Without that feature,
+operators should expect lexical Search V3 behavior plus deterministic SQL plan
+handling for empty or non-searchable queries.
+
 ### D4: Sync-Only Search Pipeline
 
 All search operations are synchronous:

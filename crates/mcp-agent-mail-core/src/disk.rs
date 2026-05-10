@@ -211,8 +211,12 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     // - relative/path.db   -> relative/path.db
     let mut path = stripped.to_string();
     if path.starts_with("//") {
-        // Absolute path (sqlite:////abs/path.db).
-        path.remove(0);
+        // Absolute path (sqlite:////abs/path.db). Also tolerate accidental
+        // extra URL slashes (sqlite://///tmp/db.sqlite3) by reducing the
+        // filesystem root to exactly one slash.
+        while path.starts_with("//") {
+            path.remove(0);
+        }
     } else if path.starts_with("/./") || path.starts_with("/../") {
         // Explicitly relative path (sqlite:///./path.db or sqlite:///../path.db).
         path.remove(0);
@@ -441,6 +445,12 @@ mod tests {
                 .unwrap()
                 .to_string_lossy(),
             "/abs/path.db"
+        );
+        assert_eq!(
+            sqlite_file_path_from_database_url("sqlite://///tmp/db.sqlite3")
+                .unwrap()
+                .to_string_lossy(),
+            "/tmp/db.sqlite3"
         );
         assert_eq!(
             sqlite_file_path_from_database_url("sqlite:////abs/path.db?cache=shared")

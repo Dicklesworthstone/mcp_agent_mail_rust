@@ -41,6 +41,11 @@ This runbook provides step-by-step procedures for migrating from SQLite FTS5 to 
 - `AM_SEARCH_SEMANTIC_ENABLED=false` + `AM_SEARCH_ENGINE=hybrid` → degrades to `lexical`
 - `AM_SEARCH_RERANK_ENABLED=false` → skips reranking step, returns fusion scores
 
+Build-mode boundary: runtime `hybrid` settings require a binary built with the
+crate `feature = "hybrid"` path. Portable and no-default-feature builds keep the
+lexical Search V3 path and deterministic SQL plan handling for empty or
+non-searchable queries.
+
 ---
 
 ## Phase 1: Preparation (Day -7)

@@ -1786,21 +1786,18 @@ fn run_cache_profile_hotset(
             let cached = cache.get_agent(expected.project_id, &expected.name);
             latencies.push(t0.elapsed().as_micros() as u64);
 
-            match cached {
-                Some(agent) => {
-                    hits += 1;
-                    assert_eq!(agent.id, expected.id, "cached agent id mismatch");
-                    checksum = checksum
-                        .wrapping_mul(1_000_003)
-                        .wrapping_add(agent.id.expect("agent id must exist") as u64);
-                }
-                None => {
-                    misses += 1;
-                    cache.put_agent(expected);
-                    checksum = checksum
-                        .wrapping_mul(1_000_003)
-                        .wrapping_add(expected.id.expect("agent id must exist") as u64);
-                }
+            if let Some(agent) = cached {
+                hits += 1;
+                assert_eq!(agent.id, expected.id, "cached agent id mismatch");
+                checksum = checksum
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(agent.id.expect("agent id must exist") as u64);
+            } else {
+                misses += 1;
+                cache.put_agent(expected);
+                checksum = checksum
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(expected.id.expect("agent id must exist") as u64);
             }
         }
     }

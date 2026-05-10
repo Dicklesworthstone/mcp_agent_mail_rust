@@ -19,6 +19,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=../../scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
+# shellcheck source=lib/structured_logging.sh
+source "${SCRIPT_DIR}/lib/structured_logging.sh"
+
+# This suite exercises request-path two-tier search behavior. Keep unrelated
+# background workers quiet so runtime task accounting issues in maintenance
+# loops cannot mask the search assertions.
+export AM_ARCHIVE_MAINTENANCE_DISABLED="${AM_ARCHIVE_MAINTENANCE_DISABLED:-1}"
+export AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS="${AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS:-3600}"
+export INTEGRITY_CHECK_ON_STARTUP="${INTEGRITY_CHECK_ON_STARTUP:-false}"
 
 e2e_init_artifacts
 e2e_banner "Two-Tier Search Hardening E2E Suite (br-2tnl.5.10.7)"
@@ -115,6 +124,38 @@ if isinstance(error, dict) and "code" in error:
     print(error["code"])
 else:
     print("")
+PY
+}
+
+extract_tool_error_from_response_file() {
+    local response_file="$1"
+    python3 - "${response_file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("")
+    raise SystemExit(0)
+
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+result = payload.get("result", {})
+if not isinstance(result, dict) or result.get("isError") is not True:
+    print("")
+    raise SystemExit(0)
+
+content = result.get("content", [])
+if content and isinstance(content[0], dict):
+    text = content[0].get("text", "")
+else:
+    text = ""
+print(text or "tool returned isError=true")
 PY
 }
 
@@ -222,7 +263,21 @@ run_rpc_success_case() {
 
     e2e_mark_case_start "${case_id}"
     if e2e_rpc_call "${case_id}" "${E2E_SERVER_URL}" "${tool_name}" "${args_json}"; then
-        e2e_rpc_assert_success "${case_id}" "${scenario_id}: ${tool_name} succeeded"
+        if ! e2e_rpc_assert_success "${case_id}" "${scenario_id}: ${tool_name} succeeded"; then
+            e2e_extract_case_logs "${case_id}" >/dev/null 2>&1 || true
+            record_scenario "${case_id}" "${scenario_id}" "fail" "${reason_code}" "RPC assertion failed"
+            e2e_mark_case_end "${case_id}"
+            return 1
+        fi
+        local tool_error
+        tool_error="$(extract_tool_error_from_response_file "${E2E_ARTIFACT_DIR}/${case_id}/response.json")"
+        if [ -n "${tool_error}" ]; then
+            e2e_fail "${scenario_id}: ${tool_name} returned tool error: ${tool_error}"
+            e2e_extract_case_logs "${case_id}" >/dev/null 2>&1 || true
+            record_scenario "${case_id}" "${scenario_id}" "fail" "${reason_code}" "Tool returned isError=true: ${tool_error}"
+            e2e_mark_case_end "${case_id}"
+            return 1
+        fi
         record_scenario "${case_id}" "${scenario_id}" "pass" "${reason_code}" "${detail}"
     else
         e2e_fail "${scenario_id}: ${tool_name} failed"
@@ -329,7 +384,13 @@ print(json.dumps({
         "seed_data_inserted"
 done
 
-e2e_assert_db_row_count "${DB_PATH}" "messages" "4" "setup seeded four messages"
+SEEDED_MESSAGE_COUNT="$(
+    e2e_db_query \
+        "${DB_PATH}" \
+        "SELECT COUNT(*) FROM messages WHERE subject LIKE 'Two-tier hardening message %'" \
+        2>/dev/null | tr -d '[:space:]'
+)"
+e2e_assert_eq "setup seeded four user messages" "4" "${SEEDED_MESSAGE_COUNT}"
 
 # ---------------------------------------------------------------------------
 # Case 3: Thread-safe init under concurrent search calls
@@ -365,7 +426,8 @@ for case_id in "${CONCURRENT_IDS[@]}"; do
     e2e_rpc_assert_success "${case_id}" "concurrent case ${case_id} succeeded"
 done
 
-INIT_COUNT="$(grep -c "Two-tier search context initialized" "${_E2E_SERVER_LOG:-}" 2>/dev/null || echo "0")"
+INIT_COUNT="$(grep -c "Two-tier search context initialized" "${_E2E_SERVER_LOG:-}" 2>/dev/null || true)"
+INIT_COUNT="${INIT_COUNT:-0}"
 if [ "${INIT_COUNT}" -le 1 ]; then
     e2e_pass "lazy init log appears once under concurrency (count=${INIT_COUNT})"
     record_scenario \

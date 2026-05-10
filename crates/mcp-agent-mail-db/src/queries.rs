@@ -1355,9 +1355,29 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
     }
 }
 
-/// Commit the current transaction (single fsync in WAL mode).
+/// Commit the current transaction and publish file-backed writes to fresh handles.
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
-    map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
+    match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
+        Outcome::Ok(_) => {
+            if tracked.inner.path() != ":memory:" {
+                // FrankenSQLite can otherwise keep a successful COMMIT private
+                // to the pooled connection until a later close. The checkpoint
+                // gives post-commit probes and sibling processes the same view
+                // immediately after the write path returns.
+                if let Err(error) = tracked.inner.execute_raw("PRAGMA wal_checkpoint(PASSIVE)") {
+                    tracing::warn!(
+                        db_path = %tracked.inner.path(),
+                        error = %error,
+                        "post_commit_checkpoint_failed_after_successful_commit"
+                    );
+                }
+            }
+            Outcome::Ok(())
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 /// Rebuild indexes via `REINDEX`.
@@ -1441,9 +1461,9 @@ async fn durability_probe_query(
     }
 
     for attempt in 0..=DURABILITY_PROBE_MAX_RETRIES {
-        // Use a plain open — no recovery, no fallback paths.  Durability probes
-        // must be side-effect-free so they never trigger REINDEX or open a fallback
-        // database, which could make committed rows appear to vanish.
+        // Use a plain open — no recovery, no fallback paths. Durability probes
+        // must be side-effect-free so they never trigger REINDEX or open a
+        // fallback database, which could make committed rows appear to vanish.
         let probe_conn = match crate::DbConn::open_file(pool.sqlite_path()) {
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
@@ -15601,8 +15621,6 @@ mod tests {
         let cx = asupersync::Cx::for_testing();
         let cfg = crate::pool::DbPoolConfig {
             database_url,
-            min_connections: 1,
-            max_connections: 1,
             run_migrations: true,
             warmup_connections: 0,
             ..Default::default()
@@ -15635,7 +15653,6 @@ mod tests {
             .into_result()
             .expect("register agent");
         });
-        drop(pool);
 
         let db_path_str = db_path.to_str().expect("utf8 db path");
         let verify =
@@ -15667,6 +15684,87 @@ mod tests {
             Some(1),
             "agent must be visible to a fresh canonical handle"
         );
+    }
+
+    #[test]
+    fn register_agent_runtime_migration_extra_slash_url_is_fresh_handle_durable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_extra_slash_runtime.db");
+        let database_url = format!("sqlite:////{}", db_path.display());
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let cfg = crate::pool::DbPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let project = ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/mcp-agent-mail-extra-slash-durability",
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("extra-slash durability"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+        });
+
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+        let verify =
+            crate::CanonicalDbConn::open_file(db_path_str).expect("open fresh canonical handle");
+        let project_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM projects \
+                 WHERE slug = 'data-projects-mcp-agent-mail-extra-slash-durability'",
+                &[],
+            )
+            .expect("query fresh project count");
+        let agent_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM agents WHERE name = 'BlueLake'",
+                &[],
+            )
+            .expect("query fresh agent count");
+        assert_eq!(
+            project_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "project must be visible to a fresh canonical handle"
+        );
+        assert_eq!(
+            agent_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "agent must be visible to a fresh canonical handle"
+        );
+        drop(pool);
     }
 
     #[test]

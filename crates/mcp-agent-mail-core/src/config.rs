@@ -366,6 +366,7 @@ pub struct Config {
     pub tui_toast_info_dismiss_secs: u64,
     pub tui_toast_warn_dismiss_secs: u64,
     pub tui_toast_error_dismiss_secs: u64,
+    pub tui_git_segfault_toast_enabled: bool,
     /// Enable one-shot contextual coach hints on first screen visit.
     pub tui_coach_hints_enabled: bool,
 
@@ -1419,6 +1420,7 @@ impl Default for Config {
             tui_toast_info_dismiss_secs: 5,
             tui_toast_warn_dismiss_secs: 8,
             tui_toast_error_dismiss_secs: 15,
+            tui_git_segfault_toast_enabled: true,
             tui_coach_hints_enabled: true,
             atc_enabled: true,
             atc_probe_interval_secs: 120,
@@ -2247,6 +2249,10 @@ impl Config {
             config.tui_toast_error_dismiss_secs,
         )
         .max(1);
+        config.tui_git_segfault_toast_enabled = console_bool(
+            "AM_TUI_GIT_SEGFAULT_TOAST_ENABLED",
+            config.tui_git_segfault_toast_enabled,
+        );
         config.tui_coach_hints_enabled =
             console_bool("AM_TUI_COACH_HINTS_ENABLED", config.tui_coach_hints_enabled);
 
@@ -4075,6 +4081,7 @@ mod tests {
         assert_eq!(config.tui_toast_info_dismiss_secs, 5);
         assert_eq!(config.tui_toast_warn_dismiss_secs, 8);
         assert_eq!(config.tui_toast_error_dismiss_secs, 15);
+        assert!(config.tui_git_segfault_toast_enabled);
     }
 
     #[test]
@@ -4087,6 +4094,7 @@ mod tests {
             ("AM_TUI_TOAST_INFO_DISMISS_SECS", "7"),
             ("AM_TUI_TOAST_WARN_DISMISS_SECS", "11"),
             ("AM_TUI_TOAST_ERROR_DISMISS_SECS", "19"),
+            ("AM_TUI_GIT_SEGFAULT_TOAST_ENABLED", "false"),
         ]);
         let config = Config::from_env();
         assert!(!config.tui_toast_enabled);
@@ -4096,6 +4104,7 @@ mod tests {
         assert_eq!(config.tui_toast_info_dismiss_secs, 7);
         assert_eq!(config.tui_toast_warn_dismiss_secs, 11);
         assert_eq!(config.tui_toast_error_dismiss_secs, 19);
+        assert!(!config.tui_git_segfault_toast_enabled);
     }
 
     #[test]
