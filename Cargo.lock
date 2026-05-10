@@ -4365,6 +4365,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.28.1",
+ "dirs",
  "fastmcp-rust",
  "fs2",
  "ftui",

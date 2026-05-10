@@ -16,6 +16,7 @@
 pub mod bench;
 pub mod ci;
 pub mod context;
+pub mod doctor;
 pub mod doctor_orphan_refs;
 pub mod e2e_artifacts;
 pub mod e2e_runner;
@@ -2036,6 +2037,65 @@ pub enum DoctorCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Print the agent-facing contract: detectors, fixers, exit codes,
+    /// env vars, run-artifact schema. JSON only.
+    ///
+    /// Stable across `doctor_version` minor bumps. Agents read this to
+    /// discover the doctor's surface programmatically.
+    #[command(name = "capabilities")]
+    Capabilities {
+        /// Output format. Capabilities is a contract — JSON regardless of
+        /// request, but accepted for symmetry with other commands.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
+
+    /// Print the paste-ready agent handbook (Markdown).
+    ///
+    /// Single source of truth for an agent invoking `am doctor` cold.
+    /// Documents the 10 verbs, 11 exit codes, 5 common workflows, and
+    /// the 11 subsystems. No external lookup needed.
+    #[command(name = "robot-docs")]
+    RobotDocs,
+
+    /// Restore from `.doctor/runs/<run-id>/backups/`.
+    ///
+    /// Reads `actions.jsonl` in reverse order; copies each backup over
+    /// its target. Idempotent — re-running on the same run-id is a no-op.
+    /// `<run-id>` may be the literal string `latest`.
+    ///
+    /// Exit codes: 0 (restored or already complete), 3 (restore failed),
+    /// 64 (run-id doesn't resolve).
+    #[command(name = "undo")]
+    Undo {
+        /// Run ID to undo, or `latest` for the most recent run.
+        run_id: String,
+        /// Print the restore plan; do NOT execute.
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse if any backup is missing or hash-mismatched (default: true).
+        #[arg(long, default_value_t = true)]
+        strict: bool,
+        /// Output format.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
+
+    /// List runs in `.doctor/runs/` with `{run_id, started_at, exit_code,
+    /// action_count, finding_count, bytes_backed_up}`.
+    #[command(name = "ls")]
+    Ls {
+        /// Output format.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
+
+    /// Cheap one-line liveness summary based on `.doctor/latest/report.json`.
+    ///
+    /// Exit 0 healthy / exit 1 findings. For CI scheduling.
+    #[command(name = "health")]
+    Health,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4481,6 +4541,8 @@ fn emit_pre_tui_startup_banner(config: &Config) {
     let web_ui = format!("http://{}:{}/mail", ui_host, config.http_port);
     let storage_root = config.storage_root.to_string_lossy();
     let app_env_str = config.app_environment.to_string();
+    let am_git_binary = std::env::var("AM_GIT_BINARY").ok();
+    let started_at_iso = chrono::Utc::now().to_rfc3339();
     let banner_lines = mcp_agent_mail_server::console::render_startup_banner(
         &mcp_agent_mail_server::console::BannerParams {
             app_environment: &app_env_str,
@@ -4498,6 +4560,26 @@ fn emit_pre_tui_startup_banner(config: &Config) {
             messages: stats.messages,
             file_reservations: stats.file_reservations,
             contact_links: stats.contact_links,
+            startup_state_json: Some(mcp_agent_mail_server::console::StartupStateJson {
+                endpoint: endpoint.as_str(),
+                web_ui: Some(web_ui.as_str()),
+                uptime: started_at_iso.as_str(),
+                environment: &app_env_str,
+                auth_enabled: config.http_bearer_token.is_some() || config.http_jwt_enabled,
+                tools_log_enabled: config.tools_log_enabled,
+                log_tool_calls_enabled: config.log_tool_calls_enabled,
+                stats: mcp_agent_mail_server::console::StartupStateStats {
+                    projects: Some(stats.projects),
+                    agents: Some(stats.agents),
+                    messages: Some(stats.messages),
+                    file_reservations: Some(stats.file_reservations),
+                    contact_links: Some(stats.contact_links),
+                },
+                storage_root: storage_root.as_ref(),
+                database_url: Some(config.database_url.as_str()),
+                http_bearer_token: config.http_bearer_token.as_deref(),
+                am_git_binary: am_git_binary.as_deref(),
+            }),
         },
     );
 
@@ -5407,6 +5489,25 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             format,
         } => handle_doctor_fix_orphan_refs(project, all, apply, force, format),
         DoctorCommand::PackArchive { json } => handle_doctor_pack_archive(json),
+        DoctorCommand::Capabilities { format } => doctor::handle_capabilities(format),
+        DoctorCommand::RobotDocs => doctor::handle_robot_docs(),
+        DoctorCommand::Undo {
+            run_id,
+            dry_run,
+            strict,
+            format,
+        } => {
+            let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            doctor::handle_undo(&target, &run_id, dry_run, strict, format)
+        }
+        DoctorCommand::Ls { format } => {
+            let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            doctor::handle_ls(&target, format)
+        }
+        DoctorCommand::Health => {
+            let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            doctor::handle_health(&target)
+        }
     }
 }
 
@@ -15729,6 +15830,7 @@ struct DoctorForeignKeyViolation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoctorOrphanedMessageRecipient {
+    rowid: i64,
     message_id: i64,
     agent_id: i64,
     missing_message: bool,
@@ -15740,6 +15842,51 @@ struct DoctorRecipientCleanupSummary {
     deleted_rows: usize,
     preserved_missing_agent_rows: usize,
     affected_agents: usize,
+}
+
+fn doctor_missing_message_recipient_count(orphaned: &[DoctorOrphanedMessageRecipient]) -> usize {
+    orphaned.iter().filter(|row| row.missing_message).count()
+}
+
+fn doctor_missing_agent_only_recipient_count(orphaned: &[DoctorOrphanedMessageRecipient]) -> usize {
+    orphaned
+        .iter()
+        .filter(|row| !row.missing_message && row.missing_agent)
+        .count()
+}
+
+fn doctor_missing_agent_only_recipient_rowids(
+    orphaned: &[DoctorOrphanedMessageRecipient],
+) -> std::collections::BTreeSet<i64> {
+    orphaned
+        .iter()
+        .filter(|row| !row.missing_message && row.missing_agent)
+        .map(|row| row.rowid)
+        .collect()
+}
+
+fn doctor_is_preserved_missing_agent_fk_violation(
+    violation: &DoctorForeignKeyViolation,
+    preserved_missing_agent_recipient_rowids: &std::collections::BTreeSet<i64>,
+) -> bool {
+    violation.table == "message_recipients"
+        && violation.parent == "agents"
+        && preserved_missing_agent_recipient_rowids.contains(&violation.rowid)
+}
+
+fn doctor_repairable_foreign_key_violation_count(
+    violations: &[DoctorForeignKeyViolation],
+    preserved_missing_agent_recipient_rowids: &std::collections::BTreeSet<i64>,
+) -> usize {
+    violations
+        .iter()
+        .filter(|violation| {
+            !doctor_is_preserved_missing_agent_fk_violation(
+                violation,
+                preserved_missing_agent_recipient_rowids,
+            )
+        })
+        .count()
 }
 
 fn doctor_foreign_key_violations(
@@ -15773,7 +15920,7 @@ fn doctor_orphaned_message_recipients(
 ) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
     let rows = conn
         .query_sync(
-            "SELECT mr.message_id, mr.agent_id, \
+            "SELECT mr.rowid, mr.message_id, mr.agent_id, \
                     CASE WHEN m.id IS NULL THEN 1 ELSE 0 END AS missing_message, \
                     CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent \
              FROM message_recipients mr \
@@ -15787,18 +15934,21 @@ fn doctor_orphaned_message_recipients(
     let mut recipients = Vec::with_capacity(rows.len());
     for row in rows {
         recipients.push(DoctorOrphanedMessageRecipient {
-            message_id: row
+            rowid: row
                 .get_as(0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            agent_id: row
+            message_id: row
                 .get_as(1)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            agent_id: row
+                .get_as(2)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
             missing_message: row
-                .get_as::<i64>(2)
+                .get_as::<i64>(3)
                 .map(|value| value != 0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
             missing_agent: row
-                .get_as::<i64>(3)
+                .get_as::<i64>(4)
                 .map(|value| value != 0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
         });
@@ -19041,21 +19191,47 @@ fn doctor_database_fix_strategy(
 
     let fk_violations = doctor_foreign_key_violations(&opened.conn)?;
     let orphaned_recipients = doctor_orphaned_message_recipients(&opened.conn)?;
-    if !fk_violations.is_empty() || !orphaned_recipients.is_empty() {
+    let missing_message_recipients = doctor_missing_message_recipient_count(&orphaned_recipients);
+    let missing_agent_only_recipients =
+        doctor_missing_agent_only_recipient_count(&orphaned_recipients);
+    let missing_agent_only_recipient_rowids =
+        doctor_missing_agent_only_recipient_rowids(&orphaned_recipients);
+    let repairable_fk_violations = doctor_repairable_foreign_key_violation_count(
+        &fk_violations,
+        &missing_agent_only_recipient_rowids,
+    );
+    if repairable_fk_violations > 0 || missing_message_recipients > 0 {
         let mut details = Vec::new();
-        if !fk_violations.is_empty() {
-            details.push(format!("{} foreign-key violation(s)", fk_violations.len()));
+        if repairable_fk_violations > 0 {
+            details.push(format!(
+                "{} repairable foreign-key violation(s)",
+                repairable_fk_violations
+            ));
         }
-        if !orphaned_recipients.is_empty() {
+        if missing_message_recipients > 0 {
             details.push(format!(
                 "{} orphaned message recipient row(s)",
-                orphaned_recipients.len()
+                missing_message_recipients
+            ));
+        }
+        if missing_agent_only_recipients > 0 {
+            details.push(format!(
+                "{} preserved missing-agent recipient row(s)",
+                missing_agent_only_recipients
             ));
         }
         return Ok(DoctorDatabaseFixStrategy::Repair(format!(
             "Database consistency issues detected in {}: {}",
             opened.opened_path,
             details.join(", ")
+        )));
+    }
+    if missing_agent_only_recipients > 0 {
+        return Ok(DoctorDatabaseFixStrategy::None(format!(
+            "Database at {} passed file, integrity, and relational consistency probes; \
+             preserved {} recipient row(s) with missing agent metadata \
+             (run `am doctor repair --prune-orphan-recipients` to delete them)",
+            opened.opened_path, missing_agent_only_recipients
         )));
     }
 
@@ -19628,17 +19804,60 @@ fn handle_doctor_check_with(
                 Ok((violations, orphaned))
             }) {
                 Ok((violations, orphaned)) => {
-                    if violations.is_empty() && orphaned.is_empty() {
+                    let missing_message_recipients =
+                        doctor_missing_message_recipient_count(&orphaned);
+                    let missing_agent_only_recipients =
+                        doctor_missing_agent_only_recipient_count(&orphaned);
+                    let missing_agent_only_recipient_rowids =
+                        doctor_missing_agent_only_recipient_rowids(&orphaned);
+                    let repairable_violations = violations
+                        .iter()
+                        .filter(|violation| {
+                            !doctor_is_preserved_missing_agent_fk_violation(
+                                violation,
+                                &missing_agent_only_recipient_rowids,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    if repairable_violations.is_empty()
+                        && missing_message_recipients == 0
+                        && missing_agent_only_recipients == 0
+                    {
                         checks.push(serde_json::json!({
                             "check": "foreign_key_integrity",
                             "status": "ok",
                             "detail": "No foreign key violations detected",
                         }));
+                    } else if repairable_violations.is_empty() && missing_message_recipients == 0 {
+                        let orphan_examples = orphaned
+                            .iter()
+                            .filter(|row| !row.missing_message && row.missing_agent)
+                            .take(5)
+                            .map(|row| {
+                                format!(
+                                    "message_id={}, agent_id={} (missing agent)",
+                                    row.message_id, row.agent_id
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        checks.push(serde_json::json!({
+                            "check": "foreign_key_integrity",
+                            "status": "warn",
+                            "detail": format!(
+                                "Preserved {} recipient row(s) with missing agent metadata; \
+                                 run `am doctor repair --prune-orphan-recipients` to delete them; \
+                                 examples: {}",
+                                missing_agent_only_recipients,
+                                orphan_examples
+                            ),
+                        }));
                     } else {
-                        let violation_examples = if violations.is_empty() {
+                        let violation_examples = if repairable_violations.is_empty() {
                             "none".to_string()
                         } else {
-                            violations
+                            repairable_violations
                                 .iter()
                                 .take(5)
                                 .map(|violation| {
@@ -19658,6 +19877,10 @@ fn handle_doctor_check_with(
                         } else {
                             let orphan_examples = orphaned
                                 .iter()
+                                .filter(|row| {
+                                    row.missing_message
+                                        || (!row.missing_message && row.missing_agent)
+                                })
                                 .take(5)
                                 .map(|row| {
                                     let mut missing = Vec::new();
@@ -19677,8 +19900,9 @@ fn handle_doctor_check_with(
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             format!(
-                                "; orphaned message_recipients={} [{}]",
-                                orphaned.len(),
+                                "; orphaned message_recipients={} repairable, {} preserved missing-agent [{}]",
+                                missing_message_recipients,
+                                missing_agent_only_recipients,
                                 orphan_examples
                             )
                         };
@@ -19686,8 +19910,8 @@ fn handle_doctor_check_with(
                             "check": "foreign_key_integrity",
                             "status": "fail",
                             "detail": format!(
-                                "{} foreign key violation(s){}; examples: {}",
-                                violations.len(),
+                                "{} repairable foreign key violation(s){}; examples: {}",
+                                repairable_violations.len(),
                                 orphan_detail,
                                 violation_examples
                             ),
@@ -35164,6 +35388,40 @@ startup_timeout_sec = 42
         .expect("insert orphaned recipient");
     }
 
+    fn seed_startup_self_heal_missing_agent_only_recipient(db_path: &Path) {
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'startup-missing-agent', '/tmp/startup-missing-agent', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (1, 1, 'RedLake', 'codex-cli', 'gpt-5', 'startup self-heal test', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert sender");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 1, 1, 'startup-missing-agent', 'preserve', 'body', 'normal', 0, 100, '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (1, 999, 'to', NULL, NULL)",
+        )
+        .expect("insert missing-agent recipient");
+        let _ = conn.execute_raw("DELETE FROM inbox_stats WHERE agent_id = 999");
+    }
+
     #[test]
     fn startup_database_self_heal_dispatches_repair_for_corrupt_db_without_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -35198,6 +35456,51 @@ startup_timeout_sec = 42
         assert!(
             !reconstruct_called.get(),
             "reconstruct runner should not be used without archive"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_accepts_preserved_missing_agent_recipients() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup_missing_agent_only.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_startup_self_heal_missing_agent_only_recipient(&db_path);
+
+        let strategy = doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy");
+        match strategy {
+            DoctorDatabaseFixStrategy::None(detail) => {
+                assert!(
+                    detail.contains("preserved 1 recipient row")
+                        && detail.contains("missing agent metadata"),
+                    "expected preserved missing-agent detail, got: {detail}"
+                );
+            }
+            other => panic!("missing-agent-only recipients should not trigger repair: {other:?}"),
+        }
+
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should accept preserved missing-agent recipients");
+
+        assert!(
+            !repair_called.get(),
+            "missing-agent-only recipient rows should not trigger startup repair"
+        );
+        assert!(
+            !reconstruct_called.get(),
+            "missing-agent-only recipient rows should not trigger reconstruction"
         );
     }
 
@@ -40012,6 +40315,37 @@ startup_timeout_sec = 42
         assert!(
             detail.contains("message_recipients") && detail.contains("message_id=999"),
             "expected orphan recipient detail, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn integration_doctor_check_warns_for_preserved_missing_agent_recipients() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_missing_agent_only.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_startup_self_heal_missing_agent_only_recipient(&db_path);
+
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        assert_eq!(
+            parsed["healthy"],
+            serde_json::Value::Bool(true),
+            "preserved missing-agent recipients should not make doctor check unhealthy"
+        );
+        let checks = parsed["checks"].as_array().expect("checks array");
+        let fk_check = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("foreign_key_integrity"))
+            .expect("foreign_key_integrity check should be present");
+        assert_eq!(fk_check["status"].as_str(), Some("warn"));
+        let detail = fk_check["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Preserved 1 recipient row")
+                && detail.contains("missing agent metadata")
+                && detail.contains("--prune-orphan-recipients"),
+            "expected preserved missing-agent warning, got: {detail}"
         );
     }
 
