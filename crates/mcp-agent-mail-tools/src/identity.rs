@@ -141,7 +141,10 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
     );
     let durability = DurabilityState::from_mailbox_state(verdict.state);
 
-    if durability == DurabilityState::Healthy && !recovery_lock.active {
+    if !recovery_lock.active
+        && (durability == DurabilityState::Healthy
+            || recovery_verdict_is_archive_lag_only(&verdict))
+    {
         return None;
     }
 
@@ -197,6 +200,15 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         recovery_lock_active: recovery_lock.active,
         recovery_lock_pid: recovery_lock.pid,
     })
+}
+
+fn recovery_verdict_is_archive_lag_only(verdict: &mcp_agent_mail_db::MailboxHealthVerdict) -> bool {
+    verdict.archive_drift.state == mcp_agent_mail_db::MailboxArchiveDriftState::DbAhead
+        && verdict
+            .probes
+            .iter()
+            .filter(|probe| !probe.passed)
+            .all(|probe| probe.name == "archive_db_parity")
 }
 
 /// Find the most recently created forensic bundle directory.
@@ -2662,6 +2674,10 @@ body
                         .as_str()
                         .is_some_and(|detail| !detail.contains("archive inventory is ahead")),
                     "health_check should not false-fail on metadata-only archive drift when the DB has newer messages: {value}"
+                );
+                assert!(
+                    value.get("recovery").is_none(),
+                    "DB-ahead archive parity drift alone should not advertise recovery: {value}"
                 );
             },
         );

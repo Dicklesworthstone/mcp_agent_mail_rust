@@ -64,17 +64,6 @@ struct StoredAction {
     ok: bool,
 }
 
-impl StoredAction {
-    /// True if this is the post-mutation "completed" line (or a legacy
-    /// line with no phase field).
-    fn is_completed(&self) -> bool {
-        match self.phase.as_deref() {
-            Some("completed") | None => true,
-            _ => false,
-        }
-    }
-}
-
 fn per_mutation_backup_dir(backups_dir: &Path, started_at_ns: u128) -> PathBuf {
     backups_dir.join(format!("seq_{:026}", started_at_ns))
 }
@@ -175,11 +164,7 @@ pub fn run_undo(
             // pack the raw line index into the upper bits to keep ordering;
             // index 0..N maps to keys 1..N+1 (avoid colliding with real
             // started_at_ns values which start large).
-            (raw_lines
-                .iter()
-                .position(|l| l == line)
-                .unwrap_or(0)
-                + 1) as u128
+            (raw_lines.iter().position(|l| l == line).unwrap_or(0) + 1) as u128
         } else {
             action.started_at_ns
         };
@@ -189,7 +174,6 @@ pub fn run_undo(
     // Process in REVERSE order of started_at_ns (most recent mutation undone
     // first; preserves the per-mutation seq backup correctness verified by
     // pass-4's property test).
-    let mut crash_window_recoveries: usize = 0;
     let actions: Vec<StoredAction> = by_started_at.values().rev().cloned().collect();
 
     for action in actions {
@@ -211,7 +195,6 @@ pub fn run_undo(
                     "[dry-run] crash-window recovery: would restore {} from backup",
                     target_file.display()
                 );
-                crash_window_recoveries += 1;
                 continue;
             }
             if backup_file.exists() {
@@ -223,7 +206,6 @@ pub fn run_undo(
                 if super::mutate::atomic_write_file(&target_file, &backup_bytes, restore_mode)
                     .is_ok()
                 {
-                    crash_window_recoveries += 1;
                     summary.actions_replayed += 1;
                 } else {
                     summary
@@ -234,15 +216,12 @@ pub fn run_undo(
                 // File didn't exist before mutation. If it now exists,
                 // mutation probably succeeded — quarantine the post-state.
                 if target_file.exists() {
-                    let quarantine = run_dir
-                        .join("quarantine_crash_window")
-                        .join(&action.path);
+                    let quarantine = run_dir.join("quarantine_crash_window").join(&action.path);
                     if let Some(parent) = quarantine.parent() {
                         fs::create_dir_all(parent)?;
                     }
                     let _ = fs::rename(&target_file, &quarantine);
                 }
-                crash_window_recoveries += 1;
             } else {
                 summary
                     .failures
@@ -925,7 +904,6 @@ mod tests {
         // Pass-5 G-Crash-Window: simulate a crash mid-mutation by writing
         // ONLY the pending line (no completed line). Run undo: must
         // recognize the crash-window and restore from backup.
-        use std::os::unix::fs::PermissionsExt;
         let td = TempDir::new().unwrap();
         let target = td.path().join("crash.txt");
         std::fs::write(&target, b"original\n").unwrap();
