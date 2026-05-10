@@ -313,6 +313,10 @@ e2e_assert_eq \
     "ATC latest canary report points at the run artifact" \
     "${ATC_GATE_PASS_OUT}/canary_report.json" \
     "$(jq -r '.artifacts.canary_report' "${ATC_CANARY_STATE_DIR}/latest_canary_report.json")"
+e2e_assert_eq \
+    "ATC reused-report fixture skips the mutating server canary" \
+    "skipped" \
+    "$(jq -r '.server_canary.status' "${ATC_GATE_PASS_OUT}/canary_report.json")"
 
 # ---------------------------------------------------------------------------
 # Case 6b: ATC perf gate holds live when no durable ATC rows were observed

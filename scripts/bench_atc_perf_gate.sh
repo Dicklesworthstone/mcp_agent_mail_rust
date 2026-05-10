@@ -14,6 +14,7 @@ BENCH_REPORT_PATH=""
 BENCH_TMPDIR_ROOT="${ATC_GATE_TMPDIR_ROOT:-/data/tmp}"
 AM_BENCH_BIN="${AM_BENCH_BIN:-}"
 CANARY_DB_PATH=""
+CANARY_DB_EXPLICIT=0
 DEFAULT_CANARY_STATE_ROOT="${STORAGE_ROOT:-${HOME:-}/.mcp_agent_mail_git_mailbox_repo}"
 CANARY_REPORT_STATE_DIR="${AM_ATC_CANARY_REPORT_DIR:-${DEFAULT_CANARY_STATE_ROOT}/atc_perf_gate}"
 
@@ -38,7 +39,7 @@ Options:
   --output-dir <path>           Output directory for gate artifacts
   --threshold-pct <n>           Max allowed p95 overhead over no_atc (default: 5.0)
   --bench-report <path>         Reuse an existing `am bench` JSON report
-  --canary-db <path>            Optional SQLite DB for quick_check + ATC row count
+  --canary-db <path>            Optional existing SQLite DB for quick_check + ATC row count
   --skip-bench                  Skip running `cargo run ... am bench` and require --bench-report
 Environment:
   AM_BENCH_BIN                  Use this prebuilt `am` binary instead of `cargo run`
@@ -53,6 +54,112 @@ require_cmd() {
         printf 'error: required command not found: %s\n' "${cmd}" >&2
         exit 2
     fi
+}
+
+write_server_canary_status() {
+    local status_path="$1"
+    local status="$2"
+    local reason="$3"
+    local stdout_path="$4"
+    local stderr_path="$5"
+    local project_path="$6"
+
+    python3 - "${status_path}" "${status}" "${reason}" "${stdout_path}" "${stderr_path}" "${project_path}" <<'PY'
+import json
+import pathlib
+import sys
+
+status_path = pathlib.Path(sys.argv[1])
+payload = {
+    "status": sys.argv[2],
+    "reason": sys.argv[3],
+    "stdout": sys.argv[4],
+    "stderr": sys.argv[5],
+    "project": sys.argv[6],
+}
+status_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+run_server_canary() {
+    local db_path="$1"
+    local storage_root="$2"
+    local output_dir="$3"
+    local server_binary="$4"
+    local status_path="$5"
+
+    local project_path="/tmp/am-atc-perf-canary"
+    local fifo="${output_dir}/server_canary.stdin.$$"
+    local stdout_path="${output_dir}/server_canary_stdio.jsonl"
+    local stderr_path="${output_dir}/server_canary_stderr.log"
+    local writer_rc=0
+    local server_rc=0
+    local status="completed"
+    local reason="server stdio canary completed"
+
+    mkfifo "${fifo}"
+
+    set +e
+    if [ -n "${server_binary}" ]; then
+        DATABASE_URL="sqlite:///${db_path}" \
+        STORAGE_ROOT="${storage_root}" \
+        AM_ATC_WRITE_MODE=live \
+        TUI_ENABLED=false \
+        RUST_LOG=error \
+        "${server_binary}" serve-stdio <"${fifo}" >"${stdout_path}" 2>"${stderr_path}" &
+    else
+        (
+            cd "${PROJECT_ROOT}" &&
+            DATABASE_URL="sqlite:///${db_path}" \
+            STORAGE_ROOT="${storage_root}" \
+            AM_ATC_WRITE_MODE=live \
+            TUI_ENABLED=false \
+            RUST_LOG=error \
+            cargo run -p mcp-agent-mail-cli --bin am -- serve-stdio
+        ) <"${fifo}" >"${stdout_path}" 2>"${stderr_path}" &
+    fi
+    local server_pid=$!
+
+    {
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"atc-perf-gate","version":"1"}}}'
+        sleep 0.5
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ensure_project","arguments":{"human_key":"/tmp/am-atc-perf-canary"}}}'
+        sleep 0.4
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/am-atc-perf-canary","name":"BlueLake","program":"bench","model":"bench","task_description":"server atc canary"}}}'
+        sleep 0.4
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/am-atc-perf-canary","name":"RedFox","program":"bench","model":"bench","task_description":"server atc canary"}}}'
+        sleep 0.4
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/am-atc-perf-canary","sender_name":"BlueLake","to":["RedFox"],"subject":"ATC perf gate server canary","body_md":"ATC perf gate server canary","thread_id":"ATC-CANARY"}}}'
+        sleep 2
+    } >"${fifo}" &
+    local writer_pid=$!
+
+    wait "${writer_pid}"
+    writer_rc=$?
+    sleep 2
+    kill "${server_pid}" 2>/dev/null
+    wait "${server_pid}"
+    server_rc=$?
+    set -e
+
+    if [ "${writer_rc}" -ne 0 ]; then
+        status="writer_failed"
+        reason="stdio canary writer exited with code ${writer_rc}"
+    elif [ "${server_rc}" -ne 0 ] && [ "${server_rc}" -ne 143 ]; then
+        status="server_failed"
+        reason="stdio canary server exited with code ${server_rc}"
+    elif ! grep -q '"id":5' "${stdout_path}" 2>/dev/null; then
+        status="missing_send_response"
+        reason="stdio canary did not observe a send_message response"
+    fi
+
+    write_server_canary_status \
+        "${status_path}" \
+        "${status}" \
+        "${reason}" \
+        "${stdout_path}" \
+        "${stderr_path}" \
+        "${project_path}"
 }
 
 while [ $# -gt 0 ]; do
@@ -79,6 +186,7 @@ while [ $# -gt 0 ]; do
             ;;
         --canary-db)
             CANARY_DB_PATH="${2:-}"
+            CANARY_DB_EXPLICIT=1
             shift 2
             ;;
         --skip-bench)
@@ -109,14 +217,18 @@ if [ "${SKIP_BENCH}" -eq 1 ] && [ -z "${BENCH_REPORT_PATH}" ]; then
 fi
 
 bench_log="${OUTPUT_DIR}/bench.log"
+server_canary_status_path="${OUTPUT_DIR}/server_canary_status.json"
+server_canary_stdout_path="${OUTPUT_DIR}/server_canary_stdio.jsonl"
+server_canary_stderr_path="${OUTPUT_DIR}/server_canary_stderr.log"
 
 if [ "${SKIP_BENCH}" -eq 0 ]; then
     BENCH_REPORT_PATH="${OUTPUT_DIR}/bench_report.json"
     bench_runtime_root="$(mktemp -d "${BENCH_TMPDIR_ROOT}/atc-perf-gate.XXXXXX")"
     bench_workspace="${bench_runtime_root}/bench-workspace"
     bench_db_path="${bench_workspace}/bench.sqlite3"
+    server_canary_db_path="${bench_runtime_root}/server-canary.sqlite3"
     if [ -z "${CANARY_DB_PATH}" ]; then
-        CANARY_DB_PATH="${bench_db_path}"
+        CANARY_DB_PATH="${server_canary_db_path}"
     fi
     mkdir -p "${bench_runtime_root}/storage"
     bench_binary=""
@@ -156,18 +268,49 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
     ) >"${BENCH_REPORT_PATH}" 2>"${bench_log}"
     bench_rc=$?
     set -e
+    if [ "${CANARY_DB_EXPLICIT}" -eq 1 ]; then
+        write_server_canary_status \
+            "${server_canary_status_path}" \
+            "skipped" \
+            "explicit --canary-db is inspected read-only and is not mutated by the server canary" \
+            "${server_canary_stdout_path}" \
+            "${server_canary_stderr_path}" \
+            "/tmp/am-atc-perf-canary"
+    elif [ "${bench_rc}" -eq 0 ] || [ "${bench_rc}" -eq 3 ]; then
+        run_server_canary \
+            "${CANARY_DB_PATH}" \
+            "${bench_runtime_root}/storage" \
+            "${OUTPUT_DIR}" \
+            "${bench_binary}" \
+            "${server_canary_status_path}"
+    else
+        write_server_canary_status \
+            "${server_canary_status_path}" \
+            "skipped" \
+            "benchmark command failed before server canary" \
+            "${server_canary_stdout_path}" \
+            "${server_canary_stderr_path}" \
+            "/tmp/am-atc-perf-canary"
+    fi
 else
     bench_rc=0
     cp "${BENCH_REPORT_PATH}" "${OUTPUT_DIR}/bench_report.json"
     BENCH_REPORT_PATH="${OUTPUT_DIR}/bench_report.json"
     printf 'skip-bench=1; reusing %s\n' "${BENCH_REPORT_PATH}" >"${bench_log}"
+    write_server_canary_status \
+        "${server_canary_status_path}" \
+        "skipped" \
+        "skip-bench reuses an existing report and does not mutate the supplied canary database" \
+        "${server_canary_stdout_path}" \
+        "${server_canary_stderr_path}" \
+        "/tmp/am-atc-perf-canary"
 fi
 
 if [ -f "${HISTORICAL_BASELINE_PATH}" ]; then
     cp "${HISTORICAL_BASELINE_PATH}" "${OUTPUT_DIR}/atc_pre_wiring_baseline.json"
 fi
 
-python3 - "${BASELINE_PATH}" "${BENCH_REPORT_PATH}" "${OUTPUT_DIR}" "${bench_rc}" "${THRESHOLD_PCT}" "${CANARY_DB_PATH}" "${CANARY_REPORT_STATE_DIR}" <<'PY'
+python3 - "${BASELINE_PATH}" "${BENCH_REPORT_PATH}" "${OUTPUT_DIR}" "${bench_rc}" "${THRESHOLD_PCT}" "${CANARY_DB_PATH}" "${CANARY_REPORT_STATE_DIR}" "${server_canary_status_path}" "${server_canary_stdout_path}" "${server_canary_stderr_path}" <<'PY'
 import json
 import pathlib
 import sqlite3
@@ -182,6 +325,9 @@ canary_db_arg = sys.argv[6]
 canary_state_dir_arg = sys.argv[7]
 canary_db_path = pathlib.Path(canary_db_arg) if canary_db_arg else None
 canary_state_dir = pathlib.Path(canary_state_dir_arg) if canary_state_dir_arg else None
+server_canary_status_path = pathlib.Path(sys.argv[8])
+server_canary_stdout_path = pathlib.Path(sys.argv[9])
+server_canary_stderr_path = pathlib.Path(sys.argv[10])
 
 summary_path = output_dir / "summary.json"
 comment_path = output_dir / "comment.md"
@@ -248,6 +394,27 @@ def read_db_health() -> dict:
         "atc_rows": atc_rows,
         "reason": "",
     }
+
+
+def read_server_canary_status() -> dict:
+    if not server_canary_status_path.is_file():
+        return {
+            "status": "missing",
+            "reason": "server canary status artifact was not written",
+            "stdout": str(server_canary_stdout_path),
+            "stderr": str(server_canary_stderr_path),
+            "project": "/tmp/am-atc-perf-canary",
+        }
+    try:
+        return json.loads(server_canary_status_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        return {
+            "status": "invalid",
+            "reason": str(error),
+            "stdout": str(server_canary_stdout_path),
+            "stderr": str(server_canary_stderr_path),
+            "project": "/tmp/am-atc-perf-canary",
+        }
 
 
 def latency_entry(name: str, entry: dict, comparison: dict | None) -> dict:
@@ -346,6 +513,9 @@ def write_canary_report(
             "baseline": str(baseline_path),
             "canary_db": db_health["path"],
             "canary_report": str(canary_report_path),
+            "server_canary_status": str(server_canary_status_path),
+            "server_canary_stdout": str(server_canary_stdout_path),
+            "server_canary_stderr": str(server_canary_stderr_path),
             "latest_canary_report": (
                 str(latest_canary_report_path)
                 if latest_canary_report_path is not None
@@ -360,6 +530,7 @@ def write_canary_report(
         "db_health": db_health,
         "baseline_regressions": baseline_regressions,
         "failures": failures,
+        "server_canary": read_server_canary_status(),
         "fallback_decision": fallback_decision(status, db_health, overhead_regressions),
         "write_modes": {
             "mail_send_no_atc": {"ATC_LEARNING_DISABLED": "1"},

@@ -40,10 +40,17 @@ as `canary_passed`, `manual_review`, `hold_live`, `hold_rollout`, or
 valid live canary; it holds live rollout until the durable ATC path is actually
 exercised.
 
-The full bench path supplies the isolated canary database automatically through
-the retained benchmark workspace. Reused reports can pass `--canary-db <path>`;
-otherwise the latency verdict is still computed, but the fallback verdict stays
-in `manual_review` for successful runs because database health was not checked.
+The full bench path supplies an isolated server-canary database automatically.
+After the latency samples complete, the gate starts a short MCP stdio server
+against that database and an isolated `STORAGE_ROOT`, registers two canary
+agents, and sends one server-side message so the durable ATC experience path is
+exercised. The stdio transcript, server stderr, and canary status JSON are
+stored beside the benchmark report for replayable operator evidence. Reused
+reports can pass `--canary-db <path>`; otherwise the latency verdict is still
+computed, but the fallback verdict stays in `manual_review` for successful runs
+because database health was not checked. Explicit `--canary-db` inputs are
+inspected read-only; the server canary only mutates the auto-created full-run
+database.
 Each run also publishes a copy to
 `$STORAGE_ROOT/atc_perf_gate/latest_canary_report.json` by default, or to
 `$AM_ATC_CANARY_REPORT_DIR/latest_canary_report.json` when that override is
@@ -80,6 +87,9 @@ capture lives in `tests/artifacts/perf/atc_pre_wiring_baseline.json`.
   verdict.
 - `tests/artifacts/perf/atc_perf_gate/<run_id>/canary_report.json` stores the
   canary latency, DB health, ATC row count, and fallback recommendation.
+- `tests/artifacts/perf/atc_perf_gate/<run_id>/server_canary_status.json`,
+  `server_canary_stdio.jsonl`, and `server_canary_stderr.log` preserve the
+  MCP stdio canary evidence from the server-wrapped durable ATC path.
 - `$STORAGE_ROOT/atc_perf_gate/latest_canary_report.json` stores the latest
   operator-surface copy. Override with `AM_ATC_CANARY_REPORT_DIR`.
 - `tests/artifacts/perf/atc_perf_gate/<run_id>/comment.md` is the PR-facing
