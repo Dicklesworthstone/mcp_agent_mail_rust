@@ -979,6 +979,30 @@ pub struct SearchResult {
     pub age: String,
 }
 
+/// robot search — compact route diagnostics derived from Search V3 explain output.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchRouteDiagnostic {
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_query: Option<String>,
+    pub used_like_fallback: bool,
+    pub facet_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub facets_applied: Vec<String>,
+}
+
+impl SearchRouteDiagnostic {
+    fn from_explain(explain: &mcp_agent_mail_db::search_planner::QueryExplain) -> Self {
+        Self {
+            method: explain.method.clone(),
+            normalized_query: explain.normalized_query.clone(),
+            used_like_fallback: explain.used_like_fallback,
+            facet_count: explain.facet_count,
+            facets_applied: explain.facets_applied.clone(),
+        }
+    }
+}
+
 /// robot message — full message with context.
 #[derive(Debug, Serialize)]
 pub struct MessageContext {
@@ -5228,25 +5252,68 @@ fn build_message(
 
 /// Facet count entry.
 #[derive(Debug, Serialize)]
-struct FacetEntry {
-    value: String,
-    count: usize,
+pub struct FacetEntry {
+    pub value: String,
+    pub count: usize,
 }
 
 /// Search result data with facets.
 #[derive(Debug, Serialize)]
-struct SearchData {
-    query: String,
-    total_results: usize,
-    results: Vec<SearchResult>,
+pub struct SearchData {
+    pub query: String,
+    pub total_results: usize,
+    pub results: Vec<SearchResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
+    pub route: Option<SearchRouteDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistance: Option<mcp_agent_mail_db::QueryAssistance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<mcp_agent_mail_db::search_planner::ZeroResultGuidance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_thread: Vec<FacetEntry>,
+    pub by_thread: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_agent: Vec<FacetEntry>,
+    pub by_agent: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    by_importance: Vec<FacetEntry>,
+    pub by_importance: Vec<FacetEntry>,
+}
+
+#[derive(Debug)]
+struct CollectedSearchRows {
+    rows: Vec<mcp_agent_mail_db::search_planner::SearchResult>,
+    explain: Option<mcp_agent_mail_db::search_planner::QueryExplain>,
+    assistance: Option<mcp_agent_mail_db::QueryAssistance>,
+    guidance: Option<mcp_agent_mail_db::search_planner::ZeroResultGuidance>,
+    next_cursor: Option<String>,
+}
+
+fn empty_search_guidance() -> mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+    mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+        summary: "No search terms provided. Enter a word, quoted phrase, thread id, or agent name."
+            .to_string(),
+        suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+            kind: "enter_search_terms".to_string(),
+            label: "Enter search terms".to_string(),
+            detail: Some(
+                "Examples: `rollback`, `\"build plan\"`, `thread:br-123`, or `from:BlueLake`."
+                    .to_string(),
+            ),
+        }],
+    }
+}
+
+fn recipient_kind_guidance(kind: &str) -> mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+    mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+        summary: format!("No results found after applying recipient-kind filter `{kind}`."),
+        suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+            kind: "drop_recipient_kind_filter".to_string(),
+            label: "Remove recipient-kind filter".to_string(),
+            detail: Some("Retry without `--kind` to include to/cc/bcc matches.".to_string()),
+        }],
+    }
 }
 
 fn build_search(
@@ -5265,6 +5332,16 @@ fn build_search(
             query: query.to_string(),
             total_results: 0,
             results: vec![],
+            route: Some(SearchRouteDiagnostic {
+                method: "empty_query".to_string(),
+                normalized_query: None,
+                used_like_fallback: false,
+                facet_count: 0,
+                facets_applied: vec![],
+            }),
+            assistance: None,
+            guidance: Some(empty_search_guidance()),
+            next_cursor: None,
             plan_diagnostic: None,
             by_thread: vec![],
             by_agent: vec![],
@@ -5275,6 +5352,7 @@ fn build_search(
     let now_us = mcp_agent_mail_db::now_micros();
     let mut search_query =
         mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
+    search_query.explain = true;
 
     if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
         let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
@@ -5301,8 +5379,14 @@ fn build_search(
             &search_query,
         )
         .ok();
-    let search_rows =
+    let collected =
         collect_search_rows(conn, pool, &search_query, recipient_kind.as_deref(), limit)?;
+    let route = collected
+        .explain
+        .as_ref()
+        .map(SearchRouteDiagnostic::from_explain);
+    let mut guidance = collected.guidance;
+    let next_cursor = collected.next_cursor;
 
     // Build results and facets
     let mut results = Vec::new();
@@ -5313,7 +5397,7 @@ fn build_search(
     let mut importance_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
-    for row in search_rows {
+    for row in collected.rows {
         let subject = row.title;
         let thread_ref = canonical_thread_ref_for_row(row.id, row.thread_id.as_deref());
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
@@ -5369,10 +5453,20 @@ fn build_search(
     by_importance.sort_by_key(|x| std::cmp::Reverse(x.count));
 
     let total = results.len();
+    if total == 0
+        && guidance.is_none()
+        && let Some(kind) = recipient_kind.as_deref()
+    {
+        guidance = Some(recipient_kind_guidance(kind));
+    }
     Ok(SearchData {
         query: query.to_string(),
         total_results: total,
         results,
+        route,
+        assistance: collected.assistance,
+        guidance,
+        next_cursor,
         plan_diagnostic,
         by_thread,
         by_agent,
@@ -5386,7 +5480,7 @@ fn collect_search_rows(
     query: &mcp_agent_mail_db::search_planner::SearchQuery,
     recipient_kind: Option<&str>,
     limit: usize,
-) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError> {
+) -> Result<CollectedSearchRows, CliError> {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build async runtime for search: {e}")))?;
@@ -5410,7 +5504,7 @@ fn collect_search_rows_with_runner<F>(
     recipient_kind: Option<&str>,
     requested_limit: usize,
     mut run_query: F,
-) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError>
+) -> Result<CollectedSearchRows, CliError>
 where
     F: FnMut(
         &mcp_agent_mail_db::search_planner::SearchQuery,
@@ -5419,9 +5513,22 @@ where
     let mut out = Vec::with_capacity(requested_limit);
     let mut seen_ids = std::collections::HashSet::new();
     let mut seen_cursors = std::collections::HashSet::new();
+    let mut explain = None;
+    let mut assistance = None;
+    let mut guidance = None;
 
     loop {
         let response = run_query(&paged_query)?;
+        if explain.is_none() {
+            explain = response.explain.clone();
+        }
+        if assistance.is_none() {
+            assistance = response.assistance.clone();
+        }
+        if guidance.is_none() {
+            guidance = response.guidance.clone();
+        }
+        let next_cursor = response.next_cursor.clone();
         let kind_id_filter = match recipient_kind {
             Some(kind) => Some(search_message_ids_by_recipient_kind(
                 conn,
@@ -5431,6 +5538,7 @@ where
             None => None,
         };
 
+        let mut omitted_matching_row_in_page = false;
         for row in response.results {
             if let Some(filter_ids) = &kind_id_filter
                 && !filter_ids.contains(&row.id)
@@ -5440,17 +5548,44 @@ where
             if !seen_ids.insert(row.id) {
                 continue;
             }
-            out.push(row);
-            if out.len() >= requested_limit {
-                return Ok(out);
+            if out.len() < requested_limit {
+                out.push(row);
+            } else {
+                omitted_matching_row_in_page = true;
             }
         }
 
-        let Some(next_cursor) = response.next_cursor else {
-            return Ok(out);
+        if out.len() >= requested_limit {
+            return Ok(CollectedSearchRows {
+                rows: out,
+                explain,
+                assistance,
+                guidance,
+                next_cursor: if omitted_matching_row_in_page {
+                    None
+                } else {
+                    next_cursor
+                },
+            });
+        }
+
+        let Some(next_cursor) = next_cursor else {
+            return Ok(CollectedSearchRows {
+                rows: out,
+                explain,
+                assistance,
+                guidance,
+                next_cursor: None,
+            });
         };
         if !seen_cursors.insert(next_cursor.clone()) {
-            return Ok(out);
+            return Ok(CollectedSearchRows {
+                rows: out,
+                explain,
+                assistance,
+                guidance,
+                next_cursor: None,
+            });
         }
         paged_query.cursor = Some(next_cursor);
     }
@@ -12842,6 +12977,10 @@ mod tests {
                     age: "3h ago".into(),
                 },
             ],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
             plan_diagnostic: None,
             by_thread: vec![FacetEntry {
                 value: "FEAT-123".into(),
@@ -12992,8 +13131,150 @@ mod tests {
             "should page until matching rows fill the limit"
         );
         assert_eq!(
-            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             vec![20, 30]
+        );
+        assert!(
+            rows.next_cursor.is_none(),
+            "final filtered page should not expose a cursor"
+        );
+    }
+
+    #[test]
+    fn collect_search_rows_with_runner_suppresses_cursor_when_filter_overflows_page() {
+        use mcp_agent_mail_db::search_planner::{
+            DocKind, SearchQuery, SearchResponse, SearchResult as PlannerSearchResult,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_search_kind_cursor_overflow.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind) VALUES
+                (1, 10, 1, 'cc'),
+                (2, 20, 1, 'to'),
+                (3, 30, 1, 'to'),
+                (4, 40, 1, 'to')",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let mut query = SearchQuery::messages("needle", 1);
+        query.limit = Some(search_page_limit(2, Some("to")));
+
+        let mut call_count = 0usize;
+        let rows = collect_search_rows_with_runner(&conn, query, Some("to"), 2, |query| {
+            call_count += 1;
+            assert!(
+                query.cursor.is_none(),
+                "collector should not fetch past the page that already filled the visible limit"
+            );
+            Ok(SearchResponse {
+                results: vec![
+                    PlannerSearchResult {
+                        doc_kind: DocKind::Message,
+                        id: 10,
+                        project_id: Some(1),
+                        title: "first".into(),
+                        body: "body".into(),
+                        score: Some(0.9),
+                        importance: Some("normal".into()),
+                        ack_required: Some(false),
+                        created_ts: Some(100),
+                        thread_id: Some("th-1".into()),
+                        from_agent: Some("Alpha".into()),
+                        reason_codes: vec![],
+                        score_factors: vec![],
+                        redacted: false,
+                        redaction_reason: None,
+                        ..PlannerSearchResult::default()
+                    },
+                    PlannerSearchResult {
+                        doc_kind: DocKind::Message,
+                        id: 20,
+                        project_id: Some(1),
+                        title: "second".into(),
+                        body: "body".into(),
+                        score: Some(0.8),
+                        importance: Some("normal".into()),
+                        ack_required: Some(false),
+                        created_ts: Some(200),
+                        thread_id: Some("th-2".into()),
+                        from_agent: Some("Beta".into()),
+                        reason_codes: vec![],
+                        score_factors: vec![],
+                        redacted: false,
+                        redaction_reason: None,
+                        ..PlannerSearchResult::default()
+                    },
+                    PlannerSearchResult {
+                        doc_kind: DocKind::Message,
+                        id: 30,
+                        project_id: Some(1),
+                        title: "third".into(),
+                        body: "body".into(),
+                        score: Some(0.7),
+                        importance: Some("normal".into()),
+                        ack_required: Some(false),
+                        created_ts: Some(300),
+                        thread_id: Some("th-3".into()),
+                        from_agent: Some("Gamma".into()),
+                        reason_codes: vec![],
+                        score_factors: vec![],
+                        redacted: false,
+                        redaction_reason: None,
+                        ..PlannerSearchResult::default()
+                    },
+                    PlannerSearchResult {
+                        doc_kind: DocKind::Message,
+                        id: 40,
+                        project_id: Some(1),
+                        title: "fourth".into(),
+                        body: "body".into(),
+                        score: Some(0.6),
+                        importance: Some("normal".into()),
+                        ack_required: Some(false),
+                        created_ts: Some(400),
+                        thread_id: Some("th-4".into()),
+                        from_agent: Some("Delta".into()),
+                        reason_codes: vec![],
+                        score_factors: vec![],
+                        redacted: false,
+                        redaction_reason: None,
+                        ..PlannerSearchResult::default()
+                    },
+                ],
+                next_cursor: Some("cursor-after-page".into()),
+                explain: None,
+                assistance: None,
+                guidance: None,
+                audit: vec![],
+            })
+        })
+        .expect("collect kind-filtered rows");
+
+        assert_eq!(call_count, 1);
+        assert_eq!(
+            rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+        assert!(
+            rows.next_cursor.is_none(),
+            "cursor would skip the unreturned matching row from the current fetched page"
         );
     }
 
@@ -14922,6 +15203,10 @@ mod tests {
             query: "authentication".into(),
             total_results: 10,
             results: vec![],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
             plan_diagnostic: None,
             by_thread: vec![FacetEntry {
                 value: "AUTH-1".into(),
@@ -14948,6 +15233,10 @@ mod tests {
             query: "nonexistent".into(),
             total_results: 0,
             results: vec![],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
             plan_diagnostic: None,
             by_thread: vec![],
             by_agent: vec![],
@@ -14958,6 +15247,70 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_results"], 0);
         assert!(v["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn robot_search_explainability_metadata_does_not_leak_result_body_text() {
+        let sensitive_body = "secret body token should stay out of explainability metadata";
+        let data = SearchData {
+            query: "form:BlueLake rollback".into(),
+            total_results: 1,
+            results: vec![SearchResult {
+                id: 42,
+                relevance: 0.91,
+                from: "BlueLake".into(),
+                subject: "Rollback plan".into(),
+                thread: "br-search".into(),
+                snippet: sensitive_body.into(),
+                age: "1m".into(),
+            }],
+            route: Some(SearchRouteDiagnostic {
+                method: "hybrid_v3".into(),
+                normalized_query: Some("form:BlueLake rollback".into()),
+                used_like_fallback: false,
+                facet_count: 2,
+                facets_applied: vec!["engine:hybrid".into(), "project_id".into()],
+            }),
+            assistance: Some(mcp_agent_mail_db::QueryAssistance {
+                query_text: "form:BlueLake rollback".into(),
+                applied_filter_hints: Vec::new(),
+                did_you_mean: vec![mcp_agent_mail_db::query_assistance::DidYouMeanHint {
+                    token: "form:BlueLake".into(),
+                    suggested_field: "from".into(),
+                    value: "BlueLake".into(),
+                }],
+            }),
+            guidance: Some(mcp_agent_mail_db::search_planner::ZeroResultGuidance {
+                summary: "No results found. 1 suggestion available to broaden your search.".into(),
+                suggestions: vec![mcp_agent_mail_db::search_planner::RecoverySuggestion {
+                    kind: "fix_typo".into(),
+                    label: "Did you mean \"from:BlueLake\"?".into(),
+                    detail: Some(
+                        "\"form:BlueLake\" is not a recognized field. Try \"from\" instead.".into(),
+                    ),
+                }],
+            }),
+            next_cursor: Some("s3feccccccccccccd:i42".into()),
+            plan_diagnostic: None,
+            by_thread: vec![],
+            by_agent: vec![],
+            by_importance: vec![],
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert!(
+            serde_json::to_string(&json["results"])
+                .unwrap()
+                .contains(sensitive_body),
+            "test fixture must include body-derived result text so the leak check is meaningful"
+        );
+        for key in ["route", "assistance", "guidance"] {
+            let metadata = serde_json::to_string(&json[key]).unwrap();
+            assert!(
+                !metadata.contains(sensitive_body),
+                "{key} metadata must not contain body-derived result text"
+            );
+        }
     }
 
     #[test]

@@ -41,7 +41,7 @@ redact_command_part_for_artifact() {
         local key="${part%%=*}"
         local upper_key="${key^^}"
         case "${upper_key}" in
-            *TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*|*PRIVATE_KEY*|*API_KEY*|*BEARER*|AUTHORIZATION|AUTH_HEADER)
+            *SECRET*|*TOKEN*|*PASSWORD*|*CREDENTIAL*|*PRIVATE_KEY*|*API_KEY*|*BEARER*|AUTH|KEY|*AUTHORIZATION*|*AUTH_HEADER*|*AUTH_SECRET*)
                 printf '%s=<redacted>' "${key}"
                 return
                 ;;
@@ -80,8 +80,7 @@ start_server_pty() {
     local -a env_overrides=("$@")
     local transcript="${E2E_ARTIFACT_DIR}/${label}.typescript"
     local timeout_s="${AM_E2E_SERVER_TIMEOUT_S:-10}"
-    local -a cmd_parts=(
-        env
+    local -a env_parts=(
         "DATABASE_URL=sqlite:////${db_path}"
         "STORAGE_ROOT=${storage_root}"
         "HTTP_HOST=127.0.0.1"
@@ -94,23 +93,27 @@ start_server_pty() {
     )
     local override
     for override in "${env_overrides[@]}"; do
-        cmd_parts+=("${override}")
+        env_parts+=("${override}")
     done
-    cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve-http --host 127.0.0.1 --port "${port}")
+    local -a server_parts=(timeout "${timeout_s}s" "${bin}" serve-http --host 127.0.0.1 --port "${port}")
     local server_cmd=""
-    local artifact_cmd=""
+    local artifact_cmd="env"
     local part
-    for part in "${cmd_parts[@]}"; do
+    for part in "${server_parts[@]}"; do
         printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+    done
+    for part in "${env_parts[@]}"; do
         local artifact_part
         artifact_part="$(redact_command_part_for_artifact "${part}")"
         printf -v artifact_cmd '%s %q' "${artifact_cmd}" "${artifact_part}"
     done
+    for part in "${server_parts[@]}"; do
+        printf -v artifact_cmd '%s %q' "${artifact_cmd}" "${part}"
+    done
     server_cmd="${server_cmd# }"
-    artifact_cmd="${artifact_cmd# }"
     printf '%s\n' "${artifact_cmd}" > "${E2E_ARTIFACT_DIR}/${label}.command.txt"
 
-    (script -q -f -c "${server_cmd}" "${transcript}") >/dev/null 2>&1 &
+    (env "${env_parts[@]}" script -q -f -c "${server_cmd}" "${transcript}") >/dev/null 2>&1 &
     echo "$!"
 }
 
@@ -168,6 +171,16 @@ PY
     fi
 }
 
+assert_artifact_bundle_not_contains() {
+    local label="$1"
+    local needle="$2"
+    if grep -R -n -F -- "${needle}" "${E2E_ARTIFACT_DIR}" >/dev/null; then
+        e2e_fail "${label}"
+    else
+        e2e_pass "${label}"
+    fi
+}
+
 BIN="$(e2e_ensure_binary "am" | tail -n 1)"
 
 e2e_case_banner "startup JSON block is parseable and masked"
@@ -177,7 +190,10 @@ STORAGE1="${WORK1}/storage"
 mkdir -p "${STORAGE1}"
 PORT1="$(pick_port)"
 PID1="$(start_server_pty "json_enabled" "${PORT1}" "${DB1}" "${STORAGE1}" "${BIN}" \
-    "HTTP_BEARER_TOKEN=secret123" "AM_GIT_BINARY=/usr/local/bin/git-2.50.x")"
+    "HTTP_BEARER_TOKEN=secret123" \
+    "AM_TEST_AUTH_HEADER=artifact-auth-secret" \
+    "AM_TEST_API_KEY=artifact-key-secret" \
+    "AM_GIT_BINARY=/usr/local/bin/git-2.50.x")"
 if ! e2e_wait_port 127.0.0.1 "${PORT1}" 10; then
     stop_server_pty "${PID1}"
     e2e_fail "server starts for JSON banner case"
@@ -209,6 +225,9 @@ if grep -Fq "secret123" "${E2E_ARTIFACT_DIR}/json_enabled.command.txt"; then
 else
     e2e_pass "saved startup command artifact masks bearer token"
 fi
+assert_artifact_bundle_not_contains "startup artifact bundle masks bearer token everywhere" "secret123"
+assert_artifact_bundle_not_contains "startup artifact bundle masks auth-like env overrides" "artifact-auth-secret"
+assert_artifact_bundle_not_contains "startup artifact bundle masks key-like env overrides" "artifact-key-secret"
 
 e2e_case_banner "AM_BANNER_JSON_DISABLED skips startup JSON block"
 WORK2="$(e2e_mktemp "e2e_banner_json_disabled")"

@@ -441,7 +441,7 @@ mod libc_consts {
     pub const O_NOFOLLOW: i32 = 0;
 }
 
-/// Set permissions on `path` via the file descriptor (G-AppendChmod fix).
+/// Set permissions on `path` via the file descriptor.
 ///
 /// Opens the file with `O_NOFOLLOW` first so a symlink-swap attacker
 /// cannot redirect the chmod to an arbitrary file. Returns `ELOOP` if
@@ -473,8 +473,8 @@ fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
 ///
 /// Errors:
 /// - `Err(MutateError::ExecFailed(_))` if the mutation could not be
-///   completed. Per H4 fix, callers using `?` see a real error rather
-///   than `Ok(ActionResult { ok: false })`.
+///   completed. Callers using `?` see a real error rather than
+///   `Ok(ActionResult { ok: false })`.
 /// - `Err(MutateError::TamperedBeforeMutate)` if the live file's hash no
 ///   longer matches the backup's right after we copied it (TOCTOU
 ///   detected).
@@ -509,25 +509,22 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         }
     };
 
-    // 2. before_hash + before_mode.
-    // G-OOM fix: stream-hash the file rather than reading entire contents
-    // into memory. Multi-GB files (e.g., storage.sqlite3) would OOM otherwise.
+    // 2. before_hash + before_mode. Stream-hash the file rather than
+    // reading entire contents into memory.
     let before_hash = sha256_of_path(path)?;
     let before_mode = fs::metadata(path).ok().map(|m| m.permissions().mode());
 
-    // 3. Preconditions: path in scope + Rename destination in scope (H8 fix —
-    // moved BEFORE the dry-run early return so dry-run cannot lie about
-    // would-be exit-4 refusals).
+    // 3. Preconditions: path in scope + Rename destination in scope. These
+    // run before dry-run returns so dry-run cannot hide exit-4 refusals.
     ensure_in_scope(&ctx.capabilities, path)?;
     if let Op::Rename { to } = &op {
         ensure_in_scope(&ctx.capabilities, to)?;
     }
 
     // 4. Verbatim backup (only if file exists). Also re-verifies that the
-    // live file still hashes to before_hash AFTER copying — if not, a
-    // concurrent writer modified the file in our window (H3 fix), and we
-    // refuse to proceed because our backup wouldn't be a real backup of
-    // the pre-mutation state.
+    // live file still hashes to before_hash after copying. If not, a
+    // concurrent writer modified the file in our window and the backup would
+    // not represent the true pre-mutation state.
     //
     // `backup_path_for` encodes absolute paths outside repo_root without
     // letting PathBuf::join drop the backup prefix. The `rel` value recorded
@@ -539,8 +536,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         cmp_strict(path, &backup_path)
             .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
         // Re-hash the live file; if it changed since step 2, someone else
-        // is writing — refuse with a concurrency-loss-style error.
-        // G-OOM fix: stream-hash to avoid loading full file twice.
+        // is writing, so refuse to proceed.
         let post_backup_hash = sha256_of_path(path)?;
         if post_backup_hash != before_hash {
             let _ = FileExt::unlock(&lock_file);
@@ -650,8 +646,8 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             Ok(())
         }
         Op::Chmod { mode } => {
-            // G-AppendChmod-TOCTOU fix: chmod via fd opened with O_NOFOLLOW
-            // so a symlink-swap attacker cannot redirect to an out-of-scope file.
+            // Chmod via fd opened with O_NOFOLLOW so a symlink-swap attacker
+            // cannot redirect to an out-of-scope file.
             chmod_via_fd(path, mode)?;
             after_mode = Some(mode);
             Ok(())
@@ -668,9 +664,8 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         }
     };
 
-    // 7. On exec failure: attempt ATOMIC rollback (H2 fix — was non-atomic
-    // fs::copy before; now uses atomic_write_file). Record the TRUE
-    // `rolled_back` outcome (C1 fix — was unconditionally `Some(true)`).
+    // 7. On exec failure: attempt atomic rollback and record the actual
+    // `rolled_back` outcome.
     let rolled_back: Option<bool> = if exec_result.is_err() {
         if backup_path.exists() && path.exists() {
             let backup_bytes = read_or_empty(&backup_path)?;
@@ -689,7 +684,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         None
     };
 
-    // 8. after_hash (read post-state via streaming hash — G-OOM fix).
+    // 8. after_hash (read post-state via streaming hash).
     // For Rename: hash the destination. Else: hash the original path.
     let after_hash = match &op {
         Op::Rename { to } if exec_result.is_ok() => sha256_of_path(to)?,
@@ -697,7 +692,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     };
 
     // 9. Append to actions.jsonl, fsync. The `rolled_back` field reflects
-    // the actual rollback result (C1 fix), not an assumption.
+    // the actual rollback result, not an assumption.
     let ok = exec_result.is_ok();
     let error = exec_result.as_ref().err().map(|e| e.to_string());
     let record = ActionRecord {
@@ -710,8 +705,8 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         run_id: ctx.run_id.clone(),
         fixer_id: ctx.fixer_id.clone(),
         ok,
-        // G-Crash-Window fix: this is the post-mutation entry. Pairs with
-        // the earlier `pending` line via shared `started_at_ns`.
+        // This post-mutation entry pairs with the earlier `pending` line via
+        // the shared `started_at_ns`.
         phase: Some("completed"),
         rename_to: rename_to_record,
         before_mode,
@@ -730,7 +725,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     }
     let _ = FileExt::unlock(&lock_file);
 
-    // H4 fix — return Err on exec failure, not Ok with ok: false.
+    // Return Err on exec failure, not Ok with ok: false.
     if let Err(e) = exec_result {
         return Err(MutateError::ExecFailed {
             path: path.to_path_buf(),
@@ -853,8 +848,8 @@ mod tests {
                 .join("actions.jsonl"),
         )
         .unwrap();
-        // Pass-5 G-Crash-Window: actions.jsonl now contains TWO lines per
-        // mutation (pending, then completed). Filter to the completed line.
+        // actions.jsonl contains two lines per mutation: pending, then
+        // completed. Validate the completed action record.
         let lines: Vec<serde_json::Value> = actions
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -872,11 +867,9 @@ mod tests {
 
     #[test]
     fn write_file_backs_up_existing_content_verbatim() {
-        // Pass-4: backups now live under `backups/seq_<started_at_ns>/<rel>`
-        // (per-mutation, not per-path) so multiple mutations to the same
-        // file in one run don't overwrite each other's backups. Verify
-        // by enumerating the backups dir and finding hello.txt with
-        // original content, regardless of the seq directory.
+        // Backups live under `backups/seq_<started_at_ns>/<rel>` so multiple
+        // mutations to the same file in one run cannot overwrite each
+        // other's backups.
         let td = TempDir::new().unwrap();
         let target = td.path().join("hello.txt");
         fs::write(&target, b"original\n").unwrap();
@@ -909,14 +902,13 @@ mod tests {
     }
 
     #[test]
-    fn pass4_multiple_mutations_to_same_path_get_distinct_backups() {
-        // Pass-4: caught by property test. Two mutations to the same path
-        // must NOT overwrite each other's backups. Each mutation gets its
-        // own seq_<ns> subdir.
+    fn multiple_mutations_to_same_path_get_distinct_backups() {
+        // Two mutations to the same path must not overwrite each other's
+        // backups. Each mutation gets its own seq_<ns> subdir.
         let td = TempDir::new().unwrap();
         let target = td.path().join("collide.txt");
         fs::write(&target, b"v0\n").unwrap();
-        let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__pass4");
+        let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__multi");
         // Two consecutive mutations.
         let _ = mutate(
             &ctx,
@@ -1029,7 +1021,7 @@ mod tests {
                 .join("actions.jsonl"),
         )
         .unwrap();
-        // Pass-5 G-Crash-Window: filter to the completed line (pending is first).
+        // The pending line is first; validate the completed line.
         let lines: Vec<serde_json::Value> = actions
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
@@ -1046,7 +1038,6 @@ mod tests {
     #[test]
     fn db_exec_returns_err_unsupported_in_this_module() {
         // Wired by the dispatch layer; the chokepoint itself doesn't have a DbConn.
-        // Per H4 fix, mutate() now returns Err on exec failure (was: Ok with ok: false).
         let td = TempDir::new().unwrap();
         let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__abc");
         let target = td.path().join("anything.txt");
@@ -1142,8 +1133,8 @@ mod tests {
 
     #[test]
     fn out_of_scope_rename_destination_refuses_in_dry_run_too() {
-        // H8 fix: dry-run must not lie about would-be exit-4 refusals on
-        // out-of-scope rename destinations.
+        // Dry-run must not hide would-be exit-4 refusals on out-of-scope
+        // rename destinations.
         let td = TempDir::new().unwrap();
         let target = td.path().join("victim.txt");
         std::fs::write(&target, b"x").unwrap();

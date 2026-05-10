@@ -7,8 +7,8 @@
 //!
 //! The existing verbs (`check`, `repair`, `backups`, `restore`,
 //! `reconstruct`, `archive-scan`, `archive-normalize`, `fix`,
-//! `fix-orphan-refs`, `pack-archive`) continue to work; pass-2 will
-//! refactor them through the chokepoint.
+//! `fix-orphan-refs`, `pack-archive`) continue to work while fixers move
+//! through the chokepoint.
 //!
 //! Every public surface here matches CLI-SURFACE.md from the
 //! `world-class-doctor-mode-for-cli-tools` skill verbatim. The handbook
@@ -29,8 +29,8 @@ use std::path::PathBuf;
 /// Print `capabilities --json` (or text fallback for `--format toon`).
 pub fn handle_capabilities(format: Option<CliOutputFormat>) -> CliResult<()> {
     let tool_version = env!("CARGO_PKG_VERSION").to_string();
-    // Pass-1: write_scopes are computed lazily by the existing fixers;
-    // here we expose the canonical set we know about.
+    // Existing fixers compute write scopes lazily; expose the canonical set
+    // known by the doctor surface.
     let write_scopes = default_write_scopes();
     let report = capabilities::build_report(tool_version, write_scopes);
 
@@ -60,10 +60,9 @@ pub fn handle_robot_docs() -> CliResult<()> {
 /// Reads `.doctor/latest/report.json` if available; else returns a stub
 /// directing the agent to `am doctor` first. JSON only.
 ///
-/// `quick=true` is recorded as metadata; pass-3 returns the filter
-/// flag in the envelope. Per-FM detector-level filtering happens in
-/// pass-4 once the per-FM detector registry is wired (today the
-/// quick_mode_eligible attribute is on the capabilities side only).
+/// `quick=true` is recorded as metadata in the envelope. Detector-level
+/// filtering is available once the detector registry is wired; today the
+/// `quick_mode_eligible` attribute lives on the capabilities side.
 pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
@@ -229,7 +228,7 @@ pub fn handle_explain(
 
 /// `am doctor selftest` — end-to-end exercise of the chokepoint primitives.
 ///
-/// Pass-6 deliverable. In an isolated tempdir:
+/// In an isolated tempdir:
 /// 1. WriteFile mutation through `mutate()` (verifies pending+completed
 ///    actions.jsonl entries, per-mutation seq backup, atomic write).
 /// 2. AppendFile mutation (verifies append + O_NOFOLLOW path).
@@ -282,7 +281,9 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
     {
         Ok(f) => f,
         Err(e) => {
-            return Err(CliError::Other(format!("opening actions.jsonl failed: {e}")));
+            return Err(CliError::Other(format!(
+                "opening actions.jsonl failed: {e}"
+            )));
         }
     };
 
@@ -326,17 +327,13 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
             content: b"appended\n".to_vec(),
         },
     );
-    let ok2 =
-        r2.is_ok() && fs::read_to_string(&target_a).ok().as_deref() == Some("alpha new\nappended\n");
+    let ok2 = r2.is_ok()
+        && fs::read_to_string(&target_a).ok().as_deref() == Some("alpha new\nappended\n");
     all_ok &= ok2;
     checks.push(serde_json::json!({"name": "append_file_mutation", "ok": ok2}));
 
     // Step 3: Chmod mutation.
-    let r3 = mutate::mutate(
-        &ctx,
-        &target_a,
-        mutate::Op::Chmod { mode: 0o600 },
-    );
+    let r3 = mutate::mutate(&ctx, &target_a, mutate::Op::Chmod { mode: 0o600 });
     let ok3 = r3.is_ok()
         && fs::metadata(&target_a)
             .map(|m| m.permissions().mode() & 0o777 == 0o600)
@@ -369,11 +366,7 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("seq_")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("seq_"))
         .collect();
     let ok5 = seq_dirs.len() >= 4;
     all_ok &= ok5;
@@ -454,7 +447,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
 
     let Some(report_path) = report_path else {
         println!("warn: no report.json in latest run");
-        // H1 fix: explicit exit 1 (`findings_present_no_fix`).
+        // Explicit exit 1: findings are present and no fix was run.
         return Err(CliError::ExitCode(1));
     };
 
@@ -479,7 +472,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             "findings_present: {} findings (last run exit {})",
             total, exit_code
         );
-        // H1 fix: explicit exit 1 (`findings_present_no_fix`).
+        // Explicit exit 1: findings are present and no fix was run.
         Err(CliError::ExitCode(1))
     }
 }
@@ -558,8 +551,7 @@ pub fn handle_undo(
         return Ok(());
     }
     let summary = undo::run_undo(target, &run_id, dry_run, strict)
-        // H1 fix: undo IO failures are exit 3 (`fix_failed_rolled_back`),
-        // not the catch-all exit 1.
+        // Undo I/O failures use exit 3 (`fix_failed_rolled_back`).
         .map_err(|e| {
             eprintln!("error: undo failed: {e}");
             CliError::ExitCode(3)
@@ -576,7 +568,7 @@ pub fn handle_undo(
     });
     match format.unwrap_or(CliOutputFormat::Json) {
         CliOutputFormat::Json => {
-            // H7 fix: don't .unwrap() on JSON serialization in user-facing path.
+            // Avoid unwraps in the user-facing JSON path.
             let s = serde_json::to_string_pretty(&json)
                 .map_err(|e| CliError::Other(format!("serializing undo result: {e}")))?;
             println!("{s}");
@@ -591,7 +583,7 @@ pub fn handle_undo(
     }
 
     if !summary.failures.is_empty() {
-        // H1 fix: exit 3 (`fix_failed_rolled_back`), not exit 1.
+        // Undo failures use exit 3 (`fix_failed_rolled_back`).
         eprintln!("error: undo had {} failures", summary.failures.len());
         return Err(CliError::ExitCode(3));
     }

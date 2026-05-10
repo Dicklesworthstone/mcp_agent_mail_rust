@@ -223,10 +223,7 @@ fn capabilities_report_schema_url_points_at_existing_spec_file() {
         "seq_",
         "exit_code",
     ] {
-        assert!(
-            body.contains(term),
-            "SPEC file should mention `{term}`"
-        );
+        assert!(body.contains(term), "SPEC file should mention `{term}`");
     }
 }
 
