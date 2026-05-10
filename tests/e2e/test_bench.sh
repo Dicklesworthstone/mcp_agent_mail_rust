@@ -55,19 +55,30 @@ run_bench_case() {
     local case_id="$1"
     shift
     local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local restore_errexit=0
+    case "$-" in
+        *e*) restore_errexit=1 ;;
+    esac
     mkdir -p "${case_dir}"
 
     e2e_mark_case_start "${case_id}"
     set +e
     "${AM_BIN}" bench "$@" >"${case_dir}/stdout.json" 2>"${case_dir}/stderr.txt"
     local rc=$?
-    set -e
+    if [ "${restore_errexit}" -eq 1 ]; then
+        set -e
+    else
+        set +e
+    fi
     echo "${rc}" >"${case_dir}/exit_code.txt"
     e2e_mark_case_end "${case_id}"
     return "${rc}"
 }
 
 WORKDIR="$(e2e_mktemp bench-e2e)"
+ATC_CANARY_STATE_DIR="${E2E_ARTIFACT_DIR}/atc_canary_state"
+mkdir -p "${ATC_CANARY_STATE_DIR}"
+export AM_ATC_CANARY_REPORT_DIR="${ATC_CANARY_STATE_DIR}"
 pushd "${WORKDIR}" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -86,7 +97,11 @@ if run_bench_case "bench_list_filter_json" --list --json --filter help; then
     e2e_assert_eq "list output default warmup" "3" "${warmup}"
     e2e_assert_eq "list output default runs" "10" "${runs}"
 
-    report_count="$(find benches/results -maxdepth 1 -name 'summary_*.json' 2>/dev/null | wc -l | tr -d ' ')"
+    if [ -d benches/results ]; then
+        report_count="$(find benches/results -maxdepth 1 -name 'summary_*.json' | wc -l | tr -d ' ')"
+    else
+        report_count="0"
+    fi
     e2e_assert_eq "list mode does not write summary report" "0" "${report_count}"
 else
     e2e_fail "bench --list --json --filter help failed"
@@ -183,8 +198,8 @@ fi
 
 if run_bench_case "bench_compare_saved_baseline" --json --filter help --baseline "${BASELINE_PATH}"; then
     out_file="${E2E_ARTIFACT_DIR}/bench_compare_saved_baseline/stdout.json"
-    baseline_present="$(jq -r '.summary.benchmarks.help.baseline.baseline_p95_ms != null' "${out_file}")"
-    delta_present="$(jq -r '.summary.benchmarks.help.baseline.delta_p95_ms != null' "${out_file}")"
+    baseline_present="$(jq -r '(.summary.benchmarks.help.baseline.baseline_p95_ms // .summary.benchmarks.help.baseline_p95_ms) != null' "${out_file}")"
+    delta_present="$(jq -r '(.summary.benchmarks.help.baseline.delta_p95_ms // .summary.benchmarks.help.delta_p95_ms) != null' "${out_file}")"
     e2e_assert_eq "baseline compare populates baseline_p95_ms" "true" "${baseline_present}"
     e2e_assert_eq "baseline compare populates delta_p95_ms" "true" "${delta_present}"
 else
@@ -208,7 +223,7 @@ set -e
 e2e_assert_eq "forced regression returns exit code 3" "3" "${reg_rc}"
 out_file="${E2E_ARTIFACT_DIR}/bench_forced_regression/stdout.json"
 if [ -f "${out_file}" ]; then
-    regression_flag="$(jq -r '.summary.benchmarks.help.baseline.regression' "${out_file}" 2>/dev/null || echo "false")"
+    regression_flag="$(jq -r '(.summary.benchmarks.help.baseline.regression // .summary.benchmarks.help.regression)' "${out_file}" 2>/dev/null || echo "false")"
     e2e_assert_eq "forced regression marks help benchmark" "true" "${regression_flag}"
 else
     e2e_fail "forced regression output file missing"
@@ -219,7 +234,8 @@ fi
 # ---------------------------------------------------------------------------
 e2e_case_banner "atc_perf_gate_absolute_drift_is_advisory"
 ATC_GATE_PASS_REPORT="${WORKDIR}/atc_gate_absolute_drift_report.json"
-ATC_GATE_PASS_OUT="${WORKDIR}/atc_gate_absolute_drift_out"
+ATC_GATE_PASS_OUT="${E2E_ARTIFACT_DIR}/atc_gate_absolute_drift_out"
+ATC_GATE_PASS_DB="${WORKDIR}/atc_gate_absolute_drift.sqlite3"
 cat > "${ATC_GATE_PASS_REPORT}" <<'JSON'
 {
   "summary": {
@@ -247,12 +263,23 @@ cat > "${ATC_GATE_PASS_REPORT}" <<'JSON'
   "failures": []
 }
 JSON
+python3 - "${ATC_GATE_PASS_DB}" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("CREATE TABLE atc_experiences (experience_id INTEGER PRIMARY KEY)")
+conn.executemany("INSERT INTO atc_experiences DEFAULT VALUES", [(), ()])
+conn.commit()
+conn.close()
+PY
 
 set +e
 bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
     --skip-bench \
     --baseline "${PROJECT_ROOT}/benches/atc_perf_baseline.json" \
     --bench-report "${ATC_GATE_PASS_REPORT}" \
+    --canary-db "${ATC_GATE_PASS_DB}" \
     --output-dir "${ATC_GATE_PASS_OUT}"
 atc_gate_pass_rc=$?
 set -e
@@ -266,13 +293,68 @@ e2e_assert_eq \
     "ATC gate preserves advisory baseline drift list" \
     "3" \
     "$(jq -r '.baseline_regressions | length' "${ATC_GATE_PASS_OUT}/summary.json")"
+e2e_assert_eq \
+    "ATC canary report records sqlite quick_check" \
+    "ok" \
+    "$(jq -r '.db_health.quick_check' "${ATC_GATE_PASS_OUT}/canary_report.json")"
+e2e_assert_eq \
+    "ATC canary report counts ATC rows" \
+    "2" \
+    "$(jq -r '.db_health.atc_rows' "${ATC_GATE_PASS_OUT}/canary_report.json")"
+e2e_assert_eq \
+    "ATC canary report passes fallback decision" \
+    "canary_passed" \
+    "$(jq -r '.fallback_decision.verdict' "${ATC_GATE_PASS_OUT}/canary_report.json")"
+e2e_assert_eq \
+    "ATC latest canary report is published for robot/TUI surfaces" \
+    "canary_passed" \
+    "$(jq -r '.fallback_decision.verdict' "${ATC_CANARY_STATE_DIR}/latest_canary_report.json")"
+e2e_assert_eq \
+    "ATC latest canary report points at the run artifact" \
+    "${ATC_GATE_PASS_OUT}/canary_report.json" \
+    "$(jq -r '.artifacts.canary_report' "${ATC_CANARY_STATE_DIR}/latest_canary_report.json")"
+
+# ---------------------------------------------------------------------------
+# Case 6b: ATC perf gate holds live when no durable ATC rows were observed
+# ---------------------------------------------------------------------------
+e2e_case_banner "atc_perf_gate_zero_rows_holds_live"
+ATC_GATE_ZERO_REPORT="${WORKDIR}/atc_gate_zero_rows_report.json"
+ATC_GATE_ZERO_OUT="${E2E_ARTIFACT_DIR}/atc_gate_zero_rows_out"
+ATC_GATE_ZERO_DB="${WORKDIR}/atc_gate_zero_rows.sqlite3"
+cp "${ATC_GATE_PASS_REPORT}" "${ATC_GATE_ZERO_REPORT}"
+python3 - "${ATC_GATE_ZERO_DB}" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("CREATE TABLE atc_experiences (experience_id INTEGER PRIMARY KEY)")
+conn.commit()
+conn.close()
+PY
+
+set +e
+bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
+    --skip-bench \
+    --baseline "${PROJECT_ROOT}/benches/atc_perf_baseline.json" \
+    --bench-report "${ATC_GATE_ZERO_REPORT}" \
+    --canary-db "${ATC_GATE_ZERO_DB}" \
+    --output-dir "${ATC_GATE_ZERO_OUT}"
+atc_gate_zero_rc=$?
+set -e
+
+e2e_assert_eq "ATC gate allows latency pass with zero-row fallback advice" "0" "${atc_gate_zero_rc}"
+e2e_assert_eq \
+    "ATC zero-row canary holds live rollout" \
+    "hold_live" \
+    "$(jq -r '.fallback_decision.verdict' "${ATC_GATE_ZERO_OUT}/canary_report.json")"
 
 # ---------------------------------------------------------------------------
 # Case 7: ATC perf gate fails when relative overhead breaches the budget
 # ---------------------------------------------------------------------------
 e2e_case_banner "atc_perf_gate_overhead_regression_exit_code"
 ATC_GATE_FAIL_REPORT="${WORKDIR}/atc_gate_overhead_regression_report.json"
-ATC_GATE_FAIL_OUT="${WORKDIR}/atc_gate_overhead_regression_out"
+ATC_GATE_FAIL_OUT="${E2E_ARTIFACT_DIR}/atc_gate_overhead_regression_out"
+ATC_GATE_FAIL_DB="${WORKDIR}/atc_gate_overhead_regression.sqlite3"
 cat > "${ATC_GATE_FAIL_REPORT}" <<'JSON'
 {
   "summary": {
@@ -300,12 +382,23 @@ cat > "${ATC_GATE_FAIL_REPORT}" <<'JSON'
   "failures": []
 }
 JSON
+python3 - "${ATC_GATE_FAIL_DB}" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("CREATE TABLE atc_experiences (experience_id INTEGER PRIMARY KEY)")
+conn.execute("INSERT INTO atc_experiences DEFAULT VALUES")
+conn.commit()
+conn.close()
+PY
 
 set +e
 bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
     --skip-bench \
     --baseline "${PROJECT_ROOT}/benches/atc_perf_baseline.json" \
     --bench-report "${ATC_GATE_FAIL_REPORT}" \
+    --canary-db "${ATC_GATE_FAIL_DB}" \
     --output-dir "${ATC_GATE_FAIL_OUT}"
 atc_gate_fail_rc=$?
 set -e
@@ -315,6 +408,14 @@ e2e_assert_eq \
     "ATC gate summary flips to regression when overhead budget is breached" \
     "regression" \
     "$(jq -r '.status' "${ATC_GATE_FAIL_OUT}/summary.json")"
+e2e_assert_eq \
+    "ATC canary report recommends disabling live on live overhead regression" \
+    "disable_live" \
+    "$(jq -r '.fallback_decision.verdict' "${ATC_GATE_FAIL_OUT}/canary_report.json")"
+e2e_assert_eq \
+    "ATC latest canary report tracks most recent fallback verdict" \
+    "disable_live" \
+    "$(jq -r '.fallback_decision.verdict' "${ATC_CANARY_STATE_DIR}/latest_canary_report.json")"
 
 popd >/dev/null
 

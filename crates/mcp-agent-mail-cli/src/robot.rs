@@ -12,8 +12,9 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::{McpContext, McpError, McpResult};
 use mcp_agent_mail_core::{
     AgentHealthGrade, AgentHealthInputs, AgentHealthMetric, AgentHealthScorecard,
-    TailLatencyPhaseLedger, TailLatencyPhaseRecorder, append_tail_latency_evidence_if_configured,
-    compute_agent_health,
+    AtcCanaryReportSummary, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
+    append_tail_latency_evidence_if_configured, compute_agent_health,
+    load_latest_atc_canary_report,
 };
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value;
@@ -1598,6 +1599,8 @@ struct AtcData {
     since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stratum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canary: Option<AtcCanaryReportSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<AtcSummaryData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8904,6 +8907,7 @@ fn build_atc_data(
     focus_agent: Option<&str>,
     since: Option<&str>,
     stratum_filter: Option<&str>,
+    canary: Option<AtcCanaryReportSummary>,
     summary_only: bool,
     limit: usize,
 ) -> AtcData {
@@ -8926,6 +8930,7 @@ fn build_atc_data(
         note: snapshot.note.clone(),
         since: since.map(ToString::to_string),
         stratum: stratum_filter.map(ToString::to_string),
+        canary,
         summary: show_summary.then(|| atc_summary_data(&snapshot, stratum_filter, limit)),
         decisions: show_decisions
             .then(|| atc_filtered_decisions(&snapshot, focus_agent, None, since_micros, limit)),
@@ -10474,8 +10479,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let focus_agent = atc_focus_agent_name(args.agent.as_deref());
             let limit = atc_default_limit(limit);
             since.as_deref().map(parse_since_micros).transpose()?;
-            let live_endpoint =
-                atc_live_endpoint_from_config(&mcp_agent_mail_core::Config::from_env());
+            let config = mcp_agent_mail_core::Config::from_env();
+            let canary = load_latest_atc_canary_report(&config.storage_root);
+            let live_endpoint = atc_live_endpoint_from_config(&config);
             let maybe_scope =
                 maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
 
@@ -10541,12 +10547,26 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 focus_agent.as_deref(),
                 since.as_deref(),
                 stratum.as_deref(),
+                canary,
                 summary_only,
                 limit,
             );
 
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = project_slug;
+            let canary_alert = env
+                .data
+                .canary
+                .as_ref()
+                .filter(|canary| canary.verdict != "canary_passed")
+                .map(|canary| (canary.verdict.clone(), canary.artifact_path.clone()));
+            if let Some((verdict, artifact_path)) = canary_alert {
+                env = env.with_alert(
+                    "warn",
+                    format!("Latest ATC canary verdict: {verdict}"),
+                    Some(artifact_path),
+                );
+            }
             if let Some(error) = live_error {
                 let alert_summary = if env.data.source == "local_db" {
                     "Live ATC snapshot unavailable; using local DB fallback"
@@ -11056,6 +11076,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             5,
         );
@@ -11178,6 +11199,38 @@ mod tests {
     }
 
     #[test]
+    fn build_atc_data_surfaces_latest_canary_report() {
+        let canary = AtcCanaryReportSummary {
+            status: "pass".to_string(),
+            verdict: "hold_live".to_string(),
+            artifact_path: "/tmp/atc/canary_report.json".to_string(),
+            quick_check: "ok".to_string(),
+            atc_rows: Some(0),
+            live_p95_ms: Some(13.0),
+            shadow_p95_ms: Some(12.5),
+            reason: "canary database recorded no ATC experience rows".to_string(),
+            recommendation: "keep live writes disabled".to_string(),
+            safe_command: Some("export AM_ATC_WRITE_MODE=shadow".to_string()),
+        };
+
+        let data = build_atc_data(
+            sample_atc_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(canary),
+            true,
+            5,
+        );
+
+        let surfaced = data.canary.expect("canary report");
+        assert_eq!(surfaced.verdict, "hold_live");
+        assert_eq!(surfaced.artifact_path, "/tmp/atc/canary_report.json");
+        assert_eq!(surfaced.atc_rows, Some(0));
+    }
+
+    #[test]
     fn build_atc_data_summary_only_filters_since_and_stratum() {
         let data = build_atc_data(
             sample_atc_snapshot(),
@@ -11185,6 +11238,7 @@ mod tests {
             None,
             Some("1970-01-01T00:00:02Z"),
             Some("liveness:probe:0"),
+            None,
             true,
             5,
         );
@@ -11241,7 +11295,16 @@ mod tests {
             ("conflict:release:2".to_string(), 6),
         ]);
 
-        let data = build_atc_data(snapshot, Vec::new(), None, None, Some("liveness"), true, 1);
+        let data = build_atc_data(
+            snapshot,
+            Vec::new(),
+            None,
+            None,
+            Some("liveness"),
+            None,
+            true,
+            1,
+        );
         let summary = data.summary.expect("summary");
 
         assert_eq!(

@@ -29,12 +29,13 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{AtcCanaryReportSummary, Config, load_latest_atc_canary_report};
 use serde::{Deserialize, Serialize};
 
 use crate::tui_bridge::{
     ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState, query_params_explain_empty_state,
 };
+use crate::tui_events::MailEvent;
 use crate::tui_widgets::{
     AnomalyCard, AnomalySeverity, MetricTile, MetricTrend, ReservationGauge, WidgetState,
 };
@@ -99,6 +100,159 @@ fn level_styled_line(
         Span::raw("  "),
         Span::styled(detail, detail_style),
     ])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitSegfaultRetryToastSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitSegfaultRetryToast {
+    pub severity: GitSegfaultRetryToastSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GitSegfaultRetryToastState {
+    first_warning_emitted: bool,
+    window_started_at: Option<Instant>,
+    window_count: u32,
+    window_warning_emitted: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GitSegfaultRetryBadge {
+    retry_count: u32,
+    exhausted_count: u32,
+}
+
+fn git_segfault_first_warning_text(repo_slug: &str) -> String {
+    format!(
+        "git 2.51.0 segfault retried on {repo_slug}. Set AM_GIT_BINARY or upgrade git to stop seeing this."
+    )
+}
+
+fn git_segfault_window_warning_text() -> &'static str {
+    "git 2.51.0 segfault retries reached 30 in 5min — production impact likely. Investigate."
+}
+
+fn git_segfault_exhausted_error_text(repo_slug: &str) -> String {
+    format!(
+        "git 2.51.0 retry EXHAUSTED on {repo_slug}. Operations failing. Set AM_GIT_BINARY immediately."
+    )
+}
+
+fn git_segfault_retry_badge_text(retry_count: u32, exhausted_count: u32) -> String {
+    if exhausted_count > 0 {
+        format!("git segfault retries: {retry_count} (EXHAUSTED {exhausted_count})")
+    } else if retry_count >= 30 {
+        format!("git segfault retries: {retry_count} (HIGH)")
+    } else {
+        format!("git segfault retries: {retry_count}")
+    }
+}
+
+fn git_segfault_retry_badge_level(retry_count: u32, exhausted_count: u32) -> Level {
+    if exhausted_count > 0 {
+        Level::Fail
+    } else if retry_count >= 30 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn git_segfault_retry_event(event: &MailEvent) -> Option<(&str, bool)> {
+    let MailEvent::GitSegfaultRetry {
+        repo_slug,
+        exhausted,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some((repo_slug.as_str(), *exhausted))
+}
+
+fn update_git_segfault_window(state: &mut GitSegfaultRetryToastState, now: Instant) -> u32 {
+    const WINDOW: Duration = Duration::from_secs(5 * 60);
+    match state.window_started_at {
+        Some(started_at) if now.duration_since(started_at) < WINDOW => {
+            state.window_count = state.window_count.saturating_add(1);
+        }
+        _ => {
+            state.window_started_at = Some(now);
+            state.window_count = 1;
+            state.window_warning_emitted = false;
+        }
+    }
+    state.window_count
+}
+
+pub(crate) fn git_segfault_retry_toast_handler(
+    state: &mut GitSegfaultRetryToastState,
+    event: &MailEvent,
+    now: Instant,
+    toasts_enabled: bool,
+    category_enabled: bool,
+) -> Vec<GitSegfaultRetryToast> {
+    let Some((repo_slug, exhausted)) = git_segfault_retry_event(event) else {
+        return Vec::new();
+    };
+
+    let window_count = update_git_segfault_window(state, now);
+    if !toasts_enabled || !category_enabled {
+        return Vec::new();
+    }
+
+    let mut toasts = Vec::new();
+    if exhausted {
+        toasts.push(GitSegfaultRetryToast {
+            severity: GitSegfaultRetryToastSeverity::Error,
+            message: git_segfault_exhausted_error_text(repo_slug),
+        });
+        return toasts;
+    }
+
+    if !state.first_warning_emitted {
+        state.first_warning_emitted = true;
+        toasts.push(GitSegfaultRetryToast {
+            severity: GitSegfaultRetryToastSeverity::Warning,
+            message: git_segfault_first_warning_text(repo_slug),
+        });
+    }
+
+    if window_count >= 30 && !state.window_warning_emitted {
+        state.window_warning_emitted = true;
+        toasts.push(GitSegfaultRetryToast {
+            severity: GitSegfaultRetryToastSeverity::Warning,
+            message: git_segfault_window_warning_text().to_string(),
+        });
+    }
+
+    toasts
+}
+
+impl GitSegfaultRetryBadge {
+    fn ingest(&mut self, event: &MailEvent) {
+        let Some((_, exhausted)) = git_segfault_retry_event(event) else {
+            return;
+        };
+        self.retry_count = self.retry_count.saturating_add(1);
+        if exhausted {
+            self.exhausted_count = self.exhausted_count.saturating_add(1);
+        }
+    }
+
+    fn text(self) -> String {
+        git_segfault_retry_badge_text(self.retry_count, self.exhausted_count)
+    }
+
+    fn level(self) -> Level {
+        git_segfault_retry_badge_level(self.retry_count, self.exhausted_count)
+    }
 }
 
 /// Human-readable HTTP status description.
@@ -341,7 +495,7 @@ impl GitRefIntegritySweepState {
             .filter(|project| project.finding_count > 0)
             .count();
         Some(format!(
-            "archive has {} orphan refs across {} projects. Run: am doctor fix-orphan-refs --all --dry-run",
+            "registered projects have {} orphan refs across {} projects. Run: am doctor fix-orphan-refs --all --dry-run",
             self.total_findings, affected_projects
         ))
     }
@@ -364,6 +518,7 @@ struct DiagnosticsSnapshot {
     path_probes: Vec<PathProbe>,
     lines: Vec<ProbeLine>,
     atc: crate::AtcOperatorSnapshot,
+    atc_canary: Option<AtcCanaryReportSummary>,
     agent_attention_count: usize,
     agent_attention_summary: String,
     git_ref_integrity: GitRefIntegritySweepState,
@@ -405,6 +560,8 @@ pub struct SystemHealthScreen {
     /// Generation snapshot from last tick (for dirty-state gating).
     #[allow(dead_code)] // reserved for future tick() gating
     last_data_gen: super::DataGeneration,
+    git_segfault_last_seq: u64,
+    git_segfault_badge: GitSegfaultRetryBadge,
 }
 
 fn system_health_worker_spawn_failure_message(error: &std::io::Error) -> String {
@@ -426,6 +583,7 @@ fn diagnostics_worker_spawn_failure_snapshot(
         token_present: env_cfg.http_bearer_token.is_some(),
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
         atc: crate::atc_operator_snapshot(),
+        atc_canary: load_latest_atc_canary_report(&env_cfg.storage_root),
         ..Default::default()
     };
 
@@ -505,6 +663,8 @@ impl SystemHealthScreen {
             last_detail_max_scroll: std::cell::Cell::new(0),
             anomaly_cursor: 0,
             last_data_gen: super::DataGeneration::stale(),
+            git_segfault_last_seq: state.event_ring_stats().next_seq.saturating_sub(1),
+            git_segfault_badge: GitSegfaultRetryBadge::default(),
         }
     }
 
@@ -800,6 +960,33 @@ impl SystemHealthScreen {
                 hint_style,
             ),
         ]));
+        if let Some(canary) = &snap.atc_canary {
+            let atc_rows = canary
+                .atc_rows
+                .map_or_else(|| "--".to_string(), |rows| rows.to_string());
+            let live_p95 = canary
+                .live_p95_ms
+                .map_or_else(|| "--".to_string(), |p95| format!("{p95:.2}ms"));
+            let canary_style = if canary.verdict == "canary_passed" {
+                crate::tui_theme::text_success(&tp)
+            } else {
+                crate::tui_theme::text_warning(&tp)
+            };
+            lines.push(Line::from_spans([
+                Span::styled("Canary:   ", label_style),
+                Span::styled(
+                    format!(
+                        "verdict={}  quick_check={}  atc_rows={}  live_p95={}",
+                        canary.verdict, canary.quick_check, atc_rows, live_p95
+                    ),
+                    canary_style,
+                ),
+            ]));
+            lines.push(Line::from_spans([
+                Span::styled("Artifact: ", label_style),
+                Span::styled(canary.artifact_path.clone(), hint_style),
+            ]));
+        }
         if let Some(decision) = snap.atc.recent_decisions.first() {
             lines.push(Line::from_spans([
                 Span::styled("Decision:  ", label_style),
@@ -881,6 +1068,13 @@ impl SystemHealthScreen {
             "\u{2500}\u{2500} Git ref integrity \u{2500}\u{2500}",
             section_style,
         )]));
+        let segfault_badge = self.git_segfault_badge;
+        lines.push(level_styled_line(
+            segfault_badge.level(),
+            &tp,
+            "Git retry guard".to_string(),
+            segfault_badge.text(),
+        ));
         let git_sweep = &snap.git_ref_integrity;
         let git_level = git_sweep.level();
         lines.push(level_styled_line(
@@ -1373,6 +1567,15 @@ impl SystemHealthScreen {
             .iter()
             .filter(|agent| agent.state != "alive")
             .count();
+        let canary_label = snap.atc_canary.as_ref().map_or_else(
+            || "none".to_string(),
+            |canary| {
+                let rows = canary
+                    .atc_rows
+                    .map_or_else(|| "--".to_string(), |rows| rows.to_string());
+                format!("{} rows={}", canary.verdict, rows)
+            },
+        );
         tracing::debug!(
             event = "tui.system_health.atc_widget_rendered",
             writes_total = snap.atc.observability.experiences_written_total,
@@ -1382,7 +1585,7 @@ impl SystemHealthScreen {
         );
 
         let body = format!(
-            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}\nattention={} worst={}",
+            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}\ncanary={} attention={} worst={}",
             tick_age,
             tick_p95,
             atc_tick_is_stale(&snap.atc),
@@ -1399,6 +1602,7 @@ impl SystemHealthScreen {
                 "off"
             },
             if snap.atc.safe_mode { "on" } else { "off" },
+            canary_label,
             snap.agent_attention_count,
             snap.agent_attention_summary,
         );
@@ -1955,6 +2159,13 @@ impl MailScreen for SystemHealthScreen {
         }
     }
 
+    fn tick(&mut self, _tick_count: u64, state: &TuiSharedState) {
+        for event in state.events_since_limited(self.git_segfault_last_seq, 256) {
+            self.git_segfault_last_seq = self.git_segfault_last_seq.max(event.seq());
+            self.git_segfault_badge.ingest(&event);
+        }
+    }
+
     fn keybindings(&self) -> Vec<HelpEntry> {
         vec![
             HelpEntry {
@@ -2230,6 +2441,7 @@ fn run_diagnostics(
         token_present: env_cfg.http_bearer_token.is_some(),
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
         atc: crate::atc_operator_snapshot(),
+        atc_canary: load_latest_atc_canary_report(&env_cfg.storage_root),
         remote_url,
         ..Default::default()
     };
@@ -2411,6 +2623,31 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             remediation: Some(
                 "Inspect ATC budget pressure and calibration telemetry before trusting automation breadth.".into(),
             ),
+        });
+    }
+
+    if let Some(canary) = &out.atc_canary
+        && canary.verdict != "canary_passed"
+    {
+        out.lines.push(ProbeLine {
+            level: if canary.verdict == "disable_live" {
+                Level::Fail
+            } else {
+                Level::Warn
+            },
+            name: "atc-canary",
+            detail: format!(
+                "Latest ATC canary verdict is {} (quick_check={}, atc_rows={})",
+                canary.verdict,
+                canary.quick_check,
+                canary
+                    .atc_rows
+                    .map_or_else(|| "--".to_string(), |rows| rows.to_string())
+            ),
+            remediation: Some(format!(
+                "{} Report: {}",
+                canary.recommendation, canary.artifact_path
+            )),
         });
     }
 
@@ -2705,8 +2942,8 @@ fn git_ref_kind(
 fn git_ref_severity(category: mcp_agent_mail_storage::recovery::RefCategory) -> &'static str {
     match category {
         mcp_agent_mail_storage::recovery::RefCategory::Protected => "error",
-        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => "warning",
-        mcp_agent_mail_storage::recovery::RefCategory::AskUser => "warning",
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => "warn",
+        mcp_agent_mail_storage::recovery::RefCategory::AskUser => "warn",
     }
 }
 
@@ -3212,6 +3449,233 @@ mod tests {
         path
     }
 
+    fn segfault_retry_event(exhausted: bool) -> MailEvent {
+        MailEvent::git_segfault_retry(
+            if exhausted {
+                "git_segfault_retry_exhausted"
+            } else {
+                "git_segfault_retry_attempt"
+            },
+            "data-projects-foo",
+            if exhausted { 4 } else { 1 },
+            Some(11),
+            exhausted,
+        )
+    }
+
+    #[test]
+    fn segfault_toast_first_event_emits_warning() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let now = Instant::now();
+        let toasts = git_segfault_retry_toast_handler(
+            &mut state,
+            &segfault_retry_event(false),
+            now,
+            true,
+            true,
+        );
+
+        assert_eq!(toasts.len(), 1);
+        assert_eq!(toasts[0].severity, GitSegfaultRetryToastSeverity::Warning);
+        assert_eq!(
+            toasts[0].message,
+            "git 2.51.0 segfault retried on data-projects-foo. Set AM_GIT_BINARY or upgrade git to stop seeing this."
+        );
+    }
+
+    #[test]
+    fn segfault_toast_subsequent_event_increments_badge_only() {
+        let mut toast_state = GitSegfaultRetryToastState::default();
+        let mut badge = GitSegfaultRetryBadge::default();
+        let now = Instant::now();
+        let event = segfault_retry_event(false);
+        let mut toast_count = 0;
+
+        for _ in 0..5 {
+            badge.ingest(&event);
+            toast_count +=
+                git_segfault_retry_toast_handler(&mut toast_state, &event, now, true, true).len();
+        }
+
+        assert_eq!(toast_count, 1);
+        assert_eq!(badge.retry_count, 5);
+        assert_eq!(badge.text(), "git segfault retries: 5");
+    }
+
+    #[test]
+    fn segfault_toast_respects_global_toast_disabled_env() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let mut badge = GitSegfaultRetryBadge::default();
+        let event = segfault_retry_event(false);
+        badge.ingest(&event);
+
+        let toasts =
+            git_segfault_retry_toast_handler(&mut state, &event, Instant::now(), false, true);
+
+        assert!(toasts.is_empty());
+        assert_eq!(badge.retry_count, 1);
+    }
+
+    #[test]
+    fn segfault_toast_respects_specific_category_disabled_env() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let toasts = git_segfault_retry_toast_handler(
+            &mut state,
+            &segfault_retry_event(false),
+            Instant::now(),
+            true,
+            false,
+        );
+
+        assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn segfault_toast_badge_format_plain_below_threshold() {
+        assert_eq!(
+            git_segfault_retry_badge_text(29, 0),
+            "git segfault retries: 29"
+        );
+        assert_eq!(git_segfault_retry_badge_level(29, 0), Level::Ok);
+    }
+
+    #[test]
+    fn segfault_toast_badge_format_high_above_30() {
+        assert_eq!(
+            git_segfault_retry_badge_text(30, 0),
+            "git segfault retries: 30 (HIGH)"
+        );
+        assert_eq!(git_segfault_retry_badge_level(30, 0), Level::Warn);
+    }
+
+    #[test]
+    fn segfault_toast_badge_format_exhausted_when_exhaust_count_positive() {
+        assert_eq!(
+            git_segfault_retry_badge_text(31, 1),
+            "git segfault retries: 31 (EXHAUSTED 1)"
+        );
+        assert_eq!(git_segfault_retry_badge_level(31, 1), Level::Fail);
+    }
+
+    #[test]
+    fn segfault_toast_rate_limit_emits_followup_at_30() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let now = Instant::now();
+        let event = segfault_retry_event(false);
+        let mut messages = Vec::new();
+
+        for _ in 0..30 {
+            messages.extend(
+                git_segfault_retry_toast_handler(&mut state, &event, now, true, true)
+                    .into_iter()
+                    .map(|toast| toast.message),
+            );
+        }
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1], git_segfault_window_warning_text());
+    }
+
+    #[test]
+    fn segfault_toast_window_resets_after_5min() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let start = Instant::now();
+        let event = segfault_retry_event(false);
+
+        for _ in 0..30 {
+            let _ = git_segfault_retry_toast_handler(&mut state, &event, start, true, true);
+        }
+        let after_window = start + Duration::from_secs(5 * 60 + 1);
+        let toasts = git_segfault_retry_toast_handler(&mut state, &event, after_window, true, true);
+
+        assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn segfault_toast_escalation_emits_error_on_exhausted() {
+        let mut state = GitSegfaultRetryToastState::default();
+        let toasts = git_segfault_retry_toast_handler(
+            &mut state,
+            &segfault_retry_event(true),
+            Instant::now(),
+            true,
+            true,
+        );
+
+        assert_eq!(toasts.len(), 1);
+        assert_eq!(toasts[0].severity, GitSegfaultRetryToastSeverity::Error);
+        assert_eq!(
+            toasts[0].message,
+            "git 2.51.0 retry EXHAUSTED on data-projects-foo. Operations failing. Set AM_GIT_BINARY immediately."
+        );
+    }
+
+    #[test]
+    fn segfault_toast_system_health_tick_updates_badge() {
+        let state = test_state();
+        let mut screen = SystemHealthScreen::new(Arc::clone(&state));
+        assert!(state.push_event(segfault_retry_event(false)));
+        assert!(state.push_event(segfault_retry_event(false)));
+        assert!(state.push_event(segfault_retry_event(true)));
+
+        screen.tick(1, &state);
+
+        assert_eq!(screen.git_segfault_badge.retry_count, 3);
+        assert_eq!(screen.git_segfault_badge.exhausted_count, 1);
+        assert_eq!(
+            screen.git_segfault_badge.text(),
+            "git segfault retries: 3 (EXHAUSTED 1)"
+        );
+    }
+
+    fn source_function_body<'a>(source: &'a str, fn_name: &str) -> &'a str {
+        let signature = format!("fn {fn_name}");
+        let start = source.find(&signature).expect("function signature");
+        let brace_start = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .expect("function body start");
+        let mut depth = 0_u32;
+        for (offset, ch) in source[brace_start..].char_indices() {
+            match ch {
+                '{' => depth = depth.saturating_add(1),
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let end = brace_start + offset + ch.len_utf8();
+                        return &source[brace_start..end];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body end for {fn_name}");
+    }
+
+    #[test]
+    fn segfault_toast_formatter_pure_no_env_reads() {
+        let source = include_str!("system_health.rs");
+        for fn_name in [
+            "git_segfault_first_warning_text",
+            "git_segfault_window_warning_text",
+            "git_segfault_exhausted_error_text",
+            "git_segfault_retry_badge_text",
+            "git_segfault_retry_badge_level",
+        ] {
+            let body = source_function_body(source, fn_name);
+            assert!(!body.contains("std::env"), "{fn_name} reads environment");
+            assert!(!body.contains("env::"), "{fn_name} reads environment");
+            assert!(
+                !body.contains("std::fs"),
+                "{fn_name} performs filesystem I/O"
+            );
+            assert!(
+                !body.contains("File::"),
+                "{fn_name} performs filesystem I/O"
+            );
+        }
+    }
+
     fn prunable_ref(
         ref_name: &str,
         category: mcp_agent_mail_storage::recovery::RefCategory,
@@ -3237,6 +3701,8 @@ mod tests {
             last_detail_max_scroll: std::cell::Cell::new(0),
             anomaly_cursor: 0,
             last_data_gen: crate::tui_screens::DataGeneration::default(),
+            git_segfault_last_seq: 0,
+            git_segfault_badge: GitSegfaultRetryBadge::default(),
         }
     }
 
@@ -4078,6 +4544,47 @@ mod tests {
     }
 
     #[test]
+    fn atc_findings_surface_canary_fallback_verdict() {
+        let mut out = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                ..Default::default()
+            },
+            atc_canary: Some(AtcCanaryReportSummary {
+                status: "pass".to_string(),
+                verdict: "hold_live".to_string(),
+                artifact_path: "/tmp/atc/canary_report.json".to_string(),
+                quick_check: "ok".to_string(),
+                atc_rows: Some(0),
+                live_p95_ms: Some(13.0),
+                shadow_p95_ms: Some(12.5),
+                reason: "canary database recorded no ATC experience rows".to_string(),
+                recommendation: "Do not promote live ATC writes.".to_string(),
+                safe_command: Some("export AM_ATC_WRITE_MODE=shadow".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        add_atc_findings(&mut out);
+
+        let finding = out
+            .lines
+            .iter()
+            .find(|line| line.name == "atc-canary")
+            .expect("canary finding");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.detail.contains("hold_live"));
+        assert!(finding.detail.contains("atc_rows=0"));
+        assert!(
+            finding
+                .remediation
+                .as_ref()
+                .is_some_and(|text| text.contains("/tmp/atc/canary_report.json"))
+        );
+    }
+
+    #[test]
     fn atc_findings_surface_agent_attention_warning() {
         let mut out = DiagnosticsSnapshot {
             atc: crate::AtcOperatorSnapshot {
@@ -4526,7 +5033,7 @@ mod tests {
         assert_eq!(
             sweep.banner().as_deref(),
             Some(
-                "archive has 3 orphan refs across 2 projects. Run: am doctor fix-orphan-refs --all --dry-run"
+                "registered projects have 3 orphan refs across 2 projects. Run: am doctor fix-orphan-refs --all --dry-run"
             )
         );
     }
@@ -4864,7 +5371,7 @@ reason = "manual prune"
                 ("project_slug", "proj-c"),
                 ("ref_kind", "orphan_stash"),
                 ("ref_name", "refs/stash"),
-                ("severity", "warning"),
+                ("severity", "warn"),
             ]
         );
         assert!(

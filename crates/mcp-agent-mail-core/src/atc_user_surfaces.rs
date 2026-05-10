@@ -41,6 +41,157 @@
 #![allow(clippy::doc_markdown)]
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// Environment override for an exact ATC canary report JSON path.
+pub const ATC_CANARY_REPORT_PATH_ENV: &str = "AM_ATC_CANARY_REPORT_PATH";
+/// Environment override for a directory containing `latest_canary_report.json`.
+pub const ATC_CANARY_REPORT_DIR_ENV: &str = "AM_ATC_CANARY_REPORT_DIR";
+/// Directory under `STORAGE_ROOT` where the latest ATC canary report is published.
+pub const ATC_CANARY_REPORT_DIR_NAME: &str = "atc_perf_gate";
+/// Stable filename read by robot and TUI surfaces.
+pub const ATC_CANARY_REPORT_FILE_NAME: &str = "latest_canary_report.json";
+
+/// Compact operator-facing summary of the latest ATC live-canary gate result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtcCanaryReportSummary {
+    /// Gate status (`pass`, `regression`, `benchmark_failed`, etc.).
+    pub status: String,
+    /// Canary fallback verdict (`canary_passed`, `hold_live`, `disable_live`, etc.).
+    pub verdict: String,
+    /// Path to the report artifact that produced this summary.
+    pub artifact_path: String,
+    /// SQLite `PRAGMA quick_check` result for the canary DB.
+    pub quick_check: String,
+    /// Number of durable ATC experience rows seen in the canary DB, when checked.
+    pub atc_rows: Option<u64>,
+    /// Live-mode p95 latency in milliseconds, when present.
+    pub live_p95_ms: Option<f64>,
+    /// Shadow-mode p95 latency in milliseconds, when present.
+    pub shadow_p95_ms: Option<f64>,
+    /// Human-readable reason attached to the fallback verdict.
+    pub reason: String,
+    /// Operator recommendation from the report.
+    pub recommendation: String,
+    /// Safe command suggested by the report, if any.
+    pub safe_command: Option<String>,
+}
+
+fn json_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn json_string_at(value: &Value, path: &[&str]) -> Option<String> {
+    json_at(value, path)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_u64_at(value: &Value, path: &[&str]) -> Option<u64> {
+    json_at(value, path)?.as_u64()
+}
+
+fn atc_canary_latency_p95_ms(value: &Value, benchmark_name: &str) -> Option<f64> {
+    value
+        .get("latency")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(benchmark_name))
+        .and_then(|entry| entry.get("p95_ms"))
+        .and_then(Value::as_f64)
+}
+
+fn parse_atc_canary_report(path: &Path, value: &Value) -> Option<AtcCanaryReportSummary> {
+    let verdict = json_string_at(value, &["fallback_decision", "verdict"])?;
+    let artifact_path = json_string_at(value, &["artifacts", "canary_report"])
+        .unwrap_or_else(|| path.display().to_string());
+    Some(AtcCanaryReportSummary {
+        status: json_string_at(value, &["status"]).unwrap_or_else(|| "unknown".to_string()),
+        verdict,
+        artifact_path,
+        quick_check: json_string_at(value, &["db_health", "quick_check"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        atc_rows: json_u64_at(value, &["db_health", "atc_rows"]),
+        live_p95_ms: atc_canary_latency_p95_ms(value, "mail_send_atc_live"),
+        shadow_p95_ms: atc_canary_latency_p95_ms(value, "mail_send_atc_shadow"),
+        reason: json_string_at(value, &["fallback_decision", "reason"]).unwrap_or_default(),
+        recommendation: json_string_at(value, &["fallback_decision", "recommendation"])
+            .unwrap_or_default(),
+        safe_command: json_string_at(value, &["fallback_decision", "safe_command"]),
+    })
+}
+
+/// Read a single ATC canary report JSON file into the compact summary surface.
+#[must_use]
+pub fn load_atc_canary_report_path(path: &Path) -> Option<AtcCanaryReportSummary> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    parse_atc_canary_report(path, &value)
+}
+
+fn latest_atc_canary_run_report(dir: &Path) -> Option<PathBuf> {
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let report_path = entry.path().join("canary_report.json");
+        if !report_path.is_file() {
+            continue;
+        }
+        let modified = report_path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if latest.as_ref().is_none_or(|(prev, _)| modified > *prev) {
+            latest = Some((modified, report_path));
+        }
+    }
+    latest.map(|(_, path)| path)
+}
+
+fn atc_canary_report_candidates(storage_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = std::env::var(ATC_CANARY_REPORT_PATH_ENV)
+        && !path.trim().is_empty()
+    {
+        paths.push(PathBuf::from(path));
+    }
+    if let Ok(dir) = std::env::var(ATC_CANARY_REPORT_DIR_ENV)
+        && !dir.trim().is_empty()
+    {
+        paths.push(PathBuf::from(dir).join(ATC_CANARY_REPORT_FILE_NAME));
+    }
+
+    paths.push(
+        storage_root
+            .join(ATC_CANARY_REPORT_DIR_NAME)
+            .join(ATC_CANARY_REPORT_FILE_NAME),
+    );
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let artifact_dir = cwd.join("tests/artifacts/perf/atc_perf_gate");
+        paths.push(artifact_dir.join(ATC_CANARY_REPORT_FILE_NAME));
+        if let Some(latest) = latest_atc_canary_run_report(&artifact_dir) {
+            paths.push(latest);
+        }
+    }
+
+    paths
+}
+
+/// Load the latest ATC canary report visible to operator surfaces.
+#[must_use]
+pub fn load_latest_atc_canary_report(storage_root: &Path) -> Option<AtcCanaryReportSummary> {
+    atc_canary_report_candidates(storage_root)
+        .into_iter()
+        .find_map(|path| load_atc_canary_report_path(&path))
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Surface state taxonomy
@@ -923,5 +1074,78 @@ mod tests {
         assert_eq!(ViewMode::Summary.to_string(), "summary");
         assert_eq!(ViewMode::Detailed.to_string(), "detailed");
         assert_eq!(ViewMode::Forensic.to_string(), "forensic");
+    }
+
+    #[test]
+    fn atc_canary_report_summary_reads_latest_storage_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let report_dir = temp.path().join(ATC_CANARY_REPORT_DIR_NAME);
+        std::fs::create_dir_all(&report_dir).expect("create report dir");
+        let report_path = report_dir.join(ATC_CANARY_REPORT_FILE_NAME);
+        std::fs::write(
+            &report_path,
+            r#"{
+              "status": "pass",
+              "artifacts": {
+                "canary_report": "/tmp/run/canary_report.json"
+              },
+              "latency": [
+                {"name": "mail_send_atc_shadow", "p95_ms": 12.5},
+                {"name": "mail_send_atc_live", "p95_ms": 13.75}
+              ],
+              "db_health": {
+                "quick_check": "ok",
+                "atc_rows": 2
+              },
+              "fallback_decision": {
+                "verdict": "canary_passed",
+                "reason": "latency budget and database quick_check passed",
+                "recommendation": "keep rollout controlled",
+                "safe_command": "export AM_ATC_WRITE_MODE=live"
+              }
+            }"#,
+        )
+        .expect("write report");
+
+        let summary = load_latest_atc_canary_report(temp.path()).expect("summary");
+        assert_eq!(summary.status, "pass");
+        assert_eq!(summary.verdict, "canary_passed");
+        assert_eq!(summary.artifact_path, "/tmp/run/canary_report.json");
+        assert_eq!(summary.quick_check, "ok");
+        assert_eq!(summary.atc_rows, Some(2));
+        assert_eq!(summary.live_p95_ms, Some(13.75));
+        assert_eq!(summary.shadow_p95_ms, Some(12.5));
+        assert_eq!(
+            summary.safe_command.as_deref(),
+            Some("export AM_ATC_WRITE_MODE=live")
+        );
+    }
+
+    #[test]
+    fn atc_canary_report_summary_falls_back_to_source_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let report_path = temp.path().join("canary_report.json");
+        std::fs::write(
+            &report_path,
+            r#"{
+              "status": "pass",
+              "db_health": {
+                "quick_check": "ok",
+                "atc_rows": 0
+              },
+              "fallback_decision": {
+                "verdict": "hold_live",
+                "reason": "canary database recorded no ATC experience rows",
+                "recommendation": "do not promote live"
+              }
+            }"#,
+        )
+        .expect("write report");
+
+        let summary = load_atc_canary_report_path(&report_path).expect("summary");
+        assert_eq!(summary.verdict, "hold_live");
+        assert_eq!(summary.atc_rows, Some(0));
+        assert_eq!(summary.artifact_path, report_path.display().to_string());
+        assert_eq!(summary.safe_command, None);
     }
 }

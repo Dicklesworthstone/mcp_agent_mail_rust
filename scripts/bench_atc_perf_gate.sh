@@ -13,6 +13,9 @@ SKIP_BENCH=0
 BENCH_REPORT_PATH=""
 BENCH_TMPDIR_ROOT="${ATC_GATE_TMPDIR_ROOT:-/data/tmp}"
 AM_BENCH_BIN="${AM_BENCH_BIN:-}"
+CANARY_DB_PATH=""
+DEFAULT_CANARY_STATE_ROOT="${STORAGE_ROOT:-${HOME:-}/.mcp_agent_mail_git_mailbox_repo}"
+CANARY_REPORT_STATE_DIR="${AM_ATC_CANARY_REPORT_DIR:-${DEFAULT_CANARY_STATE_ROOT}/atc_perf_gate}"
 
 usage() {
     cat <<'USAGE'
@@ -35,9 +38,11 @@ Options:
   --output-dir <path>           Output directory for gate artifacts
   --threshold-pct <n>           Max allowed p95 overhead over no_atc (default: 5.0)
   --bench-report <path>         Reuse an existing `am bench` JSON report
+  --canary-db <path>            Optional SQLite DB for quick_check + ATC row count
   --skip-bench                  Skip running `cargo run ... am bench` and require --bench-report
 Environment:
   AM_BENCH_BIN                  Use this prebuilt `am` binary instead of `cargo run`
+  AM_ATC_CANARY_REPORT_DIR      Directory for latest_canary_report.json operator surface
   -h, --help                    Show this help text
 USAGE
 }
@@ -72,6 +77,10 @@ while [ $# -gt 0 ]; do
             BENCH_REPORT_PATH="${2:-}"
             shift 2
             ;;
+        --canary-db)
+            CANARY_DB_PATH="${2:-}"
+            shift 2
+            ;;
         --skip-bench)
             SKIP_BENCH=1
             shift
@@ -104,6 +113,11 @@ bench_log="${OUTPUT_DIR}/bench.log"
 if [ "${SKIP_BENCH}" -eq 0 ]; then
     BENCH_REPORT_PATH="${OUTPUT_DIR}/bench_report.json"
     bench_runtime_root="$(mktemp -d "${BENCH_TMPDIR_ROOT}/atc-perf-gate.XXXXXX")"
+    bench_workspace="${bench_runtime_root}/bench-workspace"
+    bench_db_path="${bench_workspace}/bench.sqlite3"
+    if [ -z "${CANARY_DB_PATH}" ]; then
+        CANARY_DB_PATH="${bench_db_path}"
+    fi
     mkdir -p "${bench_runtime_root}/storage"
     bench_binary=""
     if [ -n "${AM_BENCH_BIN}" ] && [ -x "${AM_BENCH_BIN}" ]; then
@@ -117,8 +131,9 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
     (
         cd "${PROJECT_ROOT}"
         if [ -n "${bench_binary}" ]; then
+            AM_BENCH_WORKSPACE="${bench_workspace}" \
             STORAGE_ROOT="${bench_runtime_root}/storage" \
-            DATABASE_URL="sqlite:///${bench_runtime_root}/root.sqlite3" \
+            DATABASE_URL="sqlite:///${bench_db_path}" \
             "${bench_binary}" \
                 bench \
                 --json \
@@ -127,8 +142,9 @@ if [ "${SKIP_BENCH}" -eq 0 ]; then
                 --runs 50 \
                 --baseline "${BASELINE_PATH}"
         else
+            AM_BENCH_WORKSPACE="${bench_workspace}" \
             STORAGE_ROOT="${bench_runtime_root}/storage" \
-            DATABASE_URL="sqlite:///${bench_runtime_root}/root.sqlite3" \
+            DATABASE_URL="sqlite:///${bench_db_path}" \
             cargo run -p mcp-agent-mail-cli --bin am -- \
                 bench \
                 --json \
@@ -151,9 +167,10 @@ if [ -f "${HISTORICAL_BASELINE_PATH}" ]; then
     cp "${HISTORICAL_BASELINE_PATH}" "${OUTPUT_DIR}/atc_pre_wiring_baseline.json"
 fi
 
-python3 - "${BASELINE_PATH}" "${BENCH_REPORT_PATH}" "${OUTPUT_DIR}" "${bench_rc}" "${THRESHOLD_PCT}" <<'PY'
+python3 - "${BASELINE_PATH}" "${BENCH_REPORT_PATH}" "${OUTPUT_DIR}" "${bench_rc}" "${THRESHOLD_PCT}" "${CANARY_DB_PATH}" "${CANARY_REPORT_STATE_DIR}" <<'PY'
 import json
 import pathlib
+import sqlite3
 import sys
 
 baseline_path = pathlib.Path(sys.argv[1])
@@ -161,9 +178,19 @@ bench_report_path = pathlib.Path(sys.argv[2])
 output_dir = pathlib.Path(sys.argv[3])
 bench_rc = int(sys.argv[4])
 threshold_pct = float(sys.argv[5])
+canary_db_arg = sys.argv[6]
+canary_state_dir_arg = sys.argv[7]
+canary_db_path = pathlib.Path(canary_db_arg) if canary_db_arg else None
+canary_state_dir = pathlib.Path(canary_state_dir_arg) if canary_state_dir_arg else None
 
 summary_path = output_dir / "summary.json"
 comment_path = output_dir / "comment.md"
+canary_report_path = output_dir / "canary_report.json"
+latest_canary_report_path = (
+    canary_state_dir / "latest_canary_report.json"
+    if canary_state_dir is not None
+    else None
+)
 
 required = [
     "mail_send_no_atc",
@@ -171,17 +198,197 @@ required = [
     "mail_send_atc_live",
 ]
 
+def read_db_health() -> dict:
+    if canary_db_path is None:
+        return {
+            "checked": False,
+            "path": None,
+            "quick_check": "not_checked",
+            "atc_rows": None,
+            "reason": "no canary database path was provided",
+        }
+    if not canary_db_path.is_file():
+        return {
+            "checked": False,
+            "path": str(canary_db_path),
+            "quick_check": "not_found",
+            "atc_rows": None,
+            "reason": "canary database path does not exist",
+        }
+    try:
+        conn = sqlite3.connect(f"file:{canary_db_path}?mode=ro", uri=True)
+        try:
+            quick_rows = conn.execute("PRAGMA quick_check").fetchall()
+            quick_check = quick_rows[0][0] if quick_rows else "missing_result"
+            has_atc = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='atc_experiences'"
+                ).fetchone()
+                is not None
+            )
+            atc_rows = (
+                int(conn.execute("SELECT COUNT(*) FROM atc_experiences").fetchone()[0])
+                if has_atc
+                else 0
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        return {
+            "checked": True,
+            "path": str(canary_db_path),
+            "quick_check": "error",
+            "atc_rows": None,
+            "reason": str(error),
+        }
+    return {
+        "checked": True,
+        "path": str(canary_db_path),
+        "quick_check": str(quick_check),
+        "atc_rows": atc_rows,
+        "reason": "",
+    }
+
+
+def latency_entry(name: str, entry: dict, comparison: dict | None) -> dict:
+    return {
+        "name": name,
+        "p50_ms": entry.get("median_ms"),
+        "p95_ms": entry.get("p95_ms"),
+        "p99_ms": entry.get("p99_ms"),
+        "mean_ms": entry.get("mean_ms"),
+        "delta_vs_no_atc_pct": None if comparison is None else comparison["delta_vs_no_atc_pct"],
+        "overhead_regression": False if comparison is None else comparison["overhead_regression"],
+    }
+
+
+def fallback_decision(status: str, db_health: dict, overhead_regressions: list[str]) -> dict:
+    if status in {"benchmark_failed", "runtime_error"}:
+        return {
+            "verdict": "hold_live",
+            "applied": False,
+            "reason": "benchmark or gate runtime failed",
+            "recommendation": "Do not promote AM_ATC_WRITE_MODE=live; keep live rollout disabled until the gate succeeds.",
+            "safe_command": "export AM_ATC_WRITE_MODE=shadow",
+        }
+    if db_health["quick_check"] not in {"ok", "not_checked"}:
+        return {
+            "verdict": "disable_live",
+            "applied": False,
+            "reason": f"canary database quick_check was {db_health['quick_check']}",
+            "recommendation": "Disable live ATC writes and inspect the canary database before retrying.",
+            "safe_command": "export AM_ATC_WRITE_MODE=shadow",
+        }
+    if "mail_send_atc_live" in overhead_regressions:
+        return {
+            "verdict": "disable_live",
+            "applied": False,
+            "reason": "live ATC p95 overhead exceeded the configured budget",
+            "recommendation": "Disable or avoid live ATC writes; run shadow mode while investigating the regression.",
+            "safe_command": "export AM_ATC_WRITE_MODE=shadow",
+        }
+    if overhead_regressions:
+        return {
+            "verdict": "hold_rollout",
+            "applied": False,
+            "reason": "an ATC mode exceeded the configured p95 overhead budget",
+            "recommendation": "Hold ATC rollout and inspect the benchmark report before enabling live mode.",
+            "safe_command": "export AM_ATC_WRITE_MODE=shadow",
+        }
+    if not db_health["checked"]:
+        return {
+            "verdict": "manual_review",
+            "applied": False,
+            "reason": db_health["reason"],
+            "recommendation": "Benchmark SLOs passed, but database health was not checked; run with --canary-db or without --skip-bench before promoting live mode.",
+            "safe_command": "scripts/bench_atc_perf_gate.sh",
+        }
+    if db_health["atc_rows"] == 0:
+        return {
+            "verdict": "hold_live",
+            "applied": False,
+            "reason": "canary database recorded no ATC experience rows",
+            "recommendation": "Do not promote live ATC writes until the canary exercises the durable ATC experience path.",
+            "safe_command": "export AM_ATC_WRITE_MODE=shadow",
+        }
+    return {
+        "verdict": "canary_passed",
+        "applied": False,
+        "reason": "latency budget and database quick_check passed",
+        "recommendation": "Live ATC writes are within this gate's canary budget; keep rollout controlled by explicit operator configuration.",
+        "safe_command": "export AM_ATC_WRITE_MODE=live",
+    }
+
+
+def write_canary_report(
+    status: str,
+    reason: str,
+    benchmarks: dict,
+    comparisons: list[dict],
+    baseline_regressions: list[str],
+    failures: list[dict],
+) -> dict:
+    db_health = read_db_health()
+    by_name = {item["name"]: item for item in comparisons}
+    overhead_regressions = [item["name"] for item in comparisons if item["overhead_regression"]]
+    latency = [
+        latency_entry(name, benchmarks.get(name, {}), by_name.get(name))
+        for name in required
+    ]
+    report = {
+        "schema_version": 1,
+        "status": status,
+        "reason": reason,
+        "artifacts": {
+            "summary": str(summary_path),
+            "comment": str(comment_path),
+            "bench_report": str(bench_report_path),
+            "baseline": str(baseline_path),
+            "canary_db": db_health["path"],
+            "canary_report": str(canary_report_path),
+            "latest_canary_report": (
+                str(latest_canary_report_path)
+                if latest_canary_report_path is not None
+                else None
+            ),
+        },
+        "slo": {
+            "threshold_pct": threshold_pct,
+            "required_benchmarks": required,
+        },
+        "latency": latency,
+        "db_health": db_health,
+        "baseline_regressions": baseline_regressions,
+        "failures": failures,
+        "fallback_decision": fallback_decision(status, db_health, overhead_regressions),
+        "write_modes": {
+            "mail_send_no_atc": {"ATC_LEARNING_DISABLED": "1"},
+            "mail_send_atc_shadow": {"AM_ATC_WRITE_MODE": "shadow"},
+            "mail_send_atc_live": {"AM_ATC_WRITE_MODE": "live"},
+        },
+    }
+    canary_report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if latest_canary_report_path is not None:
+        latest_canary_report_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_canary_report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
 def write_failure(status: str, reason: str) -> None:
+    canary_report = write_canary_report(status, reason, {}, [], [], [])
     payload = {
         "schema_version": 1,
         "status": status,
         "reason": reason,
         "baseline_path": str(baseline_path),
         "bench_report_path": str(bench_report_path),
+        "canary_report_path": str(canary_report_path),
         "bench_exit_code": bench_rc,
         "threshold_pct": threshold_pct,
         "comparisons": [],
         "baseline_regressions": [],
+        "db_health": canary_report["db_health"],
+        "fallback_decision": canary_report["fallback_decision"],
     }
     summary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     comment_path.write_text(
@@ -196,6 +403,7 @@ def write_failure(status: str, reason: str) -> None:
                 "",
                 f"- Baseline: `{baseline_path}`",
                 f"- Bench report: `{bench_report_path}`",
+                f"- Canary report: `{canary_report_path}`",
             ]
         )
         + "\n",
@@ -287,18 +495,30 @@ if status == "pass" and overhead_regressions:
         + ", ".join(f"`{name}`" for name in overhead_regressions)
     )
 
+canary_report = write_canary_report(
+    status,
+    reason,
+    benchmarks,
+    comparisons,
+    baseline_regressions,
+    failures,
+)
+
 payload = {
     "schema_version": 1,
     "status": status,
     "reason": reason,
     "baseline_path": str(baseline_path),
     "bench_report_path": str(bench_report_path),
+    "canary_report_path": str(canary_report_path),
     "bench_exit_code": bench_rc,
     "threshold_pct": threshold_pct,
     "comparisons": comparisons,
     "baseline_regressions": baseline_regressions,
     "advisories": advisories,
     "failures": failures,
+    "db_health": canary_report["db_health"],
+    "fallback_decision": canary_report["fallback_decision"],
 }
 summary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -318,21 +538,36 @@ lines = [
     f"- Baseline: `{baseline_path.name}`",
     f"- Relative overhead budget: `{threshold_pct:.1f}%` over `mail_send_no_atc` p95",
     f"- Bench report: `{bench_report_path.name}`",
+    f"- Canary report: `{canary_report_path.name}`",
+    f"- Database quick_check: `{canary_report['db_health']['quick_check']}`",
+    f"- ATC rows observed: `{canary_report['db_health']['atc_rows']}`",
+    f"- Fallback verdict: `{canary_report['fallback_decision']['verdict']}`",
     "",
-    "| Benchmark | Current p95 | Baseline p95 | Delta vs no_atc | Allowed vs no_atc | Verdict |",
-    "|---|---:|---:|---:|---:|---|",
+    "| Benchmark | p50 | p95 | p99 | Baseline p95 | Delta vs no_atc | Allowed vs no_atc | Verdict |",
+    "|---|---:|---:|---:|---:|---:|---:|---|",
 ]
 
 for item in comparisons:
+    benchmark = benchmarks[item["name"]]
     verdict = "pass"
     if item["overhead_regression"]:
         verdict = "overhead regression"
     elif item["absolute_regression"]:
         verdict = "baseline drift (advisory)"
     lines.append(
-        "| {name} | {current_p95_ms:.2f}ms | {baseline} | {delta:+.2f}% | {allowed:.2f}ms | {verdict} |".format(
+        "| {name} | {p50} | {current_p95_ms:.2f}ms | {p99} | {baseline} | {delta:+.2f}% | {allowed:.2f}ms | {verdict} |".format(
             name=item["name"],
+            p50=(
+                f"{float(benchmark['median_ms']):.2f}ms"
+                if benchmark.get("median_ms") is not None
+                else "-"
+            ),
             current_p95_ms=item["current_p95_ms"],
+            p99=(
+                f"{float(benchmark['p99_ms']):.2f}ms"
+                if benchmark.get("p99_ms") is not None
+                else "-"
+            ),
             baseline=(
                 f"{float(item['baseline_p95_ms']):.2f}ms"
                 if item["baseline_p95_ms"] is not None

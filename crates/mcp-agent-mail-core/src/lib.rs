@@ -94,6 +94,11 @@ pub use atc_retention::{
     RESOLVED_EXPERIENCE_DROP_AFTER_DAYS, RESOLVED_EXPERIENCE_FULL_FIDELITY_DAYS, ROLLUP_LIVE_DAYS,
     STALE_REGIME_AFTER_DAYS, StoragePlane, retention_rule,
 };
+pub use atc_user_surfaces::{
+    ATC_CANARY_REPORT_DIR_ENV, ATC_CANARY_REPORT_DIR_NAME, ATC_CANARY_REPORT_FILE_NAME,
+    ATC_CANARY_REPORT_PATH_ENV, AtcCanaryReportSummary, load_atc_canary_report_path,
+    load_latest_atc_canary_report,
+};
 pub use backpressure::{
     CapacityAction, CapacityGovernorDecision, HealthLevel, HealthSignals, cached_health_level,
     capacity_governor_decision, capacity_governor_decision_from_parts,
