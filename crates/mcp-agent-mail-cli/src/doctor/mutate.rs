@@ -74,13 +74,12 @@ impl Op {
 /// One line of `actions.jsonl`. Schema documented in
 /// `world-class-doctor-mode-for-cli-tools` OUTPUT-SCHEMA.md.
 ///
-/// G-Crash-Window fix (Gemini round 2): the `phase` field distinguishes
-/// the two-phase write protocol. `"pending"` is appended BEFORE the
-/// mutation executes (after the backup is in place). `"completed"` is
-/// appended AFTER the mutation succeeds or rolls back. Undo treats a
-/// pending-without-completed pair as crash-window: the backup exists,
-/// restore from it. Legacy actions.jsonl lines (no `phase` field) are
-/// treated as `"completed"` for backwards compatibility.
+/// The `phase` field distinguishes the two-phase write protocol.
+/// `"pending"` is appended before the mutation executes, after the backup
+/// is in place. `"completed"` is appended after the mutation succeeds or
+/// rolls back. Undo treats a pending-without-completed pair as a
+/// crash-window record: the backup exists, so restore from it. Legacy
+/// `actions.jsonl` lines without `phase` are treated as completed.
 #[derive(Debug, Serialize)]
 pub struct ActionRecord {
     pub path: String,
@@ -127,6 +126,39 @@ pub struct MutateContext {
     pub repo_root: PathBuf,
     pub dry_run: bool,
     pub start: Instant,
+    /// Additional flock files to hold for the duration of each mutation.
+    /// Fixers can use these to coordinate with subsystem locks such as
+    /// `<repo>/.git/am.git-serialize.lock` or a SQLite database lock. Locks
+    /// are acquired in declaration order after the per-path lock and
+    /// released on return. If any extra lock cannot be acquired
+    /// non-blockingly, `mutate()` refuses with `MutateError::LockHeld`.
+    pub extra_locks: Vec<PathBuf>,
+}
+
+impl MutateContext {
+    /// Acquire each `extra_locks` path with `try_lock_exclusive`. Returns
+    /// the held file handles; they auto-release when the returned `Vec`
+    /// drops. If any fails, returns `Err(LockHeld)` immediately and the
+    /// already-acquired locks release as the temporary Vec drops.
+    fn acquire_extra_locks(&self) -> Result<Vec<std::fs::File>, MutateError> {
+        let mut held = Vec::with_capacity(self.extra_locks.len());
+        for path in &self.extra_locks {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let f = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?;
+            if f.try_lock_exclusive().is_err() {
+                return Err(MutateError::LockHeld(path.clone()));
+            }
+            held.push(f);
+        }
+        Ok(held)
+    }
 }
 
 #[derive(Debug)]
@@ -177,9 +209,8 @@ pub enum MutateError {
     Unsupported(&'static str),
 }
 
-/// G-OOM fix (Gemini round 2): streaming SHA-256 over the file's bytes
-/// without loading the entire file into memory. Returns the empty-file
-/// hash if the path doesn't exist.
+/// Stream SHA-256 over the file's bytes without loading the entire file into
+/// memory. Returns the empty-file hash if the path doesn't exist.
 fn sha256_of_path(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     if !path.exists() {
@@ -258,9 +289,8 @@ fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Streaming comparison of two files. G-OOM fix (Gemini round 2):
-/// avoids loading entire file contents into memory. Reads 64 KiB at a
-/// time; first divergence aborts.
+/// Streaming comparison of two files. Reads 64 KiB at a time and aborts on
+/// the first divergence.
 fn cmp_strict(a: &Path, b: &Path) -> std::io::Result<()> {
     use std::io::Read;
     let mut fa = fs::File::open(a)?;
@@ -296,10 +326,10 @@ fn elapsed_ns(start: Instant) -> u128 {
 
 /// Atomic write via tempfile-in-same-dir + rename.
 ///
-/// G4 fix (Gemini round 2): permissions are set on the tempfile's file
-/// descriptor BEFORE `tmp.persist(path)`. Setting permissions on `path`
-/// post-persist would race a symlink-swap attacker who could redirect
-/// `path` to an arbitrary out-of-scope file between persist and chmod.
+/// Permissions are set on the tempfile's file descriptor before
+/// `tmp.persist(path)`. Setting permissions on `path` after persist would
+/// race a symlink-swap attacker who could redirect `path` to an arbitrary
+/// out-of-scope file between persist and chmod.
 pub(crate) fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -308,7 +338,7 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::
         let mut f = tmp.as_file();
         f.write_all(content)?;
         f.sync_data()?;
-        // G4 fix: chmod via fd before persist (symlink-attack defense).
+        // Chmod via fd before persist so a path swap cannot redirect it.
         f.set_permissions(Permissions::from_mode(mode))?;
     }
     tmp.persist(path).map_err(|e| e.error)?;
@@ -321,18 +351,14 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::
 
 /// Compute the backup path for a target, sequenced by `started_at_ns`.
 ///
-/// G1 fix (Gemini round 2): when `path` is absolute and outside `repo_root`,
-/// `strip_prefix` returns Err and `PathBuf::join(absolute)` drops the base —
-/// so naive `run_dir.join("backups").join(rel)` returned the live target itself.
-/// We now encode out-of-repo paths under a sentinel `__abs__/` subdirectory.
+/// When `path` is absolute and outside `repo_root`, `strip_prefix` returns
+/// Err and `PathBuf::join(absolute)` drops the base, so a naive
+/// `run_dir.join("backups").join(rel)` would return the live target itself.
+/// Out-of-repo paths are encoded under a sentinel `__abs__/` subdirectory.
 ///
-/// Pass-4 multi-mutation fix (caught by property test): without sequencing,
-/// two mutations to the same path within one run share a backup path and the
-/// second overwrites the first. Undo then restores the wrong content. We now
-/// scope every mutation's backup under `backups/<started_at_ns>/`, so each
-/// mutation has its own backup directory. Undo finds the per-mutation backup
-/// via the recorded `started_at_ns`. `started_at_ns` is monotonically
-/// increasing per `MutateContext.start`, so two mutations cannot collide.
+/// Backups are scoped under `backups/<started_at_ns>/` so two mutations to
+/// the same path in one run cannot overwrite each other's backups. Undo
+/// finds each backup via the recorded `started_at_ns`.
 pub(crate) fn backup_path_for(
     run_dir: &Path,
     repo_root: &Path,
@@ -379,11 +405,10 @@ fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
 
 /// Append `content` to `path` (creating if missing).
 ///
-/// G-AppendChmod-TOCTOU fix (Gemini round 2): uses `O_NOFOLLOW` so a
-/// symlink-swap attacker who replaces `path` with a symlink between the
-/// step-4 hash check and this open cannot redirect the append to an
-/// out-of-scope file (e.g., /etc/shadow). On a symlink, open returns
-/// `ELOOP` which we map to `MutateError::Io`.
+/// Uses `O_NOFOLLOW` so a symlink-swap attacker who replaces `path` with a
+/// symlink between the hash check and this open cannot redirect the append to
+/// an out-of-scope file. On a symlink, open returns `ELOOP`, which maps to
+/// `MutateError::Io`.
 fn append_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -474,6 +499,16 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         return Err(MutateError::LockHeld(path.to_path_buf()));
     }
 
+    // Hold any subsystem locks declared by the fixer for the whole mutation.
+    // If any extra lock fails, release the per-path lock before returning.
+    let _extra_lock_guards = match ctx.acquire_extra_locks() {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(e);
+        }
+    };
+
     // 2. before_hash + before_mode.
     // G-OOM fix: stream-hash the file rather than reading entire contents
     // into memory. Multi-GB files (e.g., storage.sqlite3) would OOM otherwise.
@@ -494,12 +529,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // refuse to proceed because our backup wouldn't be a real backup of
     // the pre-mutation state.
     //
-    // G1 fix (Gemini round 2): use `backup_path_for` which correctly handles
-    // absolute paths outside repo_root (was: PathBuf::join with absolute
-    // path returned the live file itself, causing copy-onto-self). The
-    // `rel` value used in actions.jsonl stays the original path semantics
-    // — for absolute paths, undo's `target.join(absolute)` recovers the
-    // absolute path (PathBuf::join's same semantics that broke backup).
+    // `backup_path_for` encodes absolute paths outside repo_root without
+    // letting PathBuf::join drop the backup prefix. The `rel` value recorded
+    // in actions.jsonl preserves the original path semantics for undo.
     let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
     if !ctx.dry_run && path.exists() {
@@ -535,12 +567,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     let mut rename_to_record: Option<String> = None;
     let mut after_mode: Option<u32> = None;
 
-    // G-Crash-Window fix (Gemini round 2): write a `phase: "pending"`
-    // line to actions.jsonl BEFORE the mutation. If the process dies
-    // mid-mutation (SIGKILL, panic, power loss), the pending line +
-    // verbatim backup at `seq_<ns>/` are sufficient for undo to roll
-    // back: it sees pending without a corresponding completed entry
-    // and restores from the backup.
+    // Write a pending action before the mutation. If the process dies
+    // mid-mutation, undo can pair the pending line with the verbatim backup
+    // and restore without needing a completed action.
     {
         let pending_record = ActionRecord {
             path: rel.to_string_lossy().into_owned(),
@@ -587,14 +616,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // G-Lock-Rename-Dest fix (Gemini round 2): also acquire an
-            // advisory lock on the destination basename. The source's
-            // per-path lock (already held above) protects concurrent
-            // mutations of `path`; without locking the destination too,
-            // two concurrent renames-to-same-quarantine paths would race
-            // (one would see destination missing, one would see it exist
-            // — the loser's rename either succeeds (clobber) or fails).
-            // Note we hold this lock for the lifetime of `to_lock_file`.
+            // Also acquire an advisory lock on the destination basename. The
+            // source lock protects `path`; the destination lock prevents two
+            // concurrent renames from racing toward the same target.
             let to_basename = to
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -612,14 +636,10 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             if to_lock_file.try_lock_exclusive().is_err() {
                 return Err(MutateError::LockHeld(to.clone()));
             }
-            // G3 fix (Gemini round 2): refuse if the destination already
-            // exists. POSIX `fs::rename` overwrites silently, which would
-            // permanently destroy the existing file at `to` — direct
-            // violation of AGENTS.md RULE 1 (no file deletion). The
-            // appropriate response is to either pick a different
-            // quarantine name OR refuse with exit-4 / RenameClobberRefused.
-            // The check happens AFTER acquiring the destination lock so
-            // a concurrent rename-to-same-dest can't race past it.
+            // Refuse if the destination already exists. POSIX `fs::rename`
+            // overwrites silently, which would destroy the existing file at
+            // `to`. Check after acquiring the destination lock so concurrent
+            // renames to the same target cannot race past it.
             if fs::symlink_metadata(&to).is_ok() {
                 let _ = FileExt::unlock(&to_lock_file);
                 return Err(MutateError::RenameDestinationExists(to.clone()));
@@ -752,6 +772,7 @@ mod tests {
             repo_root: td.path().to_path_buf(),
             dry_run: false,
             start: Instant::now(),
+            extra_locks: Vec::new(),
         }
     }
 
@@ -1047,9 +1068,8 @@ mod tests {
 
     #[test]
     fn g1_backup_path_for_handles_absolute_paths_outside_repo() {
-        // G1 fix (Gemini round 2): backup_path_for must NOT use PathBuf::join
-        // with an absolute path (which drops the base). For paths outside
-        // repo_root, encode under __abs__/ subdirectory.
+        // `backup_path_for` must not use PathBuf::join with an absolute path
+        // because that drops the base. Out-of-repo paths use __abs__/.
         let run_dir = PathBuf::from("/tmp/run-dir");
         let repo_root = PathBuf::from("/repo");
         let in_repo = PathBuf::from("/repo/.config/x");
@@ -1075,8 +1095,8 @@ mod tests {
 
     #[test]
     fn g3_rename_destination_exists_refuses() {
-        // G3 fix (Gemini round 2): Op::Rename refuses if destination exists.
-        // Per AGENTS.md RULE 1, silent overwrite of existing files is forbidden.
+        // Op::Rename refuses if destination exists; silent overwrite of
+        // existing files is forbidden.
         let td = TempDir::new().unwrap();
         let src = td.path().join("source.txt");
         let dst = td.path().join("destination.txt");
@@ -1100,10 +1120,8 @@ mod tests {
 
     #[test]
     fn g4_atomic_write_chmod_via_fd_before_persist() {
-        // G4 fix (Gemini round 2): permissions set via fd before persist,
-        // not via path after. Verified by checking the file ends up with
-        // the requested mode (this test would not catch a TOCTOU attack
-        // directly, but exercises the permission-setting path).
+        // Permissions are set via fd before persist, not via path after.
+        // This checks the requested mode is applied through that path.
         use std::os::unix::fs::PermissionsExt;
         let td = TempDir::new().unwrap();
         let target = td.path().join("hook.sh");
@@ -1141,5 +1159,72 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MutateError::OutOfScope(_)));
+    }
+
+    #[test]
+    fn extra_locks_are_acquired_and_released() {
+        let td = TempDir::new().unwrap();
+        let extra_lock_path = td.path().join("project.lock");
+        let mut ctx = make_ctx(&td, "2026-05-10T07-30-00Z__extra");
+        ctx.extra_locks = vec![extra_lock_path.clone()];
+        let target = td.path().join("hello.txt");
+        let r = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"hi".to_vec(),
+                mode: 0o644,
+            },
+        );
+        assert!(r.is_ok(), "mutate should succeed when extra lock is free");
+        // Lock file was created.
+        assert!(extra_lock_path.exists());
+        // After mutate returns, the extra lock guard dropped — verify
+        // we can re-acquire it.
+        let f = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&extra_lock_path)
+            .unwrap();
+        assert!(
+            f.try_lock_exclusive().is_ok(),
+            "extra lock must be released after mutate returns"
+        );
+    }
+
+    #[test]
+    fn held_extra_lock_blocks_mutate() {
+        let td = TempDir::new().unwrap();
+        let extra_lock_path = td.path().join("project.lock");
+        let mut ctx = make_ctx(&td, "2026-05-10T07-30-01Z__extrablock");
+        ctx.extra_locks = vec![extra_lock_path.clone()];
+        // Acquire the extra lock first as a "competing" process.
+        fs::create_dir_all(td.path()).unwrap();
+        let competitor = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&extra_lock_path)
+            .unwrap();
+        competitor.try_lock_exclusive().unwrap();
+        let target = td.path().join("hello.txt");
+        std::fs::write(&target, b"original").unwrap();
+        // Now mutate should refuse.
+        let err = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"new".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, MutateError::LockHeld(_)));
+        // Target file untouched.
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        FileExt::unlock(&competitor).unwrap();
     }
 }

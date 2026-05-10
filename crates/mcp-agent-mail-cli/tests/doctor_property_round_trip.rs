@@ -69,6 +69,7 @@ fn make_ctx(td: &TempDir, run_id: &str, fixer_id: &str) -> MutateContext {
         repo_root: td.path().to_path_buf(),
         dry_run: false,
         start: Instant::now(),
+        extra_locks: Vec::new(),
     }
 }
 

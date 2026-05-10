@@ -2152,6 +2152,22 @@ pub enum DoctorCommand {
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
     },
+
+    /// End-to-end self-test of the mutate() chokepoint primitives.
+    ///
+    /// In an isolated tempdir, exercises Write/Append/Chmod/Rename
+    /// mutations through `mutate()`, verifies the per-mutation
+    /// `seq_<ns>/` backups, runs `undo`, and asserts byte-identical
+    /// recovery. Reports results as JSON.
+    ///
+    /// For operators after install/upgrade to verify the doctor
+    /// chokepoint is healthy on their machine. Exit 0 on pass, 1 on fail.
+    #[command(name = "selftest")]
+    Selftest {
+        /// Output format. JSON is the default.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -5572,6 +5588,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_explain(&target, &finding_id, format)
         }
+        DoctorCommand::Selftest { format } => doctor::handle_selftest(format),
     }
 }
 

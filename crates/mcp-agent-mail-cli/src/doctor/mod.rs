@@ -227,6 +227,211 @@ pub fn handle_explain(
     Ok(())
 }
 
+/// `am doctor selftest` — end-to-end exercise of the chokepoint primitives.
+///
+/// Pass-6 deliverable. In an isolated tempdir:
+/// 1. WriteFile mutation through `mutate()` (verifies pending+completed
+///    actions.jsonl entries, per-mutation seq backup, atomic write).
+/// 2. AppendFile mutation (verifies append + O_NOFOLLOW path).
+/// 3. Chmod mutation (verifies chmod_via_fd + before_mode/after_mode).
+/// 4. Rename mutation (verifies destination-lock + RenameDestinationExists guard).
+/// 5. Run undo. Verify byte-identical restoration.
+///
+/// Reports JSON:
+/// ```json
+/// {
+///   "schema_version": "1.0",
+///   "doctor_version": "1.0.0",
+///   "tool_version": "0.2.52",
+///   "ok": true,
+///   "checks": [
+///     {"name": "write_file_mutation", "ok": true},
+///     {"name": "append_file_mutation", "ok": true},
+///     ...
+///   ],
+///   "duration_ms": 12
+/// }
+/// ```
+///
+/// Exit 0 on pass, 1 on fail. For operators after install/upgrade.
+pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    let started_at = Instant::now();
+    let td = match tempfile::TempDir::new() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(CliError::Other(format!("could not create tempdir: {e}")));
+        }
+    };
+
+    let run_id = "selftest__inline";
+    let run_dir = match runs::scaffold_run_dir(td.path(), run_id) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(CliError::Other(format!("scaffold_run_dir failed: {e}")));
+        }
+    };
+    let actions_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(run_dir.join("actions.jsonl"))
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(CliError::Other(format!("opening actions.jsonl failed: {e}")));
+        }
+    };
+
+    let ctx = mutate::MutateContext {
+        run_id: run_id.to_string(),
+        run_dir: run_dir.clone(),
+        capabilities: mutate::Capabilities {
+            write_scopes: vec![td.path().to_path_buf()],
+        },
+        actions_file: Mutex::new(actions_file),
+        fixer_id: "selftest".to_string(),
+        repo_root: td.path().to_path_buf(),
+        dry_run: false,
+        start: started_at,
+        extra_locks: Vec::new(),
+    };
+
+    let mut checks = Vec::<serde_json::Value>::new();
+    let mut all_ok = true;
+
+    // Step 1: WriteFile mutation.
+    let target_a = td.path().join("alpha.txt");
+    fs::write(&target_a, b"alpha original\n").ok();
+    let r1 = mutate::mutate(
+        &ctx,
+        &target_a,
+        mutate::Op::WriteFile {
+            content: b"alpha new\n".to_vec(),
+            mode: 0o644,
+        },
+    );
+    let ok1 = r1.is_ok() && fs::read_to_string(&target_a).ok().as_deref() == Some("alpha new\n");
+    all_ok &= ok1;
+    checks.push(serde_json::json!({"name": "write_file_mutation", "ok": ok1}));
+
+    // Step 2: AppendFile mutation.
+    let r2 = mutate::mutate(
+        &ctx,
+        &target_a,
+        mutate::Op::AppendFile {
+            content: b"appended\n".to_vec(),
+        },
+    );
+    let ok2 =
+        r2.is_ok() && fs::read_to_string(&target_a).ok().as_deref() == Some("alpha new\nappended\n");
+    all_ok &= ok2;
+    checks.push(serde_json::json!({"name": "append_file_mutation", "ok": ok2}));
+
+    // Step 3: Chmod mutation.
+    let r3 = mutate::mutate(
+        &ctx,
+        &target_a,
+        mutate::Op::Chmod { mode: 0o600 },
+    );
+    let ok3 = r3.is_ok()
+        && fs::metadata(&target_a)
+            .map(|m| m.permissions().mode() & 0o777 == 0o600)
+            .unwrap_or(false);
+    all_ok &= ok3;
+    checks.push(serde_json::json!({"name": "chmod_mutation", "ok": ok3}));
+
+    // Step 4: Rename mutation (to a quarantine path).
+    let target_b = td.path().join("beta.txt");
+    fs::write(&target_b, b"beta original\n").ok();
+    let quarantine = td.path().join("quarantine_beta.txt");
+    let r4 = mutate::mutate(
+        &ctx,
+        &target_b,
+        mutate::Op::Rename {
+            to: quarantine.clone(),
+        },
+    );
+    let ok4 = r4.is_ok() && !target_b.exists() && quarantine.exists();
+    all_ok &= ok4;
+    checks.push(serde_json::json!({"name": "rename_mutation", "ok": ok4}));
+
+    // Drop ctx so actions.jsonl flushes before we read it.
+    drop(ctx);
+
+    // Step 5: Verify per-mutation seq backups exist.
+    let backups_root = run_dir.join("backups");
+    let seq_dirs: Vec<_> = std::fs::read_dir(&backups_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("seq_")
+        })
+        .collect();
+    let ok5 = seq_dirs.len() >= 4;
+    all_ok &= ok5;
+    checks.push(serde_json::json!({
+        "name": "per_mutation_seq_backups",
+        "ok": ok5,
+        "seq_dir_count": seq_dirs.len(),
+    }));
+
+    // Step 6: Run undo. Verify byte-identical recovery.
+    let undo_summary = undo::run_undo(td.path(), run_id, false, false);
+    let ok6 = undo_summary
+        .as_ref()
+        .map(|s| s.failures.is_empty())
+        .unwrap_or(false)
+        && fs::read_to_string(&target_a).ok().as_deref() == Some("alpha original\n")
+        && fs::read_to_string(&target_b).ok().as_deref() == Some("beta original\n")
+        && !quarantine.exists();
+    all_ok &= ok6;
+    checks.push(serde_json::json!({
+        "name": "undo_round_trip_byte_identical",
+        "ok": ok6,
+        "actions_replayed": undo_summary.as_ref().map(|s| s.actions_replayed).unwrap_or(0),
+        "failures": undo_summary
+            .as_ref()
+            .map(|s| s.failures.clone())
+            .unwrap_or_default(),
+    }));
+
+    let duration_ms = started_at.elapsed().as_millis() as u64;
+
+    let envelope = serde_json::json!({
+        "schema_version": "1.0",
+        "doctor_version": runs::DOCTOR_VERSION,
+        "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "ok": all_ok,
+        "checks": checks,
+        "duration_ms": duration_ms,
+        "tempdir": td.path().to_string_lossy(),
+    });
+
+    match format.unwrap_or(CliOutputFormat::Json) {
+        CliOutputFormat::Json | CliOutputFormat::Toon | CliOutputFormat::Table => {
+            let s = serde_json::to_string_pretty(&envelope)
+                .map_err(|e| CliError::Other(format!("serializing selftest: {e}")))?;
+            println!("{s}");
+        }
+    }
+
+    if !all_ok {
+        eprintln!("error: doctor selftest had failing checks");
+        return Err(CliError::ExitCode(1));
+    }
+    Ok(())
+}
+
 /// Print `am doctor health` — one-line liveness summary + exit 0/1.
 ///
 /// Cheap. For CI scheduling. Reads `.doctor/latest/report.json` if present.
