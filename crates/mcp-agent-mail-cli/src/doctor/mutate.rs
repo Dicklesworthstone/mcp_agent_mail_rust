@@ -39,38 +39,22 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Serialize)]
 pub enum Op {
     /// Create-or-overwrite the file at `path` (atomic via tempfile + rename).
-    WriteFile {
-        content: Vec<u8>,
-        mode: u32,
-    },
+    WriteFile { content: Vec<u8>, mode: u32 },
     /// Append to the file at `path`.
-    AppendFile {
-        content: Vec<u8>,
-    },
+    AppendFile { content: Vec<u8> },
     /// Atomic rename of `path` → `to`. Used for "delete-equivalent"
     /// (move to quarantine) and atomic state swaps.
-    Rename {
-        to: PathBuf,
-    },
+    Rename { to: PathBuf },
     /// Set the mode of `path`.
-    Chmod {
-        mode: u32,
-    },
+    Chmod { mode: u32 },
     /// Execute `sql` against the project's DB inside a transaction. Wired
     /// to the project's `DbConn` by the dispatch layer; this struct
     /// only carries the SQL.
-    DbExec {
-        sql: String,
-    },
+    DbExec { sql: String },
     /// Versioned schema migration; rolls back on error.
-    DbMigrate {
-        from: u32,
-        to: u32,
-    },
+    DbMigrate { from: u32, to: u32 },
     /// Atomic symlink replacement (used for `.doctor/latest`).
-    SymlinkAtomic {
-        target: PathBuf,
-    },
+    SymlinkAtomic { target: PathBuf },
 }
 
 impl Op {
@@ -155,6 +139,12 @@ pub enum MutateError {
     /// pre-mutation state. Maps to exit 5 (`concurrency_lost`).
     #[error("file {0} was modified between hash and backup (concurrent writer)")]
     TamperedBeforeMutate(PathBuf),
+    /// `Op::Rename` would clobber an existing file at the destination.
+    /// Per AGENTS.md RULE 1 (no file deletion), we refuse rather than
+    /// overwrite via the silent-overwrite POSIX `rename` semantics.
+    /// Maps to exit 4 (`refused_unsafe`).
+    #[error("rename destination {0} already exists (would clobber per AGENTS.md RULE 1)")]
+    RenameDestinationExists(PathBuf),
     /// The mutation execution failed. The backup was rolled back (or
     /// there was nothing to roll back to). `rolled_back` reflects the
     /// actual result. Maps to exit 3 (`fix_failed_rolled_back`) when
@@ -221,10 +211,10 @@ fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
 fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), MutateError> {
     let canonical = canonicalize_existing_or_parent(path).map_err(MutateError::Io)?;
     for scope in &caps.write_scopes {
-        if let Ok(canonical_scope) = canonicalize_existing_or_parent(scope) {
-            if canonical.starts_with(&canonical_scope) {
-                return Ok(());
-            }
+        if let Ok(canonical_scope) = canonicalize_existing_or_parent(scope)
+            && canonical.starts_with(&canonical_scope)
+        {
+            return Ok(());
         }
     }
     Err(MutateError::OutOfScope(path.to_path_buf()))
@@ -254,7 +244,12 @@ fn elapsed_ns(start: Instant) -> u128 {
 }
 
 /// Atomic write via tempfile-in-same-dir + rename.
-fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
+///
+/// G4 fix (Gemini round 2): permissions are set on the tempfile's file
+/// descriptor BEFORE `tmp.persist(path)`. Setting permissions on `path`
+/// post-persist would race a symlink-swap attacker who could redirect
+/// `path` to an arbitrary out-of-scope file between persist and chmod.
+pub(crate) fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let tmp = tempfile::NamedTempFile::new_in(parent)?;
@@ -262,14 +257,34 @@ fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::io::Result<
         let mut f = tmp.as_file();
         f.write_all(content)?;
         f.sync_data()?;
+        // G4 fix: chmod via fd before persist (symlink-attack defense).
+        f.set_permissions(Permissions::from_mode(mode))?;
     }
     tmp.persist(path).map_err(|e| e.error)?;
-    fs::set_permissions(path, Permissions::from_mode(mode))?;
     let _ = OpenOptions::new()
         .read(true)
         .open(parent)
         .and_then(|d| d.sync_all());
     Ok(())
+}
+
+/// Compute the backup path for a target.
+///
+/// G1 fix (Gemini round 2): when `path` is absolute and outside `repo_root`,
+/// `strip_prefix` returns Err and `PathBuf::join(absolute)` drops the base —
+/// so naive `run_dir.join("backups").join(rel)` returned the live target itself.
+/// We now encode out-of-repo paths under a sentinel `__abs__/` subdirectory.
+pub(crate) fn backup_path_for(run_dir: &Path, repo_root: &Path, path: &Path) -> PathBuf {
+    let backups = run_dir.join("backups");
+    if let Ok(rel) = path.strip_prefix(repo_root) {
+        return backups.join(rel);
+    }
+    // Outside repo_root — encode the absolute path as a "rooted" relative
+    // path under backups/__abs__/. Strip a leading `/` so PathBuf::join
+    // doesn't drop the prefix.
+    let abs_str = path.to_string_lossy();
+    let trimmed = abs_str.trim_start_matches('/');
+    backups.join("__abs__").join(trimmed)
 }
 
 /// Atomic symlink replacement: write tmp symlink in same dir, rename over.
@@ -340,6 +355,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     let lock_path = parent.join(format!(".{}.doctor-lock", basename));
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)?;
@@ -365,8 +381,15 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // concurrent writer modified the file in our window (H3 fix), and we
     // refuse to proceed because our backup wouldn't be a real backup of
     // the pre-mutation state.
+    //
+    // G1 fix (Gemini round 2): use `backup_path_for` which correctly handles
+    // absolute paths outside repo_root (was: PathBuf::join with absolute
+    // path returned the live file itself, causing copy-onto-self). The
+    // `rel` value used in actions.jsonl stays the original path semantics
+    // — for absolute paths, undo's `target.join(absolute)` recovers the
+    // absolute path (PathBuf::join's same semantics that broke backup).
+    let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path);
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
-    let backup_path = ctx.run_dir.join("backups").join(rel);
     if !ctx.dry_run && path.exists() {
         copy_verbatim_with_perms(path, &backup_path)?;
         cmp_strict(path, &backup_path)
@@ -415,6 +438,15 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             // Destination scope already checked at step 3.
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
+            }
+            // G3 fix (Gemini round 2): refuse if the destination already
+            // exists. POSIX `fs::rename` overwrites silently, which would
+            // permanently destroy the existing file at `to` — direct
+            // violation of AGENTS.md RULE 1 (no file deletion). The
+            // appropriate response is to either pick a different
+            // quarantine name OR refuse with exit-4 / RenameClobberRefused.
+            if fs::symlink_metadata(&to).is_ok() {
+                return Err(MutateError::RenameDestinationExists(to.clone()));
             }
             fs::rename(path, &to)?;
             rename_to_record = Some(to.to_string_lossy().into_owned());
@@ -653,7 +685,11 @@ mod tests {
         let td = TempDir::new().unwrap();
         let target = td.path().join("victim.txt");
         fs::write(&target, b"data\n").unwrap();
-        let quarantine = td.path().join(".doctor").join("quarantine").join("victim.txt");
+        let quarantine = td
+            .path()
+            .join(".doctor")
+            .join("quarantine")
+            .join("victim.txt");
         let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__abc");
         let _ = mutate(
             &ctx,
@@ -748,6 +784,79 @@ mod tests {
             }
             other => panic!("expected ExecFailed, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn g1_backup_path_for_handles_absolute_paths_outside_repo() {
+        // G1 fix (Gemini round 2): backup_path_for must NOT use PathBuf::join
+        // with an absolute path (which drops the base). For paths outside
+        // repo_root, encode under __abs__/ subdirectory.
+        let run_dir = PathBuf::from("/tmp/run-dir");
+        let repo_root = PathBuf::from("/repo");
+        let in_repo = PathBuf::from("/repo/.config/x");
+        let out_of_repo = PathBuf::from("/home/user/.config/x");
+        assert_eq!(
+            backup_path_for(&run_dir, &repo_root, &in_repo),
+            PathBuf::from("/tmp/run-dir/backups/.config/x"),
+        );
+        let bp = backup_path_for(&run_dir, &repo_root, &out_of_repo);
+        assert!(
+            bp.starts_with(run_dir.join("backups/__abs__")),
+            "expected __abs__/ encoding, got: {bp:?}"
+        );
+        assert!(
+            bp.to_string_lossy().contains("home/user/.config/x"),
+            "expected encoded absolute path, got: {bp:?}"
+        );
+    }
+
+    #[test]
+    fn g3_rename_destination_exists_refuses() {
+        // G3 fix (Gemini round 2): Op::Rename refuses if destination exists.
+        // Per AGENTS.md RULE 1, silent overwrite of existing files is forbidden.
+        let td = TempDir::new().unwrap();
+        let src = td.path().join("source.txt");
+        let dst = td.path().join("destination.txt");
+        std::fs::write(&src, b"source data").unwrap();
+        std::fs::write(&dst, b"important destination data").unwrap();
+        let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__g3");
+        let err = mutate(&ctx, &src, Op::Rename { to: dst.clone() }).unwrap_err();
+        assert!(
+            matches!(err, MutateError::RenameDestinationExists(_)),
+            "got: {err:?}"
+        );
+        // Source untouched.
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "source data");
+        // Destination preserved.
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "important destination data",
+            "destination file must be preserved per AGENTS.md RULE 1"
+        );
+    }
+
+    #[test]
+    fn g4_atomic_write_chmod_via_fd_before_persist() {
+        // G4 fix (Gemini round 2): permissions set via fd before persist,
+        // not via path after. Verified by checking the file ends up with
+        // the requested mode (this test would not catch a TOCTOU attack
+        // directly, but exercises the permission-setting path).
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("hook.sh");
+        let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__g4");
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"#!/bin/sh\necho hook\n".to_vec(),
+                mode: 0o755,
+            },
+        )
+        .unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        // Compare lower 9 bits (rwxrwxrwx).
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]

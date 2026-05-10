@@ -259,6 +259,120 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ---
 
+## `am doctor` — World-Class Self-Healing Surface
+
+`am doctor` diagnoses and (with `--fix`) repairs Agent Mail's mailbox state. The world-class surface (added in commit `641990d8`, hardened in pass-2) provides reversible, hash-witnessed, agent-ergonomic remediation with strict scope isolation.
+
+### Verbs
+
+| Verb | Mutates? | Default exit |
+|------|----------|--------------|
+| `am doctor` (or `check`) | No | 0 healthy / 1 findings |
+| `am doctor --fix` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
+| `am doctor --dry-run --fix` | No | 0 |
+| `am doctor undo <run-id>` | Yes (restore-only) | 0 / 3 |
+| `am doctor capabilities --json` | No | 0 |
+| `am doctor robot-docs` | No | 0 |
+| `am doctor health` | No | 0 / 1 |
+| `am doctor ls` | No | 0 |
+| `am doctor repair`, `reconstruct`, `fix`, `archive-scan`, `archive-normalize`, `backups`, `restore`, `fix-orphan-refs`, `pack-archive` | (legacy verbs preserved) | varies |
+
+### When to run `am doctor`
+
+- **Before any session work touching the mailbox**: `am doctor health` (cheap; one line; exit 0/1)
+- **When agents report unexpected state** (stale locks, missing config, runtime issues): `am doctor --json` to see structured findings
+- **Before non-trivial repairs**: `am doctor --dry-run --fix` to preview the plan; then `am doctor --fix --yes` to apply
+- **If `--fix` went wrong**: `am doctor undo latest` (restores from `<repo>/.doctor/runs/<id>/backups/`)
+- **When you need to discover the doctor's contract programmatically**: `am doctor capabilities --json | jq`
+
+### Hard guarantees
+
+- **Detect-then-fix.** Detectors are pure; nothing writes without `--fix`.
+- **Single chokepoint.** Every disk write under `--fix` flows through `mutate()` in `crates/mcp-agent-mail-cli/src/doctor/mutate.rs`. The 7 canonical `Op` variants are the only writes allowed.
+- **No deletion.** Per RULE 1, doctor never deletes. `Op::Rename` to `<run-dir>/quarantine/<rel>` is the only "delete-equivalent" operation. `am doctor undo` restores from quarantine.
+- **Verbatim backups.** Before every mutation, the live file is byte-copied to `<run-dir>/backups/<rel>` and verified with `cmp_strict`. Hash-witnessed in `actions.jsonl`.
+- **Atomic writes.** All mutations use write-tmp-then-rename (or DB transactions). No in-place truncation. No half-written files visible to readers.
+- **Reversible.** `am doctor undo <run-id>` reads `actions.jsonl` in reverse and restores byte-identical from `backups/`. Verifies post-restore SHA-256 matches `before_hash`. Refuses to clobber files the user modified after the fix (post-restore `after_hash` check).
+- **Idempotent.** `--fix` then `--fix` → second run reports `actions_taken: 0`. `undo <run-id>` then `undo <run-id>` → second is a no-op via the `undo_complete` sentinel.
+- **Concurrency-safe.** Per-path advisory lock (`fs2::FileExt::try_lock_exclusive`) prevents concurrent writers stepping on each other. Per-run-id `undo.lock` prevents concurrent undo invocations from racing.
+- **Symlink-safe.** `mutate()` sets permissions on the tempfile fd before persist (defeats symlink-swap chmod attack). `undo` refuses to follow symlinks at the target (defeats symlink-redirect overwrite attack).
+- **Scope-bounded.** All writes refuse if path is outside `capabilities.write_scopes` (exit 4). `--dry-run` plan checks scopes before printing — never lies about would-be exit-4 refusals.
+- **Read-only by default.** Bare `am doctor` never mutates state.
+- **Stable JSON schema.** `--json` output always includes `schema_version`. `doctor_contract_version` documented in `capabilities --json`.
+- **Stdout = data, stderr = progress.** `am doctor --json | jq` is always safe.
+- **No file deletion.** Per RULE 1. Quarantine via `Op::Rename`.
+- **No destructive shell.** Per "Irreversible Git & Filesystem Actions" — no `rm -rf`, `git reset --hard`, `git clean -fd`.
+
+### Per-run artifacts
+
+Every `--fix` run creates `<repo>/.doctor/runs/<ISO>__<run-id>/`:
+
+```
+.doctor/runs/2026-05-09T16-30-15Z__abc123/
+├── report.json           # findings + summary; same shape as `--json` output
+├── report.md             # human-readable narrative
+├── actions.jsonl         # one line per mutate() call (before/after hashes)
+├── backups/              # verbatim per-file copies (preserves perms, mtime)
+├── stderr.log
+├── stdout.json
+└── undo.sh               # idempotent shell script wrapping `am doctor undo`
+```
+
+`<repo>/.doctor/latest` is an atomic symlink to the most recent run.
+
+`<repo>/.doctor/scorecard_history.jsonl` is the per-run trend timeseries.
+
+`.doctor/` is added to `.gitignore` automatically on first run.
+
+### Common workflows for agents
+
+```bash
+# Startup health probe (CI-safe; cheap)
+am doctor health
+
+# Full diagnose (offline by default)
+am doctor --json | jq '.findings[] | select(.severity == "P0")'
+
+# Plan-then-fix
+am doctor --dry-run --fix
+am doctor --fix --yes
+
+# Reverse a fix that went wrong
+am doctor undo latest                           # most recent
+am doctor ls                                    # see all runs
+am doctor undo 2026-05-09T16-30-15Z__abc123     # specific run
+
+# Discover the contract programmatically
+am doctor capabilities --json | jq '.detectors | length'
+am doctor capabilities --json | jq '.fixers | map(.id)'
+am doctor capabilities --json | jq '.exit_codes | keys'
+```
+
+### Pre-commit hook integration (recommended; not auto-installed)
+
+```bash
+# .git/hooks/pre-commit
+#!/bin/sh
+am doctor health || {
+    echo "am doctor reports findings. Run: am doctor --json | jq" >&2
+    exit 1
+}
+```
+
+### Workspace artifacts (decision support)
+
+The full inventory of 82 failure modes (P0×24/P1×39/P2×16/P3×3) lives at `/data/projects/mcp_agent_mail_rust__doctor_workspace/`:
+
+- `analysis/taxonomy.md` — FMs by severity + subsystem
+- `analysis/dependency_graph.json` — execution-order DAG (82 nodes, 142 edges, validated)
+- `analysis/conflict_matrix.md` — 60+ never-co-run pairs
+- `analysis/safety_envelope.md` — write/read scopes, locks, exit codes
+- `analysis/repair_specs/fm-*.md` — per-FM detector + fixer + fixture spec
+- `playbook.md` — operator-facing 3-chapter playbook
+- `HANDOFF.md` — pass-2/pass-3 priority list
+
+---
+
 ## MCP Agent Mail — This Project
 
 **This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 37 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.

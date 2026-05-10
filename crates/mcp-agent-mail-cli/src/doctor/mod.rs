@@ -67,9 +67,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         return Ok(());
     }
 
-    let resolved = std::fs::read_link(&latest)
-        .ok()
-        .map(|p| root.join(p));
+    let resolved = std::fs::read_link(&latest).ok().map(|p| root.join(p));
     let report_path = resolved.and_then(|p| {
         let r = p.join("report.json");
         if r.exists() { Some(r) } else { None }
@@ -109,8 +107,8 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
 
 /// Print `am doctor ls` — list of runs.
 pub fn handle_ls(target: &std::path::Path, format: Option<CliOutputFormat>) -> CliResult<()> {
-    let runs = runs::list_runs(target)
-        .map_err(|e| CliError::Other(format!("listing runs: {e}")))?;
+    let runs =
+        runs::list_runs(target).map_err(|e| CliError::Other(format!("listing runs: {e}")))?;
     let fmt = format.unwrap_or_else(|| {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
@@ -133,19 +131,14 @@ pub fn handle_ls(target: &std::path::Path, format: Option<CliOutputFormat>) -> C
             if runs.is_empty() {
                 println!("(no runs)");
             } else {
-                println!(
-                    "{:36}  {:8}  {:8}  {}",
-                    "run_id", "exit", "actions", "findings"
-                );
+                println!("{:36}  {:8}  {:8}  findings", "run_id", "exit", "actions");
                 for r in &runs {
                     println!(
                         "{:36}  {:8}  {:8}  {}",
                         r.run_id,
                         r.exit_code.map(|c| c.to_string()).unwrap_or("-".into()),
                         r.action_count,
-                        r.finding_count
-                            .map(|n| n.to_string())
-                            .unwrap_or("-".into()),
+                        r.finding_count.map(|n| n.to_string()).unwrap_or("-".into()),
                     );
                 }
             }

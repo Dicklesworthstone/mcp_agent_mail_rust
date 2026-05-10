@@ -72,10 +72,10 @@ pub fn now_iso_seconds() -> String {
 /// Resolve the `.doctor/` root for a target. Defaults to `<target>/.doctor/`
 /// but honors `AM_DOCTOR_BACKUPS_DIR` if set.
 pub fn doctor_root(target: &Path) -> PathBuf {
-    if let Ok(s) = std::env::var("AM_DOCTOR_BACKUPS_DIR") {
-        if !s.is_empty() {
-            return PathBuf::from(s);
-        }
+    if let Ok(s) = std::env::var("AM_DOCTOR_BACKUPS_DIR")
+        && !s.is_empty()
+    {
+        return PathBuf::from(s);
     }
     target.join(".doctor")
 }
@@ -198,19 +198,22 @@ fn summarize_run(run_dir: &Path, run_id: &str) -> RunSummary {
     let mut bytes_backed_up = None;
     if let Ok(mut f) = fs::File::open(run_dir.join("report.json")) {
         let mut s = String::new();
-        if f.read_to_string(&mut s).is_ok() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                exit_code = v.get("exit_code").and_then(|e| e.as_i64()).map(|i| i as i32);
-                finding_count = v
-                    .get("summary")
-                    .and_then(|sm| sm.get("total_findings"))
-                    .and_then(|n| n.as_u64())
-                    .map(|n| n as usize);
-                bytes_backed_up = v
-                    .get("summary")
-                    .and_then(|sm| sm.get("bytes_backed_up"))
-                    .and_then(|n| n.as_u64());
-            }
+        if f.read_to_string(&mut s).is_ok()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
+        {
+            exit_code = v
+                .get("exit_code")
+                .and_then(|e| e.as_i64())
+                .map(|i| i as i32);
+            finding_count = v
+                .get("summary")
+                .and_then(|sm| sm.get("total_findings"))
+                .and_then(|n| n.as_u64())
+                .map(|n| n as usize);
+            bytes_backed_up = v
+                .get("summary")
+                .and_then(|sm| sm.get("bytes_backed_up"))
+                .and_then(|n| n.as_u64());
         }
     }
 
@@ -324,7 +327,8 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         append_scorecard_history(td.path(), r#"{"run_id":"a","aggregate":700}"#).unwrap();
         append_scorecard_history(td.path(), r#"{"run_id":"b","aggregate":750}"#).unwrap();
-        let s = fs::read_to_string(td.path().join(".doctor").join("scorecard_history.jsonl")).unwrap();
+        let s =
+            fs::read_to_string(td.path().join(".doctor").join("scorecard_history.jsonl")).unwrap();
         assert_eq!(s.lines().count(), 2);
     }
 }
