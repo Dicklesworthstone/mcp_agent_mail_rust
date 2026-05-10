@@ -97,9 +97,45 @@
       "status": "ok"
     },
     {
+      "binary": "am",
+      "candidates": [
+        {
+          "display": "<TMP_ROOT>/home/.local/bin/am",
+          "matches_source_version": true,
+          "parsed_version": "0.2.52",
+          "path": "<TMP_ROOT>/home/.local/bin/am",
+          "source": "path",
+          "version_line": "am 0.2.52"
+        }
+      ],
       "category": "environment",
       "check": "binary_version",
-      "detail": "am 0.2.42 (expected v0.2.42)",
+      "detail": "am on PATH/install matches source version v0.2.52",
+      "expected_install_path": "<TMP_ROOT>/home/.local/bin/am",
+      "path_binary": "<TMP_ROOT>/home/.local/bin/am",
+      "running_exe": "<RUNNING_EXE>",
+      "source_version": "0.2.52",
+      "status": "ok"
+    },
+    {
+      "binary": "mcp-agent-mail",
+      "candidates": [
+        {
+          "display": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+          "matches_source_version": true,
+          "parsed_version": "0.2.52",
+          "path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+          "source": "path",
+          "version_line": "mcp-agent-mail 0.2.52"
+        }
+      ],
+      "category": "environment",
+      "check": "server_binary_version",
+      "detail": "mcp-agent-mail on PATH/install matches source version v0.2.52",
+      "expected_install_path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+      "path_binary": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
+      "running_exe": "<RUNNING_EXE>",
+      "source_version": "0.2.52",
       "status": "ok"
     },
     {

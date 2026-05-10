@@ -19694,6 +19694,295 @@ fn push_git_version_findings(checks: &mut Vec<serde_json::Value>) {
     }
 }
 
+fn doctor_install_dir() -> PathBuf {
+    if let Some(dest) = mcp_agent_mail_core::config::process_env_value("DEST")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(dest);
+    }
+    mcp_agent_mail_core::config::process_env_value("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/bin")
+}
+
+fn doctor_binary_file_name(base: &str) -> String {
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
+fn doctor_path_display_with_target(path: &Path) -> String {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(path) {
+            Ok(target) => format!("{} -> {}", path.display(), target.display()),
+            Err(_) => path.display().to_string(),
+        },
+        _ => path.display().to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn doctor_path_is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn doctor_path_is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn doctor_find_first_path_binary(binary_name: &str) -> Option<PathBuf> {
+    let path_var = mcp_agent_mail_core::config::process_env_value("PATH")
+        .or_else(|| std::env::var("PATH").ok())?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(binary_name))
+        .find(|candidate| doctor_path_is_executable_file(candidate))
+}
+
+fn doctor_run_version_line(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot spawn {} --version: {error}", path.display()))?;
+
+    let stdout_h = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_h = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{} --version timed out after 3s", path.display()));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{} --version wait failed: {error}", path.display()));
+            }
+        }
+    };
+
+    let stdout = stdout_h
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_h
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    let line = combined
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("unknown")
+        .to_string();
+    if status.success() {
+        Ok(line)
+    } else {
+        Err(format!(
+            "{} --version exited {}: {line}",
+            path.display(),
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+fn doctor_parse_binary_version(line: &str, binary_base: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        (Some(name), Some(version))
+            if name == binary_base || name.trim_end_matches(".exe") == binary_base =>
+        {
+            normalize_self_update_version(version).ok()
+        }
+        _ => line
+            .split_whitespace()
+            .find_map(|token| normalize_self_update_version(token).ok()),
+    }
+}
+
+fn doctor_binary_provenance_remediation(expected_version: &str) -> String {
+    collapse_whitespace(&self_update_installer_fallback_hint(expected_version))
+}
+
+fn doctor_binary_provenance_entry(
+    check_name: &str,
+    binary_base: &str,
+    expected_version: &str,
+    install_dir: &Path,
+) -> serde_json::Value {
+    let binary_name = doctor_binary_file_name(binary_base);
+    let expected_install_path = install_dir.join(&binary_name);
+    let path_binary = doctor_find_first_path_binary(&binary_name);
+    let running_exe = std::env::current_exe().ok();
+
+    let mut candidates: Vec<(&str, PathBuf)> = Vec::new();
+    if let Some(path) = path_binary.as_ref() {
+        candidates.push(("path", path.clone()));
+    }
+    if expected_install_path.exists()
+        && candidates
+            .iter()
+            .all(|(_, path)| path != &expected_install_path)
+    {
+        candidates.push(("install", expected_install_path.clone()));
+    }
+
+    if candidates.is_empty() {
+        return serde_json::json!({
+            "check": check_name,
+            "status": "warn",
+            "binary": binary_base,
+            "source_version": expected_version,
+            "running_exe": running_exe.map(|path| path.display().to_string()),
+            "path_binary": null,
+            "expected_install_path": expected_install_path.display().to_string(),
+            "detail": format!(
+                "{binary_base} was not found on PATH or at {}; source version is v{expected_version}. Remediation: {}",
+                expected_install_path.display(),
+                doctor_binary_provenance_remediation(expected_version),
+            ),
+        });
+    }
+
+    let mut candidate_payloads = Vec::new();
+    let mut stale_parts = Vec::new();
+    let mut probe_error_parts = Vec::new();
+
+    for (source, path) in candidates {
+        match doctor_run_version_line(&path) {
+            Ok(line) => {
+                let parsed = doctor_parse_binary_version(&line, binary_base);
+                let matches = parsed.as_deref() == Some(expected_version);
+                if !matches {
+                    stale_parts.push(format!(
+                        "{source} {} reports {}",
+                        doctor_path_display_with_target(&path),
+                        parsed
+                            .as_deref()
+                            .map(|version| format!("v{version}"))
+                            .unwrap_or_else(|| line.clone()),
+                    ));
+                }
+                candidate_payloads.push(serde_json::json!({
+                    "source": source,
+                    "path": path.display().to_string(),
+                    "display": doctor_path_display_with_target(&path),
+                    "version_line": line,
+                    "parsed_version": parsed,
+                    "matches_source_version": matches,
+                }));
+            }
+            Err(error) => {
+                probe_error_parts.push(format!("{source} {}: {error}", path.display()));
+                candidate_payloads.push(serde_json::json!({
+                    "source": source,
+                    "path": path.display().to_string(),
+                    "display": doctor_path_display_with_target(&path),
+                    "probe_error": error,
+                    "matches_source_version": false,
+                }));
+            }
+        }
+    }
+
+    let status = if stale_parts.is_empty() && probe_error_parts.is_empty() {
+        "ok"
+    } else {
+        "warn"
+    };
+    let detail = if status == "ok" {
+        format!("{binary_base} on PATH/install matches source version v{expected_version}")
+    } else {
+        let mut parts = Vec::new();
+        if !stale_parts.is_empty() {
+            parts.push(format!(
+                "stale {binary_base} binary: {}; source version is v{expected_version}",
+                stale_parts.join("; ")
+            ));
+        }
+        if !probe_error_parts.is_empty() {
+            parts.push(format!(
+                "{binary_base} version probe failed: {}",
+                probe_error_parts.join("; ")
+            ));
+        }
+        parts.push(format!(
+            "remediation: {}",
+            doctor_binary_provenance_remediation(expected_version)
+        ));
+        parts.join(". ")
+    };
+
+    serde_json::json!({
+        "check": check_name,
+        "status": status,
+        "binary": binary_base,
+        "source_version": expected_version,
+        "running_exe": running_exe.map(|path| path.display().to_string()),
+        "path_binary": path_binary.map(|path| path.display().to_string()),
+        "expected_install_path": expected_install_path.display().to_string(),
+        "candidates": candidate_payloads,
+        "detail": detail,
+    })
+}
+
+fn push_binary_provenance_findings(checks: &mut Vec<serde_json::Value>) {
+    let install_dir = doctor_install_dir();
+    let current_version = env!("CARGO_PKG_VERSION");
+    checks.push(doctor_binary_provenance_entry(
+        "binary_version",
+        "am",
+        current_version,
+        &install_dir,
+    ));
+    checks.push(doctor_binary_provenance_entry(
+        "server_binary_version",
+        "mcp-agent-mail",
+        current_version,
+        &install_dir,
+    ));
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -20587,62 +20876,8 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 4d: Installed binary version matches this running CLI build.
-    {
-        let expected_path = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join(".local/bin/am");
-        let current_version = env!("CARGO_PKG_VERSION");
-
-        if !expected_path.exists() {
-            checks.push(serde_json::json!({
-                "check": "binary_version",
-                "status": "warn",
-                "detail": format!(
-                    "Expected installed binary not found at {}",
-                    expected_path.display()
-                ),
-            }));
-        } else {
-            match std::process::Command::new(&expected_path)
-                .arg("--version")
-                .output()
-            {
-                Ok(output) => {
-                    let combined = format!(
-                        "{} {}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    let line = combined
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .map(str::trim)
-                        .unwrap_or("unknown");
-                    let status = if line.contains(current_version) {
-                        "ok"
-                    } else {
-                        "warn"
-                    };
-                    checks.push(serde_json::json!({
-                        "check": "binary_version",
-                        "status": status,
-                        "detail": format!(
-                            "{} (expected v{})",
-                            line,
-                            current_version
-                        ),
-                    }));
-                }
-                Err(err) => checks.push(serde_json::json!({
-                    "check": "binary_version",
-                    "status": "warn",
-                    "detail": format!("Version probe failed: {err}"),
-                })),
-            }
-        }
-    }
+    // Check 4d: Installed/PATH binary provenance matches this running CLI build.
+    push_binary_provenance_findings(&mut checks);
 
     // Check 4e: MCP config health — verify config files use HTTP URL mode
     {
@@ -58825,6 +59060,114 @@ fn format_bytes(bytes: u64) -> String {
         current /= 1024.0;
     }
     format!("{bytes} B")
+}
+
+#[cfg(all(test, unix))]
+fn write_fake_version_binary(dir: &Path, name: &str, version_line: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(dir).expect("create fake binary dir");
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf '%s\\n' '{version_line}'\n"),
+    )
+    .expect("write fake binary");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake binary");
+    path
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_binary_provenance_flags_stale_path_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    let actual = write_fake_version_binary(&bin_dir, "am-real", "am 0.2.51");
+    symlink(&actual, bin_dir.join("am")).expect("symlink fake am");
+
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[("PATH", bin_dir.to_string_lossy().as_ref())],
+        || {
+            let entry = doctor_binary_provenance_entry("binary_version", "am", "0.2.52", &bin_dir);
+            assert_eq!(entry["status"], "warn");
+            assert_eq!(entry["source_version"], "0.2.52");
+            assert_eq!(entry["candidates"][0]["parsed_version"], "0.2.51");
+            let detail = entry["detail"].as_str().expect("detail");
+            assert!(detail.contains("0.2.51"), "{detail}");
+            assert!(detail.contains("0.2.52"), "{detail}");
+            assert!(detail.contains("install.sh"), "{detail}");
+            assert!(
+                entry["candidates"][0]["display"]
+                    .as_str()
+                    .expect("display")
+                    .contains("->"),
+                "symlink target should be visible"
+            );
+        },
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_binary_provenance_passes_fresh_server_binary() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    write_fake_version_binary(&bin_dir, "mcp-agent-mail", "mcp-agent-mail 0.2.52");
+
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[("PATH", bin_dir.to_string_lossy().as_ref())],
+        || {
+            let entry = doctor_binary_provenance_entry(
+                "server_binary_version",
+                "mcp-agent-mail",
+                "0.2.52",
+                &bin_dir,
+            );
+            assert_eq!(entry["status"], "ok");
+            assert_eq!(entry["candidates"][0]["parsed_version"], "0.2.52");
+            assert_eq!(entry["candidates"][0]["matches_source_version"], true);
+        },
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_install_dir_honors_custom_dest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let custom_dest = temp.path().join("custom-bin");
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DEST", custom_dest.to_string_lossy().as_ref()),
+            ("HOME", temp.path().to_string_lossy().as_ref()),
+        ],
+        || {
+            assert_eq!(doctor_install_dir(), custom_dest);
+        },
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_binary_provenance_is_network_independent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    write_fake_version_binary(&bin_dir, "am", "am 0.2.52");
+
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("PATH", bin_dir.to_string_lossy().as_ref()),
+            ("NO_UPDATE_CHECK", "1"),
+            ("AM_SELF_UPDATE_API_URL", "https://127.0.0.1:9/unreachable"),
+        ],
+        || {
+            let entry = doctor_binary_provenance_entry("binary_version", "am", "0.2.52", &bin_dir);
+            assert_eq!(entry["status"], "ok");
+            assert_eq!(entry["candidates"][0]["parsed_version"], "0.2.52");
+        },
+    );
 }
 
 // ── Self-update unit tests ────────────────────────────────────────────

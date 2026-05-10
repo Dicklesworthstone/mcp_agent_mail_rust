@@ -54,6 +54,13 @@ fn write_login_profile(path: &Path, local_bin: &Path) {
     std::fs::write(path, contents).expect("write shell profile");
 }
 
+fn write_version_shim(path: &Path, binary: &str, version: &str) {
+    let contents = format!("#!/bin/sh\nprintf '%s\\n' '{binary} {version}'\n");
+    std::fs::write(path, contents).expect("write version shim");
+    #[cfg(unix)]
+    set_executable(path);
+}
+
 fn read_fixture(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -152,6 +159,12 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                         Value::String("<GENERATED_AT>".to_string()),
                     );
                 }
+                if out.contains_key("running_exe") {
+                    out.insert(
+                        "running_exe".to_string(),
+                        Value::String("<RUNNING_EXE>".to_string()),
+                    );
+                }
                 Value::Object(out)
             }
             other => other,
@@ -186,6 +199,11 @@ impl TestEnv {
         std::fs::copy(am_bin(), &installed_am).expect("copy am into hermetic home");
         #[cfg(unix)]
         set_executable(&installed_am);
+        write_version_shim(
+            &local_bin.join("mcp-agent-mail"),
+            "mcp-agent-mail",
+            env!("CARGO_PKG_VERSION"),
+        );
 
         write_login_profile(&home_dir.join(".bash_profile"), &local_bin);
         write_login_profile(&home_dir.join(".profile"), &local_bin);
