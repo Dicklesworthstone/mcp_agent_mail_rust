@@ -35,7 +35,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{:x}", h)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct StoredAction {
     path: String,
     op: String,
@@ -51,12 +51,28 @@ struct StoredAction {
     /// Undo uses this to find the correct per-mutation backup.
     #[serde(default)]
     started_at_ns: u128,
+    /// Pass-5 G-Crash-Window fix: `"pending"` (mutation in flight; backup
+    /// exists; mutation may or may not have happened yet) or `"completed"`
+    /// (mutation finished). Absent = legacy / completed.
+    #[serde(default)]
+    phase: Option<String>,
     #[serde(default)]
     rename_to: Option<String>,
     #[serde(default)]
     before_mode: Option<u32>,
     #[serde(default)]
     ok: bool,
+}
+
+impl StoredAction {
+    /// True if this is the post-mutation "completed" line (or a legacy
+    /// line with no phase field).
+    fn is_completed(&self) -> bool {
+        match self.phase.as_deref() {
+            Some("completed") | None => true,
+            _ => false,
+        }
+    }
 }
 
 fn per_mutation_backup_dir(backups_dir: &Path, started_at_ns: u128) -> PathBuf {
@@ -135,22 +151,107 @@ pub fn run_undo(
     };
 
     let f = fs::File::open(&actions_path)?;
-    let mut lines: Vec<String> = BufReader::new(f).lines().map_while(Result::ok).collect();
-    lines.reverse();
+    let raw_lines: Vec<String> = BufReader::new(f).lines().map_while(Result::ok).collect();
 
-    for line in lines {
+    // G-Crash-Window fix: dedupe two-phase entries by `started_at_ns`.
+    // For each unique `started_at_ns`, the latest (last-wins) entry is
+    // authoritative. If the latest entry is `phase == "pending"`, the
+    // mutation crashed mid-flight: backup exists, restore from it.
+    // If the latest entry is `"completed"` (or has no phase = legacy),
+    // standard restore.
+    let mut by_started_at: std::collections::BTreeMap<u128, StoredAction> =
+        std::collections::BTreeMap::new();
+    for line in &raw_lines {
         if line.trim().is_empty() {
             continue;
         }
-        let action: StoredAction = match serde_json::from_str(&line) {
+        let action: StoredAction = match serde_json::from_str(line) {
             Ok(a) => a,
-            Err(e) => {
-                summary
-                    .failures
-                    .push(format!("could not parse action line: {e}"));
+            Err(_) => continue, // skip malformed; reported below
+        };
+        // started_at_ns == 0 is the legacy fallback (no per-mutation seq);
+        // process those serially in raw order (use line index as key).
+        let key = if action.started_at_ns == 0 {
+            // pack the raw line index into the upper bits to keep ordering;
+            // index 0..N maps to keys 1..N+1 (avoid colliding with real
+            // started_at_ns values which start large).
+            (raw_lines
+                .iter()
+                .position(|l| l == line)
+                .unwrap_or(0)
+                + 1) as u128
+        } else {
+            action.started_at_ns
+        };
+        by_started_at.insert(key, action);
+    }
+
+    // Process in REVERSE order of started_at_ns (most recent mutation undone
+    // first; preserves the per-mutation seq backup correctness verified by
+    // pass-4's property test).
+    let mut crash_window_recoveries: usize = 0;
+    let actions: Vec<StoredAction> = by_started_at.values().rev().cloned().collect();
+
+    for action in actions {
+        // Detect crash-window: phase=pending without subsequent completed.
+        if action.phase.as_deref() == Some("pending") {
+            // Mutation crashed mid-flight. Backup exists at
+            // `backups/seq_<started_at_ns>/<rel>`. Restore from it.
+            // We do NOT validate after_hash because the mutation may not
+            // have completed (or may have completed after the pending log
+            // but before the completed log was flushed).
+            let target_file = target.join(&action.path);
+            let backup_file = if action.started_at_ns == 0 {
+                backups_dir.join(&action.path)
+            } else {
+                per_mutation_backup_dir(&backups_dir, action.started_at_ns).join(&action.path)
+            };
+            if dry_run {
+                eprintln!(
+                    "[dry-run] crash-window recovery: would restore {} from backup",
+                    target_file.display()
+                );
+                crash_window_recoveries += 1;
                 continue;
             }
-        };
+            if backup_file.exists() {
+                if let Some(parent) = target_file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let backup_bytes = fs::read(&backup_file)?;
+                let restore_mode = action.before_mode.unwrap_or(0o644);
+                if super::mutate::atomic_write_file(&target_file, &backup_bytes, restore_mode)
+                    .is_ok()
+                {
+                    crash_window_recoveries += 1;
+                    summary.actions_replayed += 1;
+                } else {
+                    summary
+                        .failures
+                        .push(format!("crash-window restore failed for {}", action.path));
+                }
+            } else if action.before_hash == EMPTY_FILE_SHA256 {
+                // File didn't exist before mutation. If it now exists,
+                // mutation probably succeeded — quarantine the post-state.
+                if target_file.exists() {
+                    let quarantine = run_dir
+                        .join("quarantine_crash_window")
+                        .join(&action.path);
+                    if let Some(parent) = quarantine.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let _ = fs::rename(&target_file, &quarantine);
+                }
+                crash_window_recoveries += 1;
+            } else {
+                summary
+                    .failures
+                    .push(format!("crash-window: backup missing for {}", action.path));
+            }
+            continue;
+        }
+
+        // Normal completed-line processing follows.
         if !action.ok {
             // The mutation failed; mutate() already attempted rollback. Skip.
             summary.actions_skipped += 1;

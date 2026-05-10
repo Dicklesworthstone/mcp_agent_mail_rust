@@ -35,6 +35,21 @@ s.close()
 PY
 }
 
+redact_command_part_for_artifact() {
+    local part="$1"
+    if [[ "${part}" == *=* ]]; then
+        local key="${part%%=*}"
+        local upper_key="${key^^}"
+        case "${upper_key}" in
+            *TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*|*PRIVATE_KEY*|*API_KEY*|*BEARER*|AUTHORIZATION|AUTH_HEADER)
+                printf '%s=<redacted>' "${key}"
+                return
+                ;;
+        esac
+    fi
+    printf '%s' "${part}"
+}
+
 normalize_transcript() {
     local in_path="$1"
     local out_path="$2"
@@ -83,12 +98,17 @@ start_server_pty() {
     done
     cmd_parts+=(timeout "${timeout_s}s" "${bin}" serve-http --host 127.0.0.1 --port "${port}")
     local server_cmd=""
+    local artifact_cmd=""
     local part
     for part in "${cmd_parts[@]}"; do
         printf -v server_cmd '%s %q' "${server_cmd}" "${part}"
+        local artifact_part
+        artifact_part="$(redact_command_part_for_artifact "${part}")"
+        printf -v artifact_cmd '%s %q' "${artifact_cmd}" "${artifact_part}"
     done
     server_cmd="${server_cmd# }"
-    printf '%s\n' "${server_cmd}" > "${E2E_ARTIFACT_DIR}/${label}.command.txt"
+    artifact_cmd="${artifact_cmd# }"
+    printf '%s\n' "${artifact_cmd}" > "${E2E_ARTIFACT_DIR}/${label}.command.txt"
 
     (script -q -f -c "${server_cmd}" "${transcript}") >/dev/null 2>&1 &
     echo "$!"
@@ -179,6 +199,16 @@ assert_json_field "JSON includes endpoint" "${JSON1}" "doc['endpoint'].startswit
 assert_json_field "JSON includes stats object" "${JSON1}" "all(k in doc['stats'] for k in ['projects','agents','messages','file_reservations','contact_links'])"
 assert_json_field "bearer token is masked" "${JSON1}" "doc['runtime']['http_bearer_token'] == '<redacted>'"
 assert_json_field "AM_GIT_BINARY path is reduced to basename" "${JSON1}" "doc['runtime']['am_git_binary'] == 'git-2.50.x'"
+if grep -Fq "secret123" "${NORM1}"; then
+    e2e_fail "normalized startup transcript masks bearer token everywhere"
+else
+    e2e_pass "normalized startup transcript masks bearer token everywhere"
+fi
+if grep -Fq "secret123" "${E2E_ARTIFACT_DIR}/json_enabled.command.txt"; then
+    e2e_fail "saved startup command artifact masks bearer token"
+else
+    e2e_pass "saved startup command artifact masks bearer token"
+fi
 
 e2e_case_banner "AM_BANNER_JSON_DISABLED skips startup JSON block"
 WORK2="$(e2e_mktemp "e2e_banner_json_disabled")"

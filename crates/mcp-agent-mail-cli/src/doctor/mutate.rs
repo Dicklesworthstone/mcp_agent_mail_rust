@@ -73,6 +73,14 @@ impl Op {
 
 /// One line of `actions.jsonl`. Schema documented in
 /// `world-class-doctor-mode-for-cli-tools` OUTPUT-SCHEMA.md.
+///
+/// G-Crash-Window fix (Gemini round 2): the `phase` field distinguishes
+/// the two-phase write protocol. `"pending"` is appended BEFORE the
+/// mutation executes (after the backup is in place). `"completed"` is
+/// appended AFTER the mutation succeeds or rolls back. Undo treats a
+/// pending-without-completed pair as crash-window: the backup exists,
+/// restore from it. Legacy actions.jsonl lines (no `phase` field) are
+/// treated as `"completed"` for backwards compatibility.
 #[derive(Debug, Serialize)]
 pub struct ActionRecord {
     pub path: String,
@@ -84,6 +92,10 @@ pub struct ActionRecord {
     pub run_id: String,
     pub fixer_id: String,
     pub ok: bool,
+    /// `"pending"` (pre-mutation) or `"completed"` (post-mutation).
+    /// Absent means legacy / completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rename_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -523,6 +535,42 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     let mut rename_to_record: Option<String> = None;
     let mut after_mode: Option<u32> = None;
 
+    // G-Crash-Window fix (Gemini round 2): write a `phase: "pending"`
+    // line to actions.jsonl BEFORE the mutation. If the process dies
+    // mid-mutation (SIGKILL, panic, power loss), the pending line +
+    // verbatim backup at `seq_<ns>/` are sufficient for undo to roll
+    // back: it sees pending without a corresponding completed entry
+    // and restores from the backup.
+    {
+        let pending_record = ActionRecord {
+            path: rel.to_string_lossy().into_owned(),
+            op: op.op_kind().to_string(),
+            before_hash: before_hash.clone(),
+            after_hash: String::new(), // unknown until step 8
+            started_at_ns,
+            finished_at_ns: 0, // not yet finished
+            run_id: ctx.run_id.clone(),
+            fixer_id: ctx.fixer_id.clone(),
+            ok: false, // mutation hasn't executed yet
+            phase: Some("pending"),
+            rename_to: match &op {
+                Op::Rename { to } => Some(to.to_string_lossy().into_owned()),
+                _ => None,
+            },
+            before_mode,
+            after_mode: None,
+            error: None,
+            rolled_back: None,
+        };
+        let pending_line = serde_json::to_string(&pending_record)? + "\n";
+        let mut f = ctx
+            .actions_file
+            .lock()
+            .map_err(|_| MutateError::Unsupported("actions_file mutex poisoned"))?;
+        f.write_all(pending_line.as_bytes())?;
+        f.sync_data()?;
+    }
+
     // 5/6. Execute atomically.
     let exec_result: Result<(), MutateError> = match op.clone() {
         Op::WriteFile { content, mode } => {
@@ -642,6 +690,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         run_id: ctx.run_id.clone(),
         fixer_id: ctx.fixer_id.clone(),
         ok,
+        // G-Crash-Window fix: this is the post-mutation entry. Pairs with
+        // the earlier `pending` line via shared `started_at_ns`.
+        phase: Some("completed"),
         rename_to: rename_to_record,
         before_mode,
         after_mode,
