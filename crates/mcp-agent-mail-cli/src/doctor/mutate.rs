@@ -791,6 +791,11 @@ mod tests {
 
     #[test]
     fn write_file_backs_up_existing_content_verbatim() {
+        // Pass-4: backups now live under `backups/seq_<started_at_ns>/<rel>`
+        // (per-mutation, not per-path) so multiple mutations to the same
+        // file in one run don't overwrite each other's backups. Verify
+        // by enumerating the backups dir and finding hello.txt with
+        // original content, regardless of the seq directory.
         let td = TempDir::new().unwrap();
         let target = td.path().join("hello.txt");
         fs::write(&target, b"original\n").unwrap();
@@ -804,9 +809,66 @@ mod tests {
             },
         )
         .unwrap();
-        let backup = ctx.run_dir.join("backups").join("hello.txt");
-        assert_eq!(fs::read_to_string(&backup).unwrap(), "original\n");
+        // Find the seq_<ns>/hello.txt backup.
+        let backups_root = ctx.run_dir.join("backups");
+        let mut found_backup_content: Option<String> = None;
+        for entry in fs::read_dir(&backups_root).unwrap().flatten() {
+            let candidate = entry.path().join("hello.txt");
+            if let Ok(s) = fs::read_to_string(&candidate) {
+                found_backup_content = Some(s);
+                break;
+            }
+        }
+        assert_eq!(
+            found_backup_content,
+            Some("original\n".to_string()),
+            "expected to find seq_<ns>/hello.txt backup with original content"
+        );
         assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn pass4_multiple_mutations_to_same_path_get_distinct_backups() {
+        // Pass-4: caught by property test. Two mutations to the same path
+        // must NOT overwrite each other's backups. Each mutation gets its
+        // own seq_<ns> subdir.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("collide.txt");
+        fs::write(&target, b"v0\n").unwrap();
+        let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__pass4");
+        // Two consecutive mutations.
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"v1\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"v2\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        // Two distinct backup directories must exist, with v0 and v1 contents.
+        let backups_root = ctx.run_dir.join("backups");
+        let mut found_contents: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&backups_root).unwrap().flatten() {
+            if let Ok(s) = fs::read_to_string(entry.path().join("collide.txt")) {
+                found_contents.push(s);
+            }
+        }
+        found_contents.sort();
+        assert_eq!(
+            found_contents,
+            vec!["v0\n".to_string(), "v1\n".to_string()],
+            "two mutations must produce two distinct backups"
+        );
     }
 
     #[test]
