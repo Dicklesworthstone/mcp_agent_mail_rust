@@ -184,6 +184,53 @@ fn capabilities_run_artifact_layout_pinned() {
 }
 
 #[test]
+fn capabilities_report_schema_url_points_at_existing_spec_file() {
+    // Pass-7: capabilities.report_schema must reference a real document
+    // in the repo. CI catches drift if the URL is updated without
+    // shipping the doc, or if the doc is removed without updating
+    // the URL.
+    let report = build_report("test".into(), Vec::new());
+    let url = report.report_schema;
+    assert!(url.starts_with("https://"), "report_schema must be a URL");
+    // Extract the relative path under main/.
+    let suffix = url
+        .split("/blob/main/")
+        .nth(1)
+        .expect("report_schema URL must reference main branch");
+    let local_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(suffix);
+    assert!(
+        local_path.exists(),
+        "report_schema URL points at {} but local file {} does not exist",
+        url,
+        local_path.display()
+    );
+    let body = std::fs::read_to_string(&local_path).expect("read SPEC");
+    // Doc must reference the contract version pinned in capabilities.
+    assert!(
+        body.contains(report.doctor_contract_version),
+        "SPEC file at {} must reference doctor_contract_version = {}",
+        local_path.display(),
+        report.doctor_contract_version
+    );
+    // Spot-check load-bearing terms exist.
+    for term in [
+        "schema_version",
+        "doctor_contract_version",
+        "phase",
+        "actions.jsonl",
+        "seq_",
+        "exit_code",
+    ] {
+        assert!(
+            body.contains(term),
+            "SPEC file should mention `{term}`"
+        );
+    }
+}
+
+#[test]
 fn capabilities_serializes_to_json_with_schema_version_at_root() {
     let report = build_report("0.2.52".into(), Vec::new());
     let s = serde_json::to_string(&report).expect("serialize");

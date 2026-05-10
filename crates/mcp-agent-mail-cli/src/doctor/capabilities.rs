@@ -187,7 +187,7 @@ pub fn build_report(tool_version: String, write_scopes: Vec<PathBuf>) -> Capabil
             latest_symlink: ".doctor/latest -> runs/<run-id>",
             history_jsonl: ".doctor/scorecard_history.jsonl",
         },
-        report_schema: "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/main/docs/SPEC-doctor-report.json",
+        report_schema: "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/main/docs/SPEC-doctor-report.md",
     }
 }
 
