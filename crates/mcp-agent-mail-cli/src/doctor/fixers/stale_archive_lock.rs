@@ -45,7 +45,7 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{Op, mutate};
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const FM_ID: &str = "fm-archive-state-files-stale-archive-lock-from-dead-pid";
 const FM_SEVERITY: &str = "P1";
@@ -121,10 +121,10 @@ pub fn detect(archive_roots: &[PathBuf], stale_seconds: u64) -> Vec<StaleArchive
             .and_then(|s| s.lines().next().map(str::to_owned))
             .and_then(|first| first.trim().parse::<u32>().ok());
 
-        if let Some(pid) = recorded_pid {
-            if is_pid_alive(pid) {
-                continue; // live holder; not stale
-            }
+        if let Some(pid) = recorded_pid
+            && is_pid_alive(pid)
+        {
+            continue; // live holder; not stale
         }
 
         let age_seconds = meta
@@ -276,7 +276,7 @@ mod tests {
         let archive = make_archive(&td, "alpha");
         // PID 0 is reserved/never-a-real-process on Linux/macOS.
         fs::write(archive.join(".git/index.lock"), "999999999\n").unwrap();
-        let findings = detect(&[archive.clone()], DEFAULT_STALE_SECONDS);
+        let findings = detect(std::slice::from_ref(&archive), DEFAULT_STALE_SECONDS);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].recorded_pid, Some(999_999_999));
         assert_eq!(findings[0].archive_root, archive);
@@ -322,7 +322,7 @@ mod tests {
         // Plant a stale lock with dead PID.
         let lock_path = archive.join(".git/index.lock");
         fs::write(&lock_path, "999999999\n").unwrap();
-        let findings = detect(&[archive.clone()], DEFAULT_STALE_SECONDS);
+        let findings = detect(std::slice::from_ref(&archive), DEFAULT_STALE_SECONDS);
         assert_eq!(findings.len(), 1);
 
         let run_id = "2026-05-10T08-00-00Z__stalelock";
@@ -367,7 +367,7 @@ mod tests {
         let archive = make_archive(&td, "alpha");
         let lock_path = archive.join(".git/index.lock");
         fs::write(&lock_path, "999999999\n").unwrap();
-        let findings = detect(&[archive.clone()], DEFAULT_STALE_SECONDS);
+        let findings = detect(std::slice::from_ref(&archive), DEFAULT_STALE_SECONDS);
         let run_id = "2026-05-10T08-00-02Z__roundtrip";
         let ctx = ctx_for(&td, run_id);
         let _ = fix(&ctx, &findings[0]).unwrap();
