@@ -20204,10 +20204,7 @@ fn handle_doctor_check_with(
                         } else {
                             let orphan_examples = orphaned
                                 .iter()
-                                .filter(|row| {
-                                    row.missing_message
-                                        || (!row.missing_message && row.missing_agent)
-                                })
+                                .filter(|row| row.missing_message || row.missing_agent)
                                 .take(5)
                                 .map(|row| {
                                     let mut missing = Vec::new();

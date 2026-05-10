@@ -75,6 +75,7 @@ fn status_envelope() -> RobotEnvelope<StatusData> {
                 last_activity: "2026-01-02T03:04:00Z".to_string(),
             }],
             anomalies: Vec::new(),
+            recommendations: Vec::new(),
             recovery: None,
         },
     )

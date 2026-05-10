@@ -19,7 +19,7 @@ use mcp_agent_mail_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlmodel_core::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -804,6 +804,8 @@ pub struct StatusData {
     pub top_threads: Vec<ThreadSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyCard>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<OperatorRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatus>,
 }
@@ -1095,6 +1097,21 @@ pub struct AnomalyCard {
     pub headline: String,
     pub rationale: String,
     pub remediation: String,
+}
+
+/// Ranked operator next action with machine-checkable proof context.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OperatorRecommendation {
+    pub rank: usize,
+    pub category: String,
+    pub action: String,
+    pub reason: String,
+    pub confidence: f64,
+    pub affected: String,
+    pub evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    pub safe_command: String,
 }
 
 /// robot analytics — swarm topology coverage counts.
@@ -3445,6 +3462,241 @@ fn find_latest_forensic_bundle_for_robot(
     latest.map(|(_, path)| path.display().to_string())
 }
 
+const ROBOT_RECOMMENDATION_STALE_AFTER_US: i64 = 10 * MICROS_PER_MINUTE;
+const ROBOT_RECOMMENDATION_LIMIT: usize = 6;
+
+#[derive(Debug, Clone)]
+struct OperatorRecommendationCandidate {
+    category: String,
+    action: String,
+    reason: String,
+    confidence: f64,
+    affected: String,
+    evidence: String,
+    artifact: Option<String>,
+    safe_command: String,
+    observed_ts_us: i64,
+    stale_after_us: i64,
+}
+
+impl OperatorRecommendationCandidate {
+    fn is_stale(&self, now_us: i64) -> bool {
+        now_us.saturating_sub(self.observed_ts_us) > self.stale_after_us
+    }
+
+    fn dedupe_key(&self) -> String {
+        format!("{}|{}|{}", self.category, self.affected, self.safe_command)
+    }
+
+    fn into_recommendation(self, rank: usize) -> OperatorRecommendation {
+        let confidence = if self.confidence.is_finite() {
+            self.confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        OperatorRecommendation {
+            rank,
+            category: self.category,
+            action: redact_recommendation_text(&self.action),
+            reason: redact_recommendation_text(&self.reason),
+            confidence,
+            affected: redact_recommendation_text(&self.affected),
+            evidence: redact_recommendation_text(&self.evidence),
+            artifact: self
+                .artifact
+                .map(|artifact| redact_recommendation_text(&artifact)),
+            safe_command: redact_recommendation_text(&self.safe_command),
+        }
+    }
+}
+
+fn rank_operator_recommendations(
+    now_us: i64,
+    mut candidates: Vec<OperatorRecommendationCandidate>,
+    limit: usize,
+) -> Vec<OperatorRecommendation> {
+    candidates.retain(|candidate| !candidate.is_stale(now_us));
+    candidates.sort_by(|left, right| {
+        right
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| left.category.cmp(&right.category))
+            .then_with(|| left.safe_command.cmp(&right.safe_command))
+    });
+
+    let mut seen = HashSet::new();
+    let mut recommendations = Vec::new();
+    for candidate in candidates {
+        if seen.insert(candidate.dedupe_key()) {
+            recommendations.push(candidate.into_recommendation(recommendations.len() + 1));
+            if recommendations.len() >= limit {
+                break;
+            }
+        }
+    }
+    recommendations
+}
+
+fn redaction_value_delimiter(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '&' | '?' | '#' | '"' | '\'' | '`' | ')' | '(' | ']' | '[' | '}' | '{' | ',' | ';'
+        )
+}
+
+fn redact_after_marker(input: &str, marker: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let marker_lower = marker.to_ascii_lowercase();
+    let mut cursor = 0;
+    let mut output = String::with_capacity(input.len());
+
+    while let Some(relative_start) = lower[cursor..].find(&marker_lower) {
+        let marker_start = cursor + relative_start;
+        let value_start = marker_start + marker.len();
+        output.push_str(&input[cursor..value_start]);
+
+        let value_end = input[value_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| redaction_value_delimiter(ch).then_some(value_start + idx))
+            .unwrap_or(input.len());
+        if value_end > value_start {
+            output.push_str("[redacted]");
+        }
+        cursor = value_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn redact_recommendation_text(input: &str) -> String {
+    [
+        "bearer ",
+        "token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "secret=",
+        "authorization=",
+    ]
+    .into_iter()
+    .fold(input.to_string(), |text, marker| {
+        redact_after_marker(&text, marker)
+    })
+}
+
+fn robot_shell_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | ':' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn build_status_recommendations(
+    project_slug: &str,
+    agent_name: Option<&str>,
+    ack_overdue: usize,
+    reservations_expiring_soon: usize,
+    top_threads: &[ThreadSummary],
+    recovery: Option<&RecoveryStatus>,
+    now_us: i64,
+) -> Vec<OperatorRecommendation> {
+    let project_arg = robot_shell_arg(project_slug);
+    let mut candidates = Vec::new();
+
+    if ack_overdue > 0
+        && let Some(agent_name) = agent_name
+    {
+        let agent_arg = robot_shell_arg(agent_name);
+        candidates.push(OperatorRecommendationCandidate {
+            category: "ack_sla".to_string(),
+            action: "Review overdue acknowledgements".to_string(),
+            reason: format!(
+                "{ack_overdue} ack-required message(s) are beyond the 30-minute acknowledgement threshold"
+            ),
+            confidence: 1.0,
+            affected: format!("project:{project_slug};agent:{agent_name}"),
+            evidence: format!(
+                "robot://status/ack-overdue?project={project_slug}&agent={agent_name}&count={ack_overdue}"
+            ),
+            artifact: None,
+            safe_command: format!(
+                "am robot inbox --project {project_arg} --agent {agent_arg} --ack-overdue"
+            ),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    if reservations_expiring_soon > 0 {
+        candidates.push(OperatorRecommendationCandidate {
+            category: "reservation_expiry".to_string(),
+            action: "Renew or release expiring reservations".to_string(),
+            reason: format!(
+                "{reservations_expiring_soon} active reservation(s) expire within 5 minutes"
+            ),
+            confidence: 0.95,
+            affected: format!("project:{project_slug};reservations:expiring_soon"),
+            evidence: format!(
+                "robot://status/reservations-expiring-soon?project={project_slug}&count={reservations_expiring_soon}"
+            ),
+            artifact: None,
+            safe_command: format!("am robot reservations --project {project_arg} --expiring 5"),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    if let Some(recovery) = recovery {
+        candidates.push(OperatorRecommendationCandidate {
+            category: "mailbox_recovery".to_string(),
+            action: "Inspect mailbox durability state".to_string(),
+            reason: recovery.next_action.clone(),
+            confidence: if recovery.stall_detected { 0.98 } else { 0.9 },
+            affected: format!("mailbox:{};phase:{}", recovery.mode, recovery.phase),
+            evidence: format!(
+                "robot://status/recovery?mode={}&phase={}&stalled={}",
+                recovery.mode, recovery.phase, recovery.stall_detected
+            ),
+            artifact: recovery.bundle_path.clone(),
+            safe_command: "am doctor check --json".to_string(),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    if let Some(top) = top_threads.first() {
+        candidates.push(OperatorRecommendationCandidate {
+            category: "thread_activity".to_string(),
+            action: "Inspect the most active thread".to_string(),
+            reason: format!(
+                "Thread {} is the latest active thread with {} message(s) and {} participant(s)",
+                top.id, top.messages, top.participants
+            ),
+            confidence: 0.6,
+            affected: format!("project:{project_slug};thread:{}", top.id),
+            evidence: format!(
+                "resource://thread/{}?project={project_slug}&include_bodies=false",
+                top.id
+            ),
+            artifact: None,
+            safe_command: format!(
+                "am robot thread --project {project_arg} {}",
+                robot_shell_arg(&top.id)
+            ),
+            observed_ts_us: now_us,
+            stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+        });
+    }
+
+    rank_operator_recommendations(now_us, candidates, ROBOT_RECOMMENDATION_LIMIT)
+}
+
 #[cfg(test)]
 fn build_status(
     conn: &DbConn,
@@ -3703,6 +3955,20 @@ fn build_status_with_phase(
     mark_tail_latency_phase(&mut phase, "downstream_actions");
 
     let recovery = build_recovery_status_for_robot();
+    let recommendations = build_status_recommendations(
+        project_slug,
+        agent.as_ref().map(|(_, name)| name.as_str()),
+        ack_overdue,
+        reservations_expiring_soon,
+        &top_threads,
+        recovery.as_ref(),
+        now_us,
+    );
+    for recommendation in &recommendations {
+        if !actions.contains(&recommendation.safe_command) {
+            actions.push(recommendation.safe_command.clone());
+        }
+    }
 
     // Escalate health to "recovering" or "error" if durability is degraded.
     let health = if recovery.is_some() {
@@ -3744,6 +4010,7 @@ fn build_status_with_phase(
         my_reservations,
         top_threads,
         anomalies,
+        recommendations,
         recovery,
     };
 
@@ -13252,6 +13519,7 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: vec![],
+            recommendations: vec![],
             recovery: None,
         };
         let json = serde_json::to_string(&data).unwrap();
@@ -13282,6 +13550,7 @@ mod tests {
                 rationale: "Pending acknowledgements".into(),
                 remediation: "am mail ack".into(),
             }],
+            recommendations: vec![],
             recovery: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
@@ -13293,6 +13562,144 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["health"], "degraded");
         assert_eq!(v["_alerts"][0]["severity"], "warn");
+    }
+
+    fn recommendation_candidate(
+        category: &str,
+        command: &str,
+        confidence: f64,
+        observed_ts_us: i64,
+    ) -> OperatorRecommendationCandidate {
+        OperatorRecommendationCandidate {
+            category: category.to_string(),
+            action: format!("Do {category}"),
+            reason: format!("Reason for {category}"),
+            confidence,
+            affected: format!("affected:{category}"),
+            evidence: format!("robot://status/{category}"),
+            artifact: None,
+            safe_command: command.to_string(),
+            observed_ts_us,
+            stale_after_us: MICROS_PER_MINUTE,
+        }
+    }
+
+    #[test]
+    fn operator_recommendations_rank_dedupe_and_drop_stale_evidence() {
+        let now_us = 10 * MICROS_PER_MINUTE;
+        let recommendations = rank_operator_recommendations(
+            now_us,
+            vec![
+                recommendation_candidate("ack_sla", "am robot inbox --ack-overdue", 0.4, now_us),
+                recommendation_candidate("ack_sla", "am robot inbox --ack-overdue", 1.0, now_us),
+                recommendation_candidate("thread_activity", "am robot thread T-1", 0.8, now_us),
+                recommendation_candidate(
+                    "reservation_expiry",
+                    "am robot reservations --expiring 5",
+                    0.95,
+                    now_us - MICROS_PER_MINUTE - 1,
+                ),
+            ],
+            10,
+        );
+
+        assert_eq!(recommendations.len(), 2);
+        assert_eq!(recommendations[0].rank, 1);
+        assert_eq!(recommendations[0].category, "ack_sla");
+        assert_eq!(recommendations[0].confidence, 1.0);
+        assert_eq!(recommendations[1].rank, 2);
+        assert_eq!(recommendations[1].category, "thread_activity");
+        assert!(
+            recommendations
+                .iter()
+                .all(|rec| rec.category != "reservation_expiry"),
+            "stale evidence must suppress recommendations"
+        );
+    }
+
+    #[test]
+    fn operator_recommendations_redact_secret_markers() {
+        let now_us = mcp_agent_mail_db::now_micros();
+        let recommendations = rank_operator_recommendations(
+            now_us,
+            vec![OperatorRecommendationCandidate {
+                category: "mailbox_recovery".into(),
+                action: "Inspect token=super-secret-token&scope=mail".into(),
+                reason: "Authorization=Bearer abc123 should not leak".into(),
+                confidence: 0.9,
+                affected: "project:demo".into(),
+                evidence: "robot://status/recovery?api_key=abc123&mode=corrupt".into(),
+                artifact: Some("/tmp/bundle?secret=abc123&safe=true".into()),
+                safe_command: "am doctor check --json --password=hunter2".into(),
+                observed_ts_us: now_us,
+                stale_after_us: MICROS_PER_MINUTE,
+            }],
+            10,
+        );
+
+        let json = serde_json::to_string(&recommendations[0]).unwrap();
+        assert!(!json.contains("super-secret-token"));
+        assert!(!json.contains("abc123"));
+        assert!(!json.contains("hunter2"));
+        assert!(json.contains("[redacted]"));
+    }
+
+    #[test]
+    fn build_status_recommendations_emit_safe_proof_links() {
+        let now_us = mcp_agent_mail_db::now_micros();
+        let recommendations = build_status_recommendations(
+            "demo project",
+            Some("CobaltBay"),
+            2,
+            1,
+            &[ThreadSummary {
+                id: "thread-1".into(),
+                subject: "Latest".into(),
+                participants: 3,
+                messages: 4,
+                last_activity: "1m".into(),
+            }],
+            Some(&RecoveryStatus {
+                mode: "recovering".into(),
+                owner: "pid 100 (active)".into(),
+                next_action: "Recovery active; continue monitoring".into(),
+                bundle_path: Some("/tmp/forensics/bundle".into()),
+                elapsed_secs: Some(30),
+                elapsed_display: Some("30s".into()),
+                phase: "lock_held".into(),
+                stall_detected: false,
+                stall_reason: None,
+                deferred_write_backlog: None,
+                admission: None,
+            }),
+            now_us,
+        );
+
+        let categories: Vec<&str> = recommendations
+            .iter()
+            .map(|rec| rec.category.as_str())
+            .collect();
+        assert_eq!(
+            categories,
+            vec![
+                "ack_sla",
+                "reservation_expiry",
+                "mailbox_recovery",
+                "thread_activity"
+            ]
+        );
+        assert_eq!(
+            recommendations[0].safe_command,
+            "am robot inbox --project 'demo project' --agent CobaltBay --ack-overdue"
+        );
+        assert_eq!(
+            recommendations[0].evidence,
+            "robot://status/ack-overdue?project=demo project&agent=CobaltBay&count=2"
+        );
+        assert_eq!(
+            recommendations[2].artifact.as_deref(),
+            Some("/tmp/forensics/bundle")
+        );
     }
 
     #[test]
@@ -13443,6 +13850,64 @@ mod tests {
             .map(|thread| thread.id.as_str())
             .collect();
         assert_eq!(thread_ids, vec!["320", "310"]);
+    }
+
+    #[test]
+    fn build_status_surfaces_structured_operator_recommendations() {
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'ack-thread', 'Ack overdue', ?, 1, 'high')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                now_us - ACK_OVERDUE_THRESHOLD_US - 1,
+            )],
+        )
+        .expect("insert overdue message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert overdue recipient");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 2, 'crates/**', 1, 'test', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + MICROS_PER_MINUTE),
+            ],
+        )
+        .expect("insert expiring reservation");
+
+        let (status, actions) =
+            build_status(&conn, 1, "demo", Some((2, "Reader".into()))).expect("build status");
+
+        let categories: Vec<&str> = status
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.category.as_str())
+            .collect();
+        assert!(categories.contains(&"ack_sla"));
+        assert!(categories.contains(&"reservation_expiry"));
+        assert!(categories.contains(&"thread_activity"));
+        assert!(
+            actions.contains(
+                &"am robot inbox --project demo --agent Reader --ack-overdue".to_string()
+            )
+        );
+
+        let json = serde_json::to_value(&status).expect("serialize status");
+        assert_eq!(json["recommendations"][0]["rank"], 1);
+        assert_eq!(json["recommendations"][0]["category"], "ack_sla");
+        assert!(
+            json["recommendations"][0]["safe_command"]
+                .as_str()
+                .unwrap()
+                .contains("--ack-overdue")
+        );
     }
 
     #[test]
@@ -13911,6 +14376,7 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: anomalies.clone(),
+            recommendations: vec![],
             recovery: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
@@ -19146,6 +19612,7 @@ mod tests {
             my_reservations: vec![],
             top_threads: vec![],
             anomalies: vec![],
+            recommendations: vec![],
             recovery: Some(RecoveryStatus {
                 mode: "recovering".into(),
                 owner: "pid 100 (active)".into(),
