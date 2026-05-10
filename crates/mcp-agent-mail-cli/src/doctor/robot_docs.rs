@@ -53,7 +53,8 @@ quarantines via rename.
 | `am doctor gc --before <date> --yes` | Prune old run dirs. Requires both flags. | Yes (deletion) | 0 |
 
 Plus existing verbs preserved for backward compat: `repair`, `backups`,
-`restore`, `reconstruct`, `archive-scan`, `archive-normalize`, `fix`,
+`restore`, `reconstruct`, `archive-scan`, `archive-verify`,
+`archive-normalize`, `fix`,
 `fix-orphan-refs`, `pack-archive`.
 
 ## Exit codes

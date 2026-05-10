@@ -11235,7 +11235,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
             if db_schema_unhealthy || archive_db_parity_unhealthy {
                 env = env.with_action(
-                    "Run `am doctor check` and reconstruct from the Git archive before trusting mailbox reads",
+                    "Run `am doctor check` and `am doctor archive-verify --json` before reconstructing or trusting mailbox reads",
                 );
             }
             if config.integrity_check_interval_hours > 0

@@ -20,6 +20,7 @@
 //!    decide *when* to apply it.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 // ============================================================================
@@ -189,7 +190,7 @@ pub enum ArchiveAnomalyKind {
     },
 
     /// Frontmatter is valid JSON with a positive id, but required fields
-    /// (`from`, `to`, `subject`, `created_at`) are missing or malformed.
+    /// (`from`, `to`, `subject`, and a created timestamp) are missing or malformed.
     IncompleteFrontmatter {
         /// Path to the affected file.
         path: PathBuf,
@@ -306,6 +307,60 @@ pub enum ArchiveAnomalyKind {
         /// The absolute difference.
         drift: usize,
     },
+
+    // -- Archive/DB artifact cross-checks -------------------------------
+    /// A message row exists in SQLite but no canonical archive message file
+    /// carries the same message id.
+    MissingCanonicalMessage {
+        /// Project slug from the DB row.
+        project_slug: String,
+        /// Message id from the DB row.
+        message_id: i64,
+        /// Subject from the DB row, for operator triage.
+        db_subject: String,
+        /// Sender name from the DB row.
+        db_sender: String,
+    },
+
+    /// A DB sender/recipient row is missing its expected inbox/outbox archive copy.
+    MessageRecipientCopyMismatch {
+        /// Project slug from the DB row.
+        project_slug: String,
+        /// Message id whose mailbox copy is missing or inconsistent.
+        message_id: i64,
+        /// Agent whose mailbox copy was checked.
+        agent_name: String,
+        /// Which mailbox copy was checked.
+        mailbox: MailboxCopyKind,
+        /// One-line mismatch detail.
+        detail: String,
+    },
+
+    /// A DB agent row is missing a profile artifact or the artifact disagrees
+    /// with the DB identity fields.
+    AgentProfileMismatch {
+        /// Project slug from the DB row.
+        project_slug: String,
+        /// Agent name from the DB row.
+        agent_name: String,
+        /// Expected archive profile path.
+        profile_path: PathBuf,
+        /// One-line mismatch detail.
+        detail: String,
+    },
+
+    /// A DB file reservation row is missing its stable id artifact or the
+    /// artifact disagrees with the DB reservation fields.
+    FileReservationArtifactMismatch {
+        /// Project slug from the DB row.
+        project_slug: String,
+        /// File reservation id from the DB row.
+        reservation_id: i64,
+        /// Expected archive artifact path.
+        artifact_path: PathBuf,
+        /// One-line mismatch detail.
+        detail: String,
+    },
 }
 
 /// Whether an [`InvalidDateDirectory`](ArchiveAnomalyKind::InvalidDateDirectory)
@@ -323,6 +378,30 @@ impl std::fmt::Display for DateDirectoryLevel {
             Self::Year => f.write_str("year"),
             Self::Month => f.write_str("month"),
         }
+    }
+}
+
+/// Which per-agent mailbox copy was checked by the archive/DB verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxCopyKind {
+    Inbox,
+    Outbox,
+}
+
+impl MailboxCopyKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Outbox => "outbox",
+        }
+    }
+}
+
+impl std::fmt::Display for MailboxCopyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -388,6 +467,11 @@ impl ArchiveAnomalyKind {
             // itself is classified as warning. Callers can upgrade based on
             // the `drift` magnitude.
             Self::ArchiveDbCountDrift { .. } => AnomalySeverity::Warning,
+
+            Self::MissingCanonicalMessage { .. } => AnomalySeverity::Error,
+            Self::MessageRecipientCopyMismatch { .. }
+            | Self::AgentProfileMismatch { .. }
+            | Self::FileReservationArtifactMismatch { .. } => AnomalySeverity::Warning,
         }
     }
 
@@ -455,6 +539,17 @@ impl ArchiveAnomalyKind {
             // Count drift: report only. The actual resolution depends on
             // which messages are missing from which side.
             Self::ArchiveDbCountDrift { .. } => RemediationClass::ReportOnly,
+
+            // Missing canonical content cannot be synthesized from the DB
+            // without deciding whether the archive or DB is authoritative.
+            Self::MissingCanonicalMessage { .. } => RemediationClass::ManualOnly,
+
+            // Copy/profile/reservation drift is evidence, not an executable
+            // repair plan. Report it and let higher-level doctor workflows
+            // point operators at reconstruction, normalization, or inspection.
+            Self::MessageRecipientCopyMismatch { .. }
+            | Self::AgentProfileMismatch { .. }
+            | Self::FileReservationArtifactMismatch { .. } => RemediationClass::ReportOnly,
         }
     }
 
@@ -477,6 +572,10 @@ impl ArchiveAnomalyKind {
             Self::UnexpectedSymlink { .. } => "unexpected_symlink",
             Self::ArchiveDbProjectMismatch { .. } => "archive_db_project_mismatch",
             Self::ArchiveDbCountDrift { .. } => "archive_db_count_drift",
+            Self::MissingCanonicalMessage { .. } => "missing_canonical_message",
+            Self::MessageRecipientCopyMismatch { .. } => "message_recipient_copy_mismatch",
+            Self::AgentProfileMismatch { .. } => "agent_profile_mismatch",
+            Self::FileReservationArtifactMismatch { .. } => "file_reservation_artifact_mismatch",
         }
     }
 
@@ -563,6 +662,39 @@ impl ArchiveAnomalyKind {
             } => format!(
                 "message count drift: archive={archive_count}, db={db_count} (delta={drift})"
             ),
+            Self::MissingCanonicalMessage {
+                project_slug,
+                message_id,
+                db_subject,
+                db_sender,
+            } => format!(
+                "DB message {project_slug}/{message_id} from '{db_sender}' has no canonical archive file (subject: {db_subject})"
+            ),
+            Self::MessageRecipientCopyMismatch {
+                project_slug,
+                message_id,
+                agent_name,
+                mailbox,
+                detail,
+            } => format!(
+                "{mailbox} copy mismatch for {project_slug}/{message_id}/{agent_name}: {detail}"
+            ),
+            Self::AgentProfileMismatch {
+                project_slug,
+                agent_name,
+                detail,
+                ..
+            } => format!("agent profile mismatch for {project_slug}/{agent_name}: {detail}"),
+            Self::FileReservationArtifactMismatch {
+                project_slug,
+                reservation_id,
+                detail,
+                ..
+            } => {
+                format!(
+                    "file reservation artifact mismatch for {project_slug}/{reservation_id}: {detail}"
+                )
+            }
         }
     }
 }
@@ -723,14 +855,18 @@ impl ArchiveAnomalyReport {
 
 /// All known anomaly tags, useful for documentation and schema validation.
 pub const ALL_ANOMALY_TAGS: &[&str] = &[
+    "agent_profile_mismatch",
     "archive_db_count_drift",
     "archive_db_project_mismatch",
     "duplicate_canonical_id",
+    "file_reservation_artifact_mismatch",
     "incomplete_frontmatter",
     "invalid_date_directory",
     "invalid_message_id",
     "invalid_project_metadata",
     "malformed_agent_profile",
+    "message_recipient_copy_mismatch",
+    "missing_canonical_message",
     "missing_frontmatter",
     "missing_project_metadata",
     "orphaned_agent_profile",
@@ -747,7 +883,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Required frontmatter fields for a complete message.
-const REQUIRED_FRONTMATTER_FIELDS: &[&str] = &["from", "to", "subject", "created_at"];
+const REQUIRED_FRONTMATTER_FIELDS: &[&str] = &["from", "to", "subject"];
 
 /// Slug prefixes that suggest an ephemeral/test project.
 const SUSPICIOUS_SLUG_PREFIXES: &[&str] = &["tmp-", "tmp_", "test-", "test_", "dev-", "dev_"];
@@ -1278,7 +1414,7 @@ fn scan_message_file(
         .or_insert_with(|| (file_path.to_path_buf(), Vec::new()));
 
     // Check required frontmatter fields.
-    let missing_fields: Vec<String> = REQUIRED_FRONTMATTER_FIELDS
+    let mut missing_fields: Vec<String> = REQUIRED_FRONTMATTER_FIELDS
         .iter()
         .filter(|&&field| {
             let value = parsed.get(field);
@@ -1292,12 +1428,729 @@ fn scan_message_file(
         })
         .map(|&field| field.to_string())
         .collect();
+    if !message_frontmatter_has_created_timestamp(&parsed) {
+        missing_fields.push("created|created_at|created_ts".to_string());
+    }
 
     if !missing_fields.is_empty() {
         report.record(ArchiveAnomalyKind::IncompleteFrontmatter {
             path: file_path.to_path_buf(),
             missing_fields,
         });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ArchiveAgentKey {
+    project_slug: String,
+    agent_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ArchiveMessageCopyKey {
+    project_slug: String,
+    agent_name: String,
+    mailbox: MailboxCopyKind,
+    message_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ArchiveReservationKey {
+    project_slug: String,
+    reservation_id: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveJsonArtifact {
+    path: PathBuf,
+    json: Option<serde_json::Value>,
+    parse_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveDbArtifactIndex {
+    canonical_messages: BTreeMap<i64, Vec<PathBuf>>,
+    mailbox_copies: BTreeMap<ArchiveMessageCopyKey, Vec<PathBuf>>,
+    agent_profiles: BTreeMap<ArchiveAgentKey, ArchiveJsonArtifact>,
+    reservation_artifacts: BTreeMap<ArchiveReservationKey, ArchiveJsonArtifact>,
+}
+
+#[derive(Debug)]
+struct DbMessageArtifactExpectation {
+    project_slug: String,
+    message_id: i64,
+    sender_name: String,
+    subject: String,
+}
+
+#[derive(Debug)]
+struct DbMailboxCopyExpectation {
+    project_slug: String,
+    message_id: i64,
+    agent_name: String,
+    mailbox: MailboxCopyKind,
+    detail: String,
+}
+
+#[derive(Debug)]
+struct DbAgentProfileExpectation {
+    project_slug: String,
+    agent_name: String,
+    program: String,
+    model: String,
+}
+
+#[derive(Debug)]
+struct DbReservationArtifactExpectation {
+    project_slug: String,
+    reservation_id: i64,
+    agent_name: String,
+    path_pattern: String,
+}
+
+fn is_archive_year_component(value: &str) -> bool {
+    value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_archive_month_component(value: &str) -> bool {
+    value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn read_json_file_artifact(path: &Path) -> ArchiveJsonArtifact {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(json) => ArchiveJsonArtifact {
+                path: path.to_path_buf(),
+                json: Some(json),
+                parse_error: None,
+            },
+            Err(error) => ArchiveJsonArtifact {
+                path: path.to_path_buf(),
+                json: None,
+                parse_error: Some(error.to_string()),
+            },
+        },
+        Err(error) => ArchiveJsonArtifact {
+            path: path.to_path_buf(),
+            json: None,
+            parse_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn archive_message_id_from_file(path: &Path) -> Option<i64> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let frontmatter = extract_json_frontmatter(&content)?;
+    let parsed = serde_json::from_str::<serde_json::Value>(frontmatter).ok()?;
+    parsed
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0)
+}
+
+fn message_frontmatter_has_created_timestamp(parsed: &serde_json::Value) -> bool {
+    ["created", "created_at", "created_ts"].iter().any(|field| {
+        parsed.get(field).is_some_and(|value| match value {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            serde_json::Value::Number(number) => number.as_i64().is_some_and(|raw| raw > 0),
+            _ => true,
+        })
+    })
+}
+
+fn collect_dated_message_files(root: &Path) -> Vec<PathBuf> {
+    if !is_real_directory(root) || is_symlink(root) {
+        return Vec::new();
+    }
+
+    let Ok(year_entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for year_entry in year_entries.flatten() {
+        let year_path = year_entry.path();
+        if is_symlink(&year_path) || !year_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_archive_year_component(year_name) {
+            continue;
+        }
+
+        let Ok(month_entries) = std::fs::read_dir(&year_path) else {
+            continue;
+        };
+        for month_entry in month_entries.flatten() {
+            let month_path = month_entry.path();
+            if is_symlink(&month_path) || !month_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !is_archive_month_component(month_name) {
+                continue;
+            }
+
+            let Ok(file_entries) = std::fs::read_dir(&month_path) else {
+                continue;
+            };
+            for file_entry in file_entries.flatten() {
+                let file_path = file_entry.path();
+                if is_symlink(&file_path)
+                    || !file_entry.file_type().is_ok_and(|kind| kind.is_file())
+                    || file_path.extension().is_none_or(|ext| ext != "md")
+                {
+                    continue;
+                }
+                files.push(file_path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn collect_project_canonical_messages(index: &mut ArchiveDbArtifactIndex, project_path: &Path) {
+    for file_path in collect_dated_message_files(&project_path.join("messages")) {
+        if let Some(message_id) = archive_message_id_from_file(&file_path) {
+            index
+                .canonical_messages
+                .entry(message_id)
+                .or_default()
+                .push(file_path);
+        }
+    }
+}
+
+fn collect_project_agent_artifacts(
+    index: &mut ArchiveDbArtifactIndex,
+    project_slug: &str,
+    project_path: &Path,
+) {
+    let agents_dir = project_path.join("agents");
+    if !is_real_directory(&agents_dir) || is_symlink(&agents_dir) {
+        return;
+    }
+
+    let Ok(agent_entries) = std::fs::read_dir(&agents_dir) else {
+        return;
+    };
+    for agent_entry in agent_entries.flatten() {
+        let agent_path = agent_entry.path();
+        if is_symlink(&agent_path) || !agent_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(agent_name) = agent_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+
+        let profile_path = agent_path.join("profile.json");
+        if is_real_file(&profile_path) {
+            index.agent_profiles.insert(
+                ArchiveAgentKey {
+                    project_slug: project_slug.to_string(),
+                    agent_name: agent_name.clone(),
+                },
+                read_json_file_artifact(&profile_path),
+            );
+        }
+
+        for (mailbox, mailbox_dir_name) in [
+            (MailboxCopyKind::Inbox, "inbox"),
+            (MailboxCopyKind::Outbox, "outbox"),
+        ] {
+            let mailbox_dir = agent_path.join(mailbox_dir_name);
+            for file_path in collect_dated_message_files(&mailbox_dir) {
+                if let Some(message_id) = archive_message_id_from_file(&file_path) {
+                    index
+                        .mailbox_copies
+                        .entry(ArchiveMessageCopyKey {
+                            project_slug: project_slug.to_string(),
+                            agent_name: agent_name.clone(),
+                            mailbox,
+                            message_id,
+                        })
+                        .or_default()
+                        .push(file_path);
+                }
+            }
+        }
+    }
+}
+
+fn collect_project_reservation_artifacts(
+    index: &mut ArchiveDbArtifactIndex,
+    project_slug: &str,
+    project_path: &Path,
+) {
+    let reservation_dir = project_path.join("file_reservations");
+    if !is_real_directory(&reservation_dir) || is_symlink(&reservation_dir) {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(&reservation_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_symlink(&path)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || path.extension().is_none_or(|ext| ext != "json")
+        {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(raw_id) = file_name
+            .strip_prefix("id-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(reservation_id) = raw_id.parse::<i64>() else {
+            continue;
+        };
+        if reservation_id <= 0 {
+            continue;
+        }
+        index.reservation_artifacts.insert(
+            ArchiveReservationKey {
+                project_slug: project_slug.to_string(),
+                reservation_id,
+            },
+            read_json_file_artifact(&path),
+        );
+    }
+}
+
+fn collect_archive_db_artifact_index(storage_root: &Path) -> ArchiveDbArtifactIndex {
+    let projects_dir = storage_root.join("projects");
+    let mut index = ArchiveDbArtifactIndex::default();
+    if !is_real_directory(&projects_dir) || is_symlink(&projects_dir) {
+        return index;
+    }
+
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return index;
+    };
+    let mut project_dirs = Vec::new();
+    for entry in project_entries.flatten() {
+        let path = entry.path();
+        if is_symlink(&path) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(slug) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        project_dirs.push((slug, path));
+    }
+    project_dirs.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (project_slug, project_path) in project_dirs {
+        collect_project_canonical_messages(&mut index, &project_path);
+        collect_project_agent_artifacts(&mut index, &project_slug, &project_path);
+        collect_project_reservation_artifacts(&mut index, &project_slug, &project_path);
+    }
+
+    index
+}
+
+fn open_canonical_db_for_archive_verifier(db_path: &Path) -> Option<crate::CanonicalDbConn> {
+    if db_path.as_os_str() == ":memory:" {
+        return None;
+    }
+    crate::pool::validate_sqlite_target_path(db_path, "archive verifier sqlite target").ok()?;
+    let metadata = std::fs::symlink_metadata(db_path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).ok()
+}
+
+fn query_db_message_expectations(
+    conn: &crate::CanonicalDbConn,
+) -> Result<Vec<DbMessageArtifactExpectation>, String> {
+    let rows = conn
+        .query_sync(
+            "SELECT m.id AS message_id,
+                    p.slug AS project_slug,
+                    a.name AS sender_name,
+                    m.subject AS subject
+             FROM messages m
+             JOIN projects p ON p.id = m.project_id
+             JOIN agents a ON a.id = m.sender_id
+             ORDER BY p.slug, m.id",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(DbMessageArtifactExpectation {
+                project_slug: row
+                    .get_named::<String>("project_slug")
+                    .map_err(|error| error.to_string())?,
+                message_id: row
+                    .get_named::<i64>("message_id")
+                    .map_err(|error| error.to_string())?,
+                sender_name: row
+                    .get_named::<String>("sender_name")
+                    .map_err(|error| error.to_string())?,
+                subject: row
+                    .get_named::<String>("subject")
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .collect()
+}
+
+fn query_db_mailbox_copy_expectations(
+    conn: &crate::CanonicalDbConn,
+) -> Result<Vec<DbMailboxCopyExpectation>, String> {
+    let mut expectations = Vec::new();
+
+    let sender_rows = conn
+        .query_sync(
+            "SELECT m.id AS message_id,
+                    p.slug AS project_slug,
+                    sender.name AS agent_name
+             FROM messages m
+             JOIN projects p ON p.id = m.project_id
+             JOIN agents sender ON sender.id = m.sender_id
+             ORDER BY p.slug, m.id, sender.name",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in sender_rows {
+        expectations.push(DbMailboxCopyExpectation {
+            project_slug: row
+                .get_named::<String>("project_slug")
+                .map_err(|error| error.to_string())?,
+            message_id: row
+                .get_named::<i64>("message_id")
+                .map_err(|error| error.to_string())?,
+            agent_name: row
+                .get_named::<String>("agent_name")
+                .map_err(|error| error.to_string())?,
+            mailbox: MailboxCopyKind::Outbox,
+            detail: "sender outbox copy is missing".to_string(),
+        });
+    }
+
+    let recipient_rows = conn
+        .query_sync(
+            "SELECT m.id AS message_id,
+                    p.slug AS project_slug,
+                    recipient.name AS agent_name,
+                    mr.kind AS recipient_kind
+             FROM message_recipients mr
+             JOIN messages m ON m.id = mr.message_id
+             JOIN projects p ON p.id = m.project_id
+             JOIN agents recipient ON recipient.id = mr.agent_id
+             ORDER BY p.slug, m.id, recipient.name",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in recipient_rows {
+        let recipient_kind = row
+            .get_named::<String>("recipient_kind")
+            .unwrap_or_else(|_| "to".to_string());
+        expectations.push(DbMailboxCopyExpectation {
+            project_slug: row
+                .get_named::<String>("project_slug")
+                .map_err(|error| error.to_string())?,
+            message_id: row
+                .get_named::<i64>("message_id")
+                .map_err(|error| error.to_string())?,
+            agent_name: row
+                .get_named::<String>("agent_name")
+                .map_err(|error| error.to_string())?,
+            mailbox: MailboxCopyKind::Inbox,
+            detail: format!("recipient {recipient_kind} inbox copy is missing"),
+        });
+    }
+
+    Ok(expectations)
+}
+
+fn query_db_agent_profile_expectations(
+    conn: &crate::CanonicalDbConn,
+) -> Result<Vec<DbAgentProfileExpectation>, String> {
+    let rows = conn
+        .query_sync(
+            "SELECT p.slug AS project_slug,
+                    a.name AS agent_name,
+                    a.program AS program,
+                    a.model AS model
+             FROM agents a
+             JOIN projects p ON p.id = a.project_id
+             ORDER BY p.slug, a.name",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(DbAgentProfileExpectation {
+                project_slug: row
+                    .get_named::<String>("project_slug")
+                    .map_err(|error| error.to_string())?,
+                agent_name: row
+                    .get_named::<String>("agent_name")
+                    .map_err(|error| error.to_string())?,
+                program: row
+                    .get_named::<String>("program")
+                    .map_err(|error| error.to_string())?,
+                model: row
+                    .get_named::<String>("model")
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .collect()
+}
+
+fn query_db_reservation_expectations(
+    conn: &crate::CanonicalDbConn,
+) -> Result<Vec<DbReservationArtifactExpectation>, String> {
+    let rows = conn
+        .query_sync(
+            "SELECT fr.id AS reservation_id,
+                    p.slug AS project_slug,
+                    a.name AS agent_name,
+                    fr.path_pattern AS path_pattern
+             FROM file_reservations fr
+             JOIN projects p ON p.id = fr.project_id
+             JOIN agents a ON a.id = fr.agent_id
+             ORDER BY p.slug, fr.id",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(DbReservationArtifactExpectation {
+                project_slug: row
+                    .get_named::<String>("project_slug")
+                    .map_err(|error| error.to_string())?,
+                reservation_id: row
+                    .get_named::<i64>("reservation_id")
+                    .map_err(|error| error.to_string())?,
+                agent_name: row
+                    .get_named::<String>("agent_name")
+                    .map_err(|error| error.to_string())?,
+                path_pattern: row
+                    .get_named::<String>("path_pattern")
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .collect()
+}
+
+fn json_string_field(json: &serde_json::Value, key: &str) -> Option<String> {
+    json.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn profile_mismatch_detail(
+    expected: &DbAgentProfileExpectation,
+    artifact: &ArchiveJsonArtifact,
+) -> Option<String> {
+    if let Some(error) = &artifact.parse_error {
+        return Some(format!("profile.json is not valid JSON: {error}"));
+    }
+    let Some(json) = &artifact.json else {
+        return Some("profile.json could not be parsed".to_string());
+    };
+
+    let mut mismatches = Vec::new();
+    for (field, expected_value) in [
+        ("name", expected.agent_name.as_str()),
+        ("program", expected.program.as_str()),
+        ("model", expected.model.as_str()),
+    ] {
+        match json_string_field(json, field) {
+            Some(actual) if actual == expected_value => {}
+            Some(actual) => {
+                mismatches.push(format!("{field} archive='{actual}' db='{expected_value}'"));
+            }
+            None => mismatches.push(format!("{field} missing in archive profile")),
+        }
+    }
+
+    (!mismatches.is_empty()).then(|| mismatches.join("; "))
+}
+
+fn reservation_mismatch_detail(
+    expected: &DbReservationArtifactExpectation,
+    artifact: &ArchiveJsonArtifact,
+) -> Option<String> {
+    if let Some(error) = &artifact.parse_error {
+        return Some(format!("reservation artifact is not valid JSON: {error}"));
+    }
+    let Some(json) = &artifact.json else {
+        return Some("reservation artifact could not be parsed".to_string());
+    };
+
+    let mut mismatches = Vec::new();
+    match json.get("id").and_then(serde_json::Value::as_i64) {
+        Some(actual) if actual == expected.reservation_id => {}
+        Some(actual) => mismatches.push(format!(
+            "id archive={actual} db={}",
+            expected.reservation_id
+        )),
+        None => mismatches.push("id missing in archive reservation".to_string()),
+    }
+
+    match json_string_field(json, "agent") {
+        Some(actual) if actual == expected.agent_name => {}
+        Some(actual) => mismatches.push(format!(
+            "agent archive='{actual}' db='{}'",
+            expected.agent_name
+        )),
+        None => mismatches.push("agent missing in archive reservation".to_string()),
+    }
+
+    let archive_path_pattern =
+        json_string_field(json, "path_pattern").or_else(|| json_string_field(json, "path"));
+    match archive_path_pattern {
+        Some(actual) if actual == expected.path_pattern => {}
+        Some(actual) => mismatches.push(format!(
+            "path_pattern archive='{actual}' db='{}'",
+            expected.path_pattern
+        )),
+        None => mismatches.push("path_pattern missing in archive reservation".to_string()),
+    }
+
+    (!mismatches.is_empty()).then(|| mismatches.join("; "))
+}
+
+fn append_archive_db_artifact_cross_checks(
+    report: &mut ArchiveAnomalyReport,
+    storage_root: &Path,
+    db_path: &Path,
+) {
+    let Some(conn) = open_canonical_db_for_archive_verifier(db_path) else {
+        return;
+    };
+    let index = collect_archive_db_artifact_index(storage_root);
+
+    let mut messages_missing_canonical = HashSet::new();
+    if let Ok(messages) = query_db_message_expectations(&conn) {
+        for message in messages {
+            if !index.canonical_messages.contains_key(&message.message_id) {
+                messages_missing_canonical.insert(message.message_id);
+                report.record(ArchiveAnomalyKind::MissingCanonicalMessage {
+                    project_slug: message.project_slug,
+                    message_id: message.message_id,
+                    db_subject: message.subject,
+                    db_sender: message.sender_name,
+                });
+            }
+        }
+    }
+
+    if let Ok(mailbox_copies) = query_db_mailbox_copy_expectations(&conn) {
+        for expected in mailbox_copies {
+            if messages_missing_canonical.contains(&expected.message_id) {
+                continue;
+            }
+            let key = ArchiveMessageCopyKey {
+                project_slug: expected.project_slug.clone(),
+                agent_name: expected.agent_name.clone(),
+                mailbox: expected.mailbox,
+                message_id: expected.message_id,
+            };
+            if !index.mailbox_copies.contains_key(&key) {
+                report.record(ArchiveAnomalyKind::MessageRecipientCopyMismatch {
+                    project_slug: expected.project_slug,
+                    message_id: expected.message_id,
+                    agent_name: expected.agent_name,
+                    mailbox: expected.mailbox,
+                    detail: expected.detail,
+                });
+            }
+        }
+    }
+
+    if let Ok(agent_profiles) = query_db_agent_profile_expectations(&conn) {
+        for expected in agent_profiles {
+            let key = ArchiveAgentKey {
+                project_slug: expected.project_slug.clone(),
+                agent_name: expected.agent_name.clone(),
+            };
+            let expected_path = storage_root
+                .join("projects")
+                .join(&expected.project_slug)
+                .join("agents")
+                .join(&expected.agent_name)
+                .join("profile.json");
+            match index.agent_profiles.get(&key) {
+                Some(artifact) => {
+                    if let Some(detail) = profile_mismatch_detail(&expected, artifact) {
+                        report.record(ArchiveAnomalyKind::AgentProfileMismatch {
+                            project_slug: expected.project_slug,
+                            agent_name: expected.agent_name,
+                            profile_path: artifact.path.clone(),
+                            detail,
+                        });
+                    }
+                }
+                None => report.record(ArchiveAnomalyKind::AgentProfileMismatch {
+                    project_slug: expected.project_slug,
+                    agent_name: expected.agent_name,
+                    profile_path: expected_path,
+                    detail: "profile.json is missing".to_string(),
+                }),
+            }
+        }
+    }
+
+    if let Ok(reservations) = query_db_reservation_expectations(&conn) {
+        for expected in reservations {
+            let key = ArchiveReservationKey {
+                project_slug: expected.project_slug.clone(),
+                reservation_id: expected.reservation_id,
+            };
+            let expected_path = storage_root
+                .join("projects")
+                .join(&expected.project_slug)
+                .join("file_reservations")
+                .join(format!("id-{}.json", expected.reservation_id));
+            match index.reservation_artifacts.get(&key) {
+                Some(artifact) => {
+                    if let Some(detail) = reservation_mismatch_detail(&expected, artifact) {
+                        report.record(ArchiveAnomalyKind::FileReservationArtifactMismatch {
+                            project_slug: expected.project_slug,
+                            reservation_id: expected.reservation_id,
+                            artifact_path: artifact.path.clone(),
+                            detail,
+                        });
+                    }
+                }
+                None => report.record(ArchiveAnomalyKind::FileReservationArtifactMismatch {
+                    project_slug: expected.project_slug,
+                    reservation_id: expected.reservation_id,
+                    artifact_path: expected_path,
+                    detail: "stable id reservation artifact is missing".to_string(),
+                }),
+            }
+        }
     }
 }
 
@@ -1350,6 +2203,8 @@ pub fn scan_archive_anomalies_with_db(storage_root: &Path, db_path: &Path) -> Ar
             }
         }
     }
+
+    append_archive_db_artifact_cross_checks(&mut report, storage_root, db_path);
 
     // Sort by severity for consistent output.
     report.sort_by_severity();
@@ -1558,6 +2413,201 @@ mod tests {
     }
 
     #[test]
+    fn archive_db_artifact_drift_classification() {
+        let missing = ArchiveAnomalyKind::MissingCanonicalMessage {
+            project_slug: "demo-project".to_string(),
+            message_id: 42,
+            db_subject: "Hello".to_string(),
+            db_sender: "BlueLake".to_string(),
+        };
+        assert_eq!(missing.severity(), AnomalySeverity::Error);
+        assert_eq!(missing.remediation_class(), RemediationClass::ManualOnly);
+        assert_eq!(missing.tag(), "missing_canonical_message");
+
+        let copy = ArchiveAnomalyKind::MessageRecipientCopyMismatch {
+            project_slug: "demo-project".to_string(),
+            message_id: 42,
+            agent_name: "GreenField".to_string(),
+            mailbox: MailboxCopyKind::Inbox,
+            detail: "recipient to inbox copy is missing".to_string(),
+        };
+        assert_eq!(copy.severity(), AnomalySeverity::Warning);
+        assert_eq!(copy.remediation_class(), RemediationClass::ReportOnly);
+        assert_eq!(copy.tag(), "message_recipient_copy_mismatch");
+
+        let profile = ArchiveAnomalyKind::AgentProfileMismatch {
+            project_slug: "demo-project".to_string(),
+            agent_name: "BlueLake".to_string(),
+            profile_path: PathBuf::from("/archive/profile.json"),
+            detail: "model differs".to_string(),
+        };
+        assert_eq!(profile.severity(), AnomalySeverity::Warning);
+        assert_eq!(profile.remediation_class(), RemediationClass::ReportOnly);
+        assert_eq!(profile.tag(), "agent_profile_mismatch");
+
+        let reservation = ArchiveAnomalyKind::FileReservationArtifactMismatch {
+            project_slug: "demo-project".to_string(),
+            reservation_id: 99,
+            artifact_path: PathBuf::from("/archive/id-99.json"),
+            detail: "path_pattern differs".to_string(),
+        };
+        assert_eq!(reservation.severity(), AnomalySeverity::Warning);
+        assert_eq!(
+            reservation.remediation_class(),
+            RemediationClass::ReportOnly
+        );
+        assert_eq!(reservation.tag(), "file_reservation_artifact_mismatch");
+    }
+
+    fn init_archive_verifier_db(db_path: &Path) -> crate::CanonicalDbConn {
+        let conn =
+            crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn
+    }
+
+    fn write_archive_message(path: &Path, id: i64, from: &str, to: &[&str], subject: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create message parent");
+        }
+        let payload = serde_json::json!({
+            "id": id,
+            "from": from,
+            "to": to,
+            "cc": [],
+            "bcc": [],
+            "subject": subject,
+            "created_at": "2026-05-10T12:00:00Z",
+        });
+        std::fs::write(
+            path,
+            format!(
+                "---json\n{}\n---\nbody\n",
+                serde_json::to_string(&payload).expect("serialize message")
+            ),
+        )
+        .expect("write archive message");
+    }
+
+    #[test]
+    fn scan_archive_anomalies_with_db_reports_artifact_cross_checks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("mail.sqlite3");
+        let conn = init_archive_verifier_db(&db_path);
+
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'demo-project', '/data/projects/demo-project', 0);
+             INSERT INTO agents (
+                id, project_id, name, program, model, task_description,
+                inception_ts, last_active_ts, attachments_policy, contact_policy
+             ) VALUES
+                (10, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+                (11, 1, 'GreenField', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto'),
+                (12, 1, 'SilverStone', 'codex-cli', 'gpt-5', 'holder', 0, 0, 'auto', 'auto');
+             INSERT INTO messages (
+                id, project_id, sender_id, thread_id, subject, body_md,
+                importance, ack_required, created_ts, recipients_json, attachments
+             ) VALUES
+                (7, 1, 10, 'thread-7', 'DB only', 'body', 'normal', 0, 0, '{}', '[]'),
+                (8, 1, 10, 'thread-8', 'Archived', 'body', 'normal', 0, 0, '{}', '[]');
+             INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (8, 11, 'to');
+             INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, exclusive, reason,
+                created_ts, expires_ts, released_ts
+             ) VALUES (23, 1, 12, 'src/lib.rs', 1, 'verify', 0, 999999999, NULL);",
+        )
+        .expect("seed db");
+
+        let project_dir = storage_root.join("projects").join("demo-project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::create_dir_all(project_dir.join("agents").join("BlueLake").join("outbox"))
+            .expect("create outbox");
+        std::fs::create_dir_all(project_dir.join("agents").join("GreenField"))
+            .expect("create recipient agent");
+        std::fs::create_dir_all(project_dir.join("agents").join("SilverStone"))
+            .expect("create reservation agent");
+
+        std::fs::write(
+            project_dir
+                .join("agents")
+                .join("BlueLake")
+                .join("profile.json"),
+            r#"{"name":"BlueLake","program":"wrong-cli","model":"gpt-5"}"#,
+        )
+        .expect("write mismatched sender profile");
+        std::fs::write(
+            project_dir
+                .join("agents")
+                .join("GreenField")
+                .join("profile.json"),
+            r#"{"name":"GreenField","program":"codex-cli","model":"gpt-5"}"#,
+        )
+        .expect("write recipient profile");
+        std::fs::write(
+            project_dir
+                .join("agents")
+                .join("SilverStone")
+                .join("profile.json"),
+            r#"{"name":"SilverStone","program":"codex-cli","model":"gpt-5"}"#,
+        )
+        .expect("write reservation holder profile");
+
+        let canonical_dir = project_dir.join("messages").join("2026").join("05");
+        write_archive_message(
+            &canonical_dir.join("2026-05-10T12-00-00Z__archived__8.md"),
+            8,
+            "BlueLake",
+            &["GreenField"],
+            "Archived",
+        );
+        write_archive_message(
+            &canonical_dir.join("2026-05-10T12-01-00Z__duplicate__8.md"),
+            8,
+            "BlueLake",
+            &["GreenField"],
+            "Archived duplicate",
+        );
+        write_archive_message(
+            &project_dir
+                .join("agents")
+                .join("BlueLake")
+                .join("outbox")
+                .join("2026")
+                .join("05")
+                .join("2026-05-10T12-00-00Z__archived__8.md"),
+            8,
+            "BlueLake",
+            &["GreenField"],
+            "Archived",
+        );
+
+        let reservation_dir = project_dir.join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+        std::fs::write(
+            reservation_dir.join("id-23.json"),
+            r#"{"id":23,"agent":"SilverStone","path_pattern":"src/main.rs","exclusive":true}"#,
+        )
+        .expect("write mismatched reservation artifact");
+
+        let report = scan_archive_anomalies_with_db(&storage_root, &db_path);
+
+        assert_eq!(report.by_tag("missing_canonical_message").len(), 1);
+        assert_eq!(report.by_tag("duplicate_canonical_id").len(), 1);
+        assert_eq!(report.by_tag("message_recipient_copy_mismatch").len(), 1);
+        assert_eq!(report.by_tag("agent_profile_mismatch").len(), 1);
+        assert_eq!(report.by_tag("file_reservation_artifact_mismatch").len(), 1);
+    }
+
+    #[test]
     fn report_aggregation() {
         let mut report = ArchiveAnomalyReport::new();
         assert!(report.is_empty());
@@ -1622,7 +2672,7 @@ mod tests {
         assert_eq!(ALL_ANOMALY_TAGS, sorted.as_slice());
 
         // Verify every tag is represented.
-        assert_eq!(ALL_ANOMALY_TAGS.len(), 14);
+        assert_eq!(ALL_ANOMALY_TAGS.len(), 18);
     }
 
     #[test]

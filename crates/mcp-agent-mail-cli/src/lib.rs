@@ -43,6 +43,9 @@ use mcp_agent_mail_core::{
     ArchiveScanScope, ArchiveScanSeverityBucket, ArchiveScanSummary, ArtifactPointer, Config,
     DiagnosticPayload, resolve_project_identity,
 };
+use mcp_agent_mail_db::archive_anomaly::{
+    AnomalySeverity, ArchiveAnomaly, ArchiveAnomalyKind, ArchiveAnomalyReport,
+};
 use mcp_agent_mail_share as share;
 use serde::{Deserialize, Serialize};
 
@@ -1971,6 +1974,16 @@ pub enum DoctorCommand {
     /// Audit archive hygiene without mutating the mailbox archive.
     #[command(name = "archive-scan")]
     ArchiveScan {
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cross-check archive artifacts against SQLite for tamper evidence.
+    #[command(name = "archive-verify")]
+    ArchiveVerify {
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -5560,6 +5573,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             handle_doctor_reconstruct(dry_run, yes, json)
         }
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
+        DoctorCommand::ArchiveVerify { format, json } => handle_doctor_archive_verify(format, json),
         DoctorCommand::ArchiveNormalize {
             dry_run,
             yes,
@@ -17540,6 +17554,163 @@ fn doctor_archive_scan_summary(report: &DoctorArchiveAuditReport) -> ArchiveScan
     ArchiveScanSummary::build(
         doctor_archive_scan_diagnostics(report),
         DOCTOR_ARCHIVE_SCAN_SUMMARY_SAMPLE_LIMIT,
+    )
+}
+
+const DOCTOR_ARCHIVE_VERIFY_SUMMARY_SAMPLE_LIMIT: usize = 5;
+
+fn doctor_archive_verify_severity_bucket(severity: AnomalySeverity) -> ArchiveScanSeverityBucket {
+    match severity {
+        AnomalySeverity::Info => ArchiveScanSeverityBucket::Info,
+        AnomalySeverity::Warning => ArchiveScanSeverityBucket::Warning,
+        AnomalySeverity::Error | AnomalySeverity::Critical => ArchiveScanSeverityBucket::Critical,
+    }
+}
+
+fn doctor_archive_verify_scope(severity: AnomalySeverity) -> ArchiveScanScope {
+    match severity {
+        AnomalySeverity::Error | AnomalySeverity::Critical => ArchiveScanScope::ImmediateAction,
+        AnomalySeverity::Info | AnomalySeverity::Warning => ArchiveScanScope::HygieneDebt,
+    }
+}
+
+fn doctor_archive_verify_dedupe_rule(kind: &ArchiveAnomalyKind) -> ArchiveScanDedupeRule {
+    match kind {
+        ArchiveAnomalyKind::DuplicateCanonicalId { .. }
+        | ArchiveAnomalyKind::ArchiveDbCountDrift { .. }
+        | ArchiveAnomalyKind::MissingCanonicalMessage { .. }
+        | ArchiveAnomalyKind::MessageRecipientCopyMismatch { .. } => {
+            ArchiveScanDedupeRule::MessageId
+        }
+        ArchiveAnomalyKind::MissingProjectMetadata { .. }
+        | ArchiveAnomalyKind::InvalidProjectMetadata { .. }
+        | ArchiveAnomalyKind::SuspiciousEphemeralProject { .. } => {
+            ArchiveScanDedupeRule::ProjectDir
+        }
+        ArchiveAnomalyKind::MissingFrontmatter { .. }
+        | ArchiveAnomalyKind::UnparseableFrontmatter { .. }
+        | ArchiveAnomalyKind::InvalidMessageId { .. }
+        | ArchiveAnomalyKind::IncompleteFrontmatter { .. }
+        | ArchiveAnomalyKind::UnexpectedFileInMessageDir { .. }
+        | ArchiveAnomalyKind::UnexpectedSymlink { .. }
+        | ArchiveAnomalyKind::FileReservationArtifactMismatch { .. } => {
+            ArchiveScanDedupeRule::CanonicalPath
+        }
+        ArchiveAnomalyKind::OrphanedAgentProfile { .. }
+        | ArchiveAnomalyKind::MalformedAgentProfile { .. }
+        | ArchiveAnomalyKind::AgentProfileMismatch { .. } => {
+            ArchiveScanDedupeRule::AgentProfilePath
+        }
+        ArchiveAnomalyKind::ArchiveDbProjectMismatch { .. } => {
+            ArchiveScanDedupeRule::ArchiveIdentity
+        }
+        ArchiveAnomalyKind::InvalidDateDirectory { .. } => ArchiveScanDedupeRule::ProjectDir,
+    }
+}
+
+fn doctor_archive_verify_dedupe_value(kind: &ArchiveAnomalyKind) -> String {
+    match kind {
+        ArchiveAnomalyKind::DuplicateCanonicalId { message_id, .. }
+        | ArchiveAnomalyKind::MissingCanonicalMessage { message_id, .. } => message_id.to_string(),
+        ArchiveAnomalyKind::MessageRecipientCopyMismatch {
+            project_slug,
+            message_id,
+            agent_name,
+            mailbox,
+            ..
+        } => format!("{project_slug}:{message_id}:{agent_name}:{mailbox}"),
+        ArchiveAnomalyKind::MissingProjectMetadata { project_dir, .. }
+        | ArchiveAnomalyKind::SuspiciousEphemeralProject { project_dir, .. } => {
+            project_dir.display().to_string()
+        }
+        ArchiveAnomalyKind::InvalidProjectMetadata { path, .. }
+        | ArchiveAnomalyKind::MissingFrontmatter { path }
+        | ArchiveAnomalyKind::UnparseableFrontmatter { path, .. }
+        | ArchiveAnomalyKind::InvalidMessageId { path, .. }
+        | ArchiveAnomalyKind::IncompleteFrontmatter { path, .. }
+        | ArchiveAnomalyKind::InvalidDateDirectory { path, .. }
+        | ArchiveAnomalyKind::UnexpectedFileInMessageDir { path }
+        | ArchiveAnomalyKind::UnexpectedSymlink { path, .. } => path.display().to_string(),
+        ArchiveAnomalyKind::OrphanedAgentProfile { profile_path, .. }
+        | ArchiveAnomalyKind::MalformedAgentProfile { profile_path, .. }
+        | ArchiveAnomalyKind::AgentProfileMismatch { profile_path, .. } => {
+            profile_path.display().to_string()
+        }
+        ArchiveAnomalyKind::ArchiveDbProjectMismatch { archive_slug, .. } => archive_slug.clone(),
+        ArchiveAnomalyKind::ArchiveDbCountDrift { .. } => "message_count".to_string(),
+        ArchiveAnomalyKind::FileReservationArtifactMismatch { artifact_path, .. } => {
+            artifact_path.display().to_string()
+        }
+    }
+}
+
+fn doctor_archive_verify_recommendation(kind: &ArchiveAnomalyKind) -> String {
+    let recommendation = match kind {
+        ArchiveAnomalyKind::MissingCanonicalMessage { .. } => {
+            "Inspect the DB-only message before trusting reconstruction; preserve the current DB and investigate archive writer/WBQ health."
+        }
+        ArchiveAnomalyKind::DuplicateCanonicalId { .. } => {
+            "Run `am doctor archive-normalize --dry-run` before quarantining duplicate canonical files."
+        }
+        ArchiveAnomalyKind::MessageRecipientCopyMismatch { .. } => {
+            "Use the canonical message as source of truth, then inspect archive writer lag before relying on per-agent mailbox copies."
+        }
+        ArchiveAnomalyKind::AgentProfileMismatch { .. } => {
+            "Compare the DB agent row and profile.json; re-register the agent only after deciding which identity is authoritative."
+        }
+        ArchiveAnomalyKind::FileReservationArtifactMismatch { .. } => {
+            "Inspect the reservation row and id artifact; the pre-commit guard reads archive reservation artifacts directly."
+        }
+        ArchiveAnomalyKind::ArchiveDbCountDrift { .. }
+        | ArchiveAnomalyKind::ArchiveDbProjectMismatch { .. } => {
+            "Run `am doctor reconstruct --dry-run --json` and compare the archive-backed recovery plan before mutating state."
+        }
+        ArchiveAnomalyKind::MissingProjectMetadata { .. }
+        | ArchiveAnomalyKind::InvalidProjectMetadata { .. } => {
+            "Run `am doctor archive-normalize --dry-run` to preview non-destructive metadata repair."
+        }
+        ArchiveAnomalyKind::MissingFrontmatter { .. }
+        | ArchiveAnomalyKind::UnparseableFrontmatter { .. }
+        | ArchiveAnomalyKind::InvalidMessageId { .. }
+        | ArchiveAnomalyKind::IncompleteFrontmatter { .. } => {
+            "Inspect the message artifact manually; malformed canonical content should not be normalized blindly."
+        }
+        ArchiveAnomalyKind::MalformedAgentProfile { .. }
+        | ArchiveAnomalyKind::OrphanedAgentProfile { .. } => {
+            "Inspect the agent profile manually before trusting archive reconstruction for that identity."
+        }
+        ArchiveAnomalyKind::SuspiciousEphemeralProject { .. } => {
+            "Keep temporary project roots out of the production mailbox archive or isolate them with STORAGE_ROOT."
+        }
+        ArchiveAnomalyKind::InvalidDateDirectory { .. }
+        | ArchiveAnomalyKind::UnexpectedFileInMessageDir { .. }
+        | ArchiveAnomalyKind::UnexpectedSymlink { .. } => {
+            "Inspect the archive path manually; verifier is read-only and will not follow symlinks."
+        }
+    };
+    recommendation.to_string()
+}
+
+fn doctor_archive_verify_diagnostics(report: &ArchiveAnomalyReport) -> Vec<ArchiveScanDiagnostic> {
+    report
+        .anomalies
+        .iter()
+        .map(|anomaly: &ArchiveAnomaly| ArchiveScanDiagnostic {
+            code: anomaly.kind.tag().to_string(),
+            severity: doctor_archive_verify_severity_bucket(anomaly.severity()),
+            scope: doctor_archive_verify_scope(anomaly.severity()),
+            dedupe_rule: doctor_archive_verify_dedupe_rule(&anomaly.kind),
+            dedupe_value: doctor_archive_verify_dedupe_value(&anomaly.kind),
+            summary: anomaly.kind.summary(),
+            recommendation: Some(doctor_archive_verify_recommendation(&anomaly.kind)),
+        })
+        .collect()
+}
+
+fn doctor_archive_verify_summary(report: &ArchiveAnomalyReport) -> ArchiveScanSummary {
+    ArchiveScanSummary::build(
+        doctor_archive_verify_diagnostics(report),
+        DOCTOR_ARCHIVE_VERIFY_SUMMARY_SAMPLE_LIMIT,
     )
 }
 
@@ -35217,6 +35388,21 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(json);
             }
             _ => panic!("expected Doctor Fix"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_archive_verify() {
+        let cli =
+            Cli::try_parse_from(["am", "doctor", "archive-verify", "--format", "json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action: DoctorCommand::ArchiveVerify { format, json },
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Json));
+                assert!(!json);
+            }
+            _ => panic!("expected Doctor ArchiveVerify"),
         }
     }
 
@@ -54537,6 +54723,129 @@ fn handle_doctor_archive_scan(
         ftui_runtime::ftui_println!("");
         ftui_runtime::ftui_println!(
             "  Run `am doctor archive-normalize --dry-run` to preview non-destructive remediation."
+        );
+    });
+    Ok(())
+}
+
+fn doctor_archive_verify_db_path() -> CliResult<PathBuf> {
+    let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let sqlite_path = db_cfg
+        .sqlite_path()
+        .map_err(|err| CliError::Other(format!("bad database URL: {err}")))?;
+    Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        &sqlite_path,
+    )))
+}
+
+fn doctor_archive_verify_summary_text(
+    report: &ArchiveAnomalyReport,
+    summary: &ArchiveScanSummary,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("Findings:                 {}", report.len()),
+        format!(
+            "Highest severity:         {}",
+            summary
+                .highest_severity
+                .map(|severity| severity.as_str())
+                .unwrap_or("none")
+        ),
+        format!(
+            "Immediate-action groups:  {}",
+            summary.immediate_action_count
+        ),
+        format!("Hygiene-debt groups:      {}", summary.hygiene_debt_count),
+    ];
+
+    for bucket in &summary.buckets {
+        lines.push(format!(
+            "{}: {} deduped group(s) / {} raw finding(s)",
+            bucket.severity.as_str().to_uppercase(),
+            bucket.deduped_count,
+            bucket.raw_count
+        ));
+        for finding in &bucket.findings {
+            lines.push(format!(
+                "  [{}] {}",
+                finding.scope.as_str(),
+                truncate_str(&finding.summary, 88)
+            ));
+        }
+        if bucket.overflow_count > 0 {
+            lines.push(format!(
+                "  +{} more {} group(s) preserved in JSON detail",
+                bucket.overflow_count,
+                bucket.severity.as_str()
+            ));
+        }
+    }
+
+    lines
+}
+
+fn handle_doctor_archive_verify(
+    format: Option<output::CliOutputFormat>,
+    json_mode: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
+    let config = Config::from_env();
+    let storage_root = config.storage_root;
+    let db_path = doctor_archive_verify_db_path()?;
+    let report =
+        mcp_agent_mail_db::archive_anomaly::scan_archive_anomalies_with_db(&storage_root, &db_path);
+    let summary = doctor_archive_verify_summary(&report);
+
+    let mut artifacts = vec![
+        ArtifactPointer::referenced(
+            "archive_root",
+            &storage_root.display().to_string(),
+            "Git mailbox archive root",
+        ),
+        ArtifactPointer::referenced(
+            "sqlite_db",
+            &db_path.display().to_string(),
+            "SQLite database checked against archive artifacts",
+        ),
+    ];
+    let reports_dir = storage_root.join("doctor").join("reports");
+    if reports_dir.exists() {
+        artifacts.push(ArtifactPointer::referenced(
+            "doctor_reports_dir",
+            &reports_dir.display().to_string(),
+            "Doctor report artifact directory",
+        ));
+    }
+    let diagnostic_payload = DiagnosticPayload::from_archive_scan(&summary, artifacts);
+
+    let value = serde_json::json!({
+        "storage_root": storage_root.display().to_string(),
+        "database": db_path.display().to_string(),
+        "finding_count": report.len(),
+        "summary": &summary,
+        "anomalies": &report.anomalies,
+        "diagnostic_payload": diagnostic_payload,
+        "commit_provenance": {
+            "checked": false,
+            "detail": "Commit provenance is optional for this verifier and was not checked in this read-only pass."
+        }
+    });
+
+    output::emit_output(&value, fmt, || {
+        output::section("Archive Tamper-Evidence Verify:");
+        output::kv("Storage root", &storage_root.display().to_string());
+        output::kv("Database", &db_path.display().to_string());
+        for line in doctor_archive_verify_summary_text(&report, &summary) {
+            ftui_runtime::ftui_println!("  {line}");
+        }
+        if report.is_empty() {
+            ftui_runtime::ftui_println!("");
+            ftui_runtime::ftui_println!("  No archive/SQLite drift findings detected.");
+            return;
+        }
+        ftui_runtime::ftui_println!("");
+        ftui_runtime::ftui_println!(
+            "  This verifier is read-only. Follow the JSON recommendations before reconstructing or normalizing."
         );
     });
     Ok(())

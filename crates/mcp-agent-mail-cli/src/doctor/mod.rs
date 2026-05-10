@@ -6,7 +6,7 @@
 //! `mutate()` chokepoint, and the agent-ergonomic JSON contract.
 //!
 //! The existing verbs (`check`, `repair`, `backups`, `restore`,
-//! `reconstruct`, `archive-scan`, `archive-normalize`, `fix`,
+//! `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix`,
 //! `fix-orphan-refs`, `pack-archive`) continue to work while fixers move
 //! through the chokepoint.
 //!
