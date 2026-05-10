@@ -4517,28 +4517,35 @@ pub async fn list_agents(
 
     let tracked = tracked(&*conn);
 
-    // Use raw SQL with explicit column order to avoid ORM decoding issues
+    // Use raw SQL with explicit column order to avoid ORM decoding issues.
+    // Keep this as a simple ordered scan: startup/TUI paths call this often,
+    // and case-insensitive de-duplication is cheap in Rust while avoiding a
+    // FrankenSQLite window-function dependency during mailbox recovery.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
-               FROM ( \
-                 SELECT id, project_id, name, program, model, task_description, \
-                        inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                        registration_token, \
-                        ROW_NUMBER() OVER ( \
-                            PARTITION BY name COLLATE NOCASE \
-                            ORDER BY last_active_ts DESC, id DESC \
-                        ) AS rn \
-                 FROM agents \
-                 WHERE project_id = ? \
-               ) dedup \
-               WHERE rn = 1 \
+               FROM agents \
+               WHERE project_id = ? \
                ORDER BY last_active_ts DESC, id DESC";
     let params = [Value::BigInt(project_id)];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => {
-            let agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            let mut agents: Vec<AgentRow> = rows.iter().map(decode_agent_row_indexed).collect();
+            agents.sort_by(|left, right| {
+                right
+                    .last_active_ts
+                    .cmp(&left.last_active_ts)
+                    .then_with(|| {
+                        right
+                            .id
+                            .unwrap_or_default()
+                            .cmp(&left.id.unwrap_or_default())
+                    })
+            });
+
+            let mut seen_names = HashSet::new();
+            agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
             Outcome::Ok(agents)
         }
         Outcome::Err(e) => Outcome::Err(e),
@@ -15853,6 +15860,52 @@ mod tests {
                 .into_result()
                 .expect("list agents");
             assert_eq!(agents.len(), 1);
+        });
+    }
+
+    #[test]
+    fn list_agents_deduplicates_case_insensitive_names_without_window_query() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("list_agents_case_dedup_no_window.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/list-agents-case-dedup")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                .expect("drop nocase unique index");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES \
+                 ({project_id}, 'BlueLake', 'codex-cli', 'gpt-5', 'older', 1, 10, 'auto', 'auto'), \
+                 ({project_id}, 'bluelake', 'codex-cli', 'gpt-5', 'newer', 2, 20, 'auto', 'auto'), \
+                 ({project_id}, 'GreenField', 'codex-cli', 'gpt-5', 'newest', 3, 30, 'auto', 'auto')"
+            ))
+            .expect("insert duplicate historical agents");
+            drop(conn);
+
+            let agents = list_agents(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("list agents");
+
+            assert_eq!(
+                agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+                vec!["GreenField", "bluelake"]
+            );
+            assert_eq!(agents.len(), 2);
         });
     }
 
