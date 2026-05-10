@@ -5871,6 +5871,28 @@ struct ReservationConflict {
     path_b: String,
 }
 
+/// One reservation holder referenced by an advisory playbook.
+#[derive(Debug, Clone, Serialize)]
+struct ReservationPlaybookHolder {
+    agent: String,
+    path: String,
+}
+
+/// Advisory coordination plan for reservation contention.
+#[derive(Debug, Clone, Serialize)]
+struct ReservationPlaybook {
+    id: String,
+    kind: String,
+    severity: String,
+    confidence: f64,
+    title: String,
+    summary: String,
+    holders: Vec<ReservationPlaybookHolder>,
+    safe_command: String,
+    suggested_subject: String,
+    suggested_body: String,
+}
+
 /// Full reservations response data.
 #[derive(Debug, Clone, Serialize)]
 struct ReservationsData {
@@ -5881,6 +5903,8 @@ struct ReservationsData {
     conflicts: Vec<ReservationConflict>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     expiring_soon: Vec<ReservationEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    playbooks: Vec<ReservationPlaybook>,
 }
 
 /// Format remaining seconds with warning markers.
@@ -5893,6 +5917,53 @@ fn format_remaining(seconds: i64) -> String {
     } else {
         base
     }
+}
+
+fn build_reservation_conflict_playbooks(
+    project_slug: &str,
+    conflicts: &[ReservationConflict],
+) -> Vec<ReservationPlaybook> {
+    let project_arg = robot_shell_arg(project_slug);
+    conflicts
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, conflict)| {
+            let ordinal = index + 1;
+            let summary = format!(
+                "{} holds `{}` and {} holds overlapping `{}`",
+                conflict.agent_a, conflict.path_a, conflict.agent_b, conflict.path_b
+            );
+            let safe_command = format!("am robot reservations --project {project_arg} --conflicts --all");
+            ReservationPlaybook {
+                id: format!("reservation-conflict-{ordinal}"),
+                kind: "reservation_conflict".to_string(),
+                severity: "warn".to_string(),
+                confidence: 1.0,
+                title: "Coordinate exclusive reservation conflict".to_string(),
+                summary,
+                holders: vec![
+                    ReservationPlaybookHolder {
+                        agent: conflict.agent_a.clone(),
+                        path: conflict.path_a.clone(),
+                    },
+                    ReservationPlaybookHolder {
+                        agent: conflict.agent_b.clone(),
+                        path: conflict.path_b.clone(),
+                    },
+                ],
+                safe_command: safe_command.clone(),
+                suggested_subject: format!(
+                    "[reservation-conflict] {} / {}",
+                    conflict.agent_a, conflict.agent_b
+                ),
+                suggested_body: format!(
+                    "Please coordinate before editing overlapping reservations.\n\nConflict:\n- {}: `{}`\n- {}: `{}`\n\nSafe inspection command: `{safe_command}`\n\nSuggested resolution: narrow the reservation patterns, or have the relevant holder renew or release only their own reservation after handoff.",
+                    conflict.agent_a, conflict.path_a, conflict.agent_b, conflict.path_b
+                ),
+            }
+        })
+        .collect()
 }
 
 fn build_reservations(
@@ -6054,6 +6125,7 @@ fn build_reservations(
     } else {
         all_active.clone()
     };
+    let scoped_playbooks = build_reservation_conflict_playbooks(project_slug, &scoped_conflicts);
 
     // Build actions
     let mut actions = Vec::new();
@@ -6085,6 +6157,7 @@ fn build_reservations(
                 all_active: filtered,
                 conflicts: scoped_conflicts,
                 expiring_soon: vec![],
+                playbooks: scoped_playbooks,
             },
             actions,
         ));
@@ -6098,17 +6171,20 @@ fn build_reservations(
                 all_active: scoped_all_active,
                 conflicts: scoped_conflicts,
                 expiring_soon: scoped_expiring_soon,
+                playbooks: scoped_playbooks,
             },
             actions,
         ));
     }
 
+    let playbooks = build_reservation_conflict_playbooks(project_slug, &conflicts);
     Ok((
         ReservationsData {
             my_reservations,
             all_active,
             conflicts,
             expiring_soon,
+            playbooks,
         },
         actions,
     ))
@@ -13006,6 +13082,29 @@ mod tests {
                 remaining: Some("5m \u{26a0}".into()),
                 granted_at: Some("55m ago".into()),
             }],
+            playbooks: vec![ReservationPlaybook {
+                id: "reservation-conflict-1".into(),
+                kind: "reservation_conflict".into(),
+                severity: "warn".into(),
+                confidence: 1.0,
+                title: "Coordinate exclusive reservation conflict".into(),
+                summary:
+                    "BlueLake holds `src/auth/**` and RedFox holds overlapping `src/auth/jwt.rs`"
+                        .into(),
+                holders: vec![
+                    ReservationPlaybookHolder {
+                        agent: "BlueLake".into(),
+                        path: "src/auth/**".into(),
+                    },
+                    ReservationPlaybookHolder {
+                        agent: "RedFox".into(),
+                        path: "src/auth/jwt.rs".into(),
+                    },
+                ],
+                safe_command: "am robot reservations --project proj --conflicts --all".into(),
+                suggested_subject: "[reservation-conflict] BlueLake / RedFox".into(),
+                suggested_body: "Please coordinate before editing overlapping reservations.".into(),
+            }],
         };
 
         let json = serde_json::to_value(&data).unwrap();
@@ -13013,6 +13112,11 @@ mod tests {
         assert_eq!(json["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(json["conflicts"][0]["agent_a"], "BlueLake");
         assert_eq!(json["expiring_soon"].as_array().unwrap().len(), 1);
+        assert_eq!(json["playbooks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["playbooks"][0]["safe_command"],
+            "am robot reservations --project proj --conflicts --all"
+        );
     }
 
     #[test]
@@ -18152,6 +18256,22 @@ mod tests {
         assert_eq!(data.conflicts.len(), 1);
         assert_eq!(data.conflicts[0].agent_a, "Alice");
         assert_eq!(data.conflicts[0].agent_b, "Bob");
+        assert_eq!(data.playbooks.len(), 1);
+        assert_eq!(data.playbooks[0].kind, "reservation_conflict");
+        assert_eq!(
+            data.playbooks[0].safe_command,
+            "am robot reservations --project proj --conflicts --all"
+        );
+        assert!(
+            data.playbooks[0]
+                .suggested_body
+                .contains("Safe inspection command"),
+            "playbook should include operator-safe inspection guidance"
+        );
+        assert!(
+            !data.playbooks[0].safe_command.contains("force-release"),
+            "playbook must stay advisory and avoid forced release commands"
+        );
         assert_eq!(data.expiring_soon.len(), 1);
         assert_eq!(data.expiring_soon[0].agent.as_deref(), Some("Bob"));
         assert_eq!(
@@ -18190,6 +18310,10 @@ mod tests {
         assert_eq!(data.conflicts[0].path_a, "src/*/foo.rs");
         assert_eq!(data.conflicts[0].agent_b, "Bob");
         assert_eq!(data.conflicts[0].path_b, "src/bar/*.rs");
+        assert_eq!(data.playbooks.len(), 1);
+        assert_eq!(data.playbooks[0].holders.len(), 2);
+        assert_eq!(data.playbooks[0].holders[0].agent, "Alice");
+        assert_eq!(data.playbooks[0].holders[1].agent, "Bob");
     }
 
     #[test]
@@ -18232,6 +18356,36 @@ mod tests {
             "unexpected conflict agents: {:?}",
             data.conflicts[0]
         );
+        assert_eq!(data.playbooks.len(), 1);
+        assert!(
+            data.playbooks[0].summary.contains("[unknown-agent-1]"),
+            "playbook should preserve orphaned holder identity: {:?}",
+            data.playbooks[0]
+        );
+    }
+
+    #[test]
+    fn build_reservations_omits_playbooks_when_conflict_free() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'docs/**', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert non-conflicting reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, true, false, Some(10))
+            .expect("build reservations");
+
+        assert!(data.conflicts.is_empty());
+        assert!(data.playbooks.is_empty());
     }
 
     #[test]
