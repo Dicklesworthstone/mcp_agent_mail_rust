@@ -188,6 +188,7 @@ _E2E_MARKER_ACTIVE_CASE=""
 # Per-assertion ID tracking (br-1xt0m.1.13.13)
 # Auto-incremented within each case; reset by e2e_case_banner.
 _E2E_ASSERT_SEQ=0
+_E2E_DIFF_SEQ=0
 
 # Step tracking (br-1xt0m.1.13.13)
 # Optional structured step within a case. Set via e2e_step_start/e2e_step_end.
@@ -353,6 +354,37 @@ e2e_step_end() {
     _E2E_STEP_START_MS=0
 }
 
+e2e_record_expected_actual_diff() {
+    local label="$1"
+    local expected="$2"
+    local actual="$3"
+
+    if [ -z "${E2E_ARTIFACT_DIR:-}" ] || [ -z "${_E2E_CURRENT_CASE:-}" ]; then
+        return 0
+    fi
+
+    (( _E2E_DIFF_SEQ++ )) || true
+    local out="${E2E_ARTIFACT_DIR}/failures/fail_${_E2E_DIFF_SEQ}.json"
+    mkdir -p "$(dirname "$out")"
+
+    cat > "$out" <<EOJSON
+{
+  "schema_version": 1,
+  "suite": "$( _e2e_json_escape "$E2E_SUITE" )",
+  "timestamp": "$( _e2e_json_escape "$E2E_TIMESTAMP" )",
+  "case": "$( _e2e_json_escape "$_E2E_CURRENT_CASE" )",
+  "label": "$( _e2e_json_escape "$label" )",
+  "expected": "$( _e2e_json_escape "$expected" )",
+  "actual": "$( _e2e_json_escape "$actual" )",
+  "artifact_dir": "$( _e2e_json_escape "$E2E_ARTIFACT_DIR" )",
+  "replay_command": "$( _e2e_json_escape "$(e2e_repro_command)" )",
+  "env_redacted_path": "diagnostics/env_redacted.txt"
+}
+EOJSON
+    _e2e_record_case_artifact_paths "${_E2E_CURRENT_CASE}" "$out"
+    _e2e_trace_event "expected_actual_diff" "$label" "$_E2E_CURRENT_CASE"
+}
+
 # Print expected vs actual for a mismatch
 e2e_diff() {
     local label="$1"
@@ -361,6 +393,7 @@ e2e_diff() {
     echo -e "  ${_e2e_color_red}MISMATCH${_e2e_color_reset} ${label}"
     echo -e "    expected: ${_e2e_color_green}${expected}${_e2e_color_reset}"
     echo -e "    actual:   ${_e2e_color_red}${actual}${_e2e_color_reset}"
+    e2e_record_expected_actual_diff "$label" "$expected" "$actual"
 }
 
 # Assert two strings are equal
@@ -988,6 +1021,167 @@ with open(manifest_path, "w", encoding="utf-8") as handle:
 PY
 }
 
+e2e_write_scenario_logs() {
+    local artifact_dir="${1:-$E2E_ARTIFACT_DIR}"
+    if [ ! -d "$artifact_dir" ]; then
+        return 0
+    fi
+
+    local py="python3"
+    if ! command -v "$py" >/dev/null 2>&1; then
+        py="python"
+    fi
+    if ! command -v "$py" >/dev/null 2>&1; then
+        e2e_log "python unavailable; skipping scenario log generation"
+        return 0
+    fi
+
+    local rerun_command
+    rerun_command="$(e2e_repro_command)"
+
+    "$py" - "$artifact_dir" "$E2E_SUITE" "$E2E_TIMESTAMP" "$rerun_command" <<'PY'
+import glob
+import json
+import os
+import sys
+from collections import Counter, defaultdict
+
+artifact_dir = sys.argv[1]
+suite = sys.argv[2]
+run_timestamp = sys.argv[3]
+rerun_command = sys.argv[4]
+
+manifest_path = os.path.join(artifact_dir, "manifest.json")
+trace_rel = "trace/events.jsonl"
+trace_path = os.path.join(artifact_dir, trace_rel)
+scenario_dir = os.path.join(artifact_dir, "scenarios")
+events_rel = "scenarios/scenarios.jsonl"
+index_rel = "scenarios/index.json"
+events_path = os.path.join(artifact_dir, events_rel)
+index_path = os.path.join(artifact_dir, index_rel)
+
+os.makedirs(scenario_dir, exist_ok=True)
+
+def relpath(path: str) -> str:
+    return os.path.relpath(path, artifact_dir).replace(os.sep, "/")
+
+def load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+manifest = load_json(manifest_path, {"cases": []})
+trace_failures = defaultdict(list)
+if os.path.isfile(trace_path):
+    with open(trace_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            case_name = event.get("case") or ""
+            if not case_name:
+                continue
+            if event.get("kind") == "assert_fail":
+                trace_failures[case_name].append(
+                    {"message": event.get("message") or "", "artifact": None}
+                )
+
+diff_failures = defaultdict(list)
+for path in sorted(glob.glob(os.path.join(artifact_dir, "failures", "fail_*.json"))):
+    data = load_json(path, {})
+    case_name = data.get("case") or ""
+    if not case_name:
+        continue
+    diff_failures[case_name].append(
+        {
+            "artifact": relpath(path),
+            "label": data.get("label", ""),
+            "expected": data.get("expected", ""),
+            "actual": data.get("actual", ""),
+            "replay_command": data.get("replay_command", rerun_command),
+            "env_redacted_path": data.get("env_redacted_path", "diagnostics/env_redacted.txt"),
+        }
+    )
+
+scenarios = []
+for case in manifest.get("cases", []):
+    if not isinstance(case, dict):
+        continue
+    name = case.get("name") or ""
+    if not name:
+        continue
+    artifacts = []
+    seen_artifacts = set()
+    for rel in case.get("artifacts", []):
+        if not isinstance(rel, str) or rel in seen_artifacts:
+            continue
+        seen_artifacts.add(rel)
+        artifacts.append({"path": rel})
+    for failure in diff_failures.get(name, []):
+        rel = failure.get("artifact")
+        if isinstance(rel, str) and rel and rel not in seen_artifacts:
+            seen_artifacts.add(rel)
+            artifacts.append({"path": rel})
+
+    failures = list(trace_failures.get(name, [])) + list(diff_failures.get(name, []))
+    scenarios.append(
+        {
+            "schema_version": 1,
+            "suite": suite,
+            "run_timestamp": run_timestamp,
+            "case": name,
+            "status": case.get("status", "unknown"),
+            "duration_ms": int(case.get("duration_ms") or 0),
+            "assertion_count": int(case.get("assertion_count") or 0),
+            "artifact_dir": artifact_dir,
+            "artifacts": artifacts,
+            "trace": {"events": trace_rel},
+            "replay": {
+                "command": rerun_command,
+                "environment": "repro.env",
+                "metadata": "repro.json",
+            },
+            "diagnostics": {"env_redacted": "diagnostics/env_redacted.txt"},
+            "failures": failures,
+        }
+    )
+
+with open(events_path, "w", encoding="utf-8") as handle:
+    for scenario in scenarios:
+        json.dump(scenario, handle, sort_keys=True)
+        handle.write("\n")
+
+status_counts = Counter(s["status"] for s in scenarios)
+index = {
+    "schema_version": 1,
+    "suite": suite,
+    "timestamp": run_timestamp,
+    "scenario_count": len(scenarios),
+    "scenarios_jsonl": events_rel,
+    "generated_from": {
+        "manifest": "manifest.json",
+        "trace": trace_rel,
+    },
+    "statuses": dict(sorted(status_counts.items())),
+    "replay": {
+        "command": rerun_command,
+        "environment": "repro.env",
+        "metadata": "repro.json",
+    },
+    "diagnostics": {"env_redacted": "diagnostics/env_redacted.txt"},
+}
+with open(index_path, "w", encoding="utf-8") as handle:
+    json.dump(index, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+}
+
 _e2e_now_rfc3339() {
     if [ "${E2E_CLOCK_MODE:-wall}" = "deterministic" ]; then
         local epoch="${E2E_RUN_START_EPOCH_S}"
@@ -1219,6 +1413,8 @@ e2e_write_transcript_summary() {
         echo "  meta: meta.json"
         echo "  metrics: metrics.json"
         echo "  trace: trace/events.jsonl"
+        echo "  scenarios_index: scenarios/index.json"
+        echo "  scenarios_jsonl: scenarios/scenarios.jsonl"
         echo "  logs_index: logs/index.json"
         echo "  screenshots_index: screenshots/index.json"
         echo "  fixtures: fixtures.json"
@@ -1268,6 +1464,10 @@ e2e_write_bundle_manifest() {
         echo "      \"tree\": {\"path\": \"diagnostics/tree.txt\"}"
         echo "    },"
         echo "    \"trace\": {\"events\": {\"path\": \"trace/events.jsonl\", \"schema\": \"trace-events.v2\"}},"
+        echo "    \"scenarios\": {"
+        echo "      \"index\": {\"path\": \"scenarios/index.json\", \"schema\": \"scenarios-index.v1\"},"
+        echo "      \"events\": {\"path\": \"scenarios/scenarios.jsonl\", \"schema\": \"scenario-events.v1\"}"
+        echo "    },"
         echo "    \"transcript\": {\"summary\": {\"path\": \"transcript/summary.txt\"}},"
         echo "    \"logs\": {\"index\": {\"path\": \"logs/index.json\", \"schema\": \"logs-index.v1\"}},"
         echo "    \"screenshots\": {\"index\": {\"path\": \"screenshots/index.json\", \"schema\": \"screenshots-index.v1\"}},"
@@ -1310,6 +1510,14 @@ e2e_write_bundle_manifest() {
                 trace/events.jsonl)
                     kind="trace"
                     schema_json="\"trace-events.v2\""
+                    ;;
+                scenarios/index.json)
+                    kind="scenario"
+                    schema_json="\"scenarios-index.v1\""
+                    ;;
+                scenarios/scenarios.jsonl)
+                    kind="scenario"
+                    schema_json="\"scenario-events.v1\""
                     ;;
                 logs/index.json)
                     kind="log"
@@ -1464,6 +1672,14 @@ events = require(trace, "events", dict)
 required_artifact_paths.append(require(events, "path", str))
 require(events, "schema", str)
 
+scenarios = require(artifacts, "scenarios", dict)
+scenario_index_ref = require(scenarios, "index", dict)
+required_artifact_paths.append(require(scenario_index_ref, "path", str))
+require(scenario_index_ref, "schema", str)
+scenario_events_ref = require(scenarios, "events", dict)
+required_artifact_paths.append(require(scenario_events_ref, "path", str))
+require(scenario_events_ref, "schema", str)
+
 transcript = require(artifacts, "transcript", dict)
 req_path(transcript, "summary")
 
@@ -1496,6 +1712,7 @@ allowed_kinds = {
     "screenshot",
     "fixture",
     "replay",
+    "scenario",
     "opaque",
 }
 sha_re = re.compile(r"^[0-9a-f]{64}$")
@@ -1736,6 +1953,111 @@ if not seen_start:
     fail("trace/events.jsonl missing suite_start")
 if not seen_end:
     fail("trace/events.jsonl missing suite_end")
+
+scenario_index = load_json("scenarios/index.json")
+require(scenario_index, "schema_version", int)
+if require(scenario_index, "suite", str) != suite:
+    fail("scenarios/index.json suite mismatch")
+if require(scenario_index, "timestamp", str) != timestamp:
+    fail("scenarios/index.json timestamp mismatch")
+scenario_count = require(scenario_index, "scenario_count", int)
+if scenario_count < 0:
+    fail("scenarios/index.json scenario_count must be >= 0")
+if require(scenario_index, "scenarios_jsonl", str) != "scenarios/scenarios.jsonl":
+    fail("scenarios/index.json scenarios_jsonl mismatch")
+generated_from = require(scenario_index, "generated_from", dict)
+if require(generated_from, "manifest", str) != "manifest.json":
+    fail("scenarios/index.json generated_from.manifest mismatch")
+if require(generated_from, "trace", str) != "trace/events.jsonl":
+    fail("scenarios/index.json generated_from.trace mismatch")
+scenario_replay = require(scenario_index, "replay", dict)
+require(scenario_replay, "command", str)
+for key in ("environment", "metadata"):
+    rel = require(scenario_replay, key, str)
+    if rel not in file_map:
+        fail(f"scenarios/index.json replay.{key} references missing file: {rel}")
+scenario_diag = require(scenario_index, "diagnostics", dict)
+scenario_env = require(scenario_diag, "env_redacted", str)
+if scenario_env not in file_map:
+    fail(f"scenarios/index.json diagnostics.env_redacted references missing file: {scenario_env}")
+statuses = require(scenario_index, "statuses", dict)
+for key, value in statuses.items():
+    if key not in allowed_case_statuses:
+        fail(f"scenarios/index.json statuses key invalid: {key}")
+    if not isinstance(value, int) or value < 0:
+        fail(f"scenarios/index.json statuses.{key} must be non-negative int")
+
+scenario_lines = []
+scenario_names = set()
+with open(os.path.join(artifact_dir, "scenarios", "scenarios.jsonl"), "r", encoding="utf-8") as f:
+    for ln, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            scenario = json.loads(line)
+        except Exception as e:
+            fail(f"scenarios/scenarios.jsonl invalid JSON at line {ln}: {e}")
+        if not isinstance(scenario, dict):
+            fail(f"scenarios/scenarios.jsonl line {ln}: expected object")
+        require(scenario, "schema_version", int)
+        if require(scenario, "suite", str) != suite:
+            fail(f"scenarios/scenarios.jsonl line {ln}: suite mismatch")
+        if require(scenario, "run_timestamp", str) != timestamp:
+            fail(f"scenarios/scenarios.jsonl line {ln}: run_timestamp mismatch")
+        case_name = require(scenario, "case", str)
+        if case_name in scenario_names:
+            fail(f"scenarios/scenarios.jsonl duplicate case: {case_name}")
+        scenario_names.add(case_name)
+        status = require(scenario, "status", str)
+        if status not in allowed_case_statuses:
+            fail(f"scenarios/scenarios.jsonl line {ln}: status invalid: {status}")
+        duration_ms = require(scenario, "duration_ms", int)
+        if duration_ms < 0:
+            fail(f"scenarios/scenarios.jsonl line {ln}: duration_ms must be >= 0")
+        assertion_count = require(scenario, "assertion_count", int)
+        if assertion_count < 0:
+            fail(f"scenarios/scenarios.jsonl line {ln}: assertion_count must be >= 0")
+        require(scenario, "artifact_dir", str)
+        trace_ref = require(require(scenario, "trace", dict), "events", str)
+        if trace_ref != "trace/events.jsonl" or trace_ref not in file_map:
+            fail(f"scenarios/scenarios.jsonl line {ln}: bad trace events ref")
+        replay_ref = require(scenario, "replay", dict)
+        require(replay_ref, "command", str)
+        for key in ("environment", "metadata"):
+            rel = require(replay_ref, key, str)
+            if rel not in file_map:
+                fail(f"scenarios/scenarios.jsonl line {ln}: replay.{key} references missing file: {rel}")
+        diag_ref = require(scenario, "diagnostics", dict)
+        env_rel = require(diag_ref, "env_redacted", str)
+        if env_rel not in file_map:
+            fail(f"scenarios/scenarios.jsonl line {ln}: diagnostics.env_redacted references missing file: {env_rel}")
+        for i, artifact in enumerate(require(scenario, "artifacts", list)):
+            if not isinstance(artifact, dict):
+                fail(f"scenarios/scenarios.jsonl line {ln}: artifacts[{i}] must be object")
+            rel = require(artifact, "path", str)
+            if rel not in file_map:
+                fail(f"scenarios/scenarios.jsonl line {ln}: artifacts[{i}] references missing file: {rel}")
+        for i, failure in enumerate(require(scenario, "failures", list)):
+            if not isinstance(failure, dict):
+                fail(f"scenarios/scenarios.jsonl line {ln}: failures[{i}] must be object")
+            if "message" in failure and not isinstance(failure["message"], str):
+                fail(f"scenarios/scenarios.jsonl line {ln}: failures[{i}].message must be string")
+            artifact_rel = failure.get("artifact")
+            if artifact_rel is not None:
+                if not isinstance(artifact_rel, str):
+                    fail(f"scenarios/scenarios.jsonl line {ln}: failures[{i}].artifact must be string or null")
+                if artifact_rel not in file_map:
+                    fail(f"scenarios/scenarios.jsonl line {ln}: failures[{i}] references missing artifact: {artifact_rel}")
+            for key in ("label", "expected", "actual", "replay_command", "env_redacted_path"):
+                if key in failure and not isinstance(failure[key], str):
+                    fail(f"scenarios/scenarios.jsonl line {ln}: failures[{i}].{key} must be string")
+        scenario_lines.append(scenario)
+
+if scenario_count != len(scenario_lines):
+    fail("scenarios/index.json scenario_count does not match scenarios.jsonl")
+if set(seen_case_names) != scenario_names:
+    fail("scenarios/scenarios.jsonl cases must match manifest.json cases")
 
 # Generic parseability checks for JSON/JSONL artifacts.
 for path in file_map.keys():
@@ -3435,6 +3757,7 @@ e2e_summary() {
         # Write server log stats if server was used (br-3h13.12.2)
         e2e_write_server_log_stats
         e2e_write_suite_manifest_json
+        e2e_write_scenario_logs
 
         # Emit a versioned bundle manifest and validate it. This provides
         # artifact-contract enforcement for CI regression triage (br-3vwi.10.18).
