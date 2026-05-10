@@ -795,7 +795,10 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         // Sensitive file untouched.
-        assert_eq!(std::fs::read_to_string(&sensitive).unwrap(), "secret data\n");
+        assert_eq!(
+            std::fs::read_to_string(&sensitive).unwrap(),
+            "secret data\n"
+        );
     }
 
     #[test]

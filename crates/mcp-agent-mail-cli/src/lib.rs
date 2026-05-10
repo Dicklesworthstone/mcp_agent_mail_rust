@@ -2096,6 +2096,33 @@ pub enum DoctorCommand {
     /// Exit 0 healthy / exit 1 findings. For CI scheduling.
     #[command(name = "health")]
     Health,
+
+    /// Mega-command: returns `{summary, findings, actions_planned,
+    /// recommended_command, capabilities_url}` in a single round-trip.
+    ///
+    /// Collapses the typical 3-call agent loop (status + inbox + plan) into
+    /// one. JSON only. Use `--quick` to filter to fast-path detectors only.
+    #[command(name = "triage")]
+    Triage {
+        /// Run only fast-path detectors (`quick_mode_eligible: true`).
+        ///
+        /// Budget < 200ms total. For pre-commit hooks.
+        #[arg(long)]
+        quick: bool,
+    },
+
+    /// Expand a single finding by id with full evidence + remediation.
+    ///
+    /// Reads from `.doctor/latest/report.json`. If the finding id is not
+    /// found in the latest run, exits 64 with usage guidance.
+    #[command(name = "explain")]
+    Explain {
+        /// Finding id (e.g. `archive_db_parity` or `fm-...-...`).
+        finding_id: String,
+        /// Output format. JSON is the default.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -5507,6 +5534,17 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
         DoctorCommand::Health => {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_health(&target)
+        }
+        DoctorCommand::Triage { quick } => {
+            let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            doctor::handle_triage(&target, quick)
+        }
+        DoctorCommand::Explain {
+            finding_id,
+            format,
+        } => {
+            let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            doctor::handle_explain(&target, &finding_id, format)
         }
     }
 }

@@ -53,6 +53,180 @@ pub fn handle_robot_docs() -> CliResult<()> {
     Ok(())
 }
 
+/// `am doctor triage` — mega-command. Returns `{summary, findings,
+/// actions_planned, recommended_command, capabilities_url}` in one
+/// round-trip. Collapses the typical 3-call agent loop into one.
+///
+/// Reads `.doctor/latest/report.json` if available; else returns a stub
+/// directing the agent to `am doctor` first. JSON only.
+///
+/// `quick=true` is recorded as metadata; pass-3 returns the filter
+/// flag in the envelope. Per-FM detector-level filtering happens in
+/// pass-4 once the per-FM detector registry is wired (today the
+/// quick_mode_eligible attribute is on the capabilities side only).
+pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
+    let root = runs::doctor_root(target);
+    let latest = root.join("latest");
+    let resolved = std::fs::read_link(&latest).ok().map(|p| root.join(p));
+    let report_path = resolved.and_then(|p| {
+        let r = p.join("report.json");
+        if r.exists() { Some(r) } else { None }
+    });
+
+    let report_value: serde_json::Value = if let Some(rp) = report_path.as_ref() {
+        let s = std::fs::read_to_string(rp)
+            .map_err(|e| CliError::Other(format!("reading {}: {}", rp.display(), e)))?;
+        serde_json::from_str(&s)
+            .map_err(|e| CliError::Other(format!("parsing report.json: {e}")))?
+    } else {
+        serde_json::json!({
+            "ok": null,
+            "summary": null,
+            "findings": [],
+        })
+    };
+
+    let summary = report_value
+        .get("summary")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let findings = report_value
+        .get("findings")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let total_findings = summary
+        .get("total_findings")
+        .and_then(|n| n.as_u64())
+        .unwrap_or_else(|| findings.as_array().map(|arr| arr.len() as u64).unwrap_or(0));
+
+    let recommended_command = if total_findings == 0 {
+        if report_path.is_none() {
+            "am doctor".to_string()
+        } else {
+            "am doctor health".to_string()
+        }
+    } else {
+        let has_p0 = findings
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .any(|f| f.get("severity").and_then(|s| s.as_str()) == Some("P0"))
+            })
+            .unwrap_or(false);
+        if has_p0 {
+            "am doctor --fix --yes".to_string()
+        } else {
+            "am doctor --dry-run --fix".to_string()
+        }
+    };
+
+    let actions_planned: Vec<serde_json::Value> = findings
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let id = f.get("id")?.as_str()?;
+                    let severity = f.get("severity").and_then(|s| s.as_str()).unwrap_or("P3");
+                    Some(serde_json::json!({
+                        "id": id,
+                        "severity": severity,
+                        "fix_command": format!("am doctor --fix --only {} --yes", id),
+                        "explain_command": format!("am doctor explain {}", id),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let envelope = serde_json::json!({
+        "schema_version": "1.0",
+        "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "quick": quick,
+        "report_available": report_path.is_some(),
+        "report_path": report_path.map(|p| p.to_string_lossy().into_owned()),
+        "summary": summary,
+        "total_findings": total_findings,
+        "findings": findings,
+        "actions_planned": actions_planned,
+        "recommended_command": recommended_command,
+        "capabilities_url": "am doctor capabilities --json",
+        "robot_docs_url": "am doctor robot-docs",
+    });
+
+    let s = serde_json::to_string_pretty(&envelope)
+        .map_err(|e| CliError::Other(format!("serializing triage envelope: {e}")))?;
+    println!("{s}");
+    Ok(())
+}
+
+/// `am doctor explain <finding-id>` — drill into a single finding.
+///
+/// Reads `.doctor/latest/report.json` and finds the matching entry. Returns
+/// the full finding (including `evidence`, `remediation`, etc.) as JSON.
+pub fn handle_explain(
+    target: &std::path::Path,
+    finding_id: &str,
+    format: Option<CliOutputFormat>,
+) -> CliResult<()> {
+    let root = runs::doctor_root(target);
+    let latest = root.join("latest");
+    let resolved = std::fs::read_link(&latest)
+        .ok()
+        .map(|p| root.join(p))
+        .ok_or_else(|| {
+            eprintln!("error: no `.doctor/latest` symlink found. Run `am doctor` first.");
+            CliError::ExitCode(64)
+        })?;
+    let report_path = resolved.join("report.json");
+    if !report_path.exists() {
+        eprintln!(
+            "error: no report.json at {}. Run `am doctor` first.",
+            report_path.display()
+        );
+        return Err(CliError::ExitCode(64));
+    }
+    let s = std::fs::read_to_string(&report_path)
+        .map_err(|e| CliError::Other(format!("reading {}: {}", report_path.display(), e)))?;
+    let v: serde_json::Value = serde_json::from_str(&s)
+        .map_err(|e| CliError::Other(format!("parsing report.json: {e}")))?;
+    let findings = v
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| CliError::Other("report.json missing `findings` array".into()))?;
+    let matched = findings.iter().find(|f| {
+        f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
+            || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
+    });
+    let Some(finding) = matched else {
+        eprintln!(
+            "error: finding `{finding_id}` not found in latest run. Run `am doctor --json` to list all findings."
+        );
+        return Err(CliError::ExitCode(64));
+    };
+
+    let envelope = serde_json::json!({
+        "schema_version": "1.0",
+        "finding_id": finding_id,
+        "finding": finding,
+        "report_path": report_path.to_string_lossy(),
+        "next_actions": [
+            format!("am doctor --fix --only {finding_id} --yes"),
+            "am doctor capabilities --json".to_string(),
+        ],
+    });
+
+    match format.unwrap_or(CliOutputFormat::Json) {
+        CliOutputFormat::Json | CliOutputFormat::Toon | CliOutputFormat::Table => {
+            let pretty = serde_json::to_string_pretty(&envelope)
+                .map_err(|e| CliError::Other(format!("serializing explain: {e}")))?;
+            println!("{pretty}");
+        }
+    }
+    Ok(())
+}
+
 /// Print `am doctor health` — one-line liveness summary + exit 0/1.
 ///
 /// Cheap. For CI scheduling. Reads `.doctor/latest/report.json` if present.

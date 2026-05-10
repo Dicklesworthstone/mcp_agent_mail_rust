@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use mcp_agent_mail_cli::doctor::capabilities::{build_report, SUBSYSTEMS};
+use mcp_agent_mail_cli::doctor::capabilities::{SUBSYSTEMS, build_report};
 
 #[test]
 fn capabilities_contract_invariants_hold() {

@@ -170,6 +170,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{:x}", h)
 }
 
+/// G-OOM fix (Gemini round 2): streaming SHA-256 over the file's bytes
+/// without loading the entire file into memory. Returns the empty-file
+/// hash if the path doesn't exist.
+fn sha256_of_path(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    if !path.exists() {
+        return Ok(format!("sha256:{:x}", Sha256::digest(b"")));
+    }
+    let mut f = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
 fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
     match fs::read(path) {
         Ok(b) => Ok(b),
@@ -230,11 +251,34 @@ fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Streaming comparison of two files. G-OOM fix (Gemini round 2):
+/// avoids loading entire file contents into memory. Reads 64 KiB at a
+/// time; first divergence aborts.
 fn cmp_strict(a: &Path, b: &Path) -> std::io::Result<()> {
-    let ba = fs::read(a)?;
-    let bb = fs::read(b)?;
-    if ba != bb {
-        return Err(std::io::Error::other("backup verify failed (cmp-strict)"));
+    use std::io::Read;
+    let mut fa = fs::File::open(a)?;
+    let mut fb = fs::File::open(b)?;
+    let len_a = fa.metadata()?.len();
+    let len_b = fb.metadata()?.len();
+    if len_a != len_b {
+        return Err(std::io::Error::other(format!(
+            "backup verify failed (length mismatch: {len_a} vs {len_b})"
+        )));
+    }
+    let mut buf_a = vec![0u8; 65_536];
+    let mut buf_b = vec![0u8; 65_536];
+    loop {
+        let na = fa.read(&mut buf_a)?;
+        let nb = fb.read(&mut buf_b)?;
+        if na != nb {
+            return Err(std::io::Error::other("backup verify failed (cmp-strict)"));
+        }
+        if na == 0 {
+            break;
+        }
+        if buf_a[..na] != buf_b[..nb] {
+            return Err(std::io::Error::other("backup verify failed (cmp-strict)"));
+        }
     }
     Ok(())
 }
@@ -311,12 +355,56 @@ fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
 }
 
 /// Append `content` to `path` (creating if missing).
+///
+/// G-AppendChmod-TOCTOU fix (Gemini round 2): uses `O_NOFOLLOW` so a
+/// symlink-swap attacker who replaces `path` with a symlink between the
+/// step-4 hash check and this open cannot redirect the append to an
+/// out-of-scope file (e.g., /etc/shadow). On a symlink, open returns
+/// `ELOOP` which we map to `MutateError::Io`.
 fn append_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc_consts::O_NOFOLLOW)
+        .open(path)?;
     f.write_all(content)?;
     f.sync_data()?;
+    Ok(())
+}
+
+/// `O_NOFOLLOW` value as a const so we don't need a libc dep.
+mod libc_consts {
+    /// Linux/macOS/BSD: O_NOFOLLOW = 0x20000 on Linux x86_64, 0x100 on macOS.
+    /// Rust stdlib's std::fs doesn't expose this. Use cfg-target.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    pub const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    )))]
+    pub const O_NOFOLLOW: i32 = 0;
+}
+
+/// Set permissions on `path` via the file descriptor (G-AppendChmod fix).
+///
+/// Opens the file with `O_NOFOLLOW` first so a symlink-swap attacker
+/// cannot redirect the chmod to an arbitrary file. Returns `ELOOP` if
+/// `path` is now a symlink.
+fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_consts::O_NOFOLLOW)
+        .open(path)?;
+    f.set_permissions(Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -364,8 +452,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     }
 
     // 2. before_hash + before_mode.
-    let before_bytes = read_or_empty(path)?;
-    let before_hash = sha256_hex(&before_bytes);
+    // G-OOM fix: stream-hash the file rather than reading entire contents
+    // into memory. Multi-GB files (e.g., storage.sqlite3) would OOM otherwise.
+    let before_hash = sha256_of_path(path)?;
     let before_mode = fs::metadata(path).ok().map(|m| m.permissions().mode());
 
     // 3. Preconditions: path in scope + Rename destination in scope (H8 fix —
@@ -396,8 +485,8 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
         // Re-hash the live file; if it changed since step 2, someone else
         // is writing — refuse with a concurrency-loss-style error.
-        let post_backup_bytes = read_or_empty(path)?;
-        let post_backup_hash = sha256_hex(&post_backup_bytes);
+        // G-OOM fix: stream-hash to avoid loading full file twice.
+        let post_backup_hash = sha256_of_path(path)?;
         if post_backup_hash != before_hash {
             let _ = FileExt::unlock(&lock_file);
             return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
@@ -453,7 +542,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             Ok(())
         }
         Op::Chmod { mode } => {
-            fs::set_permissions(path, Permissions::from_mode(mode))?;
+            // G-AppendChmod-TOCTOU fix: chmod via fd opened with O_NOFOLLOW
+            // so a symlink-swap attacker cannot redirect to an out-of-scope file.
+            chmod_via_fd(path, mode)?;
             after_mode = Some(mode);
             Ok(())
         }
@@ -490,14 +581,12 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         None
     };
 
-    // 8. after_hash (read post-state). For Rename: read the destination.
-    // For everything else: read the original path (which is now the
-    // post-mutation state, or the rolled-back state).
-    let after_bytes = match &op {
-        Op::Rename { to } if exec_result.is_ok() => read_or_empty(to)?,
-        _ => read_or_empty(path)?,
+    // 8. after_hash (read post-state via streaming hash — G-OOM fix).
+    // For Rename: hash the destination. Else: hash the original path.
+    let after_hash = match &op {
+        Op::Rename { to } if exec_result.is_ok() => sha256_of_path(to)?,
+        _ => sha256_of_path(path)?,
     };
-    let after_hash = sha256_hex(&after_bytes);
 
     // 9. Append to actions.jsonl, fsync. The `rolled_back` field reflects
     // the actual rollback result (C1 fix), not an assumption.
