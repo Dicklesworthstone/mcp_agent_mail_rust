@@ -142,6 +142,7 @@ struct AgentStartReport {
     runtime: AgentStartRuntime,
     readiness: AgentStartReadiness,
     checks: Vec<AgentStartCheck>,
+    fix: AgentStartFixReport,
     commands: BTreeMap<&'static str, String>,
     next_actions: Vec<AgentStartAction>,
     notes: Vec<&'static str>,
@@ -201,6 +202,21 @@ struct AgentStartCheck {
     status: &'static str,
     detail: String,
     command: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartFixReport {
+    requested: bool,
+    status: &'static str,
+    blocked_reason: Option<String>,
+    actions: Vec<AgentStartFixAction>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartFixAction {
+    id: &'static str,
+    status: &'static str,
+    detail: String,
 }
 
 #[derive(Parser, Debug)]
@@ -1871,6 +1887,9 @@ pub enum AgentCommand {
         /// Model to use in suggested registration command (falls back to AGENT_MODEL, MODEL, then gpt-5.5).
         #[arg(long)]
         model: Option<String>,
+        /// Perform idempotent safe setup for an existing project and resolved agent name.
+        #[arg(long, default_value_t = false)]
+        fix: bool,
         /// Output format: table, json, or toon (default: table).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -56811,11 +56830,15 @@ fn handle_agent(action: AgentCommand) -> CliResult<()> {
             agent,
             program,
             model,
+            fix,
             format,
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let report = build_agent_start_report(project, agent, program, model)?;
+            let mut report = build_agent_start_report(project, agent, program, model)?;
+            if fix {
+                report.fix = context::run_async(apply_agent_start_fix(&report))?;
+            }
             output::emit_output(&report, fmt, || render_agent_start_report(&report));
             Ok(())
         }
@@ -57141,14 +57164,111 @@ fn build_agent_start_report(
             should_register_first: !agent_ready,
         },
         checks,
+        fix: agent_start_fix_not_requested(),
         commands,
         next_actions,
         notes: vec![
-            "This command is side-effect-free; it does not register agents or mutate the archive.",
+            "This command is side-effect-free unless --fix is passed.",
+            "--fix only ensures an existing absolute project and resolved agent identity.",
             "Top-level aliases like am status and am inbox delegate to the robot command surface.",
             "Use JSON for automation and TOON when token budget matters.",
         ],
     })
+}
+
+async fn apply_agent_start_fix(report: &AgentStartReport) -> CliResult<AgentStartFixReport> {
+    if !report.readiness.project_ready {
+        return Ok(agent_start_fix_blocked(
+            "project path must be an existing absolute path before --fix can write setup state",
+        ));
+    }
+    let Some(agent_name) = report.agent.name.as_deref() else {
+        return Ok(agent_start_fix_blocked(
+            "agent name is required before --fix can register identity state",
+        ));
+    };
+
+    let ctx = context::AsyncCliContext::open()?;
+    let cx = asupersync::Cx::for_request();
+    let project = resolve_project_async(&cx, &ctx.pool, &report.project.key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = outcome_to_result(
+        mcp_agent_mail_db::queries::register_agent(
+            &cx,
+            &ctx.pool,
+            project_id,
+            agent_name,
+            &report.agent.program,
+            &report.agent.model,
+            Some("agent start --fix"),
+            Some("auto"),
+            None,
+        )
+        .await,
+    )?;
+    let inbox = outcome_to_result(
+        mcp_agent_mail_db::queries::fetch_inbox_metadata(
+            &cx,
+            &ctx.pool,
+            project_id,
+            agent.id.unwrap_or(0),
+            true,
+            None,
+            1,
+        )
+        .await,
+    )?;
+
+    Ok(AgentStartFixReport {
+        requested: true,
+        status: "applied",
+        blocked_reason: None,
+        actions: vec![
+            AgentStartFixAction {
+                id: "ensure_project",
+                status: "applied",
+                detail: format!(
+                    "Ensured project {} for {}.",
+                    project.slug, project.human_key
+                ),
+            },
+            AgentStartFixAction {
+                id: "register_agent",
+                status: "applied",
+                detail: format!("Ensured agent identity {}.", agent.name),
+            },
+            AgentStartFixAction {
+                id: "inbox_probe",
+                status: "applied",
+                detail: format!(
+                    "Verified inbox query path; {} urgent message(s) visible.",
+                    inbox.len()
+                ),
+            },
+        ],
+    })
+}
+
+fn agent_start_fix_not_requested() -> AgentStartFixReport {
+    AgentStartFixReport {
+        requested: false,
+        status: "not_requested",
+        blocked_reason: None,
+        actions: Vec::new(),
+    }
+}
+
+fn agent_start_fix_blocked(reason: &str) -> AgentStartFixReport {
+    AgentStartFixReport {
+        requested: true,
+        status: "blocked",
+        blocked_reason: Some(reason.to_string()),
+        actions: vec![AgentStartFixAction {
+            id: "preflight",
+            status: "blocked",
+            detail: reason.to_string(),
+        }],
+    }
 }
 
 fn agent_start_check(
@@ -57298,6 +57418,27 @@ fn render_agent_start_report(report: &AgentStartReport) {
         ]);
     }
     checks.render();
+    ftui_runtime::ftui_println!("");
+
+    output::kv(
+        "Fix requested",
+        if report.fix.requested { "yes" } else { "no" },
+    );
+    output::kv("Fix status", report.fix.status);
+    if let Some(reason) = &report.fix.blocked_reason {
+        output::kv("Fix blocked", reason);
+    }
+    if !report.fix.actions.is_empty() {
+        let mut fix_actions = output::CliTable::new(vec!["FIX", "STATUS", "DETAIL"]);
+        for action in &report.fix.actions {
+            fix_actions.add_row(vec![
+                action.id.to_string(),
+                action.status.to_string(),
+                action.detail.clone(),
+            ]);
+        }
+        fix_actions.render();
+    }
     ftui_runtime::ftui_println!("");
 
     let mut table = output::CliTable::new(vec!["PRIORITY", "ACTION", "COMMAND"]);

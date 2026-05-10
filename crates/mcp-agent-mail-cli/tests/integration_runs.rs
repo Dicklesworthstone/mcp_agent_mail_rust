@@ -724,6 +724,134 @@ fn agent_start_json_missing_agent_uses_shell_safe_placeholder() {
 }
 
 #[test]
+fn agent_start_fix_idempotently_registers_identity() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    std::fs::create_dir_all(&env.storage_root).expect("create storage root");
+    let project_root = env.tmp.path().join("agent-fix-project");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let project_key = project_root.display().to_string();
+
+    for _ in 0..2 {
+        let out = run_am(
+            &env.base_env(),
+            Some(env.tmp.path()),
+            &[
+                "agent",
+                "start",
+                "--fix",
+                "--project",
+                &project_key,
+                "--agent",
+                "BlueLake",
+                "--program",
+                "codex-cli",
+                "--model",
+                "gpt-5",
+                "--json",
+            ],
+            None,
+        );
+        if !out.status.success() {
+            write_artifact(
+                "agent_start_fix_registers_identity",
+                &["agent", "start", "--fix", "--json"],
+                &out,
+            );
+            panic!(
+                "expected success\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+        assert_eq!(value["fix"]["requested"].as_bool(), Some(true));
+        assert_eq!(value["fix"]["status"].as_str(), Some("applied"));
+        let action_ids: Vec<_> = value["fix"]["actions"]
+            .as_array()
+            .expect("fix actions")
+            .iter()
+            .filter_map(|action| action["id"].as_str())
+            .collect();
+        assert_eq!(
+            action_ids,
+            vec!["ensure_project", "register_agent", "inbox_probe"]
+        );
+    }
+
+    let list = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["agents", "list", "-p", &project_key, "--json"],
+        None,
+    );
+    if !list.status.success() {
+        write_artifact(
+            "agent_start_fix_agents_list",
+            &["agents", "list", "-p", "--json"],
+            &list,
+        );
+        panic!(
+            "expected agents list success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&list.stdout),
+            String::from_utf8_lossy(&list.stderr)
+        );
+    }
+    let agents: Value = serde_json::from_slice(&list.stdout).expect("valid agents JSON");
+    let rows = agents.as_array().expect("agents list array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "re-running --fix should not duplicate agents"
+    );
+    assert_eq!(rows[0]["name"].as_str(), Some("BlueLake"));
+}
+
+#[test]
+fn agent_start_fix_blocks_without_safe_prerequisites() {
+    let env = TestEnv::new();
+    let mut env_vars = env.base_env();
+    env_vars.retain(|(key, _)| !matches!(key.as_str(), "AGENT_NAME" | "AGENT_MAIL_AGENT"));
+
+    let out = run_am(
+        &env_vars,
+        Some(env.tmp.path()),
+        &[
+            "agent",
+            "start",
+            "--fix",
+            "--project",
+            "relative-project",
+            "--json",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agent_start_fix_blocked_prerequisites",
+            &["agent", "start", "--fix", "--json"],
+            &out,
+        );
+        panic!(
+            "expected blocked report with success exit\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["fix"]["requested"].as_bool(), Some(true));
+    assert_eq!(value["fix"]["status"].as_str(), Some("blocked"));
+    assert!(
+        value["fix"]["blocked_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("existing absolute path")),
+        "blocked fix should explain the project preflight failure"
+    );
+}
+
+#[test]
 fn robot_docs_guide_prints_agent_handbook() {
     let env = TestEnv::new();
     let out = run_am(
