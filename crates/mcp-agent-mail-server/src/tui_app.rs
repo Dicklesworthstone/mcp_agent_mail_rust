@@ -365,6 +365,16 @@ pub struct TuiDiffTelemetry {
     pub last_change_ratio: f64,
 }
 
+/// Diagnostic override for app-level diff strategy benchmarks and tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiDiffDiagnosticConfig {
+    /// Render through the full-diff safety path while still observing strategy decisions.
+    pub safe_mode: bool,
+    /// Force the Bayesian strategy to return full-frame decisions.
+    pub deterministic_fallback: bool,
+}
+
 fn command_palette_theme_style() -> PaletteStyle {
     let tp = crate::tui_theme::TuiThemePalette::current();
     PaletteStyle {
@@ -2015,6 +2025,13 @@ impl MailAppModel {
             consecutive_audit_mismatches: self.diff_consecutive_audit_mismatches.get(),
             last_change_ratio: self.diff_last_change_ratio.get(),
         }
+    }
+
+    /// Configure app-level diff strategy behavior for diagnostics and benchmarks.
+    #[doc(hidden)]
+    pub fn configure_diff_strategy_for_diagnostics(&self, config: TuiDiffDiagnosticConfig) {
+        self.diff_strategy_safe_mode.set(config.safe_mode);
+        self.diff_strategy.borrow_mut().deterministic_fallback = config.deterministic_fallback;
     }
 
     /// Get mutable access to the modal manager for showing confirmation dialogs.

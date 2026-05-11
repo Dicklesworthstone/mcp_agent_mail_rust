@@ -10,19 +10,19 @@
 //! - Theme switch latency
 
 use std::hint::black_box;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ftui::layout::Rect;
 use ftui::widgets::Widget;
 use ftui::{Event, Frame, GraphemePool, KeyCode, KeyEvent, Model, PackedRgba};
 use ftui_extras::theme::ThemeId;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbConn;
-use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
+use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg, TuiDiffDiagnosticConfig};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
-use mcp_agent_mail_server::tui_decision::{BayesianDiffStrategy, FrameState};
+use mcp_agent_mail_server::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState};
 use mcp_agent_mail_server::tui_events::{DbStatSnapshot, MailEvent};
 use mcp_agent_mail_server::tui_screens::MailScreenId;
 use mcp_agent_mail_server::tui_theme;
@@ -79,6 +79,182 @@ fn make_model(state: Arc<TuiSharedState>, screen: MailScreenId) -> MailAppModel 
     let _ = model.update(MailMsg::SwitchScreen(screen));
     let _ = model.update(MailMsg::Terminal(Event::Tick));
     model
+}
+
+const DIFF_RENDER_BENCH_FRAMES: usize = 1_000;
+const DIFF_RENDER_BENCH_WIDTH: u16 = 120;
+const DIFF_RENDER_BENCH_HEIGHT: u16 = 40;
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct DiffActionCounts {
+    full: usize,
+    incremental: usize,
+    deferred: usize,
+}
+
+impl DiffActionCounts {
+    const fn record(&mut self, action: DiffAction) {
+        match action {
+            DiffAction::Full => self.full = self.full.saturating_add(1),
+            DiffAction::Incremental => {
+                self.incremental = self.incremental.saturating_add(1);
+            }
+            DiffAction::Deferred => self.deferred = self.deferred.saturating_add(1),
+        }
+    }
+
+    const fn skip_count(&self) -> usize {
+        self.incremental.saturating_add(self.deferred)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DiffStrategyRenderStats {
+    mode: &'static str,
+    frames: usize,
+    actual: DiffActionCounts,
+    shadow: DiffActionCounts,
+    resize_full_actions: usize,
+    final_safe_mode: bool,
+    audit_frames: u32,
+    deferred_frames: u64,
+    consecutive_audit_mismatches: u32,
+}
+
+impl DiffStrategyRenderStats {
+    const fn actual_skip_count(&self) -> usize {
+        self.actual.skip_count()
+    }
+
+    const fn shadow_skip_count(&self) -> usize {
+        self.shadow.skip_count()
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DiffStrategyBenchReport {
+    generated_at: String,
+    bead: &'static str,
+    frames_per_iteration: usize,
+    width: u16,
+    height: u16,
+    strategy: DiffStrategyRenderStats,
+    baseline: DiffStrategyRenderStats,
+}
+
+fn diff_strategy_render_stats(mode: &'static str, frames: usize) -> DiffStrategyRenderStats {
+    DiffStrategyRenderStats {
+        mode,
+        frames,
+        actual: DiffActionCounts::default(),
+        shadow: DiffActionCounts::default(),
+        resize_full_actions: 0,
+        final_safe_mode: false,
+        audit_frames: 0,
+        deferred_frames: 0,
+        consecutive_audit_mismatches: 0,
+    }
+}
+
+fn make_diff_strategy_bench_model(strategy_enabled: bool) -> MailAppModel {
+    let config = Config::default();
+    let state = TuiSharedState::new(&config);
+    let mut model = MailAppModel::new(state);
+    model.configure_diff_strategy_for_diagnostics(TuiDiffDiagnosticConfig {
+        safe_mode: false,
+        deterministic_fallback: !strategy_enabled,
+    });
+    let _ = model.init();
+    model
+}
+
+fn run_diff_strategy_render_loop(
+    mut model: MailAppModel,
+    mode: &'static str,
+    frames: usize,
+) -> DiffStrategyRenderStats {
+    let mut stats = diff_strategy_render_stats(mode, frames);
+
+    for frame_index in 0..frames {
+        let resize_frame = frame_index > 0 && frame_index.is_multiple_of(127);
+        let render_width = if resize_frame {
+            DIFF_RENDER_BENCH_WIDTH.saturating_add(8)
+        } else {
+            DIFF_RENDER_BENCH_WIDTH
+        };
+
+        if resize_frame {
+            let _ = model.update(MailMsg::Terminal(Event::Resize {
+                width: render_width,
+                height: DIFF_RENDER_BENCH_HEIGHT,
+            }));
+        } else if frame_index.is_multiple_of(29) {
+            let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Tab))));
+        } else if frame_index.is_multiple_of(11) {
+            let _ = model.update(MailMsg::Terminal(Event::Tick));
+        }
+
+        render_model(&model, render_width, DIFF_RENDER_BENCH_HEIGHT);
+
+        let telemetry = model.diff_telemetry();
+        stats.actual.record(telemetry.last_action);
+        stats.shadow.record(telemetry.last_shadow_action);
+        if resize_frame && telemetry.last_action == DiffAction::Full {
+            stats.resize_full_actions = stats.resize_full_actions.saturating_add(1);
+        }
+    }
+
+    let telemetry = model.diff_telemetry();
+    stats.final_safe_mode = telemetry.safe_mode;
+    stats.audit_frames = telemetry.full_diff_audit_counter;
+    stats.deferred_frames = telemetry.deferred_frames;
+    stats.consecutive_audit_mismatches = telemetry.consecutive_audit_mismatches;
+    stats
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root")
+        .to_path_buf()
+}
+
+fn save_diff_strategy_bench_report(
+    strategy: DiffStrategyRenderStats,
+    baseline: DiffStrategyRenderStats,
+) {
+    let report = DiffStrategyBenchReport {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        bead: "br-f1e0m",
+        frames_per_iteration: DIFF_RENDER_BENCH_FRAMES,
+        width: DIFF_RENDER_BENCH_WIDTH,
+        height: DIFF_RENDER_BENCH_HEIGHT,
+        strategy,
+        baseline,
+    };
+    let dir = repo_root().join("tests/artifacts/perf");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create diff strategy bench artifact directory: {error}");
+        return;
+    }
+    let path = dir.join(format!(
+        "diff_strategy_bench_{}_{}.json",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        std::process::id()
+    ));
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("failed to serialize diff strategy bench artifact: {error}");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::write(&path, format!("{json}\n")) {
+        eprintln!("failed to write diff strategy bench artifact: {error}");
+        return;
+    }
+    eprintln!("artifact: {}", path.display());
 }
 
 fn populate_dashboard_stats(state: &TuiSharedState) {
@@ -367,6 +543,48 @@ fn bench_frame_bayesian_1000(c: &mut Criterion) {
     });
 }
 
+/// Benchmark: wired app render loop with Bayesian diff strategy enabled.
+fn bench_render_1000_frames_with_strategy(c: &mut Criterion) {
+    let strategy_stats = run_diff_strategy_render_loop(
+        make_diff_strategy_bench_model(true),
+        "strategy",
+        DIFF_RENDER_BENCH_FRAMES,
+    );
+    let baseline_stats = run_diff_strategy_render_loop(
+        make_diff_strategy_bench_model(false),
+        "baseline",
+        DIFF_RENDER_BENCH_FRAMES,
+    );
+    save_diff_strategy_bench_report(strategy_stats, baseline_stats);
+
+    c.bench_function("bench_render_1000_frames_with_strategy", |b| {
+        b.iter_batched(
+            || make_diff_strategy_bench_model(true),
+            |model| {
+                let stats =
+                    run_diff_strategy_render_loop(model, "strategy", DIFF_RENDER_BENCH_FRAMES);
+                black_box((stats.actual_skip_count(), stats.shadow_skip_count()))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+/// Benchmark: wired app render loop forced through full-frame baseline mode.
+fn bench_render_1000_frames_baseline(c: &mut Criterion) {
+    c.bench_function("bench_render_1000_frames_baseline", |b| {
+        b.iter_batched(
+            || make_diff_strategy_bench_model(false),
+            |model| {
+                let stats =
+                    run_diff_strategy_render_loop(model, "baseline", DIFF_RENDER_BENCH_FRAMES);
+                black_box((stats.actual.full, stats.actual_skip_count()))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// Benchmark: dashboard frame render with 10k events in the ring buffer.
 fn bench_dashboard_frame_10k_events(c: &mut Criterion) {
     let config = Config::default();
@@ -468,6 +686,8 @@ criterion_group!(
     bench_frame_bayesian_mixed,
     bench_frame_full_baseline,
     bench_frame_bayesian_1000,
+    bench_render_1000_frames_with_strategy,
+    bench_render_1000_frames_baseline,
     bench_dashboard_frame_10k_events,
     bench_timeline_frame_10k_events,
     bench_messages_frame_1000_results,
