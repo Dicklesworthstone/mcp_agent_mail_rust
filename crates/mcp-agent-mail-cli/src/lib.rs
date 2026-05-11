@@ -4838,9 +4838,13 @@ where
             output::info(&format!(
                 "Startup detected mailbox database issues; running automatic repair ({detail})"
             ));
-            run_startup_doctor_subcommand_quietly(run_repair)?;
+            let (repair_result, repair_output) =
+                run_startup_doctor_subcommand_capturing(run_repair);
+            repair_result?;
             let post_repair_detail =
                 verify_doctor_database_repair_cleared(database_url, storage_root, &detail)?;
+            let post_repair_detail =
+                startup_post_repair_detail_with_artifacts(post_repair_detail, &repair_output);
             output::info(&format!(
                 "Automatic mailbox repair completed; {post_repair_detail}; continuing startup"
             ));
@@ -19833,6 +19837,25 @@ fn verify_doctor_database_repair_cleared(
              {detail}; original repair reason: {original_detail}"
         ))),
     }
+}
+
+fn startup_post_repair_detail_with_artifacts(
+    post_repair_detail: String,
+    captured_doctor_output: &str,
+) -> String {
+    match startup_doctor_forensic_bundle_path(captured_doctor_output) {
+        Some(path) => format!("{post_repair_detail}; forensic bundle: {path}"),
+        None => post_repair_detail,
+    }
+}
+
+fn startup_doctor_forensic_bundle_path(captured_doctor_output: &str) -> Option<&str> {
+    captured_doctor_output.lines().rev().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("Forensics: ")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    })
 }
 
 fn classify_mcp_agent_mail_config(
@@ -36497,6 +36520,23 @@ startup_timeout_sec = 42
         );
     }
 
+    #[test]
+    fn startup_post_repair_detail_surfaces_forensic_bundle_path() {
+        let detail = startup_post_repair_detail_with_artifacts(
+            "post-repair verification passed: clean".to_string(),
+            "Running database repair...\n  Forensics: /tmp/am-forensics/run-123\nRepair complete.\n",
+        );
+
+        assert!(
+            detail.contains("post-repair verification passed: clean"),
+            "verification detail should be preserved: {detail}"
+        );
+        assert!(
+            detail.contains("forensic bundle: /tmp/am-forensics/run-123"),
+            "forensic bundle path should be surfaced in startup output: {detail}"
+        );
+    }
+
     fn seed_startup_self_heal_fk_orphan(db_path: &Path) {
         let conn =
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
@@ -36637,6 +36677,35 @@ startup_timeout_sec = 42
         assert!(
             !reconstruct_called.get(),
             "missing-agent-only recipient rows should not trigger reconstruction"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_propagates_repair_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup_fk_repair_error.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_startup_self_heal_fk_orphan(&db_path);
+
+        let reconstruct_called = std::cell::Cell::new(false);
+        let result = run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || Err(CliError::Other("repair command failed".to_string())),
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        );
+
+        let err = result.expect_err("repair command failure should stop startup");
+        assert!(
+            err.to_string().contains("repair command failed"),
+            "repair error should propagate, got: {err}"
+        );
+        assert!(
+            !reconstruct_called.get(),
+            "startup should not reconstruct after a repair command error"
         );
     }
 
@@ -49520,6 +49589,8 @@ startup_timeout_sec = 42
                 (999, 2, 'to', NULL, NULL)",
         )
         .expect("insert valid + orphaned recipients");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint fixture rows");
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -49569,6 +49640,88 @@ startup_timeout_sec = 42
                 .get_named::<i64>("ack_pending_count")
                 .unwrap_or(-1),
             1
+        );
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_preserves_orphaned_message_recipients() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_repair_dry_run_orphan.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'repair-dry-run', '/tmp/repair-dry-run', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES
+                (1, 1, 'Sender', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+                (2, 1, 'Recipient', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agents");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 1, 1, 'THREAD-DRY-RUN', 'dry run', 'body', 'normal', 1, 100, '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (1, 2, 'to', NULL, NULL),
+                (999, 2, 'to', NULL, NULL)",
+        )
+        .expect("insert valid + orphaned recipients");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, true, true)
+            .expect("dry-run repair");
+        let output = capture.drain_to_string();
+
+        assert!(
+            output.contains("Repair dry run complete."),
+            "dry-run output should report completion without applying repair steps, got: {output}"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "dry-run repair should not create backup artifacts"
+        );
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let recipient_rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = 999",
+                &[],
+            )
+            .expect("recipient count");
+        assert_eq!(
+            recipient_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            1,
+            "dry-run repair should leave orphaned recipients untouched"
+        );
+        assert!(
+            matches!(
+                doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy after dry-run"),
+                DoctorDatabaseFixStrategy::Repair(_)
+            ),
+            "dry-run repair should not clear the startup repair recommendation"
         );
     }
 
@@ -53342,8 +53495,11 @@ fn handle_doctor_repair_with_options(
         );
     }
 
-    let conn =
-        open_db_sync_with_database_url_and_storage_root_locked(database_url, Some(storage_root))?;
+    let conn = if dry_run {
+        open_db_for_doctor_check(database_url)?
+    } else {
+        open_db_sync_with_database_url_and_storage_root_locked(database_url, Some(storage_root))?
+    };
 
     // 1b. Run a full PRAGMA integrity_check (not just quick_check) to detect
     // index-level corruption that quick_check misses.  Report the result but
@@ -54343,12 +54499,20 @@ fn run_startup_doctor_subcommand_quietly<F>(operation: F) -> CliResult<()>
 where
     F: FnOnce() -> CliResult<()>,
 {
+    let (result, _) = run_startup_doctor_subcommand_capturing(operation);
+    result
+}
+
+fn run_startup_doctor_subcommand_capturing<F>(operation: F) -> (CliResult<()>, String)
+where
+    F: FnOnce() -> CliResult<()>,
+{
     if let Ok(capture) = ftui_runtime::StdioCapture::install() {
         let result = operation();
-        let _ = capture.drain_to_string();
-        return result;
+        let output = capture.drain_to_string();
+        return (result, output);
     }
-    operation()
+    (operation(), String::new())
 }
 
 fn run_doctor_subcommand_quietly<F>(json: bool, operation: F) -> CliResult<()>

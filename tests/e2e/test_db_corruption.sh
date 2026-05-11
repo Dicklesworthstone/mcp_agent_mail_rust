@@ -25,6 +25,10 @@ export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
 WORK="$(e2e_mktemp "e2e_db_corruption")"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-db-corruption","version":"1.0"}}}'
+TRY_SESSION_STDOUT=""
+TRY_SESSION_STDERR=""
+TRY_SESSION_STDOUT_PATH_FILE="${WORK}/last_session_stdout_path"
+TRY_SESSION_STDERR_PATH_FILE="${WORK}/last_session_stderr_path"
 
 # Helper: run a single session and capture output + exit status
 try_session() {
@@ -36,6 +40,10 @@ try_session() {
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
+    TRY_SESSION_STDOUT="$output_file"
+    TRY_SESSION_STDERR="${srv_work}/stderr.txt"
+    printf '%s\n' "$TRY_SESSION_STDOUT" > "$TRY_SESSION_STDOUT_PATH_FILE"
+    printf '%s\n' "$TRY_SESSION_STDERR" > "$TRY_SESSION_STDERR_PATH_FILE"
 
     local database_url
     if [[ "$db_input" == sqlite://* ]]; then
@@ -44,8 +52,13 @@ try_session() {
         database_url="sqlite:////${db_input}"
     fi
 
-    DATABASE_URL="${database_url}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
+    if [ -n "${TRY_SESSION_STORAGE_ROOT:-}" ]; then
+        STORAGE_ROOT="${TRY_SESSION_STORAGE_ROOT}" DATABASE_URL="${database_url}" RUST_LOG=error \
+            am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
+    else
+        DATABASE_URL="${database_url}" RUST_LOG=error \
+            am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
+    fi
     local srv_pid=$!
     sleep 0.5
 
@@ -432,6 +445,88 @@ rm -f "$CLI_REL_DB" 2>/dev/null || true
 rmdir -p "$(dirname "$CLI_REL_DB")" 2>/dev/null || true
 rm -f "$CLI_ABS_DB" 2>/dev/null || true
 rmdir "${CLI_ABS_DB_DIR}" 2>/dev/null || true
+
+# ===========================================================================
+# Case 10: Startup repair barrier verifies orphan-recipient cleanup before serving
+# ===========================================================================
+e2e_case_banner "Startup repair barrier for orphaned message recipients"
+
+ORPHAN_STORAGE="${WORK}/startup_barrier_storage"
+ORPHAN_DB="${WORK}/startup_barrier.sqlite3"
+ORPHAN_PROJECT="/tmp/e2e_startup_barrier"
+ORPHAN_AGENT="GreenLake"
+mkdir -p "$ORPHAN_STORAGE"
+
+TRY_SESSION_STORAGE_ROOT="$ORPHAN_STORAGE"
+INIT_RESP="$(try_session "$ORPHAN_DB" \
+    "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":1001,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${ORPHAN_PROJECT}\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":1002,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${ORPHAN_PROJECT}\",\"program\":\"test\",\"model\":\"test\",\"name\":\"${ORPHAN_AGENT}\"}}}" \
+)" || true
+unset TRY_SESSION_STORAGE_ROOT
+e2e_save_artifact "case_10_startup_barrier_init.txt" "$INIT_RESP"
+
+INIT_PROJECT_CHECK="$(tool_call_succeeded "$INIT_RESP" 1001)"
+INIT_AGENT_CHECK="$(tool_call_succeeded "$INIT_RESP" 1002)"
+if [ "$INIT_PROJECT_CHECK" = "YES" ] && [ "$INIT_AGENT_CHECK" = "YES" ]; then
+    e2e_pass "startup barrier fixture initialized real SQLite project and agent"
+else
+    e2e_fail "startup barrier fixture init failed: project=${INIT_PROJECT_CHECK} agent=${INIT_AGENT_CHECK}"
+fi
+
+sqlite3 "$ORPHAN_DB" "
+PRAGMA foreign_keys=OFF;
+INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+SELECT 999999, id, 'to', NULL, NULL FROM agents WHERE name = '${ORPHAN_AGENT}' LIMIT 1;
+" 2>/dev/null
+
+SEEDED_ORPHAN_COUNT="$(sqlite3 "$ORPHAN_DB" "SELECT COUNT(*) FROM message_recipients WHERE message_id = 999999;" 2>/dev/null | tr -d '[:space:]')"
+if [ "$SEEDED_ORPHAN_COUNT" = "1" ]; then
+    e2e_pass "startup barrier fixture seeded one orphan recipient row"
+else
+    e2e_fail "startup barrier fixture did not seed orphan recipient row"
+fi
+
+TRY_SESSION_STORAGE_ROOT="$ORPHAN_STORAGE"
+BARRIER_RESP="$(try_session "$ORPHAN_DB" \
+    "$INIT_REQ" \
+    "{\"jsonrpc\":\"2.0\",\"id\":1010,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${ORPHAN_PROJECT}\"}}}" \
+)" || true
+BARRIER_STDERR_PATH="$(cat "$TRY_SESSION_STDERR_PATH_FILE" 2>/dev/null || true)"
+BARRIER_STDERR="$(cat "$BARRIER_STDERR_PATH" 2>/dev/null || true)"
+unset TRY_SESSION_STORAGE_ROOT
+BARRIER_OUTPUT="${BARRIER_RESP}
+${BARRIER_STDERR}"
+e2e_save_artifact "case_10_startup_barrier_response.txt" "$BARRIER_RESP"
+e2e_save_artifact "case_10_startup_barrier_stderr.txt" "$BARRIER_STDERR"
+
+BARRIER_CHECK="$(tool_call_succeeded "$BARRIER_RESP" 1010)"
+if [ "$BARRIER_CHECK" = "YES" ]; then
+    e2e_pass "startup continued only after repair barrier completed"
+else
+    e2e_fail "startup barrier session did not serve request after repair"
+fi
+
+if printf '%s\n' "$BARRIER_OUTPUT" | grep -F "Startup detected mailbox database issues; running automatic repair" >/dev/null \
+    && printf '%s\n' "$BARRIER_OUTPUT" | grep -F "Automatic mailbox repair completed; post-repair verification passed" >/dev/null; then
+    e2e_pass "startup output included second-pass repair verification verdict"
+else
+    e2e_fail "startup output missing second-pass repair verification verdict"
+fi
+
+REMAINING_ORPHAN_COUNT="$(sqlite3 "$ORPHAN_DB" "SELECT COUNT(*) FROM message_recipients WHERE message_id = 999999;" 2>/dev/null | tr -d '[:space:]')"
+if [ "$REMAINING_ORPHAN_COUNT" = "0" ]; then
+    e2e_pass "startup repair barrier removed orphan recipient row"
+else
+    e2e_fail "startup repair barrier left orphan recipient rows: ${REMAINING_ORPHAN_COUNT}"
+fi
+
+FK_AFTER="$(sqlite3 "$ORPHAN_DB" "PRAGMA foreign_key_check;" 2>/dev/null || true)"
+if [ -z "$(printf '%s' "$FK_AFTER" | tr -d '[:space:]')" ]; then
+    e2e_pass "startup repair barrier left SQLite foreign_key_check clean"
+else
+    e2e_fail "startup repair barrier left foreign_key_check output: ${FK_AFTER}"
+fi
 
 # ===========================================================================
 # Summary
