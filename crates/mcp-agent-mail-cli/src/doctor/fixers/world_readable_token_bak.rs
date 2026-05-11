@@ -47,7 +47,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-const FM_ID: &str = "fm-secrets_env_state-bak-tokens-readable";
+pub const FM_ID: &str = "fm-secrets_env_state-bak-tokens-readable";
 const FM_SEVERITY: &str = "P1";
 const FM_SUBSYSTEM: &str = "secrets_env_state";
 

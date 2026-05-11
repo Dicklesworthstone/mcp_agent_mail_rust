@@ -22,7 +22,7 @@
 //!    - `mcp_servers.<server-name>.url`
 //!    - `mcpServers.<server-name>.serverUrl`
 //!    - `mcpServers.<server-name>.endpoint`
-//!    Where `<server-name>` matches `*agent*mail*` (case-insensitive).
+//!      Where `<server-name>` matches `*agent*mail*` (case-insensitive).
 //! 3. Compare each found URL to the canonical. Emit a finding per
 //!    mismatch.
 //!
@@ -49,7 +49,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
-const FM_ID: &str = "fm-mcp-config-files-wrong-http-url-or-scheme";
+pub const FM_ID: &str = "fm-mcp-config-files-wrong-http-url-or-scheme";
 const FM_SEVERITY: &str = "P1";
 const FM_SUBSYSTEM: &str = "mcp_config_files";
 
@@ -167,10 +167,10 @@ pub fn fix(
         });
     }
 
-    let body = fs::read_to_string(&finding.config_path)
-        .map_err(crate::doctor::mutate::MutateError::Io)?;
-    let mut v: serde_json::Value = serde_json::from_str(&body)
-        .map_err(crate::doctor::mutate::MutateError::Serde)?;
+    let body =
+        fs::read_to_string(&finding.config_path).map_err(crate::doctor::mutate::MutateError::Io)?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(&body).map_err(crate::doctor::mutate::MutateError::Serde)?;
 
     // Walk the JSON pointer (3 segments: container.server.field).
     let parts: Vec<&str> = finding.json_pointer.split('.').collect();
@@ -209,10 +209,7 @@ pub fn fix(
     // canonical), refuse rather than clobber. The chokepoint's H3
     // (post-backup re-hash) catches the same class of race for the
     // file as a whole; this catches it at the field level.
-    let cur = server_obj
-        .get(field)
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
+    let cur = server_obj.get(field).and_then(|x| x.as_str()).unwrap_or("");
     if cur != finding.current_url {
         return Ok(FixOutcome {
             actions_taken: 0,
@@ -225,8 +222,8 @@ pub fn fix(
         serde_json::Value::String(finding.canonical_url.clone()),
     );
 
-    let new_body = serde_json::to_string_pretty(&v)
-        .map_err(crate::doctor::mutate::MutateError::Serde)?;
+    let new_body =
+        serde_json::to_string_pretty(&v).map_err(crate::doctor::mutate::MutateError::Serde)?;
     // Append trailing newline to match common JSON style.
     let mut new_bytes = new_body.into_bytes();
     if !new_bytes.ends_with(b"\n") {
@@ -311,7 +308,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let findings = detect(CANONICAL, &[p.clone()]);
+        let findings = detect(CANONICAL, std::slice::from_ref(&p));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].config_path, p);
         assert_eq!(findings[0].json_pointer, "mcpServers.agent-mail.url");
@@ -337,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn detector_matches_serverUrl_field_alias() {
+    fn detector_matches_server_url_field_alias() {
         let td = TempDir::new().unwrap();
         let p = td.path().join("config.json");
         fs::write(
@@ -390,7 +387,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let findings = detect(CANONICAL, &[p.clone()]);
+        let findings = detect(CANONICAL, std::slice::from_ref(&p));
         let run_id = "2026-05-11T08-00-00Z__urlfix";
         let ctx = ctx_for(&td, run_id);
         let outcome = fix(&ctx, &findings[0]).expect("fix");
@@ -423,7 +420,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let findings = detect(CANONICAL, &[p.clone()]);
+        let findings = detect(CANONICAL, std::slice::from_ref(&p));
         // Concurrent writer changed it to a third value.
         fs::write(
             &p,
@@ -452,13 +449,12 @@ mod tests {
         })
         .to_string();
         fs::write(&p, &original).unwrap();
-        let findings = detect(CANONICAL, &[p.clone()]);
+        let findings = detect(CANONICAL, std::slice::from_ref(&p));
         let run_id = "2026-05-11T08-00-02Z__roundtrip";
         let ctx = ctx_for(&td, run_id);
         let _ = fix(&ctx, &findings[0]).unwrap();
         drop(ctx);
-        let summary =
-            crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
+        let summary = crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
         assert_eq!(summary.actions_replayed, 1);
         let restored = fs::read_to_string(&p).unwrap();
         assert_eq!(

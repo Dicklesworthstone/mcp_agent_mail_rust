@@ -47,7 +47,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
-const FM_ID: &str = "fm-archive-state-files-stale-archive-lock-from-dead-pid";
+pub const FM_ID: &str = "fm-archive-state-files-stale-archive-lock-from-dead-pid";
 const FM_SEVERITY: &str = "P1";
 const FM_SUBSYSTEM: &str = "archive_state_files";
 

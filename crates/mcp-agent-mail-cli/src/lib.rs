@@ -2150,6 +2150,13 @@ pub enum DoctorCommand {
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
+        /// Invoke exactly one registered FM-level fixer by id (pass-15).
+        ///
+        /// Skips the legacy multi-detector `fix` flow and routes through
+        /// `mutate()` for the single FM. Use `am doctor fixers` to list
+        /// valid ids. Unknown ids exit 64 with a hint.
+        #[arg(long)]
+        only: Option<String>,
     },
 
     /// Detect and optionally prune refs whose target objects are missing
@@ -5740,7 +5747,18 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             json,
             apply_mode,
         } => handle_doctor_archive_normalize(dry_run, yes, json, apply_mode),
-        DoctorCommand::Fix { dry_run, yes, json } => handle_doctor_fix(dry_run, yes, json),
+        DoctorCommand::Fix {
+            dry_run,
+            yes,
+            json,
+            only,
+        } => {
+            if let Some(fm_id) = only {
+                doctor::handle_fix_only(&fm_id, dry_run, yes, json)
+            } else {
+                handle_doctor_fix(dry_run, yes, json)
+            }
+        }
         DoctorCommand::FixOrphanRefs {
             project,
             all,
@@ -35913,11 +35931,18 @@ http_headers = { Authorization = "Bearer secret" }
         let cli = Cli::try_parse_from(["am", "doctor", "fix"]).unwrap();
         match cli.command.unwrap() {
             Commands::Doctor {
-                action: DoctorCommand::Fix { dry_run, yes, json },
+                action:
+                    DoctorCommand::Fix {
+                        dry_run,
+                        yes,
+                        json,
+                        only,
+                    },
             } => {
                 assert!(!dry_run);
                 assert!(!yes);
                 assert!(!json);
+                assert!(only.is_none());
             }
             _ => panic!("expected Doctor Fix"),
         }
@@ -35929,11 +35954,52 @@ http_headers = { Authorization = "Bearer secret" }
             Cli::try_parse_from(["am", "doctor", "fix", "--dry-run", "-y", "--json"]).unwrap();
         match cli.command.unwrap() {
             Commands::Doctor {
-                action: DoctorCommand::Fix { dry_run, yes, json },
+                action:
+                    DoctorCommand::Fix {
+                        dry_run,
+                        yes,
+                        json,
+                        only,
+                    },
             } => {
                 assert!(dry_run);
                 assert!(yes);
                 assert!(json);
+                assert!(only.is_none());
+            }
+            _ => panic!("expected Doctor Fix"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_fix_only_flag() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "fix",
+            "--dry-run",
+            "--only",
+            "fm-archive-state-files-stale-archive-lock-from-dead-pid",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Fix {
+                        dry_run,
+                        yes,
+                        json,
+                        only,
+                    },
+            } => {
+                assert!(dry_run);
+                assert!(yes);
+                assert!(!json);
+                assert_eq!(
+                    only.as_deref(),
+                    Some("fm-archive-state-files-stale-archive-lock-from-dead-pid")
+                );
             }
             _ => panic!("expected Doctor Fix"),
         }
@@ -53176,7 +53242,11 @@ fn mutating_doctor_action_mode(
     Ok(MutatingDoctorActionMode::Prompt)
 }
 
-fn confirm_mutating_doctor_action(prompt: &str, dry_run: bool, yes: bool) -> CliResult<bool> {
+pub(crate) fn confirm_mutating_doctor_action(
+    prompt: &str,
+    dry_run: bool,
+    yes: bool,
+) -> CliResult<bool> {
     match mutating_doctor_action_mode(dry_run, yes, output::is_stdin_tty())? {
         MutatingDoctorActionMode::Proceed => Ok(true),
         MutatingDoctorActionMode::Prompt => confirm(prompt, false),

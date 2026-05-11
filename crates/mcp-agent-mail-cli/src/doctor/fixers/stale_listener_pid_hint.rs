@@ -54,7 +54,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
-const FM_ID: &str = "fm-runtime-processes-stale-listener-pid-hint";
+pub const FM_ID: &str = "fm-runtime-processes-stale-listener-pid-hint";
 const FM_SEVERITY: &str = "P1";
 const FM_SUBSYSTEM: &str = "runtime_processes";
 

@@ -289,12 +289,12 @@ pub fn handle_fixers(format: Option<CliOutputFormat>) -> CliResult<()> {
         }
         CliOutputFormat::Table => {
             println!(
-                "{:6}  {:9}  {:28}  {:14}  {:6}  {}",
-                "Sev", "Auto-fix", "Subsystem", "Op", "Count", "FM id"
+                "{:6}  {:9}  {:28}  {:14}  {:6}  FM id",
+                "Sev", "Auto-fix", "Subsystem", "Op", "Count"
             );
             println!(
-                "{:6}  {:9}  {:28}  {:14}  {:6}  {}",
-                "---", "--------", "----------------------------", "--------------", "-----", "-----"
+                "{:6}  {:9}  {:28}  {:14}  {:6}  -----",
+                "---", "--------", "----------------------------", "--------------", "-----"
             );
             for spec in &specs {
                 println!(
@@ -306,13 +306,320 @@ pub fn handle_fixers(format: Option<CliOutputFormat>) -> CliResult<()> {
                     "",
                     spec.id,
                 );
-                println!("                                                                              {}", spec.one_line_description);
+                println!(
+                    "                                                                              {}",
+                    spec.one_line_description
+                );
             }
             println!();
             println!("Total: {} FM-level fixers registered", specs.len());
         }
     }
     Ok(())
+}
+
+/// `am doctor fix --only <fm-id>` — pass-15 verb.
+///
+/// Routes a single registered FM through the `mutate()` chokepoint.
+/// Validates the id against `fixers::registry()`; unknown ids exit 64
+/// with a hint listing valid ids. Builds default `DispatchInputs` from
+/// `Config::from_env()` + cwd + the operator's well-known config dirs,
+/// scaffolds a `.doctor/runs/<run-id>/` directory, runs the dispatcher,
+/// and emits a JSON envelope to stdout. Exit codes follow the doctor
+/// contract: 0 (ok), 3 (mutate failed), 4 (refused unsafe / out-of-scope),
+/// 64 (unknown id or missing required input).
+pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> CliResult<()> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    let started_at = Instant::now();
+
+    let specs = fixers::registry();
+    let Some(spec) = specs.iter().find(|s| s.id == fm_id) else {
+        eprintln!("error: unknown FM id `{fm_id}`");
+        eprintln!("valid ids (run `am doctor fixers --format json` for the contract):");
+        for s in &specs {
+            eprintln!("  {} [{}, {}]", s.id, s.severity, s.subsystem);
+        }
+        return Err(CliError::ExitCode(64));
+    };
+
+    if !confirm_mutating_doctor_action_for_only(fm_id, spec.severity, dry_run, yes)? {
+        // Suppressing the run on operator decline is *not* an error; emit
+        // a structured envelope so wrapper scripts can detect it.
+        let envelope = serde_json::json!({
+            "schema_version": "1.0",
+            "doctor_version": runs::DOCTOR_VERSION,
+            "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+            "fm_id": fm_id,
+            "skipped": true,
+            "reason": "operator declined",
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope)
+                .map_err(|e| CliError::Other(format!("serializing fix-only envelope: {e}")))?
+        );
+        return Ok(());
+    }
+
+    let repo_root =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("getting cwd: {e}")))?;
+    let config = Config::from_env();
+    let storage_root = config.storage_root.clone();
+    let canonical_mcp_url = format!(
+        "http://{}:{}{}",
+        config.http_host, config.http_port, config.http_path
+    );
+
+    let inputs = fixers::DispatchInputs {
+        repo_root: repo_root.clone(),
+        archive_roots: enumerate_archive_roots(&storage_root),
+        pid_hint_candidates: default_listener_pid_candidates(&storage_root),
+        token_backup_candidates: default_token_backup_candidates(&storage_root),
+        mcp_config_candidates: default_mcp_config_candidates(),
+        canonical_mcp_url: Some(canonical_mcp_url),
+        git_detect: build_git_detect_inputs(),
+        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+    };
+
+    let run_id = format!(
+        "{}__only_{}",
+        runs::now_iso_seconds(),
+        short_run_suffix(fm_id),
+    );
+    let run_dir = runs::scaffold_run_dir(&repo_root, &run_id)
+        .map_err(|e| CliError::Other(format!("scaffolding run dir: {e}")))?;
+    runs::ensure_gitignore_entry(&repo_root).ok();
+    let actions_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(run_dir.join("actions.jsonl"))
+        .map_err(|e| CliError::Other(format!("opening actions.jsonl: {e}")))?;
+
+    let mut write_scopes = default_write_scopes();
+    write_scopes.push(repo_root.clone());
+    write_scopes.push(run_dir.clone());
+
+    let ctx = mutate::MutateContext {
+        run_id: run_id.clone(),
+        run_dir: run_dir.clone(),
+        capabilities: mutate::Capabilities { write_scopes },
+        actions_file: Mutex::new(actions_file),
+        fixer_id: fm_id.to_string(),
+        repo_root: repo_root.clone(),
+        dry_run,
+        start: started_at,
+        extra_locks: Vec::new(),
+    };
+
+    let outcome = match fixers::dispatch_only(fm_id, &ctx, &inputs) {
+        Ok(o) => o,
+        Err(fixers::DispatchError::UnknownFm(id)) => {
+            // Registry-validated above, so this is genuinely impossible.
+            eprintln!("error: dispatcher reported unknown FM id `{id}` after registry check");
+            return Err(CliError::ExitCode(64));
+        }
+        Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+            eprintln!("error: required input `{field}` missing for FM `{fm_id}`");
+            return Err(CliError::ExitCode(64));
+        }
+        Err(fixers::DispatchError::Mutate(me)) => {
+            eprintln!("error: mutate() refused or failed for `{fm_id}`: {me}");
+            // `OutOfScope` and `RenameDestinationExists` map to 4 (refused unsafe);
+            // everything else maps to 3 (fix failed, possibly rolled back).
+            let code = match me {
+                mutate::MutateError::OutOfScope(_)
+                | mutate::MutateError::RenameDestinationExists(_) => 4,
+                _ => 3,
+            };
+            return Err(CliError::ExitCode(code));
+        }
+    };
+
+    let envelope = serde_json::json!({
+        "schema_version": "1.0",
+        "doctor_version": runs::DOCTOR_VERSION,
+        "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "fm_id": fm_id,
+        "severity": spec.severity,
+        "subsystem": spec.subsystem,
+        "op_pattern": spec.op_pattern,
+        "dry_run": dry_run,
+        "run_id": run_id,
+        "run_dir": run_dir.to_string_lossy(),
+        "duration_ms": started_at.elapsed().as_millis() as u64,
+        "outcome": outcome,
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope)
+            .map_err(|e| CliError::Other(format!("serializing fix-only envelope: {e}")))?
+    );
+
+    if !dry_run && outcome.actions_taken > 0 {
+        runs::update_latest_symlink(&repo_root, &run_id).ok();
+    }
+    Ok(())
+}
+
+/// Prompt-or-bypass helper for `handle_fix_only`. Lifted from
+/// `confirm_mutating_doctor_action` in lib.rs so we don't have to
+/// expose its internals; matches the same semantics.
+fn confirm_mutating_doctor_action_for_only(
+    fm_id: &str,
+    severity: &str,
+    dry_run: bool,
+    yes: bool,
+) -> CliResult<bool> {
+    let prompt = format!(
+        "Proceed with `am doctor fix --only {fm_id}` (severity {severity})? This routes mutations through the chokepoint and is reversible via `am doctor undo`.",
+    );
+    crate::confirm_mutating_doctor_action(&prompt, dry_run, yes)
+}
+
+/// One level of children of `<storage_root>/projects/` containing a `.git/`.
+fn enumerate_archive_roots(storage_root: &Path) -> Vec<PathBuf> {
+    let projects = storage_root.join("projects");
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&projects) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join(".git").exists() {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Common listener.pid hint locations.
+fn default_listener_pid_candidates(storage_root: &Path) -> Vec<PathBuf> {
+    let mut v = vec![storage_root.join("listener.pid")];
+    if let Some(home) = dirs::home_dir() {
+        v.push(
+            home.join(".local")
+                .join("share")
+                .join("mcp-agent-mail")
+                .join("listener.pid"),
+        );
+        v.push(home.join(".mcp_agent_mail").join("listener.pid"));
+    }
+    if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+        v.push(
+            PathBuf::from(xdg_state)
+                .join("mcp-agent-mail")
+                .join("listener.pid"),
+        );
+    }
+    v
+}
+
+/// Top-level (non-recursive) `*.bak` / `*.tmp` / `*.orig` files under the
+/// operator's storage root, plus the canonical config dir for
+/// mcp-agent-mail. Top-level only — recursion is intentionally avoided to
+/// keep latency bounded.
+fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![storage_root.to_path_buf()];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".config").join("mcp-agent-mail"));
+        roots.push(home.join(".mcp_agent_mail"));
+    }
+    let suffixes = [".bak", ".tmp", ".orig"];
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if suffixes.iter().any(|s| name.ends_with(s)) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Common MCP client JSON config paths (per-client, no recursion).
+fn default_mcp_config_candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        v.push(home.join(".claude").join(".mcp.json"));
+        v.push(home.join(".cursor").join("mcp.json"));
+        v.push(home.join(".windsurf").join("mcp_config.json"));
+        v.push(home.join(".codex").join("mcp.json"));
+        v.push(home.join(".gemini").join("settings.json"));
+        v.push(home.join(".opencode.json"));
+        v.push(home.join(".factory.mcp.json"));
+        v.push(home.join(".cline.mcp.json"));
+    }
+    v
+}
+
+/// Shell out to `git --version`, read `AM_GIT_BINARY`. Returns `None` if
+/// `git` isn't on PATH (the known-bad-git FM is unreachable in that case).
+fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::DetectInputs> {
+    use std::process::Command;
+    let which_git = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .ok()?;
+    if !which_git.status.success() {
+        return None;
+    }
+    let system_git_path = PathBuf::from(
+        String::from_utf8_lossy(&which_git.stdout)
+            .trim()
+            .to_string(),
+    );
+    let out = Command::new(&system_git_path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `git version 2.51.0` → `2.51.0`
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let system_git_version = raw
+        .trim()
+        .strip_prefix("git version ")
+        .unwrap_or(raw.trim())
+        .to_string();
+    let am_git_binary_env = std::env::var("AM_GIT_BINARY").ok();
+    Some(fixers::known_bad_git_no_override::DetectInputs {
+        system_git_path,
+        system_git_version,
+        am_git_binary_env,
+    })
+}
+
+/// 6-char hex suffix derived from the FM id; keeps run-ids unique when
+/// the same FM is invoked multiple times in the same wall-clock second.
+fn short_run_suffix(fm_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(fm_id.as_bytes());
+    h.update(b"\0");
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    h.update(now_ns.to_le_bytes());
+    let digest = h.finalize();
+    (0..3).map(|i| format!("{:02x}", digest[i])).collect()
 }
 
 /// Exit 0 on pass, 1 on fail. For operators after install/upgrade.

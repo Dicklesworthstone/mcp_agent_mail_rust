@@ -62,7 +62,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const FM_ID: &str = "fm-archive-state-files-stale-head-or-ref-update-lock";
+pub const FM_ID: &str = "fm-archive-state-files-stale-head-or-ref-update-lock";
 const FM_SEVERITY: &str = "P2";
 const FM_SUBSYSTEM: &str = "archive_state_files";
 

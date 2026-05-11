@@ -44,7 +44,7 @@ use super::{FindingRemediation, FixOutcome};
 use serde::Serialize;
 use std::path::PathBuf;
 
-const FM_ID: &str = "fm-environment_toolchain-known-bad-git-no-override";
+pub const FM_ID: &str = "fm-environment_toolchain-known-bad-git-no-override";
 const FM_SEVERITY: &str = "P0";
 const FM_SUBSYSTEM: &str = "environment_toolchain";
 
@@ -136,6 +136,7 @@ impl KnownBadGitNoOverrideFinding {
 
 /// Input for the detector. Lets tests inject the version string and
 /// env state rather than shelling out and reading the real environment.
+#[derive(Debug, Clone)]
 pub struct DetectInputs {
     pub system_git_path: PathBuf,
     pub system_git_version: String,
