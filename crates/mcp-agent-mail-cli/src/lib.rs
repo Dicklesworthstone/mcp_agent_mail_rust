@@ -2143,6 +2143,29 @@ pub enum DoctorCommand {
         largest: usize,
     },
 
+    /// Build a sanitized incident bundle for maintainer support.
+    #[command(name = "support-bundle")]
+    SupportBundle {
+        /// Directory that will receive a unique support-bundle-* child.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        /// Optional stdout log to redact and include.
+        #[arg(long)]
+        stdout_log: Option<PathBuf>,
+        /// Optional stderr log to redact and include.
+        #[arg(long)]
+        stderr_log: Option<PathBuf>,
+        /// Redact message subjects in addition to bodies and attachments.
+        #[arg(long)]
+        redact_subjects: bool,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print the agent-facing contract: detectors, fixers, exit codes,
     /// env vars, run-artifact schema. JSON only.
     ///
@@ -5648,6 +5671,21 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             json,
             largest,
         } => handle_doctor_artifacts(format, json, largest),
+        DoctorCommand::SupportBundle {
+            output_dir,
+            stdout_log,
+            stderr_log,
+            redact_subjects,
+            format,
+            json,
+        } => doctor::handle_support_bundle(
+            output_dir,
+            stdout_log,
+            stderr_log,
+            redact_subjects,
+            format,
+            json,
+        ),
         DoctorCommand::Capabilities { format } => doctor::handle_capabilities(format),
         DoctorCommand::RobotDocs => doctor::handle_robot_docs(),
         DoctorCommand::Undo {
@@ -35701,6 +35739,45 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(largest, 3);
             }
             _ => panic!("expected Doctor Artifacts"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_support_bundle() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "support-bundle",
+            "--output-dir",
+            "/tmp/support",
+            "--stdout-log",
+            "/tmp/stdout.log",
+            "--stderr-log",
+            "/tmp/stderr.log",
+            "--redact-subjects",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::SupportBundle {
+                        output_dir,
+                        stdout_log,
+                        stderr_log,
+                        redact_subjects,
+                        format,
+                        json,
+                    },
+            } => {
+                assert_eq!(output_dir, Some(PathBuf::from("/tmp/support")));
+                assert_eq!(stdout_log, Some(PathBuf::from("/tmp/stdout.log")));
+                assert_eq!(stderr_log, Some(PathBuf::from("/tmp/stderr.log")));
+                assert!(redact_subjects);
+                assert!(format.is_none());
+                assert!(json);
+            }
+            _ => panic!("expected Doctor SupportBundle"),
         }
     }
 

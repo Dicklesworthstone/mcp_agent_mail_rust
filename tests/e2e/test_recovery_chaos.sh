@@ -404,6 +404,10 @@ latest_forensic_manifest() {
     find "${SCENARIO_STORAGE}/doctor/forensics" -type f -name manifest.json 2>/dev/null | sort | tail -n 1
 }
 
+latest_support_manifest() {
+    find "${SCENARIO_STORAGE}/doctor/support-bundles" -type f -name manifest.json 2>/dev/null | sort | tail -n 1
+}
+
 copy_latest_forensic_manifest() {
     local scenario="$1"
     local label="$2"
@@ -415,6 +419,60 @@ copy_latest_forensic_manifest() {
     fi
     e2e_pass "${scenario}/${label} forensic manifest exists"
     e2e_copy_artifact "${manifest}" "recovery_chaos/${scenario}/${label}_manifest.json"
+}
+
+copy_latest_support_manifest() {
+    local scenario="$1"
+    local label="$2"
+    local manifest
+    manifest="$(latest_support_manifest)"
+    if [ -z "${manifest}" ]; then
+        e2e_fail "${scenario}/${label} support manifest exists"
+        return 0
+    fi
+    e2e_pass "${scenario}/${label} support manifest exists"
+    e2e_copy_artifact "${manifest}" "recovery_chaos/${scenario}/${label}_support_manifest.json"
+}
+
+assert_support_bundle_observed_command() {
+    local scenario="$1"
+    local label="$2"
+    local expected="$3"
+    local manifest="${CHAOS_LOG_DIR}/${scenario}/${label}_support_manifest.json"
+    if python3 - "${manifest}" "${expected}" <<'PY'
+import json
+import sys
+path, expected = sys.argv[1:3]
+with open(path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if manifest.get("observed_recovery_command") != expected:
+    sys.exit(1)
+found = any(
+    entry.get("path") == "reports/latest-forensic-manifest.json"
+    and entry.get("source_path_class") == "raw_forensic_manifest"
+    for entry in manifest.get("files", [])
+)
+if not found:
+    sys.exit(1)
+commands = manifest.get("replay_commands", [])
+if "am doctor support-bundle --json" not in commands:
+    sys.exit(1)
+sys.exit(0)
+PY
+    then
+        e2e_pass "${scenario}/${label} support bundle references ${expected} forensic decision"
+    else
+        e2e_fail "${scenario}/${label} support bundle missing ${expected} forensic decision"
+    fi
+}
+
+assert_support_manifest_safe_sharing_limits() {
+    local scenario="$1"
+    local label="$2"
+    local manifest="${CHAOS_LOG_DIR}/${scenario}/${label}_support_manifest.json"
+    assert_file_contains "${scenario}/${label} support manifest omits raw sqlite" "${manifest}" "SQLite database and sidecars"
+    assert_file_contains "${scenario}/${label} support manifest omits message bodies" "${manifest}" "message bodies and canonical message files"
+    assert_file_contains "${scenario}/${label} support manifest omits attachments" "${manifest}" "attachment contents and attachment filenames"
 }
 
 assert_manifest_sqlite_status() {
@@ -483,6 +541,11 @@ assert_sql_eq "doctor repair removed missing-message recipient" "SELECT COUNT(*)
 copy_latest_forensic_manifest "${SCENARIO}" "doctor_repair"
 assert_manifest_sqlite_status "${SCENARIO}" "doctor_repair" "db" "captured"
 assert_manifest_has_reference "${SCENARIO}" "doctor_repair" "archive_drift_report"
+capture_step "${SCENARIO}" "doctor_support_bundle" am doctor support-bundle --stdout-log "$(step_stdout "${SCENARIO}" "doctor_repair")" --stderr-log "$(step_stderr "${SCENARIO}" "doctor_repair")" --redact-subjects --json
+assert_step_exit "${SCENARIO}" "doctor_support_bundle" "0"
+copy_latest_support_manifest "${SCENARIO}" "doctor_support_bundle"
+assert_support_bundle_observed_command "${SCENARIO}" "doctor_support_bundle" "repair"
+assert_support_manifest_safe_sharing_limits "${SCENARIO}" "doctor_support_bundle"
 
 # Scenario 3: startup path chooses automatic repair, not reconstruct, for repairable FK drift.
 SCENARIO="startup_auto_repair_orphan_recipient"
@@ -507,6 +570,11 @@ assert_step_exit "${SCENARIO}" "doctor_reconstruct" "0"
 assert_file_contains_any "reconstruct output identifies archive rebuild" "$(step_stdout "${SCENARIO}" "doctor_reconstruct")" "reconstruct" "recovered" "Reconstructed"
 assert_sql_eq "reconstructed database quick_check" "PRAGMA quick_check;" "ok"
 assert_sql_gt_zero "reconstructed database restored messages" "SELECT COUNT(*) FROM messages;"
+capture_step "${SCENARIO}" "doctor_support_bundle" am doctor support-bundle --stdout-log "$(step_stdout "${SCENARIO}" "doctor_reconstruct")" --stderr-log "$(step_stderr "${SCENARIO}" "doctor_reconstruct")" --redact-subjects --json
+assert_step_exit "${SCENARIO}" "doctor_support_bundle" "0"
+copy_latest_support_manifest "${SCENARIO}" "doctor_support_bundle"
+assert_support_bundle_observed_command "${SCENARIO}" "doctor_support_bundle" "reconstruct"
+assert_support_manifest_safe_sharing_limits "${SCENARIO}" "doctor_support_bundle"
 
 # Scenario 5: repair forensics capture live SQLite sidecars before mutation.
 SCENARIO="forensics_captures_live_sidecars"

@@ -25,7 +25,11 @@ pub mod undo;
 
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
-use std::path::PathBuf;
+use mcp_agent_mail_core::Config;
+use serde::Serialize;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// Print `capabilities --json` (or text fallback for `--format toon`).
 pub fn handle_capabilities(format: Option<CliOutputFormat>) -> CliResult<()> {
@@ -426,6 +430,836 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SupportBundleOptions {
+    pub(crate) output_dir: Option<PathBuf>,
+    pub(crate) stdout_log: Option<PathBuf>,
+    pub(crate) stderr_log: Option<PathBuf>,
+    pub(crate) redact_subjects: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SupportBundleResult {
+    pub(crate) schema_version: &'static str,
+    pub(crate) bundle_kind: &'static str,
+    pub(crate) bundle_path: String,
+    pub(crate) manifest_path: String,
+    pub(crate) summary_path: String,
+    pub(crate) file_count: usize,
+    pub(crate) current_recovery_decision: String,
+    pub(crate) observed_recovery_command: Option<String>,
+}
+
+#[derive(Debug)]
+struct SupportRedactionContext {
+    storage_root: PathBuf,
+    database_path: PathBuf,
+    redact_subjects: bool,
+}
+
+/// Build a sanitized, shareable incident bundle for mailbox startup/recovery
+/// incidents. Unlike the raw forensic bundle captured by repair/reconstruct,
+/// this command never copies SQLite databases, message bodies, or attachment
+/// contents.
+pub fn handle_support_bundle(
+    output_dir: Option<PathBuf>,
+    stdout_log: Option<PathBuf>,
+    stderr_log: Option<PathBuf>,
+    redact_subjects: bool,
+    format: Option<CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
+    let config = Config::from_env();
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let result = create_support_bundle(
+        &config,
+        &database_url,
+        SupportBundleOptions {
+            output_dir,
+            stdout_log,
+            stderr_log,
+            redact_subjects,
+        },
+    )?;
+
+    let format = if json {
+        CliOutputFormat::Json
+    } else {
+        format.unwrap_or(CliOutputFormat::Table)
+    };
+    match format {
+        CliOutputFormat::Json => {
+            let body = serde_json::to_string_pretty(&result)
+                .map_err(|err| CliError::Other(format!("serializing support bundle: {err}")))?;
+            println!("{body}");
+        }
+        CliOutputFormat::Table | CliOutputFormat::Toon => {
+            println!("Support bundle: {}", result.bundle_path);
+            println!("Manifest: {}", result.manifest_path);
+            println!(
+                "Decision: current={} observed={}",
+                result.current_recovery_decision,
+                result
+                    .observed_recovery_command
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn create_support_bundle(
+    config: &Config,
+    database_url: &str,
+    options: SupportBundleOptions,
+) -> CliResult<SupportBundleResult> {
+    let database_path = crate::resolve_mailbox_activity_sqlite_path(database_url)
+        .unwrap_or_else(|_| PathBuf::from("<unresolved-database-path>"));
+    let redaction = SupportRedactionContext {
+        storage_root: config.storage_root.clone(),
+        database_path: database_path.clone(),
+        redact_subjects: options.redact_subjects,
+    };
+
+    let parent = options
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| config.storage_root.join("doctor").join("support-bundles"));
+    reject_symlink_ancestor(&parent, "support bundle output root")?;
+    fs::create_dir_all(&parent)?;
+    reject_symlink_ancestor(&parent, "support bundle output root")?;
+
+    let bundle_name = format!(
+        "support-bundle-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        std::process::id()
+    );
+    let bundle_dir = parent.join(bundle_name);
+    reject_symlink_ancestor(&bundle_dir, "support bundle directory")?;
+    if bundle_dir.exists() {
+        return Err(CliError::Other(format!(
+            "support bundle destination already exists: {}",
+            bundle_dir.display()
+        )));
+    }
+    fs::create_dir(&bundle_dir)?;
+
+    let mut files = Vec::<serde_json::Value>::new();
+    let mut omitted = Vec::<serde_json::Value>::new();
+
+    let decision = support_recovery_decision(database_url, &config.storage_root, &redaction);
+    let sidecars = support_sqlite_sidecar_metadata(&database_path);
+    let latest_forensic = latest_forensic_manifest(&config.storage_root);
+    let observed_recovery_command = latest_forensic
+        .as_ref()
+        .and_then(|path| read_json_file(path).ok())
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(|command| command.as_str())
+                .map(ToString::to_string)
+        });
+
+    if let Some(path) = latest_forensic.as_ref() {
+        if let Ok(value) = read_json_file(path) {
+            let sanitized = redact_support_json(value, &redaction, None);
+            write_support_json_file(
+                &bundle_dir,
+                "reports/latest-forensic-manifest.json",
+                &sanitized,
+                "sanitized_metadata",
+                "raw_forensic_manifest",
+                &mut files,
+            )?;
+        } else {
+            omitted.push(serde_json::json!({
+                "source": "latest forensic manifest",
+                "source_path_class": "raw_forensic_manifest",
+                "reason": "unreadable",
+            }));
+        }
+
+        let summary = path.parent().map(|dir| dir.join("summary.json"));
+        if let Some(summary_path) = summary
+            && summary_path.exists()
+        {
+            if let Ok(value) = read_json_file(&summary_path) {
+                let sanitized = redact_support_json(value, &redaction, None);
+                write_support_json_file(
+                    &bundle_dir,
+                    "reports/latest-forensic-summary.json",
+                    &sanitized,
+                    "sanitized_metadata",
+                    "raw_forensic_summary",
+                    &mut files,
+                )?;
+            } else {
+                omitted.push(serde_json::json!({
+                    "source": "latest forensic summary",
+                    "source_path_class": "raw_forensic_summary",
+                    "reason": "unreadable",
+                }));
+            }
+        }
+    } else {
+        omitted.push(serde_json::json!({
+            "source": "doctor forensic manifest",
+            "source_path_class": "raw_forensic_manifest",
+            "reason": "no repair/reconstruct forensic bundle found",
+        }));
+    }
+
+    if let Some(report_path) = latest_doctor_report_path()
+        && report_path.exists()
+    {
+        if let Ok(value) = read_json_file(&report_path) {
+            let sanitized = redact_support_json(value, &redaction, None);
+            write_support_json_file(
+                &bundle_dir,
+                "reports/latest-doctor-report.json",
+                &sanitized,
+                "sanitized_metadata",
+                "doctor_run_report",
+                &mut files,
+            )?;
+        } else {
+            omitted.push(serde_json::json!({
+                "source": "latest doctor report",
+                "source_path_class": "doctor_run_report",
+                "reason": "unreadable",
+            }));
+        }
+    }
+
+    if let Some(path) = options.stdout_log.as_ref() {
+        write_redacted_operator_log(&bundle_dir, "logs/stdout.log", path, &redaction, &mut files)?;
+    } else {
+        omitted.push(serde_json::json!({
+            "source": "stdout log",
+            "source_path_class": "operator_supplied_log",
+            "reason": "not supplied; pass --stdout-log",
+        }));
+    }
+    if let Some(path) = options.stderr_log.as_ref() {
+        write_redacted_operator_log(&bundle_dir, "logs/stderr.log", path, &redaction, &mut files)?;
+    } else {
+        omitted.push(serde_json::json!({
+            "source": "stderr log",
+            "source_path_class": "operator_supplied_log",
+            "reason": "not supplied; pass --stderr-log",
+        }));
+    }
+
+    omitted.push(serde_json::json!({
+        "source": "SQLite database and sidecars",
+        "source_path_class": "local_database_file",
+        "reason": "raw mailbox data; use the raw forensic bundle only for local encrypted escalation",
+    }));
+    omitted.push(serde_json::json!({
+        "source": "message bodies and canonical message files",
+        "source_path_class": "mail_archive_content",
+        "reason": "private message content is excluded by default",
+    }));
+    omitted.push(serde_json::json!({
+        "source": "attachment contents and attachment filenames",
+        "source_path_class": "mail_attachment_content",
+        "reason": "attachment data and names are redacted by default",
+    }));
+
+    let replay_commands = support_replay_commands();
+    let summary = serde_json::json!({
+        "schema_version": "1.0",
+        "bundle_kind": "doctor_support_bundle",
+        "generated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "config_shape": {
+            "database_url": redact_support_text(database_url, &redaction),
+            "database_path": redact_support_text(&database_path.display().to_string(), &redaction),
+            "storage_root": redact_support_text(&config.storage_root.display().to_string(), &redaction),
+            "http_host": config.http_host,
+            "http_port": config.http_port,
+            "http_path": config.http_path,
+            "http_auth": if config.http_bearer_token.is_some() { "configured" } else { "not_configured" },
+            "tui_enabled": config.tui_enabled,
+            "interface_mode": std::env::var("AM_INTERFACE_MODE").unwrap_or_else(|_| "unset".to_string()),
+        },
+        "database": {
+            "recovery_decision": decision,
+            "sidecars": sidecars,
+            "schema_versions": support_schema_versions(database_url, &redaction),
+        },
+        "latest_forensic": {
+            "manifest_found": latest_forensic.is_some(),
+            "observed_recovery_command": observed_recovery_command,
+        },
+        "redaction": support_redaction_policy(options.redact_subjects),
+        "replay_commands": replay_commands,
+    });
+    write_support_json_file(
+        &bundle_dir,
+        "summary.json",
+        &summary,
+        "sanitized_metadata",
+        "generated",
+        &mut files,
+    )?;
+
+    write_support_text_file(
+        &bundle_dir,
+        "README.md",
+        support_bundle_readme(),
+        "generated_public_guidance",
+        "generated",
+        &mut files,
+    )?;
+
+    let current_recovery_decision = summary["database"]["recovery_decision"]["decision"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let observed_recovery_command = summary["latest_forensic"]["observed_recovery_command"]
+        .as_str()
+        .map(ToString::to_string);
+
+    let mut manifest_files = files.clone();
+    manifest_files.push(serde_json::json!({
+        "path": "manifest.json",
+        "redaction_mode": "sanitized_metadata",
+        "source_path_class": "generated",
+        "bytes": "self",
+    }));
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "bundle_kind": "doctor_support_bundle",
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "generated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "command": {
+            "name": "am doctor support-bundle",
+            "args": {
+                "redact_subjects": options.redact_subjects,
+                "stdout_log_supplied": options.stdout_log.is_some(),
+                "stderr_log_supplied": options.stderr_log.is_some(),
+            },
+        },
+        "current_recovery_decision": current_recovery_decision,
+        "observed_recovery_command": observed_recovery_command,
+        "source_path_classes": {
+            "generated": "created by support-bundle",
+            "local_database_file": "local SQLite path; raw file omitted",
+            "raw_forensic_manifest": "doctor repair/reconstruct forensic manifest; sanitized copy only",
+            "raw_forensic_summary": "doctor repair/reconstruct forensic summary; sanitized copy only",
+            "doctor_run_report": "latest .doctor report; sanitized copy only",
+            "operator_supplied_log": "operator-provided stdout/stderr log; redacted and truncated",
+            "mail_archive_content": "message archive content; omitted",
+            "mail_attachment_content": "attachment content or filename; omitted",
+        },
+        "redaction": support_redaction_policy(options.redact_subjects),
+        "files": manifest_files,
+        "omitted": omitted,
+        "replay_commands": support_replay_commands(),
+        "safe_sharing_limits": [
+            "This bundle is designed for maintainer triage, not public posting.",
+            "Raw SQLite files, canonical message files, message bodies, and attachments are omitted.",
+            "Review the manifest before sharing; paths and secrets are redacted best-effort.",
+        ],
+    });
+    write_support_json_exact(&bundle_dir.join("manifest.json"), &manifest)?;
+
+    Ok(SupportBundleResult {
+        schema_version: "1.0",
+        bundle_kind: "doctor_support_bundle",
+        bundle_path: bundle_dir.display().to_string(),
+        manifest_path: bundle_dir.join("manifest.json").display().to_string(),
+        summary_path: bundle_dir.join("summary.json").display().to_string(),
+        file_count: files.len() + 1,
+        current_recovery_decision,
+        observed_recovery_command,
+    })
+}
+
+fn support_recovery_decision(
+    database_url: &str,
+    storage_root: &Path,
+    redaction: &SupportRedactionContext,
+) -> serde_json::Value {
+    match crate::doctor_database_fix_strategy(database_url, storage_root) {
+        Ok(crate::DoctorDatabaseFixStrategy::None(detail)) => serde_json::json!({
+            "decision": "none",
+            "detail": redact_support_text(&detail, redaction),
+        }),
+        Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => serde_json::json!({
+            "decision": "repair",
+            "detail": redact_support_text(&detail, redaction),
+        }),
+        Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => serde_json::json!({
+            "decision": "reconstruct",
+            "detail": redact_support_text(&detail, redaction),
+        }),
+        Err(err) => serde_json::json!({
+            "decision": "unavailable",
+            "detail": redact_support_text(&err.to_string(), redaction),
+        }),
+    }
+}
+
+fn support_schema_versions(
+    database_url: &str,
+    redaction: &SupportRedactionContext,
+) -> serde_json::Value {
+    let conn = match crate::open_db_for_doctor_check(database_url) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "unavailable",
+                "detail": redact_support_text(&err.to_string(), redaction),
+            });
+        }
+    };
+    let user_version = conn
+        .query_sync("PRAGMA user_version", &[])
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("user_version").ok())
+        });
+    let sqlite_version = conn
+        .query_sync("SELECT sqlite_version() AS sqlite_version", &[])
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<String>("sqlite_version").ok())
+        });
+    serde_json::json!({
+        "status": "captured",
+        "database_user_version": user_version,
+        "sqlite_version": sqlite_version,
+    })
+}
+
+fn support_sqlite_sidecar_metadata(database_path: &Path) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (kind, path) in [
+        ("db", database_path.to_path_buf()),
+        (
+            "wal",
+            PathBuf::from(format!("{}-wal", database_path.display())),
+        ),
+        (
+            "shm",
+            PathBuf::from(format!("{}-shm", database_path.display())),
+        ),
+        (
+            "journal",
+            PathBuf::from(format!("{}-journal", database_path.display())),
+        ),
+    ] {
+        let value = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => serde_json::json!({
+                "status": "omitted",
+                "reason": "symlink refused",
+            }),
+            Ok(meta) => serde_json::json!({
+                "status": "present",
+                "bytes": meta.len(),
+                "readonly": meta.permissions().readonly(),
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => serde_json::json!({
+                "status": "missing",
+            }),
+            Err(err) => serde_json::json!({
+                "status": "unavailable",
+                "detail": err.to_string(),
+            }),
+        };
+        map.insert(kind.to_string(), value);
+    }
+    serde_json::Value::Object(map)
+}
+
+fn support_redaction_policy(redact_subjects: bool) -> serde_json::Value {
+    serde_json::json!({
+        "mode": "support_bundle_sanitized",
+        "database_url": "credentials_redacted",
+        "auth_tokens": "redacted",
+        "env_secrets": "redacted",
+        "home_paths": "redacted",
+        "storage_and_database_paths": "redacted",
+        "message_bodies": "redacted_or_omitted",
+        "subjects": if redact_subjects { "redacted" } else { "preserved" },
+        "attachments": "contents_and_names_redacted_or_omitted",
+        "raw_sqlite": "omitted",
+    })
+}
+
+fn support_replay_commands() -> Vec<&'static str> {
+    vec![
+        "am doctor check --json",
+        "am doctor repair --dry-run",
+        "am doctor reconstruct --dry-run --json",
+        "am doctor support-bundle --json",
+    ]
+}
+
+fn support_bundle_readme() -> &'static str {
+    "# MCP Agent Mail Doctor Support Bundle\n\n\
+This directory is a sanitized incident bundle for maintainer triage.\n\n\
+Safe-sharing limits:\n\n\
+- Raw SQLite databases, WAL/SHM/journal sidecars, canonical message files, message bodies, and attachments are not included.\n\
+- Operator stdout/stderr logs are redacted and truncated when supplied.\n\
+- Subjects are preserved by default; rerun with `--redact-subjects` when subjects may be sensitive.\n\
+- Review `manifest.json` before sharing. It lists every included file and every omitted source class.\n\n\
+Replay commands:\n\n\
+```bash\n\
+am doctor check --json\n\
+am doctor repair --dry-run\n\
+am doctor reconstruct --dry-run --json\n\
+am doctor support-bundle --json\n\
+```\n"
+}
+
+fn write_support_json_file(
+    bundle_dir: &Path,
+    rel: &str,
+    value: &serde_json::Value,
+    redaction_mode: &str,
+    source_path_class: &str,
+    files: &mut Vec<serde_json::Value>,
+) -> CliResult<()> {
+    let path = bundle_dir.join(rel);
+    write_support_json_exact(&path, value)?;
+    record_support_file(bundle_dir, rel, redaction_mode, source_path_class, files)
+}
+
+fn write_support_json_exact(path: &Path, value: &serde_json::Value) -> CliResult<()> {
+    if path.exists() {
+        return Err(CliError::Other(format!(
+            "support bundle refusing to overwrite {}",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|err| CliError::Other(format!("serializing support bundle JSON: {err}")))?;
+    fs::write(path, body)?;
+    Ok(())
+}
+
+fn write_support_text_file(
+    bundle_dir: &Path,
+    rel: &str,
+    body: &str,
+    redaction_mode: &str,
+    source_path_class: &str,
+    files: &mut Vec<serde_json::Value>,
+) -> CliResult<()> {
+    let path = bundle_dir.join(rel);
+    if path.exists() {
+        return Err(CliError::Other(format!(
+            "support bundle refusing to overwrite {}",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, body)?;
+    record_support_file(bundle_dir, rel, redaction_mode, source_path_class, files)
+}
+
+fn record_support_file(
+    bundle_dir: &Path,
+    rel: &str,
+    redaction_mode: &str,
+    source_path_class: &str,
+    files: &mut Vec<serde_json::Value>,
+) -> CliResult<()> {
+    let path = bundle_dir.join(rel);
+    let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    files.push(serde_json::json!({
+        "path": rel,
+        "redaction_mode": redaction_mode,
+        "source_path_class": source_path_class,
+        "bytes": bytes,
+    }));
+    Ok(())
+}
+
+fn write_redacted_operator_log(
+    bundle_dir: &Path,
+    rel: &str,
+    source: &Path,
+    redaction: &SupportRedactionContext,
+    files: &mut Vec<serde_json::Value>,
+) -> CliResult<()> {
+    reject_symlink_ancestor(source, "operator log")?;
+    let meta = fs::symlink_metadata(source)?;
+    if meta.file_type().is_symlink() {
+        return Err(CliError::Other(format!(
+            "operator log is a symlink and will not be followed: {}",
+            source.display()
+        )));
+    }
+    let mut file = fs::File::open(source)?;
+    let mut bytes = Vec::new();
+    let mut limited = file.by_ref().take(512 * 1024 + 1);
+    limited.read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > 512 * 1024;
+    if truncated {
+        bytes.truncate(512 * 1024);
+    }
+    let mut body = String::from_utf8_lossy(&bytes).into_owned();
+    body = redact_support_text(&body, redaction);
+    if truncated {
+        body.push_str("\n<truncated after 512 KiB>\n");
+    }
+    write_support_text_file(
+        bundle_dir,
+        rel,
+        &body,
+        "redacted_truncated_log",
+        "operator_supplied_log",
+        files,
+    )
+}
+
+fn read_json_file(path: &Path) -> CliResult<serde_json::Value> {
+    reject_symlink_ancestor(path, "JSON evidence")?;
+    let body = fs::read_to_string(path)?;
+    serde_json::from_str(&body)
+        .map_err(|err| CliError::Other(format!("parsing {}: {err}", path.display())))
+}
+
+fn latest_forensic_manifest(storage_root: &Path) -> Option<PathBuf> {
+    latest_named_file(
+        &storage_root.join("doctor").join("forensics"),
+        "manifest.json",
+    )
+}
+
+fn latest_doctor_report_path() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let doctor_root = runs::doctor_root(&cwd);
+    let latest = doctor_root.join("latest");
+    let target = fs::read_link(&latest).ok()?;
+    Some(doctor_root.join(target).join("report.json"))
+}
+
+fn latest_named_file(root: &Path, file_name: &str) -> Option<PathBuf> {
+    if !root.exists() {
+        return None;
+    }
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() || entry.file_name() != file_name {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .map(|(seen, _)| modified > *seen)
+            .unwrap_or(true)
+        {
+            latest = Some((modified, entry.path().to_path_buf()));
+        }
+    }
+    latest.map(|(_, path)| path)
+}
+
+fn reject_symlink_ancestor(path: &Path, label: &str) -> CliResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(CliError::Other(format!(
+                    "{label} contains a symlink component and will not be followed: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(CliError::Other(format!(
+                    "checking {label} {}: {err}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn redact_support_json(
+    value: serde_json::Value,
+    ctx: &SupportRedactionContext,
+    key: Option<&str>,
+) -> serde_json::Value {
+    if let Some(key) = key {
+        if support_key_is_body(key) {
+            return serde_json::Value::String("<redacted-message-body>".to_string());
+        }
+        if support_key_is_subject(key) && ctx.redact_subjects {
+            return serde_json::Value::String("<redacted-subject>".to_string());
+        }
+        if support_key_is_attachment(key) {
+            return match value {
+                serde_json::Value::Array(values) if values.is_empty() => {
+                    serde_json::Value::Array(vec![])
+                }
+                serde_json::Value::Null => serde_json::Value::Null,
+                _ => serde_json::json!("<redacted-attachment-metadata>"),
+            };
+        }
+        if support_key_is_secret(key) {
+            return serde_json::Value::String("<redacted-secret>".to_string());
+        }
+    }
+
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_support_text(&text, ctx))
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|value| redact_support_json(value, ctx, key))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let redacted = redact_support_json(value, ctx, Some(&key));
+                    (key, redacted)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn support_key_is_body(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "body" | "body_md" | "message_body" | "content"
+    )
+}
+
+fn support_key_is_subject(key: &str) -> bool {
+    key.eq_ignore_ascii_case("subject")
+}
+
+fn support_key_is_attachment(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "attachment" || key == "attachments" || key.contains("attachment_path")
+}
+
+fn support_key_is_secret(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("authorization")
+        || key == "database_url"
+        || key == "http_bearer_token"
+}
+
+fn redact_support_text(input: &str, ctx: &SupportRedactionContext) -> String {
+    let mut out = input.to_string();
+    for raw in [
+        ctx.database_path.display().to_string(),
+        ctx.storage_root.display().to_string(),
+    ] {
+        if !raw.is_empty() && raw != "." {
+            out = out.replace(&raw, "<redacted-path>");
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let home = home.display().to_string();
+        if !home.is_empty() {
+            out = out.replace(&home, "<home>");
+        }
+    }
+
+    for (pattern, replacement) in [
+        (
+            r#"(?i)Bearer\s+[A-Za-z0-9._~+/\-=]+"#,
+            "Bearer <redacted-token>",
+        ),
+        (
+            r#"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|KEY|AUTH)[A-Z0-9_]*)\s*=\s*([^\s'"]+)"#,
+            "$1=<redacted-secret>",
+        ),
+        (
+            r#"(?i)\bDATABASE_URL\s*=\s*([^\s'"]+)"#,
+            "DATABASE_URL=<redacted-database-url>",
+        ),
+        (
+            r#"(?i)"([^"]*(?:token|secret|password|authorization|bearer)[^"]*)"\s*:\s*"[^"]*""#,
+            "\"$1\":\"<redacted-secret>\"",
+        ),
+        (
+            r#"(?i)"database_url"\s*:\s*"[^"]*""#,
+            "\"database_url\":\"<redacted-database-url>\"",
+        ),
+        (
+            r#"(?i)"body(?:_md)?"\s*:\s*"[^"]*""#,
+            "\"body\":\"<redacted-message-body>\"",
+        ),
+        (
+            r#"(?im)^(body|body_md|message_body)\s*[:=]\s*.*$"#,
+            "$1=<redacted-message-body>",
+        ),
+        (
+            r#"(?i)\b(body|body_md|message_body)=\S+"#,
+            "$1=<redacted-message-body>",
+        ),
+        (
+            r#"(?is)"attachments?"\s*:\s*\[[^\]]*\]"#,
+            "\"attachments\":[\"<redacted-attachment-metadata>\"]",
+        ),
+        (
+            r#"(?i)\battachments?=\S+"#,
+            "attachments=<redacted-attachment-metadata>",
+        ),
+        (r#"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]+@"#, "$1****@"),
+    ] {
+        let re = regex::Regex::new(pattern).expect("valid support-bundle redaction regex");
+        out = re.replace_all(&out, replacement).into_owned();
+    }
+
+    if ctx.redact_subjects {
+        for (pattern, replacement) in [
+            (
+                r#"(?i)"subject"\s*:\s*"[^"]*""#,
+                "\"subject\":\"<redacted-subject>\"",
+            ),
+            (
+                r#"(?im)^subject\s*[:=]\s*.*$"#,
+                "subject=<redacted-subject>",
+            ),
+            (r#"(?i)\bsubject=\S+"#, "subject=<redacted-subject>"),
+        ] {
+            let re = regex::Regex::new(pattern).expect("valid support-bundle subject regex");
+            out = re.replace_all(&out, replacement).into_owned();
+        }
+    }
+
+    out
+}
+
 /// Print `am doctor health` — one-line liveness summary + exit 0/1.
 ///
 /// Cheap. For CI scheduling. Reads `.doctor/latest/report.json` if present.
@@ -644,5 +1478,205 @@ mod tests {
         assert!(s.contains(".doctor"));
         // Storage root is conditional; XDG paths are conditional. Just assert
         // the per-repo scopes are always present.
+    }
+
+    #[test]
+    fn support_bundle_redacts_sensitive_text_classes() {
+        let ctx = SupportRedactionContext {
+            storage_root: PathBuf::from("/home/ubuntu/.mcp_agent_mail_git_mailbox_repo"),
+            database_path: PathBuf::from(
+                "/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3",
+            ),
+            redact_subjects: true,
+        };
+        let input = r#"HTTP_BEARER_TOKEN=abc123
+Authorization: Bearer secret.jwt.token
+OPENAI_API_KEY=sk-test
+DATABASE_URL=sqlite://user:pass@example.invalid/mail
+subject=Sensitive incident title
+body_md=private message body phrase
+attachments=screenshot-secret.png
+path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
+"#;
+
+        let redacted = redact_support_text(input, &ctx);
+        for forbidden in [
+            "abc123",
+            "secret.jwt.token",
+            "sk-test",
+            "user:pass",
+            "Sensitive",
+            "private message body phrase",
+            "screenshot-secret.png",
+            "/home/ubuntu/.mcp_agent_mail_git_mailbox_repo",
+        ] {
+            assert!(
+                !redacted.contains(forbidden),
+                "support bundle text leaked {forbidden}: {redacted}"
+            );
+        }
+        assert!(redacted.contains("<redacted-secret>"));
+        assert!(redacted.contains("<redacted-message-body>"));
+        assert!(redacted.contains("<redacted-attachment-metadata>"));
+        assert!(redacted.contains("<redacted-path>"));
+    }
+
+    #[test]
+    fn support_bundle_redacts_json_bodies_subjects_and_attachments() {
+        let ctx = SupportRedactionContext {
+            storage_root: PathBuf::from("/tmp/mail-storage"),
+            database_path: PathBuf::from("/tmp/mail-storage/storage.sqlite3"),
+            redact_subjects: true,
+        };
+        let value = serde_json::json!({
+            "subject": "Sensitive subject",
+            "body_md": "Private body text",
+            "attachments": ["secret-attachment.png"],
+            "database_url": "sqlite://user:pass@example.invalid/mail",
+            "nested": {
+                "authorization": "Bearer abc123"
+            }
+        });
+
+        let redacted = redact_support_json(value, &ctx, None);
+        let encoded = serde_json::to_string(&redacted).unwrap();
+        for forbidden in [
+            "Sensitive subject",
+            "Private body text",
+            "secret-attachment.png",
+            "user:pass",
+            "abc123",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "support bundle JSON leaked {forbidden}: {encoded}"
+            );
+        }
+        assert!(encoded.contains("<redacted-subject>"));
+        assert!(encoded.contains("<redacted-message-body>"));
+        assert!(encoded.contains("<redacted-attachment-metadata>"));
+    }
+
+    #[test]
+    fn support_bundle_manifest_lists_inclusions_and_omissions() {
+        let root = tempfile::tempdir().unwrap();
+        let storage_root = root.path().join("storage");
+        let forensics = storage_root
+            .join("doctor")
+            .join("forensics")
+            .join("storage")
+            .join("repair-20260511");
+        fs::create_dir_all(&forensics).unwrap();
+        fs::write(
+            forensics.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "command": "repair",
+                "source": {
+                    "database_url": "sqlite://user:pass@example.invalid/mail",
+                    "db_path": storage_root.join("storage.sqlite3").display().to_string()
+                },
+                "subject": "Sensitive support subject",
+                "body_md": "Private support body",
+                "attachments": ["private-evidence.png"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            forensics.join("summary.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "command": "repair",
+                "body": "Private summary body"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stdout_log = root.path().join("stdout.log");
+        fs::write(
+            &stdout_log,
+            "Bearer abc123\nsubject=Sensitive log subject\nbody=Private log body\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            storage_root: storage_root.clone(),
+            ..Default::default()
+        };
+        config.http_bearer_token = Some("not-written".to_string());
+        let result = create_support_bundle(
+            &config,
+            &format!("sqlite:///{}/storage.sqlite3", storage_root.display()),
+            SupportBundleOptions {
+                output_dir: Some(root.path().join("bundles")),
+                stdout_log: Some(stdout_log),
+                stderr_log: None,
+                redact_subjects: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.observed_recovery_command.as_deref(), Some("repair"));
+        let manifest = fs::read_to_string(&result.manifest_path).unwrap();
+        for required in [
+            "\"manifest.json\"",
+            "\"summary.json\"",
+            "\"reports/latest-forensic-manifest.json\"",
+            "\"logs/stdout.log\"",
+            "\"redaction_mode\"",
+            "\"source_path_class\"",
+            "\"SQLite database and sidecars\"",
+            "\"message bodies and canonical message files\"",
+            "\"attachment contents and attachment filenames\"",
+        ] {
+            assert!(
+                manifest.contains(required),
+                "support bundle manifest missing {required}: {manifest}"
+            );
+        }
+        for forbidden in [
+            "user:pass",
+            "abc123",
+            "Sensitive support subject",
+            "Private support body",
+            "private-evidence.png",
+            storage_root.to_string_lossy().as_ref(),
+        ] {
+            assert!(
+                !manifest.contains(forbidden),
+                "support bundle manifest leaked {forbidden}: {manifest}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn support_bundle_refuses_symlink_output_root() {
+        let root = tempfile::tempdir().unwrap();
+        let storage_root = root.path().join("storage");
+        fs::create_dir_all(&storage_root).unwrap();
+        let real_output = root.path().join("real-output");
+        fs::create_dir_all(&real_output).unwrap();
+        let symlink_output = root.path().join("linked-output");
+        std::os::unix::fs::symlink(&real_output, &symlink_output).unwrap();
+
+        let config = Config {
+            storage_root,
+            ..Default::default()
+        };
+        let err = create_support_bundle(
+            &config,
+            "sqlite:///missing.sqlite3",
+            SupportBundleOptions {
+                output_dir: Some(symlink_output),
+                stdout_log: None,
+                stderr_log: None,
+                redact_subjects: false,
+            },
+        )
+        .expect_err("support bundle should refuse symlinked output roots");
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink refusal, got: {err}"
+        );
     }
 }

@@ -1347,6 +1347,10 @@ am doctor reconstruct           # Rebuild SQLite from the Git archive (+ salvage
 am doctor fix --dry-run         # Preview all safe/automatic fixes
 am doctor fix --yes             # Apply them without prompting
 
+# Sanitized incident bundle for maintainer support
+am doctor support-bundle --json
+am doctor support-bundle --stdout-log /tmp/am.stdout --stderr-log /tmp/am.stderr --redact-subjects
+
 # Backup management
 am doctor backups               # List available backups
 am doctor restore /path/to/backup.sqlite3
@@ -1365,7 +1369,7 @@ What `check` inspects:
 | Search/index state | Legacy FTS artifact presence, rebuildability, and search-side schema hygiene |
 | Storage/runtime hygiene | Stale archive locks, WAL mode, expired reservations, writable storage root |
 
-`am doctor archive-scan` is the non-mutating hygiene report for the Git archive itself. `am doctor archive-normalize` is the non-destructive remediation path for safe archive debt: it only rewrites `project.json` when the canonical absolute `human_key` is already known, and it quarantines duplicate canonical message files instead of deleting them. `am doctor repair` is the in-place SQLite hygiene path: it creates a backup, captures a forensic bundle, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it captures a forensic bundle, quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file while writing oversized warning sets to a report artifact instead of flooding the terminal. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
+`am doctor archive-scan` is the non-mutating hygiene report for the Git archive itself. `am doctor archive-normalize` is the non-destructive remediation path for safe archive debt: it only rewrites `project.json` when the canonical absolute `human_key` is already known, and it quarantines duplicate canonical message files instead of deleting them. `am doctor repair` is the in-place SQLite hygiene path: it creates a backup, captures a forensic bundle, cleans orphaned rows, rebuilds legacy FTS artifacts if they still exist, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it captures a forensic bundle, quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file while writing oversized warning sets to a report artifact instead of flooding the terminal. `am doctor support-bundle` creates a separate sanitized support artifact under `STORAGE_ROOT/doctor/support-bundles/`: it includes the current repair/reconstruct decision, schema/version shape, sidecar metadata, replay commands, redacted stdout/stderr when supplied, and sanitized copies of recent doctor reports. It deliberately omits raw SQLite files, canonical message files, message bodies, and attachments; pass `--redact-subjects` when subjects are sensitive. Review `manifest.json` before sharing because it lists every included file, redaction mode, source path class, and omitted evidence class. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
 
 ---
 
