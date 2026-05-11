@@ -173,6 +173,10 @@ pub struct Config {
     pub health_sweep_interval_seconds: u64,
     pub health_sweep_batch: usize,
 
+    // Boot-time archive git integrity check
+    pub boot_check_mode: String,
+    pub boot_auto_repair_enabled: bool,
+
     // Memory pressure monitoring (RSS-based)
     pub memory_warning_mb: u64,
     pub memory_critical_mb: u64,
@@ -1133,6 +1137,7 @@ fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
 /// when no explicit `DATABASE_URL` was provided and derive the path from
 /// `storage_root` instead.
 const DEFAULT_LEGACY_DATABASE_URL: &str = "sqlite+aiosqlite:///./storage.sqlite3";
+const BOOT_AUTO_REPAIR_GATE_VALUE: &str = "I_UNDERSTAND_THE_RISKS";
 
 impl Default for Config {
     #[allow(clippy::too_many_lines)]
@@ -1197,6 +1202,8 @@ impl Default for Config {
             health_sweep_enabled: true,
             health_sweep_interval_seconds: 900, // 15 minutes
             health_sweep_batch: 5,
+            boot_check_mode: "warn".to_string(),
+            boot_auto_repair_enabled: false,
 
             // Memory pressure monitoring
             memory_warning_mb: 2048,  // 2 GB
@@ -1514,6 +1521,8 @@ impl std::fmt::Debug for Config {
                 &self.health_sweep_interval_seconds,
             )
             .field("health_sweep_batch", &self.health_sweep_batch)
+            .field("boot_check_mode", &self.boot_check_mode)
+            .field("boot_auto_repair_enabled", &self.boot_auto_repair_enabled)
             .field("log_level", &self.log_level)
             .field("tui_enabled", &self.tui_enabled)
             .finish_non_exhaustive()
@@ -1690,6 +1699,43 @@ impl Config {
         .max(1);
         config.health_sweep_batch =
             env_usize("AM_HEALTH_SWEEP_BATCH", config.health_sweep_batch).max(1);
+
+        // Boot-time archive integrity check
+        if let Some(raw_mode) = env_value("AM_BOOT_CHECK_MODE") {
+            let normalized = raw_mode.trim().to_ascii_lowercase();
+            config.boot_check_mode = match normalized.as_str() {
+                "warn" | "abort" => normalized,
+                "auto_repair" => {
+                    if env_value("AM_BOOT_AUTO_REPAIR").as_deref()
+                        == Some(BOOT_AUTO_REPAIR_GATE_VALUE)
+                    {
+                        config.boot_auto_repair_enabled = true;
+                        normalized
+                    } else {
+                        tracing::error!(
+                            target: "mcp_agent_mail::boot_check",
+                            repo_slug = "config",
+                            caller = "Config::from_env",
+                            args_hash = "0000000000000000000000000000000000000000000000000000000000000000",
+                            duration_ms = 0_u64,
+                            outcome = "error",
+                            git_version = "n/a",
+                            mode = %normalized,
+                            "boot_check_auto_repair_gate_violated"
+                        );
+                        "warn".to_string()
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "mcp_agent_mail::config",
+                        raw_mode = %raw_mode,
+                        "invalid_boot_check_mode_defaulting_to_warn"
+                    );
+                    "warn".to_string()
+                }
+            };
+        }
 
         // Memory pressure monitoring
         config.memory_warning_mb = env_u64("MEMORY_WARNING_MB", config.memory_warning_mb);
@@ -3429,6 +3475,8 @@ mod tests {
         assert!(config.health_sweep_enabled);
         assert_eq!(config.health_sweep_interval_seconds, 900);
         assert_eq!(config.health_sweep_batch, 5);
+        assert_eq!(config.boot_check_mode, "warn");
+        assert!(!config.boot_auto_repair_enabled);
     }
 
     #[test]
@@ -3457,6 +3505,42 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("AM_HEALTH_SWEEP_BATCH", "0")]);
         let config = Config::from_env();
         assert_eq!(config.health_sweep_batch, 1);
+    }
+
+    #[test]
+    fn test_boot_check_mode_env_abort() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_BOOT_CHECK_MODE", "abort")]);
+
+        let config = Config::from_env();
+
+        assert_eq!(config.boot_check_mode, "abort");
+        assert!(!config.boot_auto_repair_enabled);
+    }
+
+    #[test]
+    fn test_boot_check_auto_repair_requires_literal_gate() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_BOOT_CHECK_MODE", "auto_repair"),
+            ("AM_BOOT_AUTO_REPAIR", "true"),
+        ]);
+
+        let config = Config::from_env();
+
+        assert_eq!(config.boot_check_mode, "warn");
+        assert!(!config.boot_auto_repair_enabled);
+    }
+
+    #[test]
+    fn test_boot_check_auto_repair_accepts_literal_gate() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_BOOT_CHECK_MODE", "auto_repair"),
+            ("AM_BOOT_AUTO_REPAIR", BOOT_AUTO_REPAIR_GATE_VALUE),
+        ]);
+
+        let config = Config::from_env();
+
+        assert_eq!(config.boot_check_mode, "auto_repair");
+        assert!(config.boot_auto_repair_enabled);
     }
 
     #[test]

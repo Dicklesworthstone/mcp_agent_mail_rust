@@ -132,7 +132,18 @@ detection and never invokes the manual prune/repack path.
 | `AM_HEALTH_SWEEP_INTERVAL_SEC` | `900` | Cadence between sweep cycles in seconds. |
 | `AM_HEALTH_SWEEP_BATCH` | `5` | Maximum registered projects checked per cycle before advancing the cursor. |
 
-## 7. Cross-References
+## 7. Boot Check Configuration
+
+The F8 boot check is a startup-facing archive preflight. `warn` proceeds after
+logging findings, `abort` reports findings as a startup blocker, and
+`auto_repair` is gated by a literal opt-in value before any repair path may run.
+
+| variable | default | description |
+|---|---|---|
+| `AM_BOOT_CHECK_MODE` | `warn` | Startup archive preflight mode: `warn`, `abort`, or `auto_repair`. |
+| `AM_BOOT_AUTO_REPAIR` | unset | Must equal `I_UNDERSTAND_THE_RISKS` for `auto_repair`; any other value demotes mode to `warn` and emits `boot_check_auto_repair_gate_violated`. |
+
+## 8. Cross-References
 
 - `br-fqs7t` - E4 TUI toast: consumes `git_segfault_retry` fields and displays
   `repo_slug`.

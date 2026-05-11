@@ -6,7 +6,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["ts", "level", "target", "name", "fields"],
-  "x-event-names": ["boot_check_started", "boot_check_result"],
+  "x-event-names": ["boot_check_started", "boot_check_finding", "boot_check_completed", "boot_check_aborted", "boot_check_auto_repair_gate_violated"],
   "x-planned": true,
   "x-drift-required-fields": [],
   "properties": {
@@ -25,8 +25,14 @@
         "duration_ms": { "type": "number", "minimum": 0 },
         "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
         "git_version": { "type": "string" },
-        "mode": { "type": "string", "enum": ["off", "warn", "enforce"] },
+        "mode": { "type": "string", "enum": ["warn", "abort", "auto_repair"] },
+        "root": { "type": "string" },
+        "total_projects": { "type": "integer", "minimum": 0 },
+        "project": { "type": "string" },
+        "kind": { "type": "string" },
+        "detail": { "type": "string" },
         "findings_count": { "type": "integer", "minimum": 0 },
+        "auto_repaired_count": { "type": "integer", "minimum": 0 },
         "degraded": { "type": "boolean" }
       }
     }

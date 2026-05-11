@@ -1,8 +1,8 @@
 {
   "ts": "2026-05-09T07:00:00Z",
   "level": "info",
-  "target": "mcp_agent_mail::archive::boot_check",
-  "name": "boot_check_result",
+  "target": "mcp_agent_mail::boot_check",
+  "name": "boot_check_completed",
   "fields": {
     "repo_slug": "data-projects-demo",
     "caller": "startup.boot_check",
