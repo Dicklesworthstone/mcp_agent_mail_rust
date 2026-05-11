@@ -512,7 +512,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Surface | Subcommands / form | What it is for |
 |---------|--------------------|----------------|
 | Runtime | `serve-http`, `serve-stdio`, `service install|status|logs|restart`, `check-inbox` | Start the server, run stdio MCP, manage a background service, or poll inbox state from hooks/editors |
-| Quality gates | `ci`, `lint`, `typecheck`, `bench` | Run the native quality pipeline and capture CLI/perf baselines |
+| Quality gates | `ci`, `verify`, `lint`, `typecheck`, `bench` | Run the native quality pipeline, build-slot-protected verification lanes, and CLI/perf baselines |
 | E2E and determinism | `e2e list|run|show`, `golden capture|verify|list`, `flake-triage scan|reproduce|detect` | Test transports and workflows, guard CLI output contracts, and triage flaky failures |
 | Share and deploy | `share export|update|preview|verify|decrypt|wizard|static-export`, `share deploy validate|tooling|verify|verify-live` | Build portable mailbox bundles, preview them, and validate live static deployments |
 | Archive and recovery | `archive save|list|restore`, `doctor check|archive-scan|archive-normalize|repair|backups|restore|reconstruct|fix` | Snapshot mailbox state, scan/archive hygiene, normalize safe archive debt, or repair/rebuild SQLite from the Git archive |
@@ -544,6 +544,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | `golden` | `capture`, `verify`, `list` |
 | `flake-triage` | `scan`, `reproduce`, `detect` |
 | `robot` | `status`, `inbox`, `timeline`, `overview`, `thread`, `search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`, `agents`, `contacts`, `projects`, `attachments`, `atc` |
+| `verify` | `cargo-fmt`, `cargo-check`, `cargo-clippy`, `cargo-test`, `e2e-list`, `e2e-stdio`, `bench-quick` |
 | `legacy` | `detect`, `import`, `status` |
 | `service` | `install`, `uninstall`, `status`, `logs`, `restart` |
 
@@ -675,6 +676,10 @@ am robot thread br-123 --project /abs/path --agent AgentName --format md
 
 # Reservation safety check before edits
 am robot reservations --project /abs/path --agent AgentName --conflicts --expiring 30
+
+# Heavy verification recommendation with build-slot admission and rch
+am robot status --project /abs/path --agent AgentName --format json \
+  | jq '.recommendations[] | select(.category == "verification_lane")'
 ```
 
 ---
@@ -1194,7 +1199,18 @@ cargo bench -p mcp-agent-mail
 
 # Multi-agent builds: offload heavy cargo work through rch
 rch exec -- cargo check --workspace --all-targets
+
+# Shared-checkout verification lanes: acquire a build slot, run through rch, preserve logs
+am verify cargo-check --path . --agent AgentName --block-on-conflicts
+am verify cargo-clippy --path . --agent AgentName --block-on-conflicts
+am verify cargo-test --path . --agent AgentName --block-on-conflicts
+am verify e2e-stdio --path . --agent AgentName --block-on-conflicts
+am verify bench-quick --path . --agent AgentName --block-on-conflicts
 ```
+
+`am verify` is a thin `am-run` lane mapper. It always shows the exact command, uses a `verify-*` build slot even when `WORKTREES_ENABLED` is not set in the shell, routes cargo-heavy work through `rch exec -- ...`, and writes `command.json`, `stdout.log`, `stderr.log`, `exit_code.txt`, and `result.json` under `STORAGE_ROOT/artifacts/verify/<timestamp>-<lane>/` unless `--artifact-dir` is supplied.
+
+Use `--dry-run` to inspect the lane without running it. Use `--no-block-on-conflicts` only when the slot conflict is understood and you intentionally want advisory behavior.
 
 ### E2E Entrypoint Policy (T9.9)
 

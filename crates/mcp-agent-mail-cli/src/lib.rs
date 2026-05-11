@@ -445,6 +445,9 @@ pub enum Commands {
         #[arg(long, short = 'p')]
         parallel: bool,
     },
+    /// Run a standard verification lane through build-slot admission and rch.
+    #[command(name = "verify")]
+    Verify(VerifyArgs),
     /// Release readiness evidence and operator verdicts.
     #[command(name = "release")]
     Release {
@@ -1628,6 +1631,55 @@ pub struct AmRunArgs {
     pub block_on_conflicts: bool,
     #[arg(long = "no-block-on-conflicts", conflicts_with = "block_on_conflicts")]
     pub no_block_on_conflicts: bool,
+    /// Directory where stdout/stderr/command metadata will be preserved.
+    #[arg(long)]
+    pub artifact_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// Verification lane to run.
+    #[arg(value_enum)]
+    pub lane: VerifyLane,
+    /// Project checkout path for build-slot identity (default: current directory).
+    #[arg(long, short = 'p', default_value = ".")]
+    pub path: PathBuf,
+    /// Agent name. Falls back to AGENT_NAME when omitted.
+    #[arg(long, short = 'a')]
+    pub agent: Option<String>,
+    /// Build-slot lease TTL in seconds.
+    #[arg(long, default_value_t = 3600)]
+    pub ttl_seconds: i64,
+    /// Print the build-slot/rch command without running it.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Directory where stdout/stderr/command metadata will be preserved.
+    #[arg(long)]
+    pub artifact_dir: Option<PathBuf>,
+    /// Abort if another active holder conflicts with this lane.
+    #[arg(long = "block-on-conflicts", conflicts_with = "no_block_on_conflicts")]
+    pub block_on_conflicts: bool,
+    /// Proceed despite build-slot conflicts.
+    #[arg(long = "no-block-on-conflicts", conflicts_with = "block_on_conflicts")]
+    pub no_block_on_conflicts: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, PartialEq, Eq)]
+pub enum VerifyLane {
+    /// `rch exec -- cargo fmt --check`
+    CargoFmt,
+    /// `rch exec -- cargo check --workspace --all-targets`
+    CargoCheck,
+    /// `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`
+    CargoClippy,
+    /// `rch exec -- cargo test --workspace`
+    CargoTest,
+    /// `rch exec -- am e2e list`
+    E2eList,
+    /// `rch exec -- bash tests/e2e/test_stdio.sh`
+    E2eStdio,
+    /// `rch exec -- cargo bench -p mcp-agent-mail-cli -- --help`
+    BenchQuick,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2909,6 +2961,7 @@ fn execute(cli: Cli) -> CliResult<()> {
             json,
             parallel,
         } => handle_ci(quick, report, format, json, parallel),
+        Commands::Verify(args) => handle_verify(args),
         Commands::Release { action } => handle_release(action),
         Commands::Bench {
             quick,
@@ -30073,6 +30126,63 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn clap_parses_verify_lane_defaults() {
+        let cli = Cli::try_parse_from(["am", "verify", "cargo-check"])
+            .expect("failed to parse verify defaults");
+        match cli.command.expect("expected command") {
+            Commands::Verify(args) => {
+                assert_eq!(args.lane, VerifyLane::CargoCheck);
+                assert_eq!(args.path, PathBuf::from("."));
+                assert!(args.agent.is_none());
+                assert_eq!(args.ttl_seconds, 3600);
+                assert!(!args.dry_run);
+                assert!(!args.block_on_conflicts);
+                assert!(!args.no_block_on_conflicts);
+                assert!(args.artifact_dir.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_lane_commands_use_rch_and_stable_slots() {
+        assert_eq!(VerifyLane::CargoCheck.slot(), "verify-cargo-check");
+        assert_eq!(
+            VerifyLane::CargoCheck.command(),
+            vec![
+                "rch",
+                "exec",
+                "--",
+                "cargo",
+                "check",
+                "--workspace",
+                "--all-targets"
+            ]
+        );
+        assert_eq!(VerifyLane::CargoClippy.slot(), "verify-cargo-clippy");
+        assert_eq!(
+            VerifyLane::CargoClippy.command(),
+            vec![
+                "rch",
+                "exec",
+                "--",
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ]
+        );
+        assert_eq!(VerifyLane::CargoTest.slot(), "verify-cargo-test");
+        assert_eq!(
+            VerifyLane::CargoTest.command(),
+            vec!["rch", "exec", "--", "cargo", "test", "--workspace"]
+        );
+    }
+
+    #[test]
     fn clap_rejects_am_run_shared_exclusive_conflict() {
         let err = Cli::try_parse_from([
             "am",
@@ -30155,6 +30265,7 @@ http_headers = { Authorization = "Bearer secret" }
             exclusive: false,
             block_on_conflicts: false,
             no_block_on_conflicts: false,
+            artifact_dir: None,
         };
 
         let capture = StdioCapture::install().unwrap();
@@ -30192,6 +30303,62 @@ http_headers = { Authorization = "Bearer secret" }
             lease.released_ts.is_some(),
             "expected released_ts to be set, got: {lease_json}"
         );
+    }
+
+    #[test]
+    fn am_run_artifact_dir_preserves_child_stdout_stderr_and_exit_code() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_dir = temp.path().join("artifacts");
+        let config = Config {
+            worktrees_enabled: true,
+            storage_root: temp.path().join("storage_root"),
+            ..Config::default()
+        };
+
+        let args = AmRunArgs {
+            slot: "cargo-check".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo stdout-line; echo stderr-line >&2".to_string(),
+            ],
+            path: PathBuf::from("/tmp/am-run-artifact-fixture"),
+            agent: Some("TestAgent".to_string()),
+            ttl_seconds: 60,
+            shared: false,
+            exclusive: false,
+            block_on_conflicts: false,
+            no_block_on_conflicts: false,
+            artifact_dir: Some(artifact_dir.clone()),
+        };
+
+        let capture = StdioCapture::install().unwrap();
+        handle_am_run_with(&config, None, None, args).unwrap();
+        let output = capture.drain_to_string();
+        drop(capture);
+
+        assert!(
+            output.contains("$ sh -c"),
+            "missing command banner: {output}"
+        );
+        let stdout = std::fs::read_to_string(artifact_dir.join("stdout.log")).unwrap();
+        let stderr = std::fs::read_to_string(artifact_dir.join("stderr.log")).unwrap();
+        let exit_code = std::fs::read_to_string(artifact_dir.join("exit_code.txt")).unwrap();
+        let result = std::fs::read_to_string(artifact_dir.join("result.json")).unwrap();
+
+        assert_eq!(stdout.trim(), "stdout-line");
+        assert_eq!(stderr.trim(), "stderr-line");
+        assert_eq!(exit_code.trim(), "0");
+        assert!(result.contains("\"slot\": \"cargo-check\""));
     }
 
     #[test]
@@ -30241,6 +30408,7 @@ http_headers = { Authorization = "Bearer secret" }
             exclusive: false,
             block_on_conflicts: true,
             no_block_on_conflicts: false,
+            artifact_dir: None,
         };
 
         let capture = StdioCapture::install().unwrap();
@@ -30342,6 +30510,7 @@ http_headers = { Authorization = "Bearer secret" }
             exclusive: false,
             block_on_conflicts: true,
             no_block_on_conflicts: false,
+            artifact_dir: None,
         };
 
         let capture = StdioCapture::install().unwrap();
@@ -30412,6 +30581,7 @@ http_headers = { Authorization = "Bearer secret" }
             exclusive: false,
             block_on_conflicts: true,
             no_block_on_conflicts: false,
+            artifact_dir: None,
         };
 
         let capture = StdioCapture::install().unwrap();
@@ -50156,6 +50326,118 @@ struct LeaseRecord {
     released_ts: Option<String>,
 }
 
+impl VerifyLane {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::CargoFmt => "cargo-fmt",
+            Self::CargoCheck => "cargo-check",
+            Self::CargoClippy => "cargo-clippy",
+            Self::CargoTest => "cargo-test",
+            Self::E2eList => "e2e-list",
+            Self::E2eStdio => "e2e-stdio",
+            Self::BenchQuick => "bench-quick",
+        }
+    }
+
+    fn slot(self) -> String {
+        format!("verify-{}", self.slug())
+    }
+
+    fn command(self) -> Vec<String> {
+        match self {
+            Self::CargoFmt => vec!["rch", "exec", "--", "cargo", "fmt", "--check"],
+            Self::CargoCheck => vec![
+                "rch",
+                "exec",
+                "--",
+                "cargo",
+                "check",
+                "--workspace",
+                "--all-targets",
+            ],
+            Self::CargoClippy => vec![
+                "rch",
+                "exec",
+                "--",
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            Self::CargoTest => vec!["rch", "exec", "--", "cargo", "test", "--workspace"],
+            Self::E2eList => vec!["rch", "exec", "--", "am", "e2e", "list"],
+            Self::E2eStdio => vec!["rch", "exec", "--", "bash", "tests/e2e/test_stdio.sh"],
+            Self::BenchQuick => vec![
+                "rch",
+                "exec",
+                "--",
+                "cargo",
+                "bench",
+                "-p",
+                "mcp-agent-mail-cli",
+                "--",
+                "--help",
+            ],
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+}
+
+fn default_verify_artifact_dir(config: &Config, lane: VerifyLane) -> PathBuf {
+    let ts = Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+    config
+        .storage_root
+        .join("artifacts")
+        .join("verify")
+        .join(format!("{ts}-{}", lane.slug()))
+}
+
+fn handle_verify(args: VerifyArgs) -> CliResult<()> {
+    let mut config = Config::from_env();
+    config.worktrees_enabled = true;
+    let cmd = args.lane.command();
+    let slot = args.lane.slot();
+    let artifact_dir = args
+        .artifact_dir
+        .clone()
+        .unwrap_or_else(|| default_verify_artifact_dir(&config, args.lane));
+    let block_on_conflicts = !args.no_block_on_conflicts;
+
+    ftui_runtime::ftui_println!("verification lane: {}", args.lane.slug());
+    ftui_runtime::ftui_println!("slot: {slot}");
+    ftui_runtime::ftui_println!("command: {}", cmd.join(" "));
+    ftui_runtime::ftui_println!("artifacts: {}", artifact_dir.display());
+
+    if args.dry_run {
+        return Ok(());
+    }
+
+    let server_url =
+        local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
+    handle_am_run_with(
+        &config,
+        Some(server_url.as_str()),
+        config.http_bearer_token.as_deref(),
+        AmRunArgs {
+            slot,
+            cmd,
+            path: args.path,
+            agent: args.agent,
+            ttl_seconds: args.ttl_seconds,
+            shared: false,
+            exclusive: true,
+            block_on_conflicts,
+            no_block_on_conflicts: !block_on_conflicts,
+            artifact_dir: Some(artifact_dir),
+        },
+    )
+}
+
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
     let server_url =
@@ -50166,6 +50448,69 @@ fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
         config.http_bearer_token.as_deref(),
         args,
     )
+}
+
+fn run_child_with_artifacts(
+    cmd: &mut std::process::Command,
+    command_words: &[String],
+    slot: &str,
+    artifact_dir: &Path,
+) -> CliResult<i32> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(artifact_dir)?;
+    let started_at = Utc::now().to_rfc3339();
+    std::fs::write(
+        artifact_dir.join("command.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "slot": slot,
+            "command": command_words,
+            "started_at": started_at,
+        }))
+        .map_err(|e| CliError::Format(e.to_string()))?,
+    )?;
+
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(artifact_dir.join("spawn_error.txt"), error.to_string())?;
+            std::fs::write(artifact_dir.join("exit_code.txt"), "127\n")?;
+            return Ok(127);
+        }
+        Err(error) => {
+            std::fs::write(artifact_dir.join("spawn_error.txt"), error.to_string())?;
+            std::fs::write(artifact_dir.join("exit_code.txt"), "1\n")?;
+            return Ok(1);
+        }
+    };
+
+    std::fs::write(artifact_dir.join("stdout.log"), &output.stdout)?;
+    std::fs::write(artifact_dir.join("stderr.log"), &output.stderr)?;
+
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    stdout.write_all(&output.stdout)?;
+    stderr.write_all(&output.stderr)?;
+
+    let exit_code = output.status.code().unwrap_or(1);
+    std::fs::write(artifact_dir.join("exit_code.txt"), format!("{exit_code}\n"))?;
+    std::fs::write(
+        artifact_dir.join("result.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "slot": slot,
+            "command": command_words,
+            "started_at": started_at,
+            "completed_at": Utc::now().to_rfc3339(),
+            "exit_code": exit_code,
+            "stdout_log": "stdout.log",
+            "stderr_log": "stderr.log",
+        }))
+        .map_err(|e| CliError::Format(e.to_string()))?,
+    )?;
+
+    Ok(exit_code)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -50462,12 +50807,15 @@ fn handle_am_run_with(
         code
     } else {
         ftui_runtime::ftui_println!("$ {}  (slot={})", args.cmd.join(" "), args.slot);
-
-        let status = cmd.status();
-        match status {
-            Ok(s) => s.code().unwrap_or(1),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127,
-            Err(_) => 1,
+        if let Some(artifact_dir) = args.artifact_dir.as_ref() {
+            run_child_with_artifacts(&mut cmd, &args.cmd, &args.slot, artifact_dir)?
+        } else {
+            let status = cmd.status();
+            match status {
+                Ok(s) => s.code().unwrap_or(1),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127,
+                Err(_) => 1,
+            }
         }
     };
 

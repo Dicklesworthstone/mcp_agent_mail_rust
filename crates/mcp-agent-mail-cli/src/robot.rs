@@ -3720,6 +3720,26 @@ fn build_status_recommendations(
         });
     }
 
+    let agent_flag = agent_name
+        .map(|name| format!(" --agent {}", robot_shell_arg(name)))
+        .unwrap_or_default();
+    candidates.push(OperatorRecommendationCandidate {
+        category: "verification_lane".to_string(),
+        action: "Run workspace cargo check under build-slot admission".to_string(),
+        reason: "Heavy verification should acquire the verify-cargo-check build slot and offload cargo through rch before running".to_string(),
+        confidence: 0.55,
+        affected: format!("project:{project_slug};slot:verify-cargo-check"),
+        evidence: format!(
+            "robot://status/verification-lane?project={project_slug}&slot=verify-cargo-check"
+        ),
+        artifact: None,
+        safe_command: format!(
+            "am verify cargo-check --path .{agent_flag} --block-on-conflicts"
+        ),
+        observed_ts_us: now_us,
+        stale_after_us: ROBOT_RECOMMENDATION_STALE_AFTER_US,
+    });
+
     rank_operator_recommendations(now_us, candidates, ROBOT_RECOMMENDATION_LIMIT)
 }
 
@@ -14125,7 +14145,8 @@ mod tests {
                 "ack_sla",
                 "reservation_expiry",
                 "mailbox_recovery",
-                "thread_activity"
+                "thread_activity",
+                "verification_lane"
             ]
         );
         assert_eq!(
@@ -14139,6 +14160,14 @@ mod tests {
         assert_eq!(
             recommendations[2].artifact.as_deref(),
             Some("/tmp/forensics/bundle")
+        );
+        assert_eq!(
+            recommendations[4].safe_command,
+            "am verify cargo-check --path . --agent CobaltBay --block-on-conflicts"
+        );
+        assert_eq!(
+            recommendations[4].evidence,
+            "robot://status/verification-lane?project=demo project&slot=verify-cargo-check"
         );
     }
 
@@ -14333,11 +14362,15 @@ mod tests {
         assert!(categories.contains(&"ack_sla"));
         assert!(categories.contains(&"reservation_expiry"));
         assert!(categories.contains(&"thread_activity"));
+        assert!(categories.contains(&"verification_lane"));
         assert!(
             actions.contains(
                 &"am robot inbox --project demo --agent Reader --ack-overdue".to_string()
             )
         );
+        assert!(actions.contains(
+            &"am verify cargo-check --path . --agent Reader --block-on-conflicts".to_string()
+        ));
 
         let json = serde_json::to_value(&status).expect("serialize status");
         assert_eq!(json["recommendations"][0]["rank"], 1);
