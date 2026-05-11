@@ -29,6 +29,7 @@ use ftui_runtime::program::Model;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
+use mcp_agent_mail_server::tui_decision::DiffAction;
 use mcp_agent_mail_server::tui_screens::{
     ALL_SCREEN_IDS, MailScreen, MailScreenId, agents::AgentsScreen, analytics::AnalyticsScreen,
     archive_browser::ArchiveBrowserScreen, atc::AtcScreen, attachments::AttachmentExplorerScreen,
@@ -178,6 +179,72 @@ fn make_sample(
         budget_p95_us,
         within_budget: p95 < budget_p95_us,
     }
+}
+
+fn make_diff_strategy_render_loop_sample(
+    state: Arc<TuiSharedState>,
+    width: u16,
+    height: u16,
+    warmup: usize,
+    iterations: usize,
+) -> PerfSample {
+    let mut model = MailAppModel::new(state);
+    let _ = model.init();
+    let mut frame_index = 0usize;
+    let mut full_actions = 0usize;
+    let mut resize_full_actions = 0usize;
+    let mut shadow_incremental_actions = 0usize;
+
+    let sorted = measure(warmup, iterations, || {
+        let resize_frame = frame_index > 0 && frame_index.is_multiple_of(37);
+        let render_width = if resize_frame {
+            width.saturating_add(8)
+        } else {
+            width
+        };
+
+        if resize_frame {
+            let _ = model.update(MailMsg::Terminal(Event::Resize {
+                width: render_width,
+                height,
+            }));
+        } else if frame_index.is_multiple_of(19) {
+            let _ = model.update(MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Tab))));
+        }
+
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(render_width, height, &mut pool);
+        model.view(&mut frame);
+
+        let telemetry = model.diff_telemetry();
+        if telemetry.last_action == DiffAction::Full {
+            full_actions = full_actions.saturating_add(1);
+        }
+        if resize_frame && telemetry.last_action == DiffAction::Full {
+            resize_full_actions = resize_full_actions.saturating_add(1);
+        }
+        if telemetry.last_shadow_action == DiffAction::Incremental {
+            shadow_incremental_actions = shadow_incremental_actions.saturating_add(1);
+        }
+        frame_index = frame_index.saturating_add(1);
+    });
+
+    let telemetry = model.diff_telemetry();
+    let detail = format!(
+        "frames={frame_index} safe_mode={} full_actions={full_actions} shadow_incremental_actions={shadow_incremental_actions} resize_full_actions={resize_full_actions} audits={} deferred={} mismatches={}",
+        telemetry.safe_mode,
+        telemetry.full_diff_audit_counter,
+        telemetry.deferred_frames,
+        telemetry.consecutive_audit_mismatches,
+    );
+    make_sample(
+        "diff_strategy_render_loop",
+        &detail,
+        warmup,
+        iterations,
+        &sorted,
+        BUDGET_APP_RENDER_P95_US,
+    )
 }
 
 const fn screen_name(id: MailScreenId) -> &'static str {
@@ -455,6 +522,39 @@ fn perf_app_render() {
         assert!(
             sample.within_budget,
             "app_render p95 {:.1}µs exceeds budget {:.1}ms",
+            sample.p95_us as f64,
+            sample.budget_p95_us as f64 / 1000.0,
+        );
+    }
+}
+
+/// PERF-TUI-5b: Full app render with diff-strategy telemetry enabled.
+#[test]
+fn perf_diff_strategy_render_loop() {
+    let state = test_state();
+    let warmup = 5;
+    let iterations = 100;
+    let sample =
+        make_diff_strategy_render_loop_sample(Arc::clone(&state), 120, 40, warmup, iterations);
+
+    eprintln!(
+        "diff_strategy_render_loop: p50={:.1}µs p95={:.1}µs p99={:.1}µs budget={:.1}ms {} {}",
+        sample.p50_us as f64,
+        sample.p95_us as f64,
+        sample.p99_us as f64,
+        sample.budget_p95_us as f64 / 1000.0,
+        if sample.within_budget { "OK" } else { "OVER" },
+        sample.detail,
+    );
+
+    assert!(
+        sample.detail.contains("shadow_incremental_actions="),
+        "diff strategy sample must report shadow action coverage"
+    );
+    if enforce_budgets() {
+        assert!(
+            sample.within_budget,
+            "diff_strategy_render_loop p95 {:.1}µs exceeds budget {:.1}ms",
             sample.p95_us as f64,
             sample.budget_p95_us as f64 / 1000.0,
         );
@@ -812,6 +912,15 @@ fn z_perf_baseline_report() {
             BUDGET_APP_RENDER_P95_US,
         ));
     }
+
+    // Full app render with diff-strategy telemetry.
+    samples.push(make_diff_strategy_render_loop_sample(
+        Arc::clone(&state),
+        width,
+        height,
+        warmup,
+        iterations,
+    ));
 
     // Tick cycle
     {

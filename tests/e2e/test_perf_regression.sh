@@ -263,11 +263,14 @@ fi
 e2e_case_banner "Action dispatch latency validation"
 
 # Extract samples that exist in the combined z_perf_baseline_report.
-# Surfaces: model_init, tick_update, screen_render, app_render, tick_cycle,
-#           search_interaction, key_navigation.
+# Surfaces: model_init, tick_update, screen_render, app_render,
+#           diff_strategy_render_loop, tick_cycle, search_interaction,
+#           key_navigation.
 # Note: p95_us can be 0 on fast hardware (sub-microsecond operations) — that's within budget.
 TICK_UPDATE_P95="$(jq '[.samples[] | select(.surface=="tick_update") | .p95_us][0] // "absent"' "$SUMMARY_JSON")"
 TICK_CYCLE_P95="$(jq '[.samples[] | select(.surface=="tick_cycle") | .p95_us][0] // "absent"' "$SUMMARY_JSON")"
+DIFF_STRATEGY_P95="$(jq '[.samples[] | select(.surface=="diff_strategy_render_loop") | .p95_us][0] // "absent"' "$SUMMARY_JSON")"
+DIFF_STRATEGY_DETAIL="$(jq -r '[.samples[] | select(.surface=="diff_strategy_render_loop") | .detail][0] // ""' "$SUMMARY_JSON")"
 SEARCH_P95="$(jq '[.samples[] | select(.surface=="search_interaction") | .p95_us][0] // "absent"' "$SUMMARY_JSON")"
 KEY_NAV_P95="$(jq '[.samples[] | select(.surface=="key_navigation") | .p95_us][0] // "absent"' "$SUMMARY_JSON")"
 
@@ -286,6 +289,23 @@ elif [ "$TICK_CYCLE_P95" = "absent" ]; then
 else
     e2e_fail "tick cycle p95: ${TICK_CYCLE_P95}us exceeds 20ms budget"
 fi
+
+if [ "$DIFF_STRATEGY_P95" != "absent" ] && [ "$DIFF_STRATEGY_P95" -lt 15000 ]; then
+    e2e_pass "diff strategy render-loop p95: ${DIFF_STRATEGY_P95}us < 15ms"
+elif [ "$DIFF_STRATEGY_P95" = "absent" ]; then
+    e2e_fail "diff strategy render-loop sample missing from perf summary"
+else
+    e2e_fail "diff strategy render-loop p95: ${DIFF_STRATEGY_P95}us exceeds 15ms budget"
+fi
+
+case "$DIFF_STRATEGY_DETAIL" in
+    *shadow_incremental_actions=*)
+        e2e_pass "diff strategy sample reports Bayesian shadow action coverage"
+        ;;
+    *)
+        e2e_fail "diff strategy sample missing shadow action coverage detail"
+        ;;
+esac
 
 if [ "$SEARCH_P95" != "absent" ] && [ "$SEARCH_P95" -lt 2000 ]; then
     e2e_pass "search interaction p95: ${SEARCH_P95}us < 2ms"

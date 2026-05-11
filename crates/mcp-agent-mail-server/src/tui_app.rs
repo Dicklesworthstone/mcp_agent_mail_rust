@@ -344,6 +344,27 @@ struct TuiDiffFrameDecision {
     first_frame: bool,
 }
 
+/// Read-only diagnostics for the app-level TUI diff strategy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TuiDiffTelemetry {
+    /// Whether the app is currently rendering through the full-diff safe path.
+    pub safe_mode: bool,
+    /// Whether the next rendered frame will be treated as the first frame.
+    pub first_frame_pending: bool,
+    /// Last action actually applied to the frame.
+    pub last_action: DiffAction,
+    /// Last action selected by the Bayesian strategy before safe-mode override.
+    pub last_shadow_action: DiffAction,
+    /// Number of frames rendered through the deferred degradation path.
+    pub deferred_frames: u64,
+    /// Number of completed frames observed by the diff audit hook.
+    pub full_diff_audit_counter: u32,
+    /// Consecutive audit mismatches seen before the last matching audit.
+    pub consecutive_audit_mismatches: u32,
+    /// Last completed-frame change ratio recorded from the rendered buffer.
+    pub last_change_ratio: f64,
+}
+
 fn command_palette_theme_style() -> PaletteStyle {
     let tp = crate::tui_theme::TuiThemePalette::current();
     PaletteStyle {
@@ -1392,6 +1413,8 @@ pub struct MailAppModel {
     diff_first_frame_pending: Cell<bool>,
     /// Last action applied by the app-level strategy.
     diff_last_action: Cell<DiffAction>,
+    /// Last Bayesian shadow action before safe-mode overrides.
+    diff_last_shadow_action: Cell<DiffAction>,
     /// Count of degraded deferred decisions for diagnostics.
     diff_deferred_frames: Cell<u64>,
     /// Cached summary of recent event severities for ambient health heuristics.
@@ -1563,6 +1586,7 @@ impl MailAppModel {
             diff_resize_pending: Cell::new(false),
             diff_first_frame_pending: Cell::new(true),
             diff_last_action: Cell::new(DiffAction::Full),
+            diff_last_shadow_action: Cell::new(DiffAction::Full),
             diff_deferred_frames: Cell::new(0),
             ambient_signal_summary: Cell::new(AmbientEventSignalSummary::default()),
             ambient_signal_total_pushed: Cell::new(0),
@@ -1976,6 +2000,21 @@ impl MailAppModel {
     #[must_use]
     pub const fn help_visible(&self) -> bool {
         self.help_visible
+    }
+
+    /// Current render-loop diff strategy telemetry.
+    #[must_use]
+    pub fn diff_telemetry(&self) -> TuiDiffTelemetry {
+        TuiDiffTelemetry {
+            safe_mode: self.diff_strategy_safe_mode.get(),
+            first_frame_pending: self.diff_first_frame_pending.get(),
+            last_action: self.diff_last_action.get(),
+            last_shadow_action: self.diff_last_shadow_action.get(),
+            deferred_frames: self.diff_deferred_frames.get(),
+            full_diff_audit_counter: self.diff_full_diff_audit_counter.get(),
+            consecutive_audit_mismatches: self.diff_consecutive_audit_mismatches.get(),
+            last_change_ratio: self.diff_last_change_ratio.get(),
+        }
     }
 
     /// Get mutable access to the modal manager for showing confirmation dialogs.
@@ -2679,6 +2718,7 @@ impl MailAppModel {
             shadow_action
         };
         self.diff_last_action.set(action);
+        self.diff_last_shadow_action.set(shadow_action);
         tracing::debug!(
             target: TUI_DIFF_TRACE_TARGET,
             name = "frame_decision_start",
