@@ -73,5 +73,9 @@ harness = false
 name = "frame_bench"
 harness = false
 
+[[bench]]
+name = "health_sweep_bench"
+harness = false
+
 [lints]
 workspace = true
