@@ -1270,6 +1270,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // the exclusive attempt will fail with EAGAIN, deadlocking startup.
     let probe_report = startup_checks::run_stdio_startup_probes(config);
     ensure_stdio_startup_probes_pass(&probe_report)?;
+    ensure_boot_archive_preflight_pass(config)?;
 
     // Now that probes have confirmed no other process holds the locks,
     // acquire our runtime shared lock for the duration of the process.
@@ -1870,12 +1871,74 @@ fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
+    ensure_boot_archive_preflight_pass(config)?;
 
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
     Ok(())
+}
+
+fn boot_check_mode_from_config(
+    config: &mcp_agent_mail_core::Config,
+) -> mcp_agent_mail_storage::boot_check::BootCheckMode {
+    use mcp_agent_mail_storage::boot_check::BootCheckMode;
+
+    match BootCheckMode::parse(&config.boot_check_mode) {
+        Some(BootCheckMode::AutoRepair) if config.boot_auto_repair_enabled => {
+            BootCheckMode::AutoRepair
+        }
+        Some(BootCheckMode::AutoRepair) => {
+            tracing::error!(
+                target: "mcp_agent_mail::boot_check",
+                repo_slug = "startup",
+                caller = "server.startup",
+                args_hash = "0000000000000000000000000000000000000000000000000000000000000000",
+                duration_ms = 0_u64,
+                outcome = "error",
+                git_version = "n/a",
+                mode = "auto_repair",
+                "boot_check_auto_repair_gate_violated"
+            );
+            BootCheckMode::Warn
+        }
+        Some(mode) => mode,
+        None => {
+            tracing::warn!(
+                target: "mcp_agent_mail::boot_check",
+                mode = %config.boot_check_mode,
+                "invalid_boot_check_mode_defaulting_to_warn"
+            );
+            BootCheckMode::Warn
+        }
+    }
+}
+
+fn ensure_boot_archive_preflight_pass(
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<mcp_agent_mail_storage::boot_check::BootCheckReport> {
+    let mode = boot_check_mode_from_config(config);
+    let report =
+        mcp_agent_mail_storage::boot_check::preflight_archive_integrity(&config.storage_root, mode);
+    if !report.should_abort() {
+        return Ok(report);
+    }
+
+    let sample = report
+        .findings
+        .iter()
+        .take(3)
+        .map(|finding| format!("{}: {}", finding.project, finding.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(std::io::Error::other(format!(
+        "archive boot check found {} finding(s) across {} project candidate(s); \
+         refusing startup because AM_BOOT_CHECK_MODE=abort. First finding(s): {}",
+        report.findings.len(),
+        report.total_projects,
+        sample
+    )))
 }
 
 const STARTUP_READINESS_FAST_PATH_GRACE: Duration = Duration::from_secs(1);
@@ -2871,6 +2934,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
+    ensure_boot_archive_preflight_pass(config)?;
 
     // Now that probes have confirmed we are the sole owner, acquire the
     // runtime shared lock for the lifetime of the process.
@@ -15172,6 +15236,77 @@ mod tests {
             "got: {message}"
         );
         assert!(message.contains("run repair"), "got: {message}");
+    }
+
+    fn config_for_boot_check_storage(
+        storage_root: &std::path::Path,
+        mode: &str,
+    ) -> mcp_agent_mail_core::Config {
+        let mut config = mcp_agent_mail_core::Config {
+            storage_root: storage_root.to_path_buf(),
+            boot_check_mode: mode.to_string(),
+            ..Default::default()
+        };
+        config.boot_auto_repair_enabled = false;
+        config
+    }
+
+    fn create_broken_archive_project(storage_root: &std::path::Path, project: &str) {
+        let project_dir = storage_root.join("projects").join(project);
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(project_dir.join(".git"), "not a git repository")
+            .expect("write malformed git metadata marker");
+    }
+
+    #[test]
+    fn boot_archive_preflight_warn_mode_allows_findings() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        create_broken_archive_project(&storage_root, "broken-project");
+        let config = config_for_boot_check_storage(&storage_root, "warn");
+
+        let report = ensure_boot_archive_preflight_pass(&config)
+            .expect("warn mode should log findings and allow startup");
+
+        assert_eq!(report.total_projects, 1);
+        assert!(report.has_findings());
+        assert!(!report.should_abort());
+    }
+
+    #[test]
+    fn boot_archive_preflight_abort_mode_blocks_findings() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        create_broken_archive_project(&storage_root, "broken-project");
+        let config = config_for_boot_check_storage(&storage_root, "abort");
+
+        let error = ensure_boot_archive_preflight_pass(&config)
+            .expect_err("abort mode should block startup when findings exist");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("AM_BOOT_CHECK_MODE=abort"),
+            "got: {message}"
+        );
+        assert!(message.contains("broken-project"), "got: {message}");
+    }
+
+    #[test]
+    fn boot_archive_preflight_auto_repair_without_gate_demotes_to_warn() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        create_broken_archive_project(&storage_root, "broken-project");
+        let config = config_for_boot_check_storage(&storage_root, "auto_repair");
+
+        let report = ensure_boot_archive_preflight_pass(&config)
+            .expect("ungated auto_repair should demote to warn for startup");
+
+        assert_eq!(
+            report.mode,
+            mcp_agent_mail_storage::boot_check::BootCheckMode::Warn
+        );
+        assert!(report.has_findings());
+        assert!(!report.should_abort());
     }
 
     #[test]
