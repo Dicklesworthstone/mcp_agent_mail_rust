@@ -2872,6 +2872,25 @@ body
     }
 
     #[test]
+    fn health_check_direct_sqlite_probe_uses_canonical_engine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("health-check-engine.sqlite3");
+
+        let conn = open_health_check_sync_db_connection(&db_path)
+            .expect("health_check direct probe should open sqlite");
+        let type_name = std::any::type_name_of_val(&conn);
+
+        assert!(
+            type_name.contains("sqlmodel_sqlite"),
+            "health_check must use canonical sqlmodel_sqlite, got {type_name}"
+        );
+        assert!(
+            !type_name.contains("frankensqlite") && !type_name.contains("fsqlite"),
+            "health_check must not use experimental SQLite engines on the normal path: {type_name}"
+        );
+    }
+
+    #[test]
     fn list_agents_uses_archive_snapshot_when_live_db_is_stale() {
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");

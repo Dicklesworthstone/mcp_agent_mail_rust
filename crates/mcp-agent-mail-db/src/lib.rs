@@ -369,3 +369,26 @@ impl Drop for DbConnGuard {
 pub const fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
     DbConnGuard::new(conn, context)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normal_mailbox_connection_aliases_use_canonical_sqlite() {
+        for (label, type_name) in [
+            ("DbConn", std::any::type_name::<super::DbConn>()),
+            (
+                "CanonicalDbConn",
+                std::any::type_name::<super::CanonicalDbConn>(),
+            ),
+        ] {
+            assert!(
+                type_name.contains("sqlmodel_sqlite"),
+                "{label} must stay on canonical sqlmodel_sqlite, got {type_name}"
+            );
+            assert!(
+                !type_name.contains("frankensqlite") && !type_name.contains("fsqlite"),
+                "{label} must not route normal mailbox traffic through experimental SQLite engines: {type_name}"
+            );
+        }
+    }
+}

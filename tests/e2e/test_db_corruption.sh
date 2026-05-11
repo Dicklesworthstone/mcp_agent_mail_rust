@@ -491,6 +491,7 @@ TRY_SESSION_STORAGE_ROOT="$ORPHAN_STORAGE"
 BARRIER_RESP="$(try_session "$ORPHAN_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":1010,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${ORPHAN_PROJECT}\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":1011,\"method\":\"tools/call\",\"params\":{\"name\":\"health_check\",\"arguments\":{}}}" \
 )" || true
 BARRIER_STDERR_PATH="$(cat "$TRY_SESSION_STDERR_PATH_FILE" 2>/dev/null || true)"
 BARRIER_STDERR="$(cat "$BARRIER_STDERR_PATH" 2>/dev/null || true)"
@@ -501,10 +502,11 @@ e2e_save_artifact "case_10_startup_barrier_response.txt" "$BARRIER_RESP"
 e2e_save_artifact "case_10_startup_barrier_stderr.txt" "$BARRIER_STDERR"
 
 BARRIER_CHECK="$(tool_call_succeeded "$BARRIER_RESP" 1010)"
-if [ "$BARRIER_CHECK" = "YES" ]; then
-    e2e_pass "startup continued only after repair barrier completed"
+BARRIER_HEALTH_CHECK="$(tool_call_succeeded "$BARRIER_RESP" 1011)"
+if [ "$BARRIER_CHECK" = "YES" ] && [ "$BARRIER_HEALTH_CHECK" = "YES" ]; then
+    e2e_pass "startup and health_check continued only after repair barrier completed"
 else
-    e2e_fail "startup barrier session did not serve request after repair"
+    e2e_fail "startup barrier session did not serve requests after repair: ensure_project=${BARRIER_CHECK} health_check=${BARRIER_HEALTH_CHECK}"
 fi
 
 if printf '%s\n' "$BARRIER_OUTPUT" | grep -F "Startup detected mailbox database issues; running automatic repair" >/dev/null \
@@ -512,6 +514,26 @@ if printf '%s\n' "$BARRIER_OUTPUT" | grep -F "Startup detected mailbox database 
     e2e_pass "startup output included second-pass repair verification verdict"
 else
     e2e_fail "startup output missing second-pass repair verification verdict"
+fi
+
+BARRIER_PANIC_SIGNATURES='RefCell already borrowed
+asupersync-worker-blocking
+fsqlite-core/src/connection.rs
+frankensqlite/crates/fsqlite-core
+stack backtrace:'
+BARRIER_SIGNATURE_HIT=""
+while IFS= read -r signature; do
+    if [ -n "$signature" ] && printf '%s\n' "$BARRIER_OUTPUT" | grep -F "$signature" >/dev/null; then
+        BARRIER_SIGNATURE_HIT="$signature"
+        break
+    fi
+done <<EOF
+$BARRIER_PANIC_SIGNATURES
+EOF
+if [ -z "$BARRIER_SIGNATURE_HIT" ]; then
+    e2e_pass "startup/health_check stderr artifacts have no FrankenSQLite panic signatures"
+else
+    e2e_fail "startup/health_check stderr artifacts include panic signature: ${BARRIER_SIGNATURE_HIT}"
 fi
 
 REMAINING_ORPHAN_COUNT="$(sqlite3 "$ORPHAN_DB" "SELECT COUNT(*) FROM message_recipients WHERE message_id = 999999;" 2>/dev/null | tr -d '[:space:]')"

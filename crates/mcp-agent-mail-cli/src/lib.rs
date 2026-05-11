@@ -41741,6 +41741,56 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn normal_runtime_crate_manifests_do_not_pull_experimental_sqlite_adapters() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let normal_runtime_crates = [
+            "mcp-agent-mail-cli",
+            "mcp-agent-mail-db",
+            "mcp-agent-mail-server",
+            "mcp-agent-mail-tools",
+        ];
+        let forbidden = [
+            "sqlmodel-frankensqlite",
+            "sqlmodel_frankensqlite",
+            "frankensqlite",
+            "fsqlite",
+        ];
+
+        for crate_name in normal_runtime_crates {
+            let manifest_path = workspace_root
+                .join("crates")
+                .join(crate_name)
+                .join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", manifest_path.display()));
+            for forbidden_name in forbidden {
+                assert!(
+                    !manifest.contains(forbidden_name),
+                    "{} must not depend on experimental SQLite adapter `{}` on normal startup/health paths",
+                    manifest_path.display(),
+                    forbidden_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn beads_issue_awareness_counts_use_canonical_sqlite_engine() {
+        let type_name = std::any::type_name::<mcp_agent_mail_db::CanonicalDbConn>();
+        assert!(
+            type_name.contains("sqlmodel_sqlite"),
+            "beads issue awareness must use canonical sqlmodel_sqlite, got {type_name}"
+        );
+        assert!(
+            !type_name.contains("frankensqlite") && !type_name.contains("fsqlite"),
+            "beads issue awareness must not route startup doctor probes through experimental SQLite engines: {type_name}"
+        );
+    }
+
+    #[test]
     fn clap_parses_beads_status_flags() {
         let cli = Cli::try_parse_from(["am", "beads", "status", "--json"])
             .expect("failed to parse beads status");
