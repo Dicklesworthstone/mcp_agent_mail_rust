@@ -16427,34 +16427,62 @@ fn beads_issue_awareness_counts_from(
     start: Option<&Path>,
 ) -> Result<(usize, usize, usize), String> {
     let beads_dir = beads_rust::config::discover_beads_dir(start).map_err(|e| e.to_string())?;
-    let (storage, _paths) =
-        beads_rust::config::open_storage(&beads_dir, None, None).map_err(|e| e.to_string())?;
+    let db_path = beads_dir.join("beads.db");
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+        .map_err(|e| format!("failed to open beads database: {e}"))?;
 
-    let ready = storage
-        .get_ready_issues(
-            &beads_rust::storage::ReadyFilters::default(),
-            beads_rust::storage::ReadySortPolicy::Hybrid,
-        )
-        .map_err(|e| e.to_string())?
-        .len();
+    let ready = beads_issue_awareness_count(
+        &conn,
+        "SELECT COUNT(*) AS cnt
+         FROM issues AS issue
+         WHERE issue.status = 'open'
+           AND issue.deleted_at IS NULL
+           AND issue.ephemeral = 0
+           AND issue.pinned = 0
+           AND issue.is_template = 0
+           AND (issue.defer_until IS NULL OR issue.defer_until <= CURRENT_TIMESTAMP)
+           AND NOT EXISTS (
+               SELECT 1
+               FROM dependencies AS dep
+               JOIN issues AS blocker ON blocker.id = dep.depends_on_id
+               WHERE dep.issue_id = issue.id
+                 AND dep.type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')
+                 AND blocker.status NOT IN ('closed', 'tombstone')
+                 AND blocker.deleted_at IS NULL
+           )",
+    )?;
 
-    let open = storage
-        .list_issues(&beads_rust::storage::ListFilters {
-            statuses: Some(vec![beads_rust::model::Status::Open]),
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())?
-        .len();
+    let open = beads_issue_awareness_count(
+        &conn,
+        "SELECT COUNT(*) AS cnt
+         FROM issues
+         WHERE status = 'open'
+           AND deleted_at IS NULL
+           AND is_template = 0",
+    )?;
 
-    let in_progress = storage
-        .list_issues(&beads_rust::storage::ListFilters {
-            statuses: Some(vec![beads_rust::model::Status::InProgress]),
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())?
-        .len();
+    let in_progress = beads_issue_awareness_count(
+        &conn,
+        "SELECT COUNT(*) AS cnt
+         FROM issues
+         WHERE status = 'in_progress'
+           AND deleted_at IS NULL
+           AND is_template = 0",
+    )?;
 
     Ok((ready, open, in_progress))
+}
+
+fn beads_issue_awareness_count(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    sql: &str,
+) -> Result<usize, String> {
+    let rows = conn.query_sync(sql, &[]).map_err(|e| e.to_string())?;
+    let count: i64 = rows
+        .first()
+        .and_then(|row| row.get_named("cnt").ok())
+        .unwrap_or(0);
+    usize::try_from(count).map_err(|_| format!("negative beads count returned: {count}"))
 }
 
 fn beads_issue_awareness_counts() -> Result<(usize, usize, usize), String> {

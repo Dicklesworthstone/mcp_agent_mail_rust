@@ -23,7 +23,6 @@ sha1.workspace = true
 fs2.workspace = true
 globset.workspace = true
 nix.workspace = true
-sqlmodel-frankensqlite.workspace = true
 tracing.workspace = true
 
 [features]

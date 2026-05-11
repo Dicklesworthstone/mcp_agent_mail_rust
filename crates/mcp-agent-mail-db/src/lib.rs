@@ -304,14 +304,13 @@ pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
 pub use query_assistance::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
 pub use sqlmodel_core;
-pub use sqlmodel_frankensqlite;
 pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Runtime mailbox traffic uses canonical SQLite. FrankenSQLite remains
-/// available to targeted tests and experiments, but it must not own the live
-/// mailbox file until its B-tree/index corruption bugs are fixed upstream.
+/// Runtime mailbox traffic uses canonical SQLite. FrankenSQLite is kept out of
+/// this crate's normal dependency graph so startup, recovery, and TUI polling
+/// cannot accidentally route live mailbox files through that engine.
 pub type DbConn = sqlmodel_sqlite::SqliteConnection;
 
 /// The connection type used by canonical verification and recovery flows.

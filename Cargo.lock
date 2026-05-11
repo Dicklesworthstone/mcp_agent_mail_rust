@@ -4445,7 +4445,6 @@ dependencies = [
  "sha1 0.10.6",
  "shellexpand",
  "shlex",
- "sqlmodel-frankensqlite",
  "tempfile",
  "thiserror",
  "tracing",
@@ -4478,7 +4477,6 @@ dependencies = [
  "sha2 0.10.9",
  "sqlmodel",
  "sqlmodel-core",
- "sqlmodel-frankensqlite",
  "sqlmodel-pool",
  "sqlmodel-query",
  "sqlmodel-schema",
@@ -6569,20 +6567,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlmodel-frankensqlite"
-version = "0.2.2"
-dependencies = [
- "asupersync",
- "fsqlite",
- "fsqlite-core",
- "fsqlite-error",
- "fsqlite-types",
- "serde",
- "serde_json",
- "sqlmodel-core",
-]
-
-[[package]]
 name = "sqlmodel-macros"
 version = "0.2.2"
 dependencies = [
@@ -8358,3 +8342,7 @@ version = "0.4.0"
 [[patch.unused]]
 name = "ftui-widgets"
 version = "0.4.0"
+
+[[patch.unused]]
+name = "sqlmodel-frankensqlite"
+version = "0.2.2"
