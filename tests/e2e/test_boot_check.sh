@@ -33,7 +33,7 @@ done
 
 WORK="$(e2e_mktemp "e2e_boot_check")"
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
-SCENARIOS_TOTAL=5
+SCENARIOS_TOTAL=6
 SCENARIOS_PASSED=0
 SCENARIOS_FAILED=0
 
@@ -326,6 +326,43 @@ scenario_seeded_findings_abort_mode_refuses_to_start() {
     e2e_assert_eq "${scenario}: two findings logged before abort" "2" "$(event_count "${scenario}" "boot_check_finding")"
 }
 
+scenario_auto_repair_with_correct_gate_repairs_then_starts() {
+    local scenario="$1"
+    local storage="${WORK}/${scenario}/storage"
+    local stash_ref backup_glob
+    mkdir -p "${storage}/projects"
+    init_orphan_repo "${scenario}" "${storage}/projects/orphan_one" || return 1
+    stash_ref="${storage}/projects/orphan_one/.git/refs/stash"
+    backup_glob="${storage}/backups/refs/orphan_one/"'*.txt'
+
+    if ! run_server_case \
+        "${scenario}" \
+        "${storage}" \
+        "auto_repair" \
+        "AM_BOOT_AUTO_REPAIR=I_UNDERSTAND_THE_RISKS"
+    then
+        e2e_fail "${scenario}: gated auto_repair repairs and starts"
+        return 1
+    fi
+    e2e_assert_event_count_at_least \
+        "${scenario}: repair attempt logged" \
+        "${scenario}" \
+        "boot_check_auto_repair_attempted" \
+        1
+    e2e_assert_eq "${scenario}: repaired archive has no residual boot findings" \
+        "0" "$(event_count "${scenario}" "boot_check_finding")"
+    if [ -e "${stash_ref}" ]; then
+        e2e_fail "${scenario}: refs/stash should be pruned after backup"
+    else
+        e2e_pass "${scenario}: refs/stash pruned after backup"
+    fi
+    if compgen -G "${backup_glob}" >/dev/null; then
+        e2e_pass "${scenario}: backup file written before prune"
+    else
+        e2e_fail "${scenario}: backup file missing"
+    fi
+}
+
 scenario_auto_repair_without_gate_logs_error_and_demotes() {
     local scenario="$1"
     local storage="${WORK}/${scenario}/storage"
@@ -400,10 +437,13 @@ run_scenario "s2_seeded_findings_warn_mode_starts_with_warnings" \
 run_scenario "s3_seeded_findings_abort_mode_refuses_to_start" \
     "Seeded findings abort mode refuses startup" \
     scenario_seeded_findings_abort_mode_refuses_to_start
-run_scenario "s4_auto_repair_without_gate_logs_error_and_demotes" \
+run_scenario "s4_auto_repair_with_correct_gate_repairs_then_starts" \
+    "Gated auto repair repairs then starts" \
+    scenario_auto_repair_with_correct_gate_repairs_then_starts
+run_scenario "s5_auto_repair_without_gate_logs_error_and_demotes" \
     "Ungated auto repair logs error and demotes" \
     scenario_auto_repair_without_gate_logs_error_and_demotes
-run_scenario "s5_corrupt_repo_warn_mode_does_not_crash" \
+run_scenario "s6_corrupt_repo_warn_mode_does_not_crash" \
     "Corrupt repo warn mode does not crash" \
     scenario_corrupt_repo_warn_mode_does_not_crash
 

@@ -1,18 +1,24 @@
 //! Boot-time archive integrity preflight.
 //!
-//! This module is intentionally read-only for its first slice: it discovers
-//! archive git repositories, checks whether they open cleanly, and reuses the
-//! git-2.51 recovery detector for missing-ref findings.
+//! The default path is read-only: it discovers archive git repositories,
+//! checks whether they open cleanly, and reuses the git-2.51 recovery detector
+//! for missing-ref findings. `AutoRepair` is intentionally narrower than the
+//! detector: it writes a backup first, then prunes only refs already classified
+//! by the recovery layer as safe-to-prune.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
 use git2::Repository;
+use mcp_agent_mail_core::git_lock::{RepoFlock, canonicalize_repo};
+use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::recovery::detect_missing_refs;
+use crate::recovery::{PrunableRef, RefCategory, detect_missing_refs};
 
 const TARGET: &str = "mcp_agent_mail::boot_check";
 const CALLER: &str = "startup.boot_check";
@@ -94,6 +100,25 @@ struct ArchiveRepoCandidate {
     path: PathBuf,
 }
 
+#[derive(Debug)]
+enum CandidateCheck {
+    Clean,
+    Broken(BootCheckFinding),
+    MissingRefs {
+        refs: Vec<PrunableRef>,
+        finding: BootCheckFinding,
+    },
+}
+
+#[derive(Debug)]
+struct AutoRepairOutcome {
+    actions: Vec<String>,
+    backup_path: Option<PathBuf>,
+    before_refs: Vec<String>,
+    after_refs: Vec<String>,
+    pruned_refs: Vec<String>,
+}
+
 /// Read-only boot preflight for archive git repositories.
 #[must_use]
 pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootCheckReport {
@@ -120,9 +145,43 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
     );
 
     let mut findings = Vec::new();
+    let mut auto_repaired_count = 0_u32;
     for candidate in &candidates {
-        if let Some(finding) = check_candidate(candidate) {
-            findings.push(finding);
+        match check_candidate(candidate) {
+            CandidateCheck::Clean => {}
+            CandidateCheck::Broken(finding) => findings.push(finding),
+            CandidateCheck::MissingRefs { refs, finding } => {
+                if mode != BootCheckMode::AutoRepair {
+                    findings.push(finding);
+                    continue;
+                }
+
+                match auto_repair_missing_refs(root, candidate, &refs) {
+                    Ok(outcome) => {
+                        emit_auto_repair_attempted(
+                            &repo_slug, &args_hash, mode, candidate, &outcome,
+                        );
+                        record_auto_repair_evidence(candidate, &outcome);
+                        if !outcome.pruned_refs.is_empty() {
+                            auto_repaired_count = auto_repaired_count.saturating_add(1);
+                        }
+                        if !outcome.after_refs.is_empty() {
+                            findings.push(missing_refs_finding_from_names(
+                                candidate,
+                                outcome.after_refs.clone(),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        emit_auto_repair_failed(&repo_slug, &args_hash, mode, candidate, &error);
+                        findings.push(BootCheckFinding {
+                            project: finding.project,
+                            kind: finding.kind,
+                            detail: format!("auto repair failed: {error}; {}", finding.detail),
+                        });
+                    }
+                }
+            }
         }
     }
     for finding in &findings {
@@ -145,8 +204,6 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let duration_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
     let should_abort = mode == BootCheckMode::Abort && !findings.is_empty();
-    let auto_repaired_count = 0_u32;
-
     tracing::info!(
         target: TARGET,
         repo_slug = %repo_slug,
@@ -262,9 +319,9 @@ fn path_is_nonsymlink_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
 
-fn check_candidate(candidate: &ArchiveRepoCandidate) -> Option<BootCheckFinding> {
+fn check_candidate(candidate: &ArchiveRepoCandidate) -> CandidateCheck {
     if let Err(error) = Repository::open(&candidate.path) {
-        return Some(BootCheckFinding {
+        return CandidateCheck::Broken(BootCheckFinding {
             project: candidate.project.clone(),
             kind: BootCheckFindingKind::RepoBroken,
             detail: format!(
@@ -275,23 +332,12 @@ fn check_candidate(candidate: &ArchiveRepoCandidate) -> Option<BootCheckFinding>
     }
 
     match detect_missing_refs(&candidate.path) {
-        Ok(refs) if refs.is_empty() => None,
+        Ok(refs) if refs.is_empty() => CandidateCheck::Clean,
         Ok(refs) => {
-            let ref_names = refs
-                .into_iter()
-                .map(|finding| finding.ref_name)
-                .collect::<Vec<_>>();
-            Some(BootCheckFinding {
-                project: candidate.project.clone(),
-                detail: format!(
-                    "{} missing ref target(s): {}",
-                    ref_names.len(),
-                    ref_names.join(", ")
-                ),
-                kind: BootCheckFindingKind::OrphanRefs(ref_names),
-            })
+            let finding = missing_refs_finding(candidate, &refs);
+            CandidateCheck::MissingRefs { refs, finding }
         }
-        Err(error) => Some(BootCheckFinding {
+        Err(error) => CandidateCheck::Broken(BootCheckFinding {
             project: candidate.project.clone(),
             kind: BootCheckFindingKind::RepoBroken,
             detail: format!(
@@ -299,6 +345,279 @@ fn check_candidate(candidate: &ArchiveRepoCandidate) -> Option<BootCheckFinding>
                 candidate.path.display()
             ),
         }),
+    }
+}
+
+fn missing_refs_finding(
+    candidate: &ArchiveRepoCandidate,
+    refs: &[PrunableRef],
+) -> BootCheckFinding {
+    let ref_names = refs
+        .iter()
+        .map(|finding| finding.ref_name.clone())
+        .collect::<Vec<_>>();
+    missing_refs_finding_from_names(candidate, ref_names)
+}
+
+fn missing_refs_finding_from_names(
+    candidate: &ArchiveRepoCandidate,
+    ref_names: Vec<String>,
+) -> BootCheckFinding {
+    BootCheckFinding {
+        project: candidate.project.clone(),
+        detail: format!(
+            "{} missing ref target(s): {}",
+            ref_names.len(),
+            ref_names.join(", ")
+        ),
+        kind: BootCheckFindingKind::OrphanRefs(ref_names),
+    }
+}
+
+fn auto_repair_missing_refs(
+    root: &Path,
+    candidate: &ArchiveRepoCandidate,
+    refs: &[PrunableRef],
+) -> Result<AutoRepairOutcome, String> {
+    let before_refs = refs
+        .iter()
+        .map(|finding| finding.ref_name.clone())
+        .collect::<Vec<_>>();
+    let safe_refs = refs
+        .iter()
+        .filter(|finding| finding.category == RefCategory::SafeToPrune)
+        .collect::<Vec<_>>();
+    let mut actions = Vec::new();
+    if safe_refs.is_empty() {
+        actions.push("refused_no_safe_refs".to_string());
+        return Ok(AutoRepairOutcome {
+            actions,
+            backup_path: None,
+            before_refs: before_refs.clone(),
+            after_refs: before_refs,
+            pruned_refs: Vec::new(),
+        });
+    }
+
+    let canonical = canonicalize_repo(&candidate.path)
+        .ok_or_else(|| format!("canonicalize repo {}", candidate.path.display()))?;
+    let _flock = RepoFlock::acquire(&canonical)
+        .map_err(|error| format!("acquire repo lock {}: {error}", canonical.display()))?;
+
+    let backup_path = write_ref_backup(root, candidate, refs)?;
+    actions.push(format!("backup_refs:{}", backup_path.display()));
+
+    let mut pruned_refs = Vec::new();
+    for finding in safe_refs {
+        prune_ref(&candidate.path, &finding.ref_name)?;
+        actions.push(format!("prune_ref:{}", finding.ref_name));
+        pruned_refs.push(finding.ref_name.clone());
+    }
+
+    repack_refs(root, candidate)?;
+    actions.push("repack_refs".to_string());
+
+    let after = detect_missing_refs(&candidate.path)
+        .map_err(|error| format!("post-repair missing-ref scan failed: {error}"))?;
+    let after_refs = after
+        .into_iter()
+        .map(|finding| finding.ref_name)
+        .collect::<Vec<_>>();
+
+    Ok(AutoRepairOutcome {
+        actions,
+        backup_path: Some(backup_path),
+        before_refs,
+        after_refs,
+        pruned_refs,
+    })
+}
+
+fn write_ref_backup(
+    root: &Path,
+    candidate: &ArchiveRepoCandidate,
+    refs: &[PrunableRef],
+) -> Result<PathBuf, String> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros())
+        .unwrap_or(0);
+    let backup_dir = root
+        .join("backups")
+        .join("refs")
+        .join(safe_backup_project_name(&candidate.project));
+    fs::create_dir_all(&backup_dir)
+        .map_err(|error| format!("create backup dir {}: {error}", backup_dir.display()))?;
+    let backup_path = backup_dir.join(format!("{ts}.txt"));
+    let mut text = String::new();
+    text.push_str(&format!("# boot-check auto-repair backup {ts}\n"));
+    text.push_str(&format!("# project: {}\n", candidate.project));
+    text.push_str(&format!("# repo: {}\n", candidate.path.display()));
+    text.push_str("# format: <status> <ref_name> <target_sha> <category> <reason>\n");
+    if let Ok(repo) = Repository::open(&candidate.path) {
+        text.push_str("#\n# ALL refs at backup time:\n");
+        if let Ok(references) = repo.references() {
+            for reference in references.flatten() {
+                if let (Some(name), Some(target)) = (reference.name(), reference.target()) {
+                    text.push_str(&format!("ref  {name}  {target}\n"));
+                }
+            }
+        }
+        text.push_str("#\n");
+    }
+    text.push_str("# ORPHAN findings:\n");
+    for finding in refs {
+        text.push_str(&format!(
+            "orphan  {}  {}  {:?}  {}\n",
+            finding.ref_name, finding.target_sha, finding.category, finding.reason,
+        ));
+    }
+    fs::write(&backup_path, text.as_bytes())
+        .map_err(|error| format!("write backup {}: {error}", backup_path.display()))?;
+    Ok(backup_path)
+}
+
+fn prune_ref(repo_path: &Path, ref_name: &str) -> Result<(), String> {
+    let repo =
+        Repository::open(repo_path).map_err(|error| format!("open repo for pruning: {error}"))?;
+    let mut reference = repo
+        .find_reference(ref_name)
+        .map_err(|error| format!("find reference {ref_name}: {error}"))?;
+    reference
+        .delete()
+        .map_err(|error| format!("delete reference {ref_name}: {error}"))?;
+    Ok(())
+}
+
+fn repack_refs(root: &Path, candidate: &ArchiveRepoCandidate) -> Result<(), String> {
+    let admin_dir = mcp_agent_mail_core::git_lock::admin_dir_for(&candidate.path)
+        .ok_or_else(|| format!("resolve git admin dir for {}", candidate.path.display()))?;
+    let packed_refs = admin_dir.join("packed-refs");
+    if packed_refs.is_file() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_micros())
+            .unwrap_or(0);
+        let backup_dir = root
+            .join("backups")
+            .join("refs")
+            .join(safe_backup_project_name(&candidate.project));
+        fs::create_dir_all(&backup_dir)
+            .map_err(|error| format!("create packed-refs backup dir: {error}"))?;
+        let backup_path = backup_dir.join(format!("{ts}-packed-refs.txt"));
+        fs::copy(&packed_refs, &backup_path).map_err(|error| {
+            format!(
+                "copy packed-refs backup {} -> {}: {error}",
+                packed_refs.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(&candidate.path)
+        .args(["pack-refs", "--all", "--prune"])
+        .skip_flock()
+        .run()
+        .map_err(|error| format!("pack-refs invocation: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pack-refs exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    Ok(())
+}
+
+fn safe_backup_project_name(project: &str) -> String {
+    project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn emit_auto_repair_attempted(
+    repo_slug: &str,
+    args_hash: &str,
+    mode: BootCheckMode,
+    candidate: &ArchiveRepoCandidate,
+    outcome: &AutoRepairOutcome,
+) {
+    let before_state = json!({ "missing_refs": outcome.before_refs });
+    let after_state = json!({ "missing_refs": outcome.after_refs });
+    tracing::warn!(
+        target: TARGET,
+        repo_slug = %repo_slug,
+        caller = CALLER,
+        args_hash = %args_hash,
+        duration_ms = 0_u64,
+        outcome = "success",
+        git_version = GIT_VERSION,
+        mode = mode.observability_label(),
+        project = %candidate.project,
+        actions = ?outcome.actions,
+        before_state = %before_state,
+        after_state = %after_state,
+        "boot_check_auto_repair_attempted"
+    );
+}
+
+fn emit_auto_repair_failed(
+    repo_slug: &str,
+    args_hash: &str,
+    mode: BootCheckMode,
+    candidate: &ArchiveRepoCandidate,
+    error: &str,
+) {
+    tracing::error!(
+        target: TARGET,
+        repo_slug = %repo_slug,
+        caller = CALLER,
+        args_hash = %args_hash,
+        duration_ms = 0_u64,
+        outcome = "error",
+        git_version = GIT_VERSION,
+        mode = mode.observability_label(),
+        project = %candidate.project,
+        actions = ?["backup_refs", "prune_safe_refs", "repack_refs"],
+        error = %error,
+        "boot_check_auto_repair_failed"
+    );
+}
+
+fn record_auto_repair_evidence(candidate: &ArchiveRepoCandidate, outcome: &AutoRepairOutcome) {
+    if outcome.pruned_refs.is_empty() {
+        return;
+    }
+    let evidence = json!({
+        "project": candidate.project,
+        "repo": candidate.path,
+        "actions": outcome.actions,
+        "backup_path": outcome.backup_path,
+        "before_state": { "missing_refs": outcome.before_refs },
+        "after_state": { "missing_refs": outcome.after_refs },
+        "pruned_refs": outcome.pruned_refs,
+    });
+    let entry = EvidenceLedgerEntry::new(
+        format!("boot_check_auto_repair:{}", candidate.project),
+        "boot_check.auto_repair",
+        "prune_safe_missing_refs",
+        1.0,
+        evidence,
+    );
+    if let Err(error) = append_evidence_entry_if_configured(&entry) {
+        tracing::warn!(
+            target: TARGET,
+            project = %candidate.project,
+            err = %error,
+            "boot_check_auto_repair_evidence_write_failed"
+        );
     }
 }
 
@@ -326,6 +645,14 @@ mod tests {
                 .unwrap();
         }
         repo
+    }
+
+    fn backup_files(root: &Path, project: &str) -> Vec<PathBuf> {
+        let dir = root.join("backups").join("refs").join(project);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        entries.flatten().map(|entry| entry.path()).collect()
     }
 
     #[test]
@@ -397,14 +724,34 @@ mod tests {
     }
 
     #[test]
-    fn preflight_auto_repair_mode_is_read_only_until_repair_wiring_lands() {
+    fn preflight_auto_repair_prunes_safe_orphan_refs_after_backup() {
         let tmp = TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
-        std::fs::write(
-            tmp.path().join(".git/refs/heads/broken"),
-            "cafebabecafebabecafebabecafebabecafebabe\n",
-        )
-        .unwrap();
+        let fake = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let stash_ref = tmp.path().join(".git/refs/stash");
+        std::fs::write(&stash_ref, format!("{fake}\n")).unwrap();
+
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::AutoRepair);
+
+        assert_eq!(report.total_projects, 1);
+        assert!(!report.has_findings());
+        assert_eq!(report.auto_repaired_count, 1);
+        assert!(!stash_ref.exists());
+
+        let backups = backup_files(tmp.path(), ARCHIVE_ROOT_LABEL);
+        assert!(
+            backups.iter().any(|path| std::fs::read_to_string(path)
+                .is_ok_and(|text| text.contains("orphan  refs/stash"))),
+            "expected refs/stash backup in {backups:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_auto_repair_refuses_non_safe_refs_without_pruning() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        let broken_ref = tmp.path().join(".git/refs/heads/broken");
+        std::fs::write(&broken_ref, "cafebabecafebabecafebabecafebabecafebabe\n").unwrap();
 
         let report = preflight_archive_integrity(tmp.path(), BootCheckMode::AutoRepair);
 
@@ -412,6 +759,8 @@ mod tests {
         assert!(report.has_findings());
         assert_eq!(report.auto_repaired_count, 0);
         assert!(!report.should_abort());
+        assert!(broken_ref.exists());
+        assert!(backup_files(tmp.path(), ARCHIVE_ROOT_LABEL).is_empty());
     }
 
     #[test]
