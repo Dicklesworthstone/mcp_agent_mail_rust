@@ -17244,24 +17244,29 @@ fn doctor_project_search_roots() -> Vec<PathBuf> {
     }
 
     if roots.is_empty() {
-        let data_projects = PathBuf::from("/data/projects");
-        if data_projects.is_dir() {
-            roots.insert(data_projects);
-        }
-
-        if let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from)
-            && home_dir.is_dir()
-        {
-            roots.insert(home_dir);
-        }
-
-        let tmp_dir = PathBuf::from("/tmp");
-        if tmp_dir.is_dir() {
-            roots.insert(tmp_dir);
-        }
+        roots = doctor_default_project_search_roots();
     }
 
     roots.into_iter().collect()
+}
+
+fn doctor_default_project_search_roots() -> std::collections::BTreeSet<PathBuf> {
+    let mut roots = std::collections::BTreeSet::new();
+
+    let data_projects = PathBuf::from("/data/projects");
+    if data_projects.is_dir() {
+        roots.insert(data_projects);
+    }
+
+    if let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from)
+        && home_dir.is_dir()
+    {
+        roots.insert(home_dir);
+    }
+
+    // Temp roots can contain unbounded transient test directories. Operators
+    // can still opt in with AM_DOCTOR_PROJECT_SEARCH_ROOTS when they need it.
+    roots
 }
 
 fn doctor_collect_normalization_db_project_identities()
@@ -37417,6 +37422,25 @@ startup_timeout_sec = 42
             metadata["human_key_source"],
             DoctorProjectMetadataNormalizationSource::SyntheticPlaceholder.as_str()
         );
+    }
+
+    #[test]
+    fn doctor_default_project_search_roots_do_not_scan_tmp() {
+        let roots = doctor_default_project_search_roots();
+
+        assert!(
+            !roots.contains(&PathBuf::from("/tmp")),
+            "doctor check must not scan unbounded temporary directories by default"
+        );
+    }
+
+    #[test]
+    fn doctor_project_search_roots_allows_explicit_tmp_override() {
+        with_doctor_project_search_roots_for_test("/tmp", || {
+            let roots = doctor_project_search_roots();
+
+            assert_eq!(roots, vec![PathBuf::from("/tmp")]);
+        });
     }
 
     #[test]

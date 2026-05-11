@@ -126,17 +126,20 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
     let db_path = PathBuf::from(&resolved.canonical_path);
     let storage_root = &config.storage_root;
 
-    // Lightweight recovery-lock + ownership probes (no full verdict).
+    // Recovery status is included in the request-path health_check response, so
+    // keep the common healthy path bounded. Ownership discovery walks /proc and
+    // is only needed once we know we will actually surface recovery context.
     let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
-    let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
 
-    // Compute the full verdict to get the durability state.
+    // Compute a fast verdict to get the durability state without archive and
+    // ownership walks; full doctor/startup diagnostics still use the default
+    // verdict options.
     let verdict = compute_mailbox_verdict(
         &config.database_url,
         storage_root.as_path(),
         &VerdictOptions {
-            skip_integrity_check: true, // integrity is already probed elsewhere
-            ..VerdictOptions::default()
+            skip_integrity_check: true,
+            ..VerdictOptions::fast()
         },
     );
     let durability = DurabilityState::from_mailbox_state(verdict.state);
@@ -148,6 +151,7 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         return None;
     }
 
+    let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
     let mode = durability.to_string();
 
     let owner = match ownership.disposition {

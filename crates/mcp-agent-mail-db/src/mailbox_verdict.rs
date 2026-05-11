@@ -736,6 +736,7 @@ fn compute_state_from_probes(probes: &[ProbeResult], recovery_lock_held: bool) -
 
 /// Options for verdict computation.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VerdictOptions {
     /// Skip archive count check (for offline/fast-path).
     pub skip_archive_count: bool,
@@ -745,6 +746,12 @@ pub struct VerdictOptions {
     pub stale_threshold_abs: usize,
     /// Skip integrity check (expensive).
     pub skip_integrity_check: bool,
+    /// Skip live mailbox owner discovery.
+    ///
+    /// Ownership inspection walks `/proc/*/fd` on Linux to find processes with
+    /// open mailbox files. That is appropriate for doctor/startup diagnostics,
+    /// but too expensive for request-path readiness probes.
+    pub skip_ownership_check: bool,
     /// Check for recovery lock.
     pub check_recovery_lock: bool,
 }
@@ -756,6 +763,7 @@ impl Default for VerdictOptions {
             stale_threshold_pct: 0.05,
             stale_threshold_abs: 100,
             skip_integrity_check: false,
+            skip_ownership_check: false,
             check_recovery_lock: true,
         }
     }
@@ -768,6 +776,7 @@ impl VerdictOptions {
         Self {
             skip_archive_count: true,
             skip_integrity_check: true,
+            skip_ownership_check: true,
             check_recovery_lock: true,
             ..Default::default()
         }
@@ -896,7 +905,22 @@ pub fn compute_mailbox_verdict(
         probes.push(probe_recovery_lock(&recovery_lock));
     }
 
-    let ownership = inspect_mailbox_ownership(&db_path, archive_root);
+    let ownership = if options.skip_ownership_check {
+        MailboxOwnershipState {
+            disposition: MailboxOwnershipDisposition::Unowned,
+            storage_lock_path: archive_root
+                .join(".mailbox.activity.lock")
+                .display()
+                .to_string(),
+            sqlite_lock_path: format!("{}.activity.lock", db_path.display()),
+            processes: Vec::new(),
+            competing_pids: Vec::new(),
+            supervised_restart_required: false,
+            detail: "Ownership inspection skipped by verdict options".to_string(),
+        }
+    } else {
+        inspect_mailbox_ownership(&db_path, archive_root)
+    };
     probes.push(probe_mailbox_ownership(&ownership));
 
     let integrity = if !options.skip_integrity_check
@@ -2306,6 +2330,7 @@ mod tests {
         let opts = VerdictOptions::default();
         assert!(!opts.skip_archive_count);
         assert!(!opts.skip_integrity_check);
+        assert!(!opts.skip_ownership_check);
         assert!(opts.check_recovery_lock);
         assert!((opts.stale_threshold_pct - 0.05).abs() < f64::EPSILON);
         assert_eq!(opts.stale_threshold_abs, 100);
@@ -2316,6 +2341,7 @@ mod tests {
         let opts = VerdictOptions::fast();
         assert!(opts.skip_archive_count);
         assert!(opts.skip_integrity_check);
+        assert!(opts.skip_ownership_check);
         assert!(opts.check_recovery_lock);
     }
 
@@ -2542,6 +2568,40 @@ first body
             .find(|probe| probe.name == "schema_populated")
             .expect("schema_populated probe present");
         assert_eq!(schema_probe.severity, ProbeSeverity::Error);
+    }
+
+    #[test]
+    fn compute_mailbox_verdict_fast_skips_ownership_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = dir.path().join("fast-ownership.sqlite3");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        drop(conn);
+
+        let verdict = compute_mailbox_verdict(
+            &format!("sqlite:///{}", db_path.display()),
+            &storage_root,
+            &VerdictOptions::fast(),
+        );
+
+        assert_eq!(
+            verdict.ownership.disposition,
+            MailboxOwnershipDisposition::Unowned
+        );
+        assert!(
+            verdict
+                .ownership
+                .detail
+                .contains("Ownership inspection skipped"),
+            "fast verdict should not walk live process ownership: {verdict:?}"
+        );
+        let ownership_probe = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "mailbox_ownership")
+            .expect("mailbox ownership probe present");
+        assert!(ownership_probe.passed);
     }
 
     // ── DurabilityState tests ────────────────────────────────────────
