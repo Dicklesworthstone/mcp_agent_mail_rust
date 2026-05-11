@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod known_bad_git_no_override;
 pub mod stale_archive_lock;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
