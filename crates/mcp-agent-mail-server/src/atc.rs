@@ -4894,7 +4894,11 @@ impl AtcEngine {
                     .saturating_add((self.config.probe_interval_micros / 2).max(250_000)),
             );
         }
-        next_review
+        if next_review <= now_micros {
+            now_micros.saturating_add((self.config.probe_interval_micros / 2).max(250_000))
+        } else {
+            next_review
+        }
     }
 
     fn reschedule_agent(&mut self, agent: &str, now_micros: i64, incumbent_k: f64) {
@@ -11801,6 +11805,40 @@ mod alien_enhancement_tests {
             "compaction should keep only the latest schedule entry per agent"
         );
         assert_eq!(engine.scheduled_agent_count(), 1);
+    }
+
+    #[test]
+    fn stale_flaky_agent_reschedules_into_future() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("LaggingAgent", "claude-code", None);
+
+        let now = 600_000_000;
+        let old_activity = 1_000_000;
+        {
+            let entry = engine
+                .agents
+                .get_mut("LaggingAgent")
+                .expect("registered agent");
+            entry.state = LivenessState::Flaky;
+            entry.rhythm.last_activity_ts = old_activity;
+            entry.probe_sent_at = old_activity;
+        }
+
+        let incumbent_k = engine.incumbent_policy.suspicion_k;
+        engine.reschedule_agent("LaggingAgent", now, incumbent_k);
+
+        let entry = engine.agents.get("LaggingAgent").expect("registered agent");
+        let minimum_future_delay = (engine.config.probe_interval_micros / 2).max(250_000);
+        assert_eq!(
+            entry.next_review_micros,
+            now.saturating_add(minimum_future_delay)
+        );
+        assert!(
+            engine
+                .next_scheduled_review_micros()
+                .is_some_and(|due| due > now),
+            "stale flaky agents must not be requeued at an already-overdue timestamp"
+        );
     }
 
     #[test]
