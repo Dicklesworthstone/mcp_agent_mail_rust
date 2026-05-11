@@ -191,6 +191,54 @@ e2e_assert_event_count_at_least() {
     fi
 }
 
+assert_auto_repair_evidence_ledger() {
+    local scenario="$1"
+    local ledger_path="$2"
+
+    if [ ! -s "${ledger_path}" ]; then
+        e2e_fail "${scenario}: evidence ledger audit row missing"
+        return 0
+    fi
+
+    if python3 - "${ledger_path}" <<'PY'
+import json
+import sys
+
+ledger_path = sys.argv[1]
+with open(ledger_path, encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("decision_point") != "boot_check.auto_repair":
+            continue
+        if record.get("action") != "prune_safe_missing_refs":
+            continue
+        evidence = record.get("evidence", {})
+        actions = evidence.get("actions", [])
+        before_refs = evidence.get("before_state", {}).get("missing_refs", [])
+        after_refs = evidence.get("after_state", {}).get("missing_refs", [])
+        pruned_refs = evidence.get("pruned_refs", [])
+        backup_path = evidence.get("backup_path")
+        if (
+            "refs/stash" in before_refs
+            and "refs/stash" in pruned_refs
+            and "refs/stash" not in after_refs
+            and backup_path
+            and any(action.startswith("backup_refs:") for action in actions)
+            and "prune_ref:refs/stash" in actions
+            and "repack_refs" in actions
+        ):
+            sys.exit(0)
+sys.exit(1)
+PY
+    then
+        e2e_pass "${scenario}: evidence ledger records backup/prune diff"
+    else
+        e2e_fail "${scenario}: evidence ledger audit row incomplete"
+    fi
+}
+
 run_server_case() {
     local scenario="$1"
     local storage_root="$2"
@@ -329,17 +377,19 @@ scenario_seeded_findings_abort_mode_refuses_to_start() {
 scenario_auto_repair_with_correct_gate_repairs_then_starts() {
     local scenario="$1"
     local storage="${WORK}/${scenario}/storage"
-    local stash_ref backup_glob
+    local stash_ref backup_glob ledger_path
     mkdir -p "${storage}/projects"
     init_orphan_repo "${scenario}" "${storage}/projects/orphan_one" || return 1
     stash_ref="${storage}/projects/orphan_one/.git/refs/stash"
     backup_glob="${storage}/backups/refs/orphan_one/"'*.txt'
+    ledger_path="$(scenario_dir "${scenario}")/evidence/ledger.jsonl"
 
     if ! run_server_case \
         "${scenario}" \
         "${storage}" \
         "auto_repair" \
-        "AM_BOOT_AUTO_REPAIR=I_UNDERSTAND_THE_RISKS"
+        "AM_BOOT_AUTO_REPAIR=I_UNDERSTAND_THE_RISKS" \
+        "AM_EVIDENCE_LEDGER_PATH=${ledger_path}"
     then
         e2e_fail "${scenario}: gated auto_repair repairs and starts"
         return 1
@@ -361,6 +411,7 @@ scenario_auto_repair_with_correct_gate_repairs_then_starts() {
     else
         e2e_fail "${scenario}: backup file missing"
     fi
+    assert_auto_repair_evidence_ledger "${scenario}" "${ledger_path}"
 }
 
 scenario_auto_repair_without_gate_logs_error_and_demotes() {
