@@ -19,8 +19,38 @@
 #![forbid(unsafe_code)]
 
 pub mod stale_archive_lock;
+pub mod stale_listener_pid_hint;
 
 use serde::Serialize;
+
+/// `kill(pid, 0)` — POSIX liveness probe.
+///
+/// Shared helper for any fixer that needs to check whether a recorded
+/// PID is still running. Returns `true` iff the process exists, including
+/// when the caller lacks permission to signal it.
+///
+/// Caveat: `Pid::from_raw(0)` would refer to the calling process's
+/// process group on POSIX, so PID 0 is rejected before probing. Tests
+/// that want a guaranteed-dead PID should use `999_999_999` (above all
+/// known `pid_max` values on Linux/macOS/BSD).
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
+    use nix::unistd::Pid;
+
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+
+    pid_probe_result_is_alive(nix::sys::signal::kill(Pid::from_raw(pid), None))
+}
+
+fn pid_probe_result_is_alive(result: Result<(), nix::errno::Errno>) -> bool {
+    use nix::errno::Errno;
+
+    matches!(result, Ok(()) | Err(Errno::EPERM))
+}
 
 /// One finding from a detector. Serializable for inclusion in
 /// `report.json::findings[]`.
@@ -56,4 +86,23 @@ pub struct FixOutcome {
     pub actions_taken: usize,
     pub actions_skipped: usize,
     pub quarantined_paths: Vec<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::errno::Errno;
+
+    #[test]
+    fn pid_probe_result_treats_permission_denied_as_alive() {
+        assert!(pid_probe_result_is_alive(Ok(())));
+        assert!(pid_probe_result_is_alive(Err(Errno::EPERM)));
+        assert!(!pid_probe_result_is_alive(Err(Errno::ESRCH)));
+    }
+
+    #[test]
+    fn is_pid_alive_rejects_posix_special_or_unrepresentable_values() {
+        assert!(!is_pid_alive(0));
+        assert!(!is_pid_alive(u32::MAX));
+    }
 }

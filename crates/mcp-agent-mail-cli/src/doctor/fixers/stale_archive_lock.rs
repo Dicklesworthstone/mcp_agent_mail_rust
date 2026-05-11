@@ -122,7 +122,7 @@ pub fn detect(archive_roots: &[PathBuf], stale_seconds: u64) -> Vec<StaleArchive
             .and_then(|first| first.trim().parse::<u32>().ok());
 
         if let Some(pid) = recorded_pid
-            && is_pid_alive(pid)
+            && super::is_pid_alive(pid)
         {
             continue; // live holder; not stale
         }
@@ -201,18 +201,7 @@ pub fn fix(
     })
 }
 
-/// True iff `kill(pid, 0)` succeeds (process exists).
-///
-/// On Linux/macOS, sending signal 0 is the canonical liveness probe —
-/// no signal is delivered, but `ESRCH` returns if the PID has no
-/// process. We use `nix::sys::signal::kill` which is already in the
-/// project's dependency graph.
-fn is_pid_alive(pid: u32) -> bool {
-    use nix::sys::signal;
-    use nix::unistd::Pid;
-    let pid = Pid::from_raw(pid as i32);
-    matches!(signal::kill(pid, None), Ok(()))
-}
+// `is_pid_alive` moved to `super::is_pid_alive` (pass-9 dedup).
 
 #[cfg(test)]
 mod tests {
