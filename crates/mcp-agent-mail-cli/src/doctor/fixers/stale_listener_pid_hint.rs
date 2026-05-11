@@ -305,10 +305,7 @@ mod tests {
         let hint = td.path().join("listener.pid");
         fs::write(&hint, "").unwrap();
         let findings = detect(&[hint], DEFAULT_STALE_SECONDS);
-        assert!(
-            findings.is_empty(),
-            "recent empty hint must be left alone"
-        );
+        assert!(findings.is_empty(), "recent empty hint must be left alone");
     }
 
     #[test]
@@ -386,8 +383,7 @@ mod tests {
         let ctx = ctx_for(&td, run_id);
         let _ = fix(&ctx, &findings[0]).unwrap();
         drop(ctx);
-        let summary =
-            crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
+        let summary = crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
         assert_eq!(summary.actions_replayed, 1);
         assert!(hint.exists(), "undo must restore the hint file");
         assert_eq!(fs::read_to_string(&hint).unwrap(), "999999999\n");
