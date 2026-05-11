@@ -1915,12 +1915,35 @@ fn boot_check_mode_from_config(
     }
 }
 
+static BOOT_ARCHIVE_PREFLIGHT_SNAPSHOT: std::sync::LazyLock<
+    Mutex<Option<tui_bridge::BootArchivePreflightSnapshot>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+fn record_boot_archive_preflight_report(
+    report: &mcp_agent_mail_storage::boot_check::BootCheckReport,
+) {
+    *lock_mutex(&BOOT_ARCHIVE_PREFLIGHT_SNAPSHOT) = Some(
+        tui_bridge::BootArchivePreflightSnapshot::from_report(report),
+    );
+}
+
+fn latest_boot_archive_preflight_snapshot() -> Option<tui_bridge::BootArchivePreflightSnapshot> {
+    lock_mutex(&BOOT_ARCHIVE_PREFLIGHT_SNAPSHOT).clone()
+}
+
+fn apply_latest_boot_archive_preflight_snapshot(state: &tui_bridge::TuiSharedState) {
+    if let Some(snapshot) = latest_boot_archive_preflight_snapshot() {
+        state.update_boot_archive_preflight_snapshot(snapshot);
+    }
+}
+
 fn ensure_boot_archive_preflight_pass(
     config: &mcp_agent_mail_core::Config,
 ) -> std::io::Result<mcp_agent_mail_storage::boot_check::BootCheckReport> {
     let mode = boot_check_mode_from_config(config);
     let report =
         mcp_agent_mail_storage::boot_check::preflight_archive_integrity(&config.storage_root, mode);
+    record_boot_archive_preflight_report(&report);
     if !report.should_abort() {
         return Ok(report);
     }
@@ -2954,6 +2977,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
 
     // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
     let tui_state = tui_bridge::TuiSharedState::new(config);
+    apply_latest_boot_archive_preflight_snapshot(&tui_state);
     let http_runtime = match build_http_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -9126,6 +9150,7 @@ impl HttpState {
                 RateLimitRedisState::Disabled
             };
         let ws_state_fallback = tui_bridge::TuiSharedState::new(&config);
+        apply_latest_boot_archive_preflight_snapshot(&ws_state_fallback);
         Self {
             router,
             server_info,
@@ -15271,6 +15296,30 @@ mod tests {
         assert_eq!(report.total_projects, 1);
         assert!(report.has_findings());
         assert!(!report.should_abort());
+    }
+
+    #[test]
+    fn boot_archive_preflight_snapshot_populates_tui_state() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *lock_mutex(&BOOT_ARCHIVE_PREFLIGHT_SNAPSHOT) = None;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        create_broken_archive_project(&storage_root, "broken-project");
+        let config = config_for_boot_check_storage(&storage_root, "warn");
+
+        ensure_boot_archive_preflight_pass(&config).expect("warn mode allows startup");
+        let state = tui_bridge::TuiSharedState::new(&config);
+        apply_latest_boot_archive_preflight_snapshot(&state);
+
+        let snapshot = state
+            .boot_archive_preflight_snapshot()
+            .expect("boot snapshot");
+        assert_eq!(snapshot.mode, "warn");
+        assert_eq!(snapshot.findings_count, 1);
+        assert_eq!(snapshot.findings[0].project, "broken-project");
     }
 
     #[test]

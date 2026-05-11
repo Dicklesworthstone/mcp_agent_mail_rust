@@ -34,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::tui_bridge::{
-    ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState, query_params_explain_empty_state,
+    BootArchivePreflightSnapshot, ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState,
+    query_params_explain_empty_state,
 };
 use crate::tui_events::MailEvent;
 use crate::tui_widgets::{
@@ -666,6 +667,71 @@ fn git_ref_integrity_project_summary_json(project: &GitRefIntegrityProjectSummar
     })
 }
 
+fn boot_archive_preflight_json(snapshot: Option<&BootArchivePreflightSnapshot>) -> Value {
+    let Some(snapshot) = snapshot else {
+        return Value::Null;
+    };
+
+    json!({
+        "mode": snapshot.mode,
+        "root": snapshot.root.as_str(),
+        "started_at": snapshot.started_at.as_str(),
+        "completed_at": snapshot.completed_at.as_str(),
+        "duration_ms": snapshot.duration_ms,
+        "total_projects": snapshot.total_projects,
+        "findings_count": snapshot.findings_count,
+        "auto_repaired_count": snapshot.auto_repaired_count,
+        "should_abort": snapshot.should_abort,
+        "level": boot_archive_preflight_level(Some(snapshot)).label(),
+        "findings": snapshot
+            .findings
+            .iter()
+            .map(|finding| {
+                json!({
+                    "project": finding.project.as_str(),
+                    "kind": finding.kind,
+                    "detail": finding.detail.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn boot_archive_preflight_level(snapshot: Option<&BootArchivePreflightSnapshot>) -> Level {
+    let Some(snapshot) = snapshot else {
+        return Level::Warn;
+    };
+    if snapshot.should_abort {
+        Level::Fail
+    } else if snapshot.findings_count > 0 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn boot_archive_preflight_affected_projects(snapshot: &BootArchivePreflightSnapshot) -> usize {
+    let mut projects = snapshot
+        .findings
+        .iter()
+        .map(|finding| finding.project.as_str())
+        .collect::<Vec<_>>();
+    projects.sort_unstable();
+    projects.dedup();
+    projects.len()
+}
+
+fn boot_archive_preflight_remediation(snapshot: &BootArchivePreflightSnapshot) -> Option<String> {
+    if snapshot.findings_count == 0 {
+        return None;
+    }
+    Some(format!(
+        "archive has {} boot finding(s) across {} project candidate(s). Run: am doctor fix-orphan-refs --all --dry-run",
+        snapshot.findings_count,
+        boot_archive_preflight_affected_projects(snapshot),
+    ))
+}
+
 /// Build the optional System Health payload for supported `/mail/ws-state`
 /// polling consumers.
 #[must_use]
@@ -687,8 +753,10 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
         &dismissals,
         Utc::now(),
     );
+    let boot_archive_preflight = state.boot_archive_preflight_snapshot();
 
     json!({
+        "boot_archive_preflight": boot_archive_preflight_json(boot_archive_preflight.as_ref()),
         "git_ref_integrity": {
             "enabled": sweep.enabled(),
             "interval_seconds": sweep.interval_seconds(),
@@ -736,6 +804,7 @@ struct DiagnosticsSnapshot {
     agent_attention_count: usize,
     agent_attention_summary: String,
     git_ref_integrity: GitRefIntegritySweepState,
+    boot_archive_preflight: Option<BootArchivePreflightSnapshot>,
     /// Tailscale remote-access URL with token, if Tailscale is active.
     remote_url: Option<String>,
 }
@@ -1289,6 +1358,35 @@ impl SystemHealthScreen {
             "Git retry guard".to_string(),
             segfault_badge.text(),
         ));
+        let boot_level = boot_archive_preflight_level(snap.boot_archive_preflight.as_ref());
+        let boot_detail = snap.boot_archive_preflight.as_ref().map_or_else(
+            || "not observed for this process".to_string(),
+            |boot| {
+                format!(
+                    "mode={} projects={} findings={} repaired={} duration={}ms completed={}",
+                    boot.mode,
+                    boot.total_projects,
+                    boot.findings_count,
+                    boot.auto_repaired_count,
+                    boot.duration_ms,
+                    boot.completed_at
+                )
+            },
+        );
+        lines.push(level_styled_line(
+            boot_level,
+            &tp,
+            "Last boot check".to_string(),
+            boot_detail,
+        ));
+        if let Some(boot) = snap.boot_archive_preflight.as_ref()
+            && let Some(remediation) = boot_archive_preflight_remediation(boot)
+        {
+            lines.push(Line::from_spans([
+                Span::styled("       ", accent_style),
+                Span::styled(remediation, crate::tui_theme::text_warning(&tp)),
+            ]));
+        }
         let git_sweep = &snap.git_ref_integrity;
         let git_level = git_sweep.level();
         lines.push(level_styled_line(
@@ -1876,8 +1974,17 @@ impl SystemHealthScreen {
                 "no orphan-ref banner".to_string()
             }
         });
+        let boot_summary = snap.boot_archive_preflight.as_ref().map_or_else(
+            || "boot=not observed".to_string(),
+            |boot| {
+                format!(
+                    "boot={} projects={} findings={} repaired={}",
+                    boot.mode, boot.total_projects, boot.findings_count, boot.auto_repaired_count
+                )
+            },
+        );
         let body = format!(
-            "state={} batch={} interval={}s cursor={}->{} scanned={}/{}\nfindings={} checked={checked}\n{project_summary}\n{banner}",
+            "state={} batch={} interval={}s cursor={}->{} scanned={}/{}\nfindings={} checked={checked}\n{boot_summary}\n{project_summary}\n{banner}",
             if sweep.enabled { "enabled" } else { "disabled" },
             sweep.batch_size,
             sweep.interval_seconds,
@@ -1924,6 +2031,21 @@ impl SystemHealthScreen {
                 title: "TCP connection failed".to_string(),
                 rationale: Some(err.clone()),
                 next_steps: Vec::new(),
+            });
+        }
+        if let Some(boot) = snap.boot_archive_preflight.as_ref()
+            && let Some(remediation) = boot_archive_preflight_remediation(boot)
+        {
+            findings.push(FindingCard {
+                severity: if boot.should_abort {
+                    AnomalySeverity::High
+                } else {
+                    AnomalySeverity::Medium
+                },
+                confidence: 0.95,
+                title: "Boot archive check findings".to_string(),
+                rationale: Some(remediation),
+                next_steps: vec!["am doctor fix-orphan-refs --all --dry-run".to_string()],
             });
         }
         if let Some(banner) = snap.git_ref_integrity.banner() {
@@ -2190,6 +2312,19 @@ impl SystemHealthScreen {
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
         if let Some(err) = &snap.tcp_error {
             lines.push(("[CRIT] TCP".into(), err.clone(), Some(tp.severity_critical)));
+        }
+        if let Some(boot) = snap.boot_archive_preflight.as_ref()
+            && let Some(remediation) = boot_archive_preflight_remediation(boot)
+        {
+            lines.push((
+                "[WARN] Boot check".into(),
+                remediation,
+                Some(if boot.should_abort {
+                    tp.severity_critical
+                } else {
+                    tp.severity_warn
+                }),
+            ));
         }
         if let Some(banner) = snap.git_ref_integrity.banner() {
             lines.push(("[WARN] Git refs".into(), banner, Some(tp.severity_warn)));
@@ -2460,6 +2595,9 @@ fn format_uptime(d: Duration) -> String {
 fn critical_finding_count(snap: &DiagnosticsSnapshot) -> usize {
     usize::from(snap.tcp_error.is_some())
         + usize::from(snap.git_ref_integrity.level() == Level::Fail)
+        + usize::from(
+            boot_archive_preflight_level(snap.boot_archive_preflight.as_ref()) == Level::Fail,
+        )
         + snap
             .lines
             .iter()
@@ -2737,6 +2875,26 @@ fn build_system_health_recommendations(
         });
     }
 
+    if let Some(boot) = snap.boot_archive_preflight.as_ref()
+        && let Some(remediation) = boot_archive_preflight_remediation(boot)
+    {
+        recommendations.push(OperatorRecommendationCard {
+            severity: if boot.should_abort {
+                AnomalySeverity::High
+            } else {
+                AnomalySeverity::Medium
+            },
+            confidence: 0.95,
+            action: "Review boot archive findings".to_string(),
+            reason: remediation,
+            evidence: format!(
+                "mode={} projects={} findings={} duration={}ms",
+                boot.mode, boot.total_projects, boot.findings_count, boot.duration_ms
+            ),
+            safe_command: "am doctor fix-orphan-refs --all --dry-run".to_string(),
+        });
+    }
+
     recommendations
 }
 
@@ -2768,6 +2926,7 @@ fn run_diagnostics(
         token_len: env_cfg.http_bearer_token.as_deref().map_or(0, str::len),
         atc: crate::atc_operator_snapshot(),
         atc_canary: load_latest_atc_canary_report(&env_cfg.storage_root),
+        boot_archive_preflight: state.boot_archive_preflight_snapshot(),
         remote_url,
         ..Default::default()
     };
@@ -3764,6 +3923,29 @@ mod tests {
 
     fn test_state() -> Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn boot_preflight_snapshot(findings_count: usize) -> BootArchivePreflightSnapshot {
+        BootArchivePreflightSnapshot {
+            mode: "warn",
+            root: "/tmp/mailbox".to_string(),
+            started_at: "2026-05-11T00:00:00Z".to_string(),
+            completed_at: "2026-05-11T00:00:01Z".to_string(),
+            duration_ms: 12,
+            total_projects: 3,
+            findings_count,
+            auto_repaired_count: 0,
+            should_abort: false,
+            findings: if findings_count == 0 {
+                Vec::new()
+            } else {
+                vec![crate::tui_bridge::BootArchivePreflightFindingSnapshot {
+                    project: "proj-a".to_string(),
+                    kind: "orphan_refs",
+                    detail: "refs/stash target missing".to_string(),
+                }]
+            },
+        }
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -5228,6 +5410,51 @@ mod tests {
     }
 
     #[test]
+    fn text_view_surfaces_last_boot_check() {
+        let state = test_state();
+        let mut screen = test_screen(DiagnosticsSnapshot {
+            boot_archive_preflight: Some(boot_preflight_snapshot(1)),
+            ..Default::default()
+        });
+        screen.view_mode = ViewMode::Text;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Last boot check"),
+            "expected boot-check row, got:\n{text}"
+        );
+        assert!(
+            text.contains("am doctor fix-orphan-refs --all --dry-run"),
+            "expected boot-check remediation, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn ws_state_payload_includes_boot_archive_preflight() {
+        let state = test_state();
+        state.update_boot_archive_preflight_snapshot(boot_preflight_snapshot(1));
+
+        let payload = ws_state_system_health_payload(&state);
+
+        assert_eq!(
+            payload["boot_archive_preflight"]["mode"].as_str(),
+            Some("warn")
+        );
+        assert_eq!(
+            payload["boot_archive_preflight"]["findings_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            payload["boot_archive_preflight"]["findings"][0]["kind"].as_str(),
+            Some("orphan_refs")
+        );
+    }
+
+    #[test]
     fn atc_health_widget_renders_observability_summary() {
         let screen = test_screen(DiagnosticsSnapshot::default());
         let snap = DiagnosticsSnapshot {
@@ -5762,6 +5989,7 @@ reason = "manual prune"
                 }],
                 ..Default::default()
             },
+            boot_archive_preflight: Some(boot_preflight_snapshot(0)),
             ..Default::default()
         };
 
@@ -5781,6 +6009,10 @@ reason = "manual prune"
         assert!(
             text.contains("proj-c"),
             "expected project row, got:\n{text}"
+        );
+        assert!(
+            text.contains("boot=warn"),
+            "expected boot-check summary, got:\n{text}"
         );
     }
 

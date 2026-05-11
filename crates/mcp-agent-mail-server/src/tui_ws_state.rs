@@ -23,7 +23,7 @@ fn include_value_requests_system_health(value: &str) -> bool {
     value.split(',').any(|item| {
         matches!(
             item.trim(),
-            "system_health" | "health_sweep" | "git_ref_integrity"
+            "system_health" | "health_sweep" | "git_ref_integrity" | "boot_archive_preflight"
         )
     })
 }
@@ -59,7 +59,7 @@ fn parse_poll_params(query: Option<&str>) -> PollParams {
             "include" => {
                 include_system_health |= include_value_requests_system_health(value);
             }
-            "system_health" | "health_sweep" | "git_ref_integrity" => {
+            "system_health" | "health_sweep" | "git_ref_integrity" | "boot_archive_preflight" => {
                 include_system_health |= query_value_truthy(value);
             }
             _ => {}
@@ -220,6 +220,12 @@ mod tests {
         let parsed = parse_poll_params(Some("health_sweep=1"));
         assert!(parsed.include_system_health);
 
+        let parsed = parse_poll_params(Some("include=boot_archive_preflight"));
+        assert!(parsed.include_system_health);
+
+        let parsed = parse_poll_params(Some("boot_archive_preflight=1"));
+        assert!(parsed.include_system_health);
+
         let parsed = parse_poll_params(Some("system_health=false"));
         assert!(!parsed.include_system_health);
     }
@@ -275,6 +281,12 @@ mod tests {
                 .pointer("/system_health/git_ref_integrity/total_projects")
                 .is_some(),
             "system health payload must include git-ref integrity summary"
+        );
+        assert!(
+            payload
+                .pointer("/system_health/boot_archive_preflight")
+                .is_some(),
+            "system health payload must include boot archive preflight summary"
         );
     }
 

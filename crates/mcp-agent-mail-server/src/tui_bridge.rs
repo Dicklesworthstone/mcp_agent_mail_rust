@@ -214,6 +214,88 @@ impl ScreenDiagnosticSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootArchivePreflightFindingSnapshot {
+    pub project: String,
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootArchivePreflightSnapshot {
+    pub mode: &'static str,
+    pub root: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub duration_ms: u64,
+    pub total_projects: u32,
+    pub findings_count: usize,
+    pub auto_repaired_count: u32,
+    pub should_abort: bool,
+    pub findings: Vec<BootArchivePreflightFindingSnapshot>,
+}
+
+impl BootArchivePreflightSnapshot {
+    #[must_use]
+    pub fn from_report(report: &mcp_agent_mail_storage::boot_check::BootCheckReport) -> Self {
+        Self {
+            mode: boot_archive_preflight_mode_label(report.mode),
+            root: report.root.display().to_string(),
+            started_at: report.started_at.clone(),
+            completed_at: report.completed_at.clone(),
+            duration_ms: report.duration_ms,
+            total_projects: report.total_projects,
+            findings_count: report.findings.len(),
+            auto_repaired_count: report.auto_repaired_count,
+            should_abort: report.should_abort(),
+            findings: report
+                .findings
+                .iter()
+                .map(BootArchivePreflightFindingSnapshot::from_finding)
+                .collect(),
+        }
+    }
+}
+
+impl BootArchivePreflightFindingSnapshot {
+    #[must_use]
+    fn from_finding(finding: &mcp_agent_mail_storage::boot_check::BootCheckFinding) -> Self {
+        Self {
+            project: finding.project.clone(),
+            kind: boot_archive_preflight_finding_kind_label(&finding.kind),
+            detail: finding.detail.clone(),
+        }
+    }
+}
+
+const fn boot_archive_preflight_mode_label(
+    mode: mcp_agent_mail_storage::boot_check::BootCheckMode,
+) -> &'static str {
+    match mode {
+        mcp_agent_mail_storage::boot_check::BootCheckMode::Warn => "warn",
+        mcp_agent_mail_storage::boot_check::BootCheckMode::Abort => "abort",
+        mcp_agent_mail_storage::boot_check::BootCheckMode::AutoRepair => "auto_repair",
+    }
+}
+
+fn boot_archive_preflight_finding_kind_label(
+    kind: &mcp_agent_mail_storage::boot_check::BootCheckFindingKind,
+) -> &'static str {
+    match kind {
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::RepoBroken => "repo_broken",
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::OrphanRefs(_) => "orphan_refs",
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::DanglingBranch(_) => {
+            "dangling_branch"
+        }
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::ConfigCorrupt(_) => {
+            "config_corrupt"
+        }
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::AutoRepaired { .. } => {
+            "auto_repaired"
+        }
+    }
+}
+
 fn env_truthy(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
         let normalized = value.trim().to_ascii_lowercase();
@@ -371,6 +453,8 @@ pub struct TuiSharedState {
     /// Per-screen diagnostics snapshots, keyed by insertion sequence.
     screen_diagnostics: Mutex<VecDeque<(u64, ScreenDiagnosticSnapshot)>>,
     screen_diagnostic_seq: AtomicU64,
+    /// Last archive boot-time integrity check report produced during startup.
+    boot_archive_preflight: Mutex<Option<BootArchivePreflightSnapshot>>,
     /// Generation counter bumped when `update_db_stats` changes semantic DB content.
     db_stats_gen: AtomicU64,
     /// Whether the DB poller most recently observed a usable MCP Agent Mail DB context.
@@ -425,6 +509,7 @@ impl TuiSharedState {
             console_log_seq: AtomicU64::new(0),
             screen_diagnostics: Mutex::new(VecDeque::with_capacity(SCREEN_DIAGNOSTIC_CAPACITY)),
             screen_diagnostic_seq: AtomicU64::new(0),
+            boot_archive_preflight: Mutex::new(None),
             db_stats_gen: AtomicU64::new(0),
             db_context_available: AtomicBool::new(false),
             urgent_ack_pending: AtomicBool::new(false),
@@ -839,6 +924,22 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = snapshot;
+    }
+
+    #[must_use]
+    pub fn boot_archive_preflight_snapshot(&self) -> Option<BootArchivePreflightSnapshot> {
+        self.boot_archive_preflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn update_boot_archive_preflight_snapshot(&self, snapshot: BootArchivePreflightSnapshot) {
+        let mut guard = self
+            .boot_archive_preflight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(snapshot);
     }
 
     /// Snapshot the active message drag state, if any.
