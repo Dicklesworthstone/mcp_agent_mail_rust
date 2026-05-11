@@ -2334,6 +2334,20 @@ pub enum DoctorCommand {
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
     },
+
+    /// List all per-FM detector+fixer pairs registered in this build.
+    ///
+    /// Each registered fixer reports its FM id, severity, subsystem,
+    /// `Op` write pattern, auto-fixability, and one-line description.
+    /// JSON by default for agent consumption. Use this to discover what
+    /// concrete per-FM remediations are available before invoking
+    /// `am doctor --fix --only <fm-id>`.
+    #[command(name = "fixers")]
+    Fixers {
+        /// Output format. JSON is the default.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -5783,6 +5797,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             doctor::handle_explain(&target, &finding_id, format)
         }
         DoctorCommand::Selftest { format } => doctor::handle_selftest(format),
+        DoctorCommand::Fixers { format } => doctor::handle_fixers(format),
     }
 }
 

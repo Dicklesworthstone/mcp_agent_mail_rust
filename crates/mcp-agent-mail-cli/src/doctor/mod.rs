@@ -257,6 +257,64 @@ pub fn handle_explain(
 /// }
 /// ```
 ///
+/// `am doctor fixers` — pass-14 verb. Lists all registered per-FM
+/// detector+fixer pairs in this build with their Op pattern, severity,
+/// subsystem, and auto-fixable status.
+///
+/// JSON output is an array of `FixerSpec` from `fixers::registry()`.
+/// Table output is a human-readable table for operator browsing.
+pub fn handle_fixers(format: Option<CliOutputFormat>) -> CliResult<()> {
+    let specs = fixers::registry();
+    let fmt = format.unwrap_or_else(|| {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            CliOutputFormat::Table
+        } else {
+            CliOutputFormat::Json
+        }
+    });
+    match fmt {
+        CliOutputFormat::Json | CliOutputFormat::Toon => {
+            let envelope = serde_json::json!({
+                "schema_version": "1.0",
+                "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+                "tool": "am",
+                "tool_version": env!("CARGO_PKG_VERSION"),
+                "fixers_count": specs.len(),
+                "fixers": specs,
+            });
+            let s = serde_json::to_string_pretty(&envelope)
+                .map_err(|e| CliError::Other(format!("serializing fixers: {e}")))?;
+            println!("{s}");
+        }
+        CliOutputFormat::Table => {
+            println!(
+                "{:6}  {:9}  {:28}  {:14}  {:6}  {}",
+                "Sev", "Auto-fix", "Subsystem", "Op", "Count", "FM id"
+            );
+            println!(
+                "{:6}  {:9}  {:28}  {:14}  {:6}  {}",
+                "---", "--------", "----------------------------", "--------------", "-----", "-----"
+            );
+            for spec in &specs {
+                println!(
+                    "{:6}  {:9}  {:28}  {:14}  {:6}  {}",
+                    spec.severity,
+                    if spec.auto_fixable { "yes" } else { "no" },
+                    spec.subsystem,
+                    spec.op_pattern,
+                    "",
+                    spec.id,
+                );
+                println!("                                                                              {}", spec.one_line_description);
+            }
+            println!();
+            println!("Total: {} FM-level fixers registered", specs.len());
+        }
+    }
+    Ok(())
+}
+
 /// Exit 0 on pass, 1 on fail. For operators after install/upgrade.
 pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
     use std::fs;
