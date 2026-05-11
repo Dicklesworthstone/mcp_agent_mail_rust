@@ -18,18 +18,20 @@
     clippy::too_many_lines
 )]
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use ftui::{Event, Frame, GraphemePool, KeyCode, KeyEvent};
-use ftui_harness::Rect;
+use ftui_harness::{Rect, buffer_to_text};
 use ftui_runtime::program::Model;
 
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_decision::DiffAction;
+use mcp_agent_mail_server::tui_focus::FocusGraph;
 use mcp_agent_mail_server::tui_screens::{
     ALL_SCREEN_IDS, MailScreen, MailScreenId, agents::AgentsScreen, analytics::AnalyticsScreen,
     archive_browser::ArchiveBrowserScreen, atc::AtcScreen, attachments::AttachmentExplorerScreen,
@@ -38,6 +40,7 @@ use mcp_agent_mail_server::tui_screens::{
     search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
     timeline::TimelineScreen, tool_metrics::ToolMetricsScreen,
 };
+use mcp_agent_mail_server::tui_theme;
 
 // ── Budget constants (microseconds) ──────────────────────────────────
 
@@ -90,6 +93,35 @@ struct TuiBaselineReport {
     all_within_budget: bool,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ScreenGateSample {
+    screen: String,
+    theme: &'static str,
+    terminal_size: String,
+    iterations: usize,
+    warmup: usize,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+    budget_p95_us: u64,
+    within_budget: bool,
+    rendered_lines: usize,
+    max_line_width: usize,
+    focus_nodes: usize,
+    frame_text_path: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ScreenGateReport {
+    generated_at: String,
+    agent: &'static str,
+    bead: &'static str,
+    samples: Vec<ScreenGateSample>,
+    failures: Vec<String>,
+    all_within_budget: bool,
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {
@@ -107,6 +139,16 @@ fn artifacts_dir() -> PathBuf {
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn gate_artifacts_dir() -> PathBuf {
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let dir = repo_root().join(format!(
+        "tests/artifacts/tui/accessibility_latency_gates/{ts}_{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(dir.join("frames")).expect("create TUI gate artifact dir");
     dir
 }
 
@@ -178,6 +220,79 @@ fn make_sample(
         max_us: sorted.last().copied().unwrap_or(0),
         budget_p95_us,
         within_budget: p95 < budget_p95_us,
+    }
+}
+
+fn config_for_theme(theme: &'static str, high_contrast: bool) -> Config {
+    Config {
+        tui_high_contrast: high_contrast,
+        tui_reduced_motion: true,
+        tui_effects: false,
+        tui_ambient: "off".to_string(),
+        tui_theme: theme.to_string(),
+        ..Default::default()
+    }
+}
+
+fn render_screen_text(
+    screen: &dyn MailScreen,
+    state: &TuiSharedState,
+    width: u16,
+    height: u16,
+) -> String {
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(width, height, &mut pool);
+    screen.view(&mut frame, Rect::new(0, 0, width, height), state);
+    buffer_to_text(&frame.buffer)
+}
+
+fn screen_frame_artifact_path(
+    run_dir: &Path,
+    theme: &str,
+    screen: &str,
+    width: u16,
+    height: u16,
+) -> PathBuf {
+    run_dir
+        .join("frames")
+        .join(format!("{theme}_{screen}_{width}x{height}.rendered.txt"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_screen_gate_sample(
+    id: MailScreenId,
+    theme: &'static str,
+    width: u16,
+    height: u16,
+    warmup: usize,
+    iterations: usize,
+    sorted: &[u64],
+    frame_text_path: &Path,
+    rendered_text: &str,
+) -> ScreenGateSample {
+    let p95 = percentile(sorted, 95.0);
+    ScreenGateSample {
+        screen: screen_name(id).to_string(),
+        theme,
+        terminal_size: format!("{width}x{height}"),
+        iterations,
+        warmup,
+        p50_us: percentile(sorted, 50.0),
+        p95_us: p95,
+        p99_us: percentile(sorted, 99.0),
+        max_us: sorted.last().copied().unwrap_or(0),
+        budget_p95_us: BUDGET_SCREEN_RENDER_P95_US,
+        within_budget: p95 < BUDGET_SCREEN_RENDER_P95_US,
+        rendered_lines: rendered_text.lines().count(),
+        max_line_width: rendered_text
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or_default(),
+        focus_nodes: FocusGraph::for_screen(id, Rect::new(0, 0, width, height))
+            .nodes()
+            .len(),
+        frame_text_path: frame_text_path.display().to_string(),
     }
 }
 
@@ -290,6 +405,127 @@ fn new_screen(id: MailScreenId, state: &Arc<TuiSharedState>) -> Box<dyn MailScre
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn accessibility_latency_gate_all_screens() {
+    let run_dir = gate_artifacts_dir();
+    let theme_modes = [("default", false), ("high_contrast", true)];
+    let terminal_sizes = [(80u16, 24u16), (160u16, 48u16)];
+    let warmup = 2;
+    let iterations = 20;
+    let mut samples = Vec::new();
+    let mut failures = Vec::new();
+
+    for (theme, high_contrast) in theme_modes {
+        tui_theme::init_named_theme(theme);
+        let config = config_for_theme(theme, high_contrast);
+        let state = TuiSharedState::new(&config);
+        let mut app = MailAppModel::with_config(Arc::clone(&state), &config);
+        assert_eq!(
+            app.accessibility().high_contrast,
+            high_contrast,
+            "model accessibility should match theme mode {theme}"
+        );
+        assert!(
+            app.accessibility().reduced_motion,
+            "gate config should enable reduced motion for deterministic frames"
+        );
+
+        for (width, height) in terminal_sizes {
+            for &id in ALL_SCREEN_IDS {
+                let _ = app.update(MailMsg::SwitchScreen(id));
+                let mut screen = new_screen(id, &state);
+                screen.tick(1, &state);
+                let screen_label = screen_name(id);
+                let frame_path = screen_frame_artifact_path(
+                    &run_dir,
+                    theme,
+                    &screen_label.to_ascii_lowercase(),
+                    width,
+                    height,
+                );
+
+                let sorted = measure(warmup, iterations, || {
+                    let mut pool = GraphemePool::new();
+                    let mut frame = Frame::new(width, height, &mut pool);
+                    screen.view(&mut frame, Rect::new(0, 0, width, height), &state);
+                });
+                let rendered_text = render_screen_text(screen.as_ref(), &state, width, height);
+                fs::write(&frame_path, &rendered_text).expect("write frame text artifact");
+
+                let sample = make_screen_gate_sample(
+                    id,
+                    theme,
+                    width,
+                    height,
+                    warmup,
+                    iterations,
+                    &sorted,
+                    &frame_path,
+                    &rendered_text,
+                );
+
+                if rendered_text.trim().is_empty() {
+                    failures.push(format!(
+                        "{screen_label} {theme} {width}x{height} rendered a blank frame: {}",
+                        frame_path.display()
+                    ));
+                }
+                if sample.rendered_lines > usize::from(height)
+                    || sample.max_line_width > usize::from(width)
+                {
+                    failures.push(format!(
+                        "{screen_label} {theme} {width}x{height} overflowed frame (lines={} max_width={}): {}",
+                        sample.rendered_lines,
+                        sample.max_line_width,
+                        frame_path.display()
+                    ));
+                }
+                if sample.focus_nodes == 0 {
+                    failures.push(format!(
+                        "{screen_label} {theme} {width}x{height} has no focus graph nodes: {}",
+                        frame_path.display()
+                    ));
+                }
+                if !sample.within_budget {
+                    failures.push(format!(
+                        "{screen_label} {theme} {width}x{height} p95={}us exceeded {}us: {}",
+                        sample.p95_us,
+                        sample.budget_p95_us,
+                        frame_path.display()
+                    ));
+                }
+
+                samples.push(sample);
+            }
+        }
+    }
+
+    tui_theme::init_named_theme("default");
+    let all_within_budget = samples.iter().all(|sample| sample.within_budget);
+    let report = ScreenGateReport {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        agent: "CreamBirch",
+        bead: "br-oci92.14",
+        samples,
+        failures,
+        all_within_budget,
+    };
+    let report_path = run_dir.join("summary.json");
+    fs::write(
+        &report_path,
+        serde_json::to_string_pretty(&report).expect("serialize TUI screen gate report"),
+    )
+    .expect("write TUI screen gate report");
+    eprintln!("artifact: {}", report_path.display());
+
+    assert!(
+        report.failures.is_empty(),
+        "TUI accessibility/latency gate failures:\n{}\nsummary: {}",
+        report.failures.join("\n"),
+        report_path.display(),
+    );
+}
 
 /// PERF-TUI-1: Model cold-start initialization.
 /// Measures `MailAppModel::new()` which creates all 13 screens, palette, etc.
