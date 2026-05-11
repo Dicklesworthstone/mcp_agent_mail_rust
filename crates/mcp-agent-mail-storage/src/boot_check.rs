@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
 use git2::Repository;
@@ -24,6 +24,7 @@ const TARGET: &str = "mcp_agent_mail::boot_check";
 const CALLER: &str = "startup.boot_check";
 const GIT_VERSION: &str = "libgit2";
 const ARCHIVE_ROOT_LABEL: &str = "archive-root";
+const BOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +68,7 @@ pub enum BootCheckFindingKind {
     OrphanRefs(Vec<String>),
     DanglingBranch(String),
     ConfigCorrupt(String),
+    TimeoutExceeded { elapsed_ms: u64, timeout_ms: u64 },
     AutoRepaired { actions: Vec<String> },
 }
 
@@ -106,7 +108,7 @@ enum CandidateCheck {
     Broken(BootCheckFinding),
     MissingRefs {
         refs: Vec<PrunableRef>,
-        finding: BootCheckFinding,
+        findings: Vec<BootCheckFinding>,
     },
 }
 
@@ -122,6 +124,14 @@ struct AutoRepairOutcome {
 /// Read-only boot preflight for archive git repositories.
 #[must_use]
 pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootCheckReport {
+    preflight_archive_integrity_with_timeout(root, mode, BOOT_CHECK_TIMEOUT)
+}
+
+fn preflight_archive_integrity_with_timeout(
+    root: &Path,
+    mode: BootCheckMode,
+    timeout: Duration,
+) -> BootCheckReport {
     let started = Utc::now();
     let started_at = started.to_rfc3339_opts(SecondsFormat::Micros, true);
     let timer = Instant::now();
@@ -146,13 +156,31 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
 
     let mut findings = Vec::new();
     let mut auto_repaired_count = 0_u32;
-    for candidate in &candidates {
+    let mut effective_mode = mode;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if let Some(timeout_finding) = timeout_finding_if_exceeded(root, timer.elapsed(), timeout) {
+            effective_mode = BootCheckMode::Abort;
+            emit_timeout_exceeded(
+                &repo_slug,
+                &args_hash,
+                timeout_finding_elapsed_ms(&timeout_finding),
+                duration_ms(timeout),
+                total_projects,
+                u32::try_from(index).unwrap_or(u32::MAX),
+            );
+            findings.push(timeout_finding);
+            break;
+        }
+
         match check_candidate(candidate) {
             CandidateCheck::Clean => {}
             CandidateCheck::Broken(finding) => findings.push(finding),
-            CandidateCheck::MissingRefs { refs, finding } => {
+            CandidateCheck::MissingRefs {
+                refs,
+                findings: missing_ref_findings,
+            } => {
                 if mode != BootCheckMode::AutoRepair {
-                    findings.push(finding);
+                    findings.extend(missing_ref_findings);
                     continue;
                 }
 
@@ -166,22 +194,38 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
                             auto_repaired_count = auto_repaired_count.saturating_add(1);
                         }
                         if !outcome.after_refs.is_empty() {
-                            findings.push(missing_refs_finding_from_names(
+                            findings.extend(missing_refs_findings_from_names(
                                 candidate,
-                                outcome.after_refs.clone(),
+                                &outcome.after_refs,
                             ));
                         }
                     }
                     Err(error) => {
                         emit_auto_repair_failed(&repo_slug, &args_hash, mode, candidate, &error);
-                        findings.push(BootCheckFinding {
-                            project: finding.project,
-                            kind: finding.kind,
-                            detail: format!("auto repair failed: {error}; {}", finding.detail),
-                        });
+                        findings.extend(missing_ref_findings.into_iter().map(|finding| {
+                            BootCheckFinding {
+                                project: finding.project,
+                                kind: finding.kind,
+                                detail: format!("auto repair failed: {error}; {}", finding.detail),
+                            }
+                        }));
                     }
                 }
             }
+        }
+
+        if let Some(timeout_finding) = timeout_finding_if_exceeded(root, timer.elapsed(), timeout) {
+            effective_mode = BootCheckMode::Abort;
+            emit_timeout_exceeded(
+                &repo_slug,
+                &args_hash,
+                timeout_finding_elapsed_ms(&timeout_finding),
+                duration_ms(timeout),
+                total_projects,
+                u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX),
+            );
+            findings.push(timeout_finding);
+            break;
         }
     }
     for finding in &findings {
@@ -193,7 +237,7 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
             duration_ms = 0_u64,
             outcome = "error",
             git_version = GIT_VERSION,
-            mode = mode.observability_label(),
+            mode = effective_mode.observability_label(),
             project = %finding.project,
             kind = finding_kind_label(&finding.kind),
             detail = %finding.detail,
@@ -203,7 +247,7 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
 
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let duration_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let should_abort = mode == BootCheckMode::Abort && !findings.is_empty();
+    let should_abort = effective_mode == BootCheckMode::Abort && !findings.is_empty();
     tracing::info!(
         target: TARGET,
         repo_slug = %repo_slug,
@@ -216,7 +260,7 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
             "success"
         },
         git_version = GIT_VERSION,
-        mode = mode.observability_label(),
+        mode = effective_mode.observability_label(),
         total_projects,
         findings_count = findings.len(),
         auto_repaired_count,
@@ -232,7 +276,7 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
             duration_ms,
             outcome = "error",
             git_version = GIT_VERSION,
-            mode = mode.observability_label(),
+            mode = effective_mode.observability_label(),
             total_projects,
             findings_count = findings.len(),
             auto_repaired_count,
@@ -241,7 +285,7 @@ pub fn preflight_archive_integrity(root: &Path, mode: BootCheckMode) -> BootChec
     }
 
     BootCheckReport {
-        mode,
+        mode: effective_mode,
         root: root.to_path_buf(),
         started_at,
         completed_at,
@@ -258,8 +302,68 @@ fn finding_kind_label(kind: &BootCheckFindingKind) -> &'static str {
         BootCheckFindingKind::OrphanRefs(_) => "orphan_refs",
         BootCheckFindingKind::DanglingBranch(_) => "dangling_branch",
         BootCheckFindingKind::ConfigCorrupt(_) => "config_corrupt",
+        BootCheckFindingKind::TimeoutExceeded { .. } => "timeout_exceeded",
         BootCheckFindingKind::AutoRepaired { .. } => "auto_repaired",
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn timeout_finding_if_exceeded(
+    root: &Path,
+    elapsed: Duration,
+    timeout: Duration,
+) -> Option<BootCheckFinding> {
+    if elapsed < timeout {
+        return None;
+    }
+    let elapsed_ms = duration_ms(elapsed);
+    let timeout_ms = duration_ms(timeout);
+    Some(BootCheckFinding {
+        project: ARCHIVE_ROOT_LABEL.to_string(),
+        kind: BootCheckFindingKind::TimeoutExceeded {
+            elapsed_ms,
+            timeout_ms,
+        },
+        detail: format!(
+            "archive boot check exceeded timeout after {elapsed_ms}ms \
+             while scanning {}",
+            root.display()
+        ),
+    })
+}
+
+fn timeout_finding_elapsed_ms(finding: &BootCheckFinding) -> u64 {
+    match &finding.kind {
+        BootCheckFindingKind::TimeoutExceeded { elapsed_ms, .. } => *elapsed_ms,
+        _ => 0,
+    }
+}
+
+fn emit_timeout_exceeded(
+    repo_slug: &str,
+    args_hash: &str,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+    total_projects: u32,
+    scanned_projects: u32,
+) {
+    tracing::error!(
+        target: TARGET,
+        repo_slug = %repo_slug,
+        caller = CALLER,
+        args_hash = %args_hash,
+        duration_ms = elapsed_ms,
+        outcome = "error",
+        git_version = GIT_VERSION,
+        mode = BootCheckMode::Abort.observability_label(),
+        total_projects,
+        scanned_projects,
+        timeout_ms,
+        "boot_check_timeout_exceeded"
+    );
 }
 
 fn boot_check_args_hash(root: &Path, mode: BootCheckMode) -> String {
@@ -334,8 +438,8 @@ fn check_candidate(candidate: &ArchiveRepoCandidate) -> CandidateCheck {
     match detect_missing_refs(&candidate.path) {
         Ok(refs) if refs.is_empty() => CandidateCheck::Clean,
         Ok(refs) => {
-            let finding = missing_refs_finding(candidate, &refs);
-            CandidateCheck::MissingRefs { refs, finding }
+            let findings = missing_refs_findings(candidate, &refs);
+            CandidateCheck::MissingRefs { refs, findings }
         }
         Err(error) => CandidateCheck::Broken(BootCheckFinding {
             project: candidate.project.clone(),
@@ -348,30 +452,62 @@ fn check_candidate(candidate: &ArchiveRepoCandidate) -> CandidateCheck {
     }
 }
 
-fn missing_refs_finding(
+fn missing_refs_findings(
     candidate: &ArchiveRepoCandidate,
     refs: &[PrunableRef],
-) -> BootCheckFinding {
-    let ref_names = refs
-        .iter()
-        .map(|finding| finding.ref_name.clone())
-        .collect::<Vec<_>>();
-    missing_refs_finding_from_names(candidate, ref_names)
+) -> Vec<BootCheckFinding> {
+    let mut findings = Vec::new();
+    let mut orphan_ref_names = Vec::new();
+    for missing_ref in refs {
+        if missing_ref.ref_name.starts_with("refs/heads/") {
+            findings.push(BootCheckFinding {
+                project: candidate.project.clone(),
+                detail: format!(
+                    "dangling branch ref target missing: {} -> {} ({})",
+                    missing_ref.ref_name, missing_ref.target_sha, missing_ref.reason
+                ),
+                kind: BootCheckFindingKind::DanglingBranch(missing_ref.ref_name.clone()),
+            });
+        } else {
+            orphan_ref_names.push(missing_ref.ref_name.clone());
+        }
+    }
+    findings.extend(missing_refs_findings_from_names(
+        candidate,
+        &orphan_ref_names,
+    ));
+    findings
 }
 
-fn missing_refs_finding_from_names(
+fn missing_refs_findings_from_names(
     candidate: &ArchiveRepoCandidate,
-    ref_names: Vec<String>,
-) -> BootCheckFinding {
-    BootCheckFinding {
-        project: candidate.project.clone(),
-        detail: format!(
-            "{} missing ref target(s): {}",
-            ref_names.len(),
-            ref_names.join(", ")
-        ),
-        kind: BootCheckFindingKind::OrphanRefs(ref_names),
+    ref_names: &[String],
+) -> Vec<BootCheckFinding> {
+    let mut findings = Vec::new();
+    let mut orphan_ref_names = Vec::new();
+    for ref_name in ref_names {
+        if ref_name.starts_with("refs/heads/") {
+            findings.push(BootCheckFinding {
+                project: candidate.project.clone(),
+                detail: format!("dangling branch ref target still missing: {ref_name}"),
+                kind: BootCheckFindingKind::DanglingBranch(ref_name.clone()),
+            });
+        } else {
+            orphan_ref_names.push(ref_name.clone());
+        }
     }
+    if !orphan_ref_names.is_empty() {
+        findings.push(BootCheckFinding {
+            project: candidate.project.clone(),
+            detail: format!(
+                "{} missing ref target(s): {}",
+                orphan_ref_names.len(),
+                orphan_ref_names.join(", ")
+            ),
+            kind: BootCheckFindingKind::OrphanRefs(orphan_ref_names),
+        });
+    }
+    findings
 }
 
 fn auto_repair_missing_refs(
@@ -724,6 +860,33 @@ mod tests {
     }
 
     #[test]
+    fn preflight_detects_dangling_branch_refs_in_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        let fake = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        std::fs::write(
+            tmp.path().join(".git/refs/heads/crash-recovery"),
+            format!("{fake}\n"),
+        )
+        .unwrap();
+
+        let report = preflight_archive_integrity(tmp.path(), BootCheckMode::Warn);
+
+        assert_eq!(report.total_projects, 1);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].project, ARCHIVE_ROOT_LABEL);
+        assert_eq!(
+            report.findings[0].kind,
+            BootCheckFindingKind::DanglingBranch("refs/heads/crash-recovery".to_string())
+        );
+        assert!(
+            report.findings[0]
+                .detail
+                .contains("dangling branch ref target missing")
+        );
+    }
+
+    #[test]
     fn preflight_auto_repair_prunes_safe_orphan_refs_after_backup() {
         let tmp = TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
@@ -777,6 +940,27 @@ mod tests {
 
         assert!(report.has_findings());
         assert!(report.should_abort());
+    }
+
+    #[test]
+    fn preflight_timeout_exceeded_escalates_to_abort() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        let report = preflight_archive_integrity_with_timeout(
+            tmp.path(),
+            BootCheckMode::Warn,
+            Duration::ZERO,
+        );
+
+        assert_eq!(report.mode, BootCheckMode::Abort);
+        assert!(report.has_findings());
+        assert!(report.should_abort());
+        assert_eq!(report.findings[0].project, ARCHIVE_ROOT_LABEL);
+        assert!(matches!(
+            report.findings[0].kind,
+            BootCheckFindingKind::TimeoutExceeded { timeout_ms: 0, .. }
+        ));
     }
 
     #[test]

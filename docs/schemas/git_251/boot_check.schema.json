@@ -13,7 +13,8 @@
     "boot_check_aborted",
     "boot_check_auto_repair_attempted",
     "boot_check_auto_repair_failed",
-    "boot_check_auto_repair_gate_violated"
+    "boot_check_auto_repair_gate_violated",
+    "boot_check_timeout_exceeded"
   ],
   "x-planned": true,
   "x-drift-required-fields": [],
@@ -40,7 +41,9 @@
         "kind": { "type": "string" },
         "detail": { "type": "string" },
         "findings_count": { "type": "integer", "minimum": 0 },
+        "scanned_projects": { "type": "integer", "minimum": 0 },
         "auto_repaired_count": { "type": "integer", "minimum": 0 },
+        "timeout_ms": { "type": "integer", "minimum": 0 },
         "degraded": { "type": "boolean" },
         "actions": {
           "type": "array",

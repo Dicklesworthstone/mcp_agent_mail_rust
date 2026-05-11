@@ -290,6 +290,9 @@ fn boot_archive_preflight_finding_kind_label(
         mcp_agent_mail_storage::boot_check::BootCheckFindingKind::ConfigCorrupt(_) => {
             "config_corrupt"
         }
+        mcp_agent_mail_storage::boot_check::BootCheckFindingKind::TimeoutExceeded { .. } => {
+            "timeout_exceeded"
+        }
         mcp_agent_mail_storage::boot_check::BootCheckFindingKind::AutoRepaired { .. } => {
             "auto_repaired"
         }
