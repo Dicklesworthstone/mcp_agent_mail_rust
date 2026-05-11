@@ -208,9 +208,15 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 Use the web overseer form when humans need to redirect active agents quickly:
 
 1. Open `/mail/{project}/overseer/compose`.
-2. Select recipients and write subject/body (optionally set `thread_id`).
-3. Submit to send a high-importance message as `HumanOverseer`.
-4. Agents receive it through normal inbox resources/tools and can reply in-thread.
+2. Select explicit recipients, enter the intervention reason, and write subject/body
+   (optionally set `thread_id`).
+3. For multiple recipients, confirm the final recipient list before sending.
+4. Submit to send a high-importance message as `HumanOverseer`.
+5. Agents receive it through normal inbox resources/tools and can reply in-thread.
+
+The overseer route rejects broadcast-style sends and unknown recipients. The
+response and structured audit event include the `HumanOverseer` marker, reason,
+recipient list, thread id, and contact-policy-bypass flag.
 
 ### 4.6 Agent Network Graph Interpretation (Contacts)
 

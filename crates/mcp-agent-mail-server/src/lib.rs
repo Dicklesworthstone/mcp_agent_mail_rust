@@ -18177,6 +18177,29 @@ first body
     }
 
     #[test]
+    fn bearer_auth_runs_before_overseer_send_body_parsing() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/mail/my-project/overseer/send",
+            &[("Content-Type", "application/json")],
+            Some(peer),
+        );
+        req.body = b"not json".to_vec();
+        let resp = block_on(state.handle(req));
+        assert_eq!(
+            resp.status, 401,
+            "missing bearer auth must 401 before overseer JSON parsing"
+        );
+    }
+
+    #[test]
     fn bearer_auth_runs_before_content_type_validation() {
         let config = mcp_agent_mail_core::Config {
             http_bearer_token: Some("secret".to_string()),
