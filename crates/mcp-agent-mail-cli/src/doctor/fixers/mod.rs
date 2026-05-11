@@ -333,6 +333,92 @@ pub fn dispatch_only(
     Ok(outcome)
 }
 
+/// Outcome of `detect_only`: findings plus the inferred action-count
+/// that a full `dispatch_only` would have planned. Used by
+/// `am doctor fix --only <fm-id> --list` (pass-16) to preview work
+/// without invoking the `mutate()` chokepoint at all.
+#[derive(Debug, Default, Serialize)]
+pub struct DetectOutcome {
+    pub fm_id: String,
+    pub findings_count: usize,
+    /// Each finding's `remediation.estimated_actions` summed. For
+    /// detect-only FMs this is 0.
+    pub actions_planned: usize,
+    pub findings: Vec<Finding>,
+}
+
+/// Pure-detection variant of `dispatch_only`. Calls only `detect()`,
+/// never `fix()`. Skips the `mutate()` chokepoint entirely — no
+/// run-dir scaffolding, no `actions.jsonl` lines, no advisory locks.
+///
+/// Used by `am doctor fix --only <fm-id> --list`: an operator can
+/// preview the findings (and the inferred action plan) before
+/// committing to a real `--fix` run. Roughly an order of magnitude
+/// cheaper than `--dry-run` for FMs whose `fix()` does substantial
+/// pre-mutate work (JSON re-parse, etc.).
+pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome, DispatchError> {
+    let mut outcome = DetectOutcome {
+        fm_id: fm_id.to_string(),
+        ..Default::default()
+    };
+
+    let raw_findings: Vec<Finding> = if fm_id == stale_archive_lock::FM_ID {
+        stale_archive_lock::detect(&inputs.archive_roots, inputs.stale_seconds)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_head_or_ref_lock::FM_ID {
+        stale_head_or_ref_lock::detect(&inputs.archive_roots, inputs.stale_seconds)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_listener_pid_hint::FM_ID {
+        stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, inputs.stale_seconds)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == known_bad_git_no_override::FM_ID {
+        let git_inputs = inputs
+            .git_detect
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: known_bad_git_no_override::FM_ID,
+                field: "git_detect",
+            })?;
+        known_bad_git_no_override::detect(git_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == world_readable_token_bak::FM_ID {
+        world_readable_token_bak::detect(&inputs.token_backup_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == wrong_mcp_url_json::FM_ID {
+        let canonical = inputs
+            .canonical_mcp_url
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: wrong_mcp_url_json::FM_ID,
+                field: "canonical_mcp_url",
+            })?;
+        wrong_mcp_url_json::detect(canonical, &inputs.mcp_config_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else {
+        return Err(DispatchError::UnknownFm(fm_id.to_string()));
+    };
+
+    outcome.findings_count = raw_findings.len();
+    outcome.actions_planned = raw_findings
+        .iter()
+        .map(|f| f.remediation.estimated_actions)
+        .sum();
+    outcome.findings = raw_findings;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

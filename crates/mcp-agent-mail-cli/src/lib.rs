@@ -2157,6 +2157,18 @@ pub enum DoctorCommand {
         /// valid ids. Unknown ids exit 64 with a hint.
         #[arg(long)]
         only: Option<String>,
+        /// With `--only <fm-id>`: detect-only, no `fix()` call (pass-16).
+        ///
+        /// Faster than `--dry-run` because the `mutate()` chokepoint is
+        /// not exercised at all (no run-dir scaffolding, no actions
+        /// recorded). Emits the same `findings[]` array a real fix
+        /// would, plus an `actions_planned` count. Useful before
+        /// committing to a real run.
+        ///
+        /// Without `--only`, this flag is rejected (exit 2) — listing
+        /// every FM's findings simultaneously isn't supported yet.
+        #[arg(long)]
+        list: bool,
     },
 
     /// Detect and optionally prune refs whose target objects are missing
@@ -5752,9 +5764,19 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             yes,
             json,
             only,
+            list,
         } => {
             if let Some(fm_id) = only {
-                doctor::handle_fix_only(&fm_id, dry_run, yes, json)
+                if list {
+                    doctor::handle_fix_only_list(&fm_id, json)
+                } else {
+                    doctor::handle_fix_only(&fm_id, dry_run, yes, json)
+                }
+            } else if list {
+                eprintln!(
+                    "error: `--list` requires `--only <fm-id>` (use `am doctor fixers` to enumerate registered FMs, or `am doctor --json` for a full check)"
+                );
+                Err(CliError::ExitCode(2))
             } else {
                 handle_doctor_fix(dry_run, yes, json)
             }
@@ -35937,12 +35959,14 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         json,
                         only,
+                        list,
                     },
             } => {
                 assert!(!dry_run);
                 assert!(!yes);
                 assert!(!json);
                 assert!(only.is_none());
+                assert!(!list);
             }
             _ => panic!("expected Doctor Fix"),
         }
@@ -35960,12 +35984,14 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         json,
                         only,
+                        list,
                     },
             } => {
                 assert!(dry_run);
                 assert!(yes);
                 assert!(json);
                 assert!(only.is_none());
+                assert!(!list);
             }
             _ => panic!("expected Doctor Fix"),
         }
@@ -35991,6 +36017,7 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         json,
                         only,
+                        list,
                     },
             } => {
                 assert!(dry_run);
@@ -36000,6 +36027,43 @@ http_headers = { Authorization = "Bearer secret" }
                     only.as_deref(),
                     Some("fm-archive-state-files-stale-archive-lock-from-dead-pid")
                 );
+                assert!(!list);
+            }
+            _ => panic!("expected Doctor Fix"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_doctor_fix_only_list_flag() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "fix",
+            "--only",
+            "fm-archive-state-files-stale-archive-lock-from-dead-pid",
+            "--list",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action:
+                    DoctorCommand::Fix {
+                        dry_run,
+                        yes,
+                        json,
+                        only,
+                        list,
+                    },
+            } => {
+                assert!(!dry_run);
+                assert!(!yes);
+                assert!(json);
+                assert_eq!(
+                    only.as_deref(),
+                    Some("fm-archive-state-files-stale-archive-lock-from-dead-pid")
+                );
+                assert!(list);
             }
             _ => panic!("expected Doctor Fix"),
         }

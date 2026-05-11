@@ -125,6 +125,61 @@ fn dispatch_only_unknown_fm_id_returns_error() {
 }
 
 #[test]
+fn detect_only_finds_stale_lock_without_touching_chokepoint() {
+    // Pass-16: pure detection. Asserts no .doctor/runs/, no
+    // actions.jsonl, no quarantine — just findings.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = plant_stale_lock_archive(&td, "alpha");
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: vec![archive.clone()],
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+    };
+
+    let outcome =
+        fixers::detect_only(fixers::stale_archive_lock::FM_ID, &inputs).expect("detect_only");
+    assert_eq!(outcome.fm_id, fixers::stale_archive_lock::FM_ID);
+    assert_eq!(outcome.findings_count, 1);
+    assert_eq!(outcome.actions_planned, 1);
+    assert_eq!(outcome.findings.len(), 1);
+
+    // Lock must STILL EXIST — detect_only never quarantines.
+    let lock_path = archive.join(".git").join("index.lock");
+    assert!(
+        lock_path.exists(),
+        "detect_only must NOT remove the lock — it's read-only"
+    );
+    // No run-dir scaffolded under the tempdir.
+    assert!(
+        !td.path().join(".doctor").exists(),
+        "detect_only must not create .doctor/ scaffolding"
+    );
+}
+
+#[test]
+fn detect_only_unknown_fm_id_returns_error() {
+    let inputs = DispatchInputs {
+        repo_root: PathBuf::from("/tmp"),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        stale_seconds: 300,
+    };
+    let err =
+        fixers::detect_only("fm-also-not-real-xxx", &inputs).expect_err("unknown id should error");
+    assert!(matches!(err, fixers::DispatchError::UnknownFm(_)));
+}
+
+#[test]
 fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
     let td = tempfile::TempDir::new().expect("tempdir");
     let ctx = build_ctx(

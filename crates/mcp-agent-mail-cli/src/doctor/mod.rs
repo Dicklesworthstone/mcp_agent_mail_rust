@@ -437,6 +437,16 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         }
     };
 
+    // Pass-16: in dry-run the dispatcher's `actions_taken` is actually
+    // "planned" (chokepoint returned success without writing). Surface
+    // both fields explicitly so JSON consumers can pick the right one
+    // without needing to inspect `dry_run` first.
+    let (actions_taken, actions_planned) = if dry_run {
+        (0_usize, outcome.actions_taken)
+    } else {
+        (outcome.actions_taken, outcome.actions_taken)
+    };
+
     let envelope = serde_json::json!({
         "schema_version": "1.0",
         "doctor_version": runs::DOCTOR_VERSION,
@@ -447,10 +457,13 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         "severity": spec.severity,
         "subsystem": spec.subsystem,
         "op_pattern": spec.op_pattern,
+        "mode": if dry_run { "dry-run" } else { "fix" },
         "dry_run": dry_run,
         "run_id": run_id,
         "run_dir": run_dir.to_string_lossy(),
         "duration_ms": started_at.elapsed().as_millis() as u64,
+        "actions_taken": actions_taken,
+        "actions_planned": actions_planned,
         "outcome": outcome,
     });
 
@@ -463,6 +476,91 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     if !dry_run && outcome.actions_taken > 0 {
         runs::update_latest_symlink(&repo_root, &run_id).ok();
     }
+    Ok(())
+}
+
+/// Pass-16 verb: `am doctor fix --only <fm-id> --list`.
+///
+/// Pure-detection variant — runs the FM's detector and prints a JSON
+/// envelope of `findings[]` + `actions_planned` without touching the
+/// `mutate()` chokepoint. No run-dir is scaffolded, no `actions.jsonl`
+/// is written, no advisory locks are taken. Exit codes match
+/// `handle_fix_only` for usage errors (64 for unknown id / missing
+/// input); the success path always exits 0 — findings ≠ failure.
+pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
+    use std::time::Instant;
+
+    let started_at = Instant::now();
+    let specs = fixers::registry();
+    let Some(spec) = specs.iter().find(|s| s.id == fm_id) else {
+        eprintln!("error: unknown FM id `{fm_id}`");
+        eprintln!("valid ids (run `am doctor fixers --format json` for the contract):");
+        for s in &specs {
+            eprintln!("  {} [{}, {}]", s.id, s.severity, s.subsystem);
+        }
+        return Err(CliError::ExitCode(64));
+    };
+
+    let repo_root =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("getting cwd: {e}")))?;
+    let config = Config::from_env();
+    let storage_root = config.storage_root.clone();
+    let canonical_mcp_url = format!(
+        "http://{}:{}{}",
+        config.http_host, config.http_port, config.http_path
+    );
+
+    let inputs = fixers::DispatchInputs {
+        repo_root: repo_root.clone(),
+        archive_roots: enumerate_archive_roots(&storage_root),
+        pid_hint_candidates: default_listener_pid_candidates(&storage_root),
+        token_backup_candidates: default_token_backup_candidates(&storage_root),
+        mcp_config_candidates: default_mcp_config_candidates(),
+        canonical_mcp_url: Some(canonical_mcp_url),
+        git_detect: build_git_detect_inputs(),
+        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+    };
+
+    let outcome = match fixers::detect_only(fm_id, &inputs) {
+        Ok(o) => o,
+        Err(fixers::DispatchError::UnknownFm(id)) => {
+            eprintln!("error: detect_only reported unknown FM id `{id}` after registry check");
+            return Err(CliError::ExitCode(64));
+        }
+        Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+            eprintln!("error: required input `{field}` missing for FM `{fm_id}`");
+            return Err(CliError::ExitCode(64));
+        }
+        Err(fixers::DispatchError::Mutate(me)) => {
+            // detect_only doesn't call mutate(), so this is structurally
+            // impossible. Treat as an internal invariant violation.
+            eprintln!("error: internal — detect_only surfaced a MutateError: {me}");
+            return Err(CliError::ExitCode(1));
+        }
+    };
+
+    let envelope = serde_json::json!({
+        "schema_version": "1.0",
+        "doctor_version": runs::DOCTOR_VERSION,
+        "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "fm_id": fm_id,
+        "severity": spec.severity,
+        "subsystem": spec.subsystem,
+        "op_pattern": spec.op_pattern,
+        "mode": "list",
+        "duration_ms": started_at.elapsed().as_millis() as u64,
+        "findings_count": outcome.findings_count,
+        "actions_planned": outcome.actions_planned,
+        "findings": outcome.findings,
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope)
+            .map_err(|e| CliError::Other(format!("serializing fix-only-list envelope: {e}")))?
+    );
     Ok(())
 }
 
