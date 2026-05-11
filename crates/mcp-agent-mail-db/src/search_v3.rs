@@ -19,7 +19,7 @@ use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{AllQuery, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::{Index, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
 use crate::DbConn;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
@@ -53,9 +53,8 @@ impl TantivyBridge {
         };
 
         register_tokenizer(&index);
-        let doc_count = index
-            .reader()
-            .map_or(0, |reader| reader.searcher().num_docs());
+        let doc_count =
+            manual_index_reader(&index).map_or(0, |reader| reader.searcher().num_docs());
         let index_size_bytes = measure_index_dir_bytes(index_dir);
         global_metrics()
             .search
@@ -171,6 +170,13 @@ impl TantivyBridge {
             fetch_limit = fetch_limit.saturating_mul(2).min(max_fetch_limit);
         }
     }
+}
+
+fn manual_index_reader(index: &Index) -> tantivy::Result<IndexReader> {
+    index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
 }
 
 fn measure_index_dir_bytes(index_dir: &Path) -> u64 {
@@ -554,10 +560,8 @@ fn upsert_indexable_message(
 fn refresh_index_health_metrics(bridge: &TantivyBridge) {
     static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-    let doc_count = bridge
-        .index()
-        .reader()
-        .map_or(0, |reader| reader.searcher().num_docs());
+    let doc_count =
+        manual_index_reader(bridge.index()).map_or(0, |reader| reader.searcher().num_docs());
 
     // Only perform the expensive recursive filesystem scan occasionally
     // to avoid blocking the synchronous message send path.
@@ -817,9 +821,7 @@ fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String
 }
 
 fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, String> {
-    let reader = bridge
-        .index()
-        .reader()
+    let reader = manual_index_reader(bridge.index())
         .map_err(|e| format!("backfill index reader error: {e}"))?;
     let searcher = reader.searcher();
     let handles = bridge.handles();

@@ -18,7 +18,7 @@ use tantivy::query::Query;
 #[cfg(feature = "tantivy-engine")]
 use tantivy::schema::Value;
 #[cfg(feature = "tantivy-engine")]
-use tantivy::{Index, TantivyDocument};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
 
 // Always available (used by find_highlights)
 use mcp_agent_mail_core::HighlightRange;
@@ -43,6 +43,14 @@ const SNIPPET_MAX_CHARS: usize = 200;
 
 /// Context characters to include before/after a match in snippets
 const SNIPPET_CONTEXT: usize = 40;
+
+#[cfg(feature = "tantivy-engine")]
+fn manual_index_reader(index: &Index) -> tantivy::Result<IndexReader> {
+    index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+}
 
 /// Generate a text snippet from a document field, highlighting matched terms.
 ///
@@ -243,7 +251,7 @@ pub fn execute_search(
 ) -> SearchResults {
     let start = Instant::now();
 
-    let Ok(reader) = index.reader() else {
+    let Ok(reader) = manual_index_reader(index) else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
     let searcher = reader.searcher();
