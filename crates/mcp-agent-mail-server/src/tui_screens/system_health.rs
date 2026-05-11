@@ -31,6 +31,7 @@ use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{AtcCanaryReportSummary, Config, load_latest_atc_canary_report};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::tui_bridge::{
     ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState, query_params_explain_empty_state,
@@ -650,6 +651,67 @@ impl GitRefIntegritySweepState {
             self.total_findings, affected_projects
         ))
     }
+}
+
+fn git_ref_integrity_project_summary_json(project: &GitRefIntegrityProjectSummary) -> Value {
+    json!({
+        "slug": project.slug(),
+        "last_sweep_at_us": project.last_sweep_ts.map(|ts| ts.timestamp_micros()),
+        "finding_count": project.finding_count(),
+        "protected_count": project.protected_count(),
+        "safe_to_prune_count": project.safe_to_prune_count(),
+        "ask_user_count": project.ask_user_count(),
+        "classification": project.classification_label(),
+        "error": project.error(),
+    })
+}
+
+/// Build the optional System Health payload for supported `/mail/ws-state`
+/// polling consumers.
+#[must_use]
+pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
+    let env_cfg = Config::from_env();
+    let am_git_binary_set = std::env::var_os("AM_GIT_BINARY").is_some();
+    let db_snapshot = state.db_stats_snapshot();
+    let targets = db_snapshot
+        .as_ref()
+        .map_or_else(Vec::new, git_ref_integrity_targets_from_snapshot);
+    let dismissals = load_git_ref_sweep_dismissals(&git_ref_sweep_dismissals_path());
+    let sweep = git_ref_integrity_sweep(
+        &targets,
+        0,
+        env_cfg.health_sweep_batch,
+        env_cfg.health_sweep_enabled,
+        env_cfg.health_sweep_interval_seconds,
+        am_git_binary_set,
+        &dismissals,
+        Utc::now(),
+    );
+
+    json!({
+        "git_ref_integrity": {
+            "enabled": sweep.enabled(),
+            "interval_seconds": sweep.interval_seconds(),
+            "batch_size": sweep.batch_size(),
+            "cursor_index": sweep.cursor_index(),
+            "next_cursor_index": sweep.next_cursor_index(),
+            "total_projects": sweep.total_projects(),
+            "projects_scanned": sweep.projects_scanned(),
+            "total_findings": sweep.total_findings(),
+            "checked_at_us": sweep.checked_at().map(|ts| ts.timestamp_micros()),
+            "level": sweep.level_label(),
+            "am_git_binary_set": am_git_binary_set,
+            "banner": sweep.banner(),
+            "banner_suppressed_by_am_git_binary": am_git_binary_set
+                && sweep.total_findings() > 0
+                && sweep.banner().is_none(),
+            "projects": sweep
+                .projects()
+                .iter()
+                .map(git_ref_integrity_project_summary_json)
+                .collect::<Vec<_>>(),
+        }
+    })
 }
 
 #[derive(Debug, Clone, Default)]

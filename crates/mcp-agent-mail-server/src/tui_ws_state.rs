@@ -12,14 +12,33 @@ const MAX_EVENT_LIMIT: usize = 1_000;
 struct PollParams {
     since: Option<u64>,
     limit: usize,
+    include_system_health: bool,
+}
+
+fn query_value_truthy(value: &str) -> bool {
+    !matches!(value.trim(), "" | "0" | "false" | "no" | "off")
+}
+
+fn include_value_requests_system_health(value: &str) -> bool {
+    value.split(',').any(|item| {
+        matches!(
+            item.trim(),
+            "system_health" | "health_sweep" | "git_ref_integrity"
+        )
+    })
 }
 
 fn parse_poll_params(query: Option<&str>) -> PollParams {
     let mut since = None;
     let mut limit = DEFAULT_EVENT_LIMIT;
+    let mut include_system_health = false;
 
     let Some(query) = query else {
-        return PollParams { since, limit };
+        return PollParams {
+            since,
+            limit,
+            include_system_health,
+        };
     };
 
     for pair in query.split('&').filter(|segment| !segment.is_empty()) {
@@ -37,11 +56,21 @@ fn parse_poll_params(query: Option<&str>) -> PollParams {
                     limit = parsed.clamp(1, MAX_EVENT_LIMIT);
                 }
             }
+            "include" => {
+                include_system_health |= include_value_requests_system_health(value);
+            }
+            "system_health" | "health_sweep" | "git_ref_integrity" => {
+                include_system_health |= query_value_truthy(value);
+            }
             _ => {}
         }
     }
 
-    PollParams { since, limit }
+    PollParams {
+        since,
+        limit,
+        include_system_health,
+    }
 }
 
 fn now_micros() -> i64 {
@@ -77,13 +106,21 @@ fn request_counters_json(counters: RequestCounters, avg_latency_ms: u64) -> Valu
     })
 }
 
-fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
+fn maybe_add_system_health(mut payload: Value, state: &TuiSharedState, include: bool) -> Value {
+    if include {
+        payload["system_health"] =
+            crate::tui_screens::system_health::ws_state_system_health_payload(state);
+    }
+    payload
+}
+
+fn snapshot_payload(state: &TuiSharedState, limit: usize, include_system_health: bool) -> Value {
     let counters = state.request_counters();
     let ring = state.event_ring_stats();
     let next_seq = ring.next_seq;
     let events = state.recent_events(limit);
 
-    json!({
+    let payload = json!({
         "schema_version": "am_ws_state_poll.v1",
         "transport": "http-poll",
         "mode": "snapshot",
@@ -97,16 +134,22 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
         "atc": crate::atc_operator_snapshot(),
         "sparkline_ms": state.sparkline_snapshot(),
         "events": events,
-    })
+    });
+    maybe_add_system_health(payload, state, include_system_health)
 }
 
-fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
+fn delta_payload(
+    state: &TuiSharedState,
+    since: u64,
+    limit: usize,
+    include_system_health: bool,
+) -> Value {
     let counters = state.request_counters();
     let ring = state.event_ring_stats();
     let events = state.events_since_limited(since, limit);
     let to_seq = events.last().map_or(since, MailEvent::seq);
 
-    json!({
+    let payload = json!({
         "schema_version": "am_ws_state_poll.v1",
         "transport": "http-poll",
         "mode": "delta",
@@ -120,15 +163,16 @@ fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
         "atc": crate::atc_operator_snapshot(),
         "sparkline_ms": state.sparkline_snapshot(),
         "events": events,
-    })
+    });
+    maybe_add_system_health(payload, state, include_system_health)
 }
 
 #[must_use]
 pub fn poll_payload(state: &TuiSharedState, query: Option<&str>) -> Value {
     let params = parse_poll_params(query);
     params.since.map_or_else(
-        || snapshot_payload(state, params.limit),
-        |since| delta_payload(state, since, params.limit),
+        || snapshot_payload(state, params.limit, params.include_system_health),
+        |since| delta_payload(state, since, params.limit, params.include_system_health),
     )
 }
 
@@ -142,6 +186,7 @@ mod tests {
         let parsed = parse_poll_params(None);
         assert_eq!(parsed.since, None);
         assert_eq!(parsed.limit, DEFAULT_EVENT_LIMIT);
+        assert!(!parsed.include_system_health);
     }
 
     #[test]
@@ -149,6 +194,7 @@ mod tests {
         let parsed = parse_poll_params(Some("since=42&limit=100000"));
         assert_eq!(parsed.since, Some(42));
         assert_eq!(parsed.limit, MAX_EVENT_LIMIT);
+        assert!(!parsed.include_system_health);
     }
 
     #[test]
@@ -156,12 +202,26 @@ mod tests {
         let parsed = parse_poll_params(Some("since=not-a-number&limit=abc&ignored=1"));
         assert_eq!(parsed.since, None);
         assert_eq!(parsed.limit, DEFAULT_EVENT_LIMIT);
+        assert!(!parsed.include_system_health);
     }
 
     #[test]
     fn parse_poll_params_clamps_limit_lower_bound() {
         let parsed = parse_poll_params(Some("limit=0"));
         assert_eq!(parsed.limit, 1);
+    }
+
+    #[test]
+    fn parse_poll_params_accepts_system_health_include() {
+        let parsed = parse_poll_params(Some("include=events,system_health&limit=5"));
+        assert_eq!(parsed.limit, 5);
+        assert!(parsed.include_system_health);
+
+        let parsed = parse_poll_params(Some("health_sweep=1"));
+        assert!(parsed.include_system_health);
+
+        let parsed = parse_poll_params(Some("system_health=false"));
+        assert!(!parsed.include_system_health);
     }
 
     #[test]
@@ -200,6 +260,21 @@ mod tests {
         assert!(
             payload.get("atc").is_some(),
             "delta payload should include ATC state"
+        );
+    }
+
+    #[test]
+    fn poll_payload_can_include_system_health() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let payload = poll_payload(&state, Some("include=system_health&limit=1"));
+
+        assert_eq!(payload["mode"], "snapshot");
+        assert!(
+            payload
+                .pointer("/system_health/git_ref_integrity/total_projects")
+                .is_some(),
+            "system health payload must include git-ref integrity summary"
         );
     }
 
