@@ -166,8 +166,18 @@ fn digest(s: &str) -> String {
 const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["serve-http", "--help"],
     &["serve-stdio", "--help"],
+    &["capabilities", "--help"],
+    &["agent", "--help"],
+    &["status", "--help"],
+    &["inbox", "--help"],
+    &["reservations", "--help"],
+    &["health", "--help"],
+    &["thread", "--help"],
     &["check-inbox", "--help"],
+    &["check", "--help"],
     &["ci", "--help"],
+    &["verify", "--help"],
+    &["release", "--help"],
     &["bench", "--help"],
     &["e2e", "--help"],
     &["share", "--help"],
@@ -194,7 +204,9 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["setup", "--help"],
     &["golden", "--help"],
     &["flake-triage", "--help"],
+    &["atc", "--help"],
     &["robot", "--help"],
+    &["robot-docs", "--help"],
     &["legacy", "--help"],
     &["upgrade", "--help"],
     &["service", "--help"],
@@ -206,8 +218,18 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["share"],
     &["archive"],
     &["guard"],
+    &["capabilities"],
+    &["agent"],
+    &["status"],
+    &["inbox"],
+    &["reservations"],
+    &["health"],
+    &["thread"],
     &["check-inbox"],
+    &["check"],
     &["ci"],
+    &["verify"],
+    &["release"],
     &["bench"],
     &["e2e"],
     &["acks"],
@@ -228,7 +250,9 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["setup"],
     &["golden"],
     &["flake-triage"],
+    &["atc"],
     &["robot"],
+    &["robot-docs"],
     &["legacy"],
     &["upgrade"],
     &["service"],
@@ -564,7 +588,7 @@ fn golden_denial_message_format_contract() {
 
 #[test]
 fn golden_cli_mode_denial_for_mcp_only_serve() {
-    let mut env = base_env();
+    let (root, mut env) = isolated_env_without_precreated_root("cli_deny_serve");
     env.push(("AM_INTERFACE_MODE".to_string(), "cli".to_string()));
     let am = am_bin();
     let target_dir = am.parent().expect("target dir");
@@ -574,6 +598,12 @@ fn golden_cli_mode_denial_for_mcp_only_serve() {
         eprintln!("SKIP: MCP binary not found.");
         return;
     }
+
+    assert!(
+        !root.exists(),
+        "isolated root should not exist before CLI-mode wrong-surface denial: {}",
+        root.display()
+    );
 
     let out = run_mcp(&["serve"], &env);
     let serr = stderr_str(&out);
@@ -587,6 +617,11 @@ fn golden_cli_mode_denial_for_mcp_only_serve() {
     assert!(
         stdout_str(&out).is_empty(),
         "CLI mode denial for `serve` must not write to stdout"
+    );
+    assert!(
+        !root.exists(),
+        "CLI-mode wrong-surface denial must not create mailbox or config state under {}",
+        root.display()
     );
     assert!(
         serr.contains("\"serve\" is not available in CLI mode"),

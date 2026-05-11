@@ -5,8 +5,18 @@ Usage: am [COMMAND]
 Commands:
   serve-http                  
   serve-stdio                 
+  capabilities                Print the machine-readable CLI capabilities contract
+  agent                       First-turn cockpit for agents: identity, project, runtime hints, and next actions
+  status                      Direct alias for `am robot status`
+  inbox                       Direct alias for `am robot inbox`
+  reservations                Direct alias for `am robot reservations`
+  health                      Direct alias for `am robot health`
+  thread                      Direct alias for `am robot thread`
   check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
+  check                       Run the unified local pre-release quality gate
   ci                          Run CI quality gates (format, lint, build, test)
+  verify                      Run a standard verification lane through build-slot admission and rch
+  release                     Release readiness evidence and operator verdicts
   bench                       Run native CLI benchmarks
   lint                        
   typecheck                   
@@ -36,7 +46,9 @@ Commands:
   setup                       Detect coding agents and configure MCP server connections
   golden                      Capture, verify, and inspect deterministic golden CLI artifacts
   flake-triage                Flake triage: scan artifacts, reproduce failures, detect flaky tests
+  atc                         ATC maintenance and backfill workflows
   robot                       Agent-optimized commands with TOON/JSON/Markdown output
+  robot-docs                  Agent-targeted CLI docs and copy-paste workflow recipes
   legacy                      Legacy Python installation detection, migration/import, and status
   upgrade                     Upgrade helper: detect legacy install, import data, refresh setup
   self-update                 Check for updates or self-update the binary
