@@ -522,6 +522,25 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Migration and lifecycle | `legacy detect|import|status`, `upgrade`, `migrate`, `self-update`, `am-run`, `guard ...` | Migrate Python installs, perform DB-format upgrades, run slot-aware build commands, and manage guard hooks |
 | Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. Use sparingly. |
 
+### Setup Drift Reports
+
+`am setup status` is read-only. It inventories supported MCP clients, reports the
+current redacted server entry beside the expected entry, and labels drift such
+as `missing_file`, `legacy_stdio`, `stale_http_path`, `wrong_bearer_header`,
+`wrong_startup_timeout`, `duplicate_server_entries`, and `unsupported_config`.
+
+Use the reported remediation in two steps:
+
+```bash
+am setup status --format json
+am setup run --dry-run --project-dir "$PWD" --format toon
+am setup run --yes --project-dir "$PWD" --format toon
+```
+
+For bearer-header checks, pass `--token` to `am setup status` or expose the
+expected token through `HTTP_BEARER_TOKEN` / `config.env`; status output redacts
+token values.
+
 ### Family Detail
 
 | Family | Current subcommands / modes |

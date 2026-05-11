@@ -22,15 +22,24 @@ background and TUI-specific troubleshooting.
 cd /abs/path/project
 am setup run --dry-run --yes --project-dir "$PWD" --format toon
 am setup status --format toon
+am setup status --format json
 ```
 
 **Expected output:** A dry-run summary showing which config files would be
 written or skipped, followed by a status report for the detected shell/editor
-integration.
+integration. Status output includes `primary_drift_reason`, `risk`, current and
+expected server entries, and a remediation command. Tokens are redacted.
 
 **Troubleshooting:** If the detected host, port, or path are wrong for this
-checkout, rerun with `--host`, `--port`, or `--path`. When the dry run looks
-correct, rerun `am setup run` without `--dry-run` to apply it.
+checkout, rerun with `--host`, `--port`, or `--path`. For bearer-header drift,
+provide the expected token with `--token` or through `HTTP_BEARER_TOKEN` /
+`config.env`. When the dry run looks correct, apply the exact same target with
+an explicit fix command:
+
+```bash
+am setup run --dry-run --project-dir "$PWD" --format toon
+am setup run --yes --project-dir "$PWD" --format toon
+```
 
 ## 2. Start a local HTTP server on a custom port [stateful]
 

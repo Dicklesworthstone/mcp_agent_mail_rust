@@ -1012,6 +1012,12 @@ pub enum SetupCommand {
         /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Target specific agents (comma-separated: claude,codex,cursor,gemini).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Expected bearer token for header drift checks.
+        #[arg(long)]
+        token: Option<String>,
         /// Override port for status check (default: 8765).
         #[arg(long, default_value_t = 8765)]
         port: u16,
@@ -1021,6 +1027,15 @@ pub enum SetupCommand {
         /// Override MCP base path (default: /mcp/).
         #[arg(long, default_value = "/mcp/")]
         path: String,
+        /// Project directory for project-local configs (default: cwd).
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+        /// Skip user-level config files (project-local only).
+        #[arg(long, default_value_t = false)]
+        no_user_config: bool,
+        /// Skip Claude Code hook status.
+        #[arg(long, default_value_t = false)]
+        no_hooks: bool,
     },
 }
 
@@ -5020,6 +5035,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         path: config.http_path.clone(),
         token: resolved_token.clone(),
         project_dir: project_dir.clone(),
+        home_dir_override: None,
         agents: Some(target_agents.clone()),
         dry_run: false,
         skip_user_config: existing_cache
@@ -8545,6 +8561,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 path,
                 token: resolved_token.clone(),
                 project_dir: pdir.clone(),
+                home_dir_override: None,
                 agents: Some(target_agents),
                 dry_run,
                 skip_user_config: no_user_config,
@@ -8595,19 +8612,43 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
         SetupCommand::Status {
             format,
             json,
+            agent,
+            token,
             port,
             host,
             path,
+            project_dir,
+            no_user_config,
+            no_hooks,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let pdir = std::env::current_dir().unwrap_or_default();
+            let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+            let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+                .unwrap_or_else(|| PathBuf::from(".config"))
+                .join("mcp-agent-mail")
+                .join("config.env");
+            let resolved_token = setup::resolve_existing_token(token.as_deref(), &config_env_file)
+                .unwrap_or_default();
+            let agents = match agent {
+                Some(agent_list) => Some(
+                    setup::parse_agent_list(&agent_list)
+                        .map_err(|e| CliError::Other(e.to_string()))?,
+                ),
+                None => None,
+            };
 
             let params = setup::SetupParams {
                 host,
                 port,
                 path,
                 project_dir: pdir,
-                skip_user_config: false,
+                token: resolved_token,
+                agents,
+                skip_user_config: no_user_config,
+                skip_hooks: no_hooks,
                 ..Default::default()
             };
 
@@ -8638,7 +8679,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                             )
                             && mcp_config_url_matches_any_expected(&actual_url, &desired_urls)
                         {
-                            cf.url_matches = true;
+                            cf.mark_url_matches();
                         }
                     }
                 }
@@ -8664,6 +8705,9 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                     "CONFIG",
                     "SERVER ENTRY",
                     "URL OK",
+                    "DRIFT",
+                    "RISK",
+                    "FIX",
                 ]);
                 for status in &statuses {
                     let detected_str = if status.detected { "yes" } else { "no" };
@@ -8671,6 +8715,9 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                         table.add_row(vec![
                             status.platform.clone(),
                             detected_str.into(),
+                            "-".into(),
+                            "-".into(),
+                            "-".into(),
                             "-".into(),
                             "-".into(),
                             "-".into(),
@@ -8690,12 +8737,21 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                             let exists_str = if cf.exists { "exists" } else { "missing" };
                             let server_str = if cf.has_server_entry { "yes" } else { "no" };
                             let url_str = if cf.url_matches { "yes" } else { "no" };
+                            let fix_str = if cf.primary_drift_reason == setup::ConfigDriftReason::Ok
+                            {
+                                "no action".to_string()
+                            } else {
+                                cf.remediation.clone()
+                            };
                             table.add_row(vec![
                                 platform_col,
                                 detected_col,
                                 exists_str.into(),
                                 server_str.into(),
                                 url_str.into(),
+                                cf.primary_drift_reason.to_string(),
+                                cf.risk.to_string(),
+                                fix_str,
                             ]);
                         }
                     }
