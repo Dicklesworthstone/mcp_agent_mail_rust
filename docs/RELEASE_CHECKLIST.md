@@ -28,7 +28,26 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Cross-platform native command portability | Pass rate = `100%` (`fail=0`) for native command matrix on Linux/macOS/Windows | CI job `native-command-matrix` in `.github/workflows/ci.yml` | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
 | Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
 | Determinism | Golden/export checks report zero mismatches | `am golden verify` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
-| Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json` | `tests/artifacts/ci/gate_report.json`, sign-off ledger row |
+| Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, unified release health has `decision=\"go\"` or explicitly waived blockers, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json`, then `am release health --report tests/artifacts/release/health.json ...` | `tests/artifacts/ci/gate_report.json`, `tests/artifacts/release/health.json`, sign-off ledger row |
+
+### Unified Release Health Verdict
+
+Release owners should publish one operator-readable verdict after the component evidence exists:
+
+```bash
+am ci --report tests/artifacts/ci/gate_report.json
+am doctor --json > tests/artifacts/release/doctor.json
+am robot health --format json > tests/artifacts/release/robot_health.json
+# Produce installer/checksum/provenance evidence from the dist workflow or release job.
+am release health \
+  --ci-report tests/artifacts/ci/gate_report.json \
+  --doctor-report tests/artifacts/release/doctor.json \
+  --robot-health-report tests/artifacts/release/robot_health.json \
+  --installer-report tests/artifacts/release/installer_provenance.json \
+  --report tests/artifacts/release/health.json
+```
+
+The verdict composes doctor, robot health, E2E, performance, installer/provenance, schema/conformance, and checklist evidence. Missing files, skipped CI gates, and offline-only omissions are non-green and block release unless a release owner records an explicit `--waive component=reason` entry in the command and sign-off ledger.
 
 ### Gate-to-Bead Evidence Map
 

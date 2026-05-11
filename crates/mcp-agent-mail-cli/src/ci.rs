@@ -7,7 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -1127,6 +1128,733 @@ impl GateReport {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Release Health Verdict
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Schema version for release health verdict reports.
+pub const RELEASE_HEALTH_SCHEMA_VERSION: &str = "am_release_health.v1";
+
+/// Default CI gate report consumed by `am release health`.
+pub const DEFAULT_RELEASE_HEALTH_CI_REPORT: &str = "tests/artifacts/ci/gate_report.json";
+
+/// Default release checklist reference consumed by `am release health`.
+pub const DEFAULT_RELEASE_HEALTH_CHECKLIST: &str = DEFAULT_CHECKLIST_REFERENCE;
+
+const E2E_RELEASE_HEALTH_GATES: &[&str] = &[
+    "E2E full matrix",
+    "E2E dual-mode",
+    "E2E mode matrix",
+    "E2E security/privacy",
+    "E2E TUI accessibility",
+];
+
+const PERF_RELEASE_HEALTH_GATES: &[&str] = &[
+    "Perf + security regressions",
+    "Perf migration guardrails",
+    "Archive perf gate",
+    "ATC perf gate",
+];
+
+const SCHEMA_RELEASE_HEALTH_GATES: &[&str] = &[
+    "Docs drift + resource coverage",
+    "Mode matrix harness",
+    "Semantic conformance",
+    "Help snapshots",
+];
+
+/// Component families in the release health verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseHealthComponentId {
+    /// `am doctor` or equivalent mailbox health evidence.
+    Doctor,
+    /// `am robot health` operational health evidence.
+    RobotHealth,
+    /// E2E smoke and matrix evidence.
+    E2eSmoke,
+    /// Performance budget evidence.
+    PerfBudgets,
+    /// Installer, self-update, checksum, and provenance evidence.
+    InstallerProvenance,
+    /// Schema, conformance, mode-matrix, and docs-drift evidence.
+    SchemaConformance,
+    /// Release checklist evidence and release-doc gate coverage.
+    ReleaseChecklist,
+}
+
+impl ReleaseHealthComponentId {
+    /// Stable machine identifier for the component.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Doctor => "doctor",
+            Self::RobotHealth => "robot_health",
+            Self::E2eSmoke => "e2e_smoke",
+            Self::PerfBudgets => "perf_budgets",
+            Self::InstallerProvenance => "installer_provenance",
+            Self::SchemaConformance => "schema_conformance",
+            Self::ReleaseChecklist => "release_checklist",
+        }
+    }
+
+    /// Human-readable component label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Doctor => "Doctor",
+            Self::RobotHealth => "Robot health",
+            Self::E2eSmoke => "E2E smoke",
+            Self::PerfBudgets => "Performance budgets",
+            Self::InstallerProvenance => "Installer provenance",
+            Self::SchemaConformance => "Schema/conformance",
+            Self::ReleaseChecklist => "Release checklist",
+        }
+    }
+
+    /// Parses a CLI component identifier or common alias.
+    ///
+    /// # Errors
+    /// Returns a message naming the unknown component.
+    pub fn parse_cli(raw: &str) -> Result<Self, String> {
+        match raw.trim().replace('-', "_").as_str() {
+            "doctor" => Ok(Self::Doctor),
+            "robot" | "robot_health" => Ok(Self::RobotHealth),
+            "e2e" | "e2e_smoke" => Ok(Self::E2eSmoke),
+            "perf" | "performance" | "perf_budgets" => Ok(Self::PerfBudgets),
+            "installer" | "provenance" | "installer_provenance" => Ok(Self::InstallerProvenance),
+            "schema" | "conformance" | "schema_conformance" => Ok(Self::SchemaConformance),
+            "checklist" | "release_checklist" => Ok(Self::ReleaseChecklist),
+            other => Err(format!("unknown release health component: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseHealthComponentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Status for one release health component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseHealthStatus {
+    /// Required evidence passed.
+    Pass,
+    /// Required evidence exists but failed.
+    Fail,
+    /// Required evidence file or CI gate is absent.
+    Missing,
+    /// Required evidence was intentionally not run, such as in offline mode or quick CI mode.
+    Skipped,
+    /// A named operator waiver made an otherwise blocking component non-blocking.
+    Waived,
+}
+
+impl ReleaseHealthStatus {
+    /// Stable machine identifier for the status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Missing => "missing",
+            Self::Skipped => "skipped",
+            Self::Waived => "waived",
+        }
+    }
+
+    const fn blocks_release(self) -> bool {
+        matches!(self, Self::Fail | Self::Missing | Self::Skipped)
+    }
+}
+
+impl std::fmt::Display for ReleaseHealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Overall release health decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseHealthDecision {
+    /// All required components passed without waivers.
+    Go,
+    /// All remaining blockers were explicitly waived.
+    GoWithWaivers,
+    /// At least one unwaived component blocks release.
+    NoGo,
+}
+
+impl ReleaseHealthDecision {
+    /// Stable machine identifier for the decision.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Go => "go",
+            Self::GoWithWaivers => "go-with-waivers",
+            Self::NoGo => "no-go",
+        }
+    }
+}
+
+impl std::fmt::Display for ReleaseHealthDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Operator waiver for one release health component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseHealthWaiver {
+    /// Component being waived.
+    pub component: ReleaseHealthComponentId,
+    /// Human-readable waiver reason.
+    pub reason: String,
+}
+
+impl ReleaseHealthWaiver {
+    /// Parses a CLI waiver in `component=reason` form.
+    ///
+    /// # Errors
+    /// Returns a message if the component is unknown or the reason is empty.
+    pub fn parse_cli(raw: &str) -> Result<Self, String> {
+        let (component, reason) = raw
+            .split_once('=')
+            .ok_or_else(|| "waivers must use component=reason form".to_string())?;
+        let component = ReleaseHealthComponentId::parse_cli(component)?;
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err("waiver reason must not be empty".to_string());
+        }
+        Ok(Self {
+            component,
+            reason: reason.to_string(),
+        })
+    }
+}
+
+/// Inputs consumed by the release health verdict builder.
+#[derive(Debug, Clone)]
+pub struct ReleaseHealthInputs {
+    /// CI gate report JSON path.
+    pub ci_report: PathBuf,
+    /// Optional doctor evidence report path.
+    pub doctor_report: Option<PathBuf>,
+    /// Optional robot health evidence report path.
+    pub robot_health_report: Option<PathBuf>,
+    /// Optional installer/provenance evidence report path.
+    pub installer_report: Option<PathBuf>,
+    /// Release checklist document path.
+    pub release_checklist: PathBuf,
+    /// Do not expect live-only evidence unless an artifact path is provided.
+    pub offline: bool,
+    /// Explicit operator waivers.
+    pub waivers: Vec<ReleaseHealthWaiver>,
+}
+
+impl Default for ReleaseHealthInputs {
+    fn default() -> Self {
+        Self {
+            ci_report: PathBuf::from(DEFAULT_RELEASE_HEALTH_CI_REPORT),
+            doctor_report: None,
+            robot_health_report: None,
+            installer_report: None,
+            release_checklist: PathBuf::from(DEFAULT_RELEASE_HEALTH_CHECKLIST),
+            offline: false,
+            waivers: Vec::new(),
+        }
+    }
+}
+
+/// One component in a release health verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseHealthComponent {
+    /// Stable component identifier.
+    pub id: ReleaseHealthComponentId,
+    /// Human-readable component label.
+    pub name: String,
+    /// Component status.
+    pub status: ReleaseHealthStatus,
+    /// Whether this component is required for release.
+    pub required: bool,
+    /// Whether this component currently blocks release.
+    pub blocking: bool,
+    /// Short operator-readable summary.
+    pub summary: String,
+    /// Evidence paths backing this component.
+    pub evidence_paths: Vec<String>,
+    /// Gate or file details backing the summary.
+    pub details: Vec<String>,
+    /// Waiver reason when `status=waived`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiver_reason: Option<String>,
+    /// Original status before waiver application.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_status: Option<ReleaseHealthStatus>,
+}
+
+impl ReleaseHealthComponent {
+    fn new(
+        id: ReleaseHealthComponentId,
+        status: ReleaseHealthStatus,
+        summary: impl Into<String>,
+        evidence_paths: Vec<String>,
+        details: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: id.label().to_string(),
+            status,
+            required: true,
+            blocking: status.blocks_release(),
+            summary: summary.into(),
+            evidence_paths,
+            details,
+            waiver_reason: None,
+            original_status: None,
+        }
+    }
+
+    fn apply_waiver(&mut self, reason: &str) {
+        if self.status.blocks_release() {
+            self.original_status = Some(self.status);
+            self.status = ReleaseHealthStatus::Waived;
+            self.blocking = false;
+            self.waiver_reason = Some(reason.to_string());
+            self.summary = format!("waived: {reason}");
+        }
+    }
+}
+
+/// Release health verdict report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseHealthReport {
+    /// Schema version identifier.
+    pub schema_version: String,
+    /// ISO-8601 timestamp when report was generated.
+    pub generated_at: String,
+    /// Overall release decision.
+    pub decision: ReleaseHealthDecision,
+    /// Whether the release can proceed under the reported evidence.
+    pub release_eligible: bool,
+    /// Short reason for the decision.
+    pub decision_reason: String,
+    /// Whether the report ran in offline artifact-only mode.
+    pub offline: bool,
+    /// CI gate report path used by the verdict.
+    pub ci_report: String,
+    /// Release checklist path used by the verdict.
+    pub release_checklist: String,
+    /// All evidence paths referenced by components.
+    pub artifact_paths: Vec<String>,
+    /// Explicit operator waivers.
+    pub waivers: Vec<ReleaseHealthWaiver>,
+    /// Component verdicts.
+    pub components: Vec<ReleaseHealthComponent>,
+}
+
+impl ReleaseHealthReport {
+    /// Serializes the report to JSON.
+    ///
+    /// # Errors
+    /// Returns an error if serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Writes the report to disk as pretty JSON.
+    ///
+    /// # Errors
+    /// Returns an error if serialization or file writing fails.
+    pub fn write_to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        use std::io::Write;
+        let json = self
+            .to_json()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(json.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn read_ci_report(path: &Path) -> Result<GateReport, String> {
+    GateReport::from_file(path).map_err(|err| format!("failed to read CI report: {err}"))
+}
+
+fn ci_gate_artifacts(report: &GateReport, gate_name: &str) -> Vec<String> {
+    report
+        .artifact_links
+        .get(gate_name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn ci_component_from_gates(
+    id: ReleaseHealthComponentId,
+    ci_report_path: &Path,
+    ci_report: Result<&GateReport, &str>,
+    gate_names: &[&str],
+) -> ReleaseHealthComponent {
+    let ci_path = display_path(ci_report_path);
+    let report = match ci_report {
+        Ok(report) => report,
+        Err(reason) => {
+            return ReleaseHealthComponent::new(
+                id,
+                ReleaseHealthStatus::Missing,
+                reason,
+                vec![ci_path],
+                vec!["CI gate report is required evidence".to_string()],
+            );
+        }
+    };
+
+    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut details = Vec::new();
+    let mut evidence = BTreeSet::from([ci_path]);
+
+    for gate_name in gate_names {
+        match report.gates.iter().find(|gate| gate.name == *gate_name) {
+            Some(gate) => {
+                details.push(format!("{}={}", gate.name, gate.status));
+                evidence.extend(ci_gate_artifacts(report, &gate.name));
+                match gate.status {
+                    GateStatus::Pass => {}
+                    GateStatus::Fail => failed.push(gate.name.clone()),
+                    GateStatus::Skip => skipped.push(gate.name.clone()),
+                }
+            }
+            None => missing.push((*gate_name).to_string()),
+        }
+    }
+
+    let (status, summary) = if !failed.is_empty() {
+        (
+            ReleaseHealthStatus::Fail,
+            format!("failed gates: {}", failed.join(", ")),
+        )
+    } else if !missing.is_empty() {
+        (
+            ReleaseHealthStatus::Missing,
+            format!("missing gates: {}", missing.join(", ")),
+        )
+    } else if !skipped.is_empty() {
+        (
+            ReleaseHealthStatus::Skipped,
+            format!("skipped gates: {}", skipped.join(", ")),
+        )
+    } else {
+        (
+            ReleaseHealthStatus::Pass,
+            format!("{} gate(s) passed", gate_names.len()),
+        )
+    };
+
+    ReleaseHealthComponent::new(id, status, summary, evidence.into_iter().collect(), details)
+}
+
+fn evidence_text_status(text: &str) -> ReleaseHealthStatus {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ReleaseHealthStatus::Fail;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && json_value_has_failure_marker(&value)
+    {
+        return ReleaseHealthStatus::Fail;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("error:")
+        || lower.contains("\"status\":\"fail\"")
+        || lower.contains("\"status\":\"failed\"")
+        || lower.contains("\"status\":\"error\"")
+        || lower.contains("\"decision\":\"no-go\"")
+        || lower.contains("\"release_eligible\":false")
+    {
+        ReleaseHealthStatus::Fail
+    } else {
+        ReleaseHealthStatus::Pass
+    }
+}
+
+fn json_value_has_failure_marker(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            let key = key.as_str();
+            match value {
+                serde_json::Value::String(text) => {
+                    let text = text.to_ascii_lowercase();
+                    matches!(key, "status" | "decision" | "result" | "health")
+                        && matches!(
+                            text.as_str(),
+                            "fail" | "failed" | "error" | "unhealthy" | "no-go"
+                        )
+                }
+                serde_json::Value::Bool(false) => matches!(key, "ok" | "healthy" | "ready"),
+                nested => json_value_has_failure_marker(nested),
+            }
+        }),
+        serde_json::Value::Array(values) => values.iter().any(json_value_has_failure_marker),
+        _ => false,
+    }
+}
+
+fn evidence_file_component(
+    id: ReleaseHealthComponentId,
+    path: Option<&Path>,
+    offline: bool,
+    missing_hint: &str,
+) -> ReleaseHealthComponent {
+    let Some(path) = path else {
+        let status = if offline {
+            ReleaseHealthStatus::Skipped
+        } else {
+            ReleaseHealthStatus::Missing
+        };
+        let summary = if offline {
+            format!("offline mode: {missing_hint}")
+        } else {
+            missing_hint.to_string()
+        };
+        return ReleaseHealthComponent::new(id, status, summary, Vec::new(), Vec::new());
+    };
+
+    let evidence = vec![display_path(path)];
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let status = evidence_text_status(&text);
+            let summary = match status {
+                ReleaseHealthStatus::Pass => "evidence file present and non-failing".to_string(),
+                ReleaseHealthStatus::Fail => "evidence file contains a failure marker".to_string(),
+                ReleaseHealthStatus::Missing
+                | ReleaseHealthStatus::Skipped
+                | ReleaseHealthStatus::Waived => "unexpected evidence state".to_string(),
+            };
+            ReleaseHealthComponent::new(id, status, summary, evidence, Vec::new())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ReleaseHealthComponent::new(
+            id,
+            ReleaseHealthStatus::Missing,
+            format!("evidence file not found: {}", path.display()),
+            evidence,
+            Vec::new(),
+        ),
+        Err(err) => ReleaseHealthComponent::new(
+            id,
+            ReleaseHealthStatus::Fail,
+            format!("failed to read evidence file: {err}"),
+            evidence,
+            Vec::new(),
+        ),
+    }
+}
+
+fn release_checklist_component(
+    path: &Path,
+    ci_report_path: &Path,
+    ci_report: Result<&GateReport, &str>,
+) -> ReleaseHealthComponent {
+    let mut evidence = BTreeSet::from([display_path(path), display_path(ci_report_path)]);
+    if !path.exists() {
+        return ReleaseHealthComponent::new(
+            ReleaseHealthComponentId::ReleaseChecklist,
+            ReleaseHealthStatus::Missing,
+            format!("release checklist not found: {}", path.display()),
+            evidence.into_iter().collect(),
+            Vec::new(),
+        );
+    }
+
+    let report = match ci_report {
+        Ok(report) => report,
+        Err(reason) => {
+            return ReleaseHealthComponent::new(
+                ReleaseHealthComponentId::ReleaseChecklist,
+                ReleaseHealthStatus::Missing,
+                reason,
+                evidence.into_iter().collect(),
+                vec!["Release docs references present=missing".to_string()],
+            );
+        }
+    };
+
+    let Some(gate) = report
+        .gates
+        .iter()
+        .find(|gate| gate.name == "Release docs references present")
+    else {
+        return ReleaseHealthComponent::new(
+            ReleaseHealthComponentId::ReleaseChecklist,
+            ReleaseHealthStatus::Missing,
+            "missing gate: Release docs references present",
+            evidence.into_iter().collect(),
+            Vec::new(),
+        );
+    };
+
+    evidence.extend(ci_gate_artifacts(report, &gate.name));
+    let status = match gate.status {
+        GateStatus::Pass => ReleaseHealthStatus::Pass,
+        GateStatus::Fail => ReleaseHealthStatus::Fail,
+        GateStatus::Skip => ReleaseHealthStatus::Skipped,
+    };
+    ReleaseHealthComponent::new(
+        ReleaseHealthComponentId::ReleaseChecklist,
+        status,
+        format!("Release docs references present={}", gate.status),
+        evidence.into_iter().collect(),
+        vec![format!("{}={}", gate.name, gate.status)],
+    )
+}
+
+/// Builds the unified release health verdict from local evidence artifacts.
+#[must_use]
+pub fn build_release_health_report(inputs: &ReleaseHealthInputs) -> ReleaseHealthReport {
+    let ci_report_path = inputs.ci_report.as_path();
+    let ci_report_result = read_ci_report(ci_report_path);
+    let ci_report_ref = ci_report_result
+        .as_ref()
+        .map_err(std::string::String::as_str);
+
+    let mut components = vec![
+        evidence_file_component(
+            ReleaseHealthComponentId::Doctor,
+            inputs.doctor_report.as_deref(),
+            inputs.offline,
+            "provide --doctor-report from `am doctor --json` or `am doctor health`",
+        ),
+        evidence_file_component(
+            ReleaseHealthComponentId::RobotHealth,
+            inputs.robot_health_report.as_deref(),
+            inputs.offline,
+            "provide --robot-health-report from `am robot health --format json`",
+        ),
+        ci_component_from_gates(
+            ReleaseHealthComponentId::E2eSmoke,
+            ci_report_path,
+            ci_report_ref,
+            E2E_RELEASE_HEALTH_GATES,
+        ),
+        ci_component_from_gates(
+            ReleaseHealthComponentId::PerfBudgets,
+            ci_report_path,
+            ci_report_ref,
+            PERF_RELEASE_HEALTH_GATES,
+        ),
+        evidence_file_component(
+            ReleaseHealthComponentId::InstallerProvenance,
+            inputs.installer_report.as_deref(),
+            inputs.offline,
+            "provide --installer-report with installer/checksum/provenance evidence",
+        ),
+        ci_component_from_gates(
+            ReleaseHealthComponentId::SchemaConformance,
+            ci_report_path,
+            ci_report_ref,
+            SCHEMA_RELEASE_HEALTH_GATES,
+        ),
+        release_checklist_component(
+            inputs.release_checklist.as_path(),
+            ci_report_path,
+            ci_report_ref,
+        ),
+    ];
+
+    for waiver in &inputs.waivers {
+        if let Some(component) = components
+            .iter_mut()
+            .find(|component| component.id == waiver.component)
+        {
+            component.apply_waiver(&waiver.reason);
+        }
+    }
+
+    let mut artifact_paths = BTreeSet::new();
+    for component in &components {
+        artifact_paths.extend(component.evidence_paths.iter().cloned());
+    }
+
+    let blocking_count = components
+        .iter()
+        .filter(|component| component.blocking)
+        .count();
+    let waived_count = components
+        .iter()
+        .filter(|component| component.status == ReleaseHealthStatus::Waived)
+        .count();
+    let decision = if blocking_count > 0 {
+        ReleaseHealthDecision::NoGo
+    } else if waived_count > 0 {
+        ReleaseHealthDecision::GoWithWaivers
+    } else {
+        ReleaseHealthDecision::Go
+    };
+    let release_eligible = !matches!(decision, ReleaseHealthDecision::NoGo);
+    let decision_reason = match decision {
+        ReleaseHealthDecision::Go => "all required release health components passed".to_string(),
+        ReleaseHealthDecision::GoWithWaivers => {
+            format!("all blockers cleared with {waived_count} waiver(s)")
+        }
+        ReleaseHealthDecision::NoGo => {
+            format!("{blocking_count} release health component(s) block release")
+        }
+    };
+
+    ReleaseHealthReport {
+        schema_version: RELEASE_HEALTH_SCHEMA_VERSION.to_string(),
+        generated_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        decision,
+        release_eligible,
+        decision_reason,
+        offline: inputs.offline,
+        ci_report: display_path(ci_report_path),
+        release_checklist: display_path(&inputs.release_checklist),
+        artifact_paths: artifact_paths.into_iter().collect(),
+        waivers: inputs.waivers.clone(),
+        components,
+    }
+}
+
+/// Prints a human-readable release health verdict.
+pub fn print_release_health_summary(report: &ReleaseHealthReport) {
+    println!();
+    println!("RELEASE HEALTH VERDICT");
+    println!("Decision: {}", report.decision);
+    println!("Eligible: {}", report.release_eligible);
+    println!("Reason: {}", report.decision_reason);
+    println!();
+    for component in &report.components {
+        println!(
+            "  {:<22} {:<8} {}",
+            component.name,
+            component.status.to_string().to_ascii_uppercase(),
+            component.summary
+        );
+        for evidence in &component.evidence_paths {
+            println!("      evidence: {evidence}");
+        }
+    }
+    if !report.waivers.is_empty() {
+        println!();
+        println!("Waivers:");
+        for waiver in &report.waivers {
+            println!("  {}: {}", waiver.component, waiver.reason);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Default Gates
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1912,6 +2640,86 @@ mod tests {
         PARALLEL_COMPLETE_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn release_health_gate_category(name: &str) -> GateCategory {
+        if PERF_RELEASE_HEALTH_GATES.contains(&name) {
+            GateCategory::Performance
+        } else if SCHEMA_RELEASE_HEALTH_GATES.contains(&name)
+            || name == "Release docs references present"
+        {
+            GateCategory::Docs
+        } else {
+            GateCategory::Quality
+        }
+    }
+
+    fn release_health_gate_result(name: &str, status: GateStatus) -> GateResult {
+        let config = GateConfig::new(name, release_health_gate_category(name), ["true"]);
+        match status {
+            GateStatus::Pass => GateResult::pass(&config, Duration::from_secs(1)),
+            GateStatus::Fail => {
+                GateResult::fail_simple(&config, Duration::from_secs(1), "gate failed")
+            }
+            GateStatus::Skip => GateResult::skip(&config, "--quick mode"),
+        }
+    }
+
+    fn release_health_all_ci_results(status: GateStatus) -> Vec<GateResult> {
+        E2E_RELEASE_HEALTH_GATES
+            .iter()
+            .chain(PERF_RELEASE_HEALTH_GATES.iter())
+            .chain(SCHEMA_RELEASE_HEALTH_GATES.iter())
+            .chain(["Release docs references present"].iter())
+            .map(|name| release_health_gate_result(name, status))
+            .collect()
+    }
+
+    fn write_release_health_fixture(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, text).expect("write fixture");
+    }
+
+    fn write_release_health_ci_report(path: &Path, results: Vec<GateResult>) {
+        let report = GateReport::new(RunMode::Full, results);
+        write_release_health_fixture(path, &report.to_json().expect("serialize report"));
+    }
+
+    fn release_health_inputs_for_temp(temp: &Path) -> ReleaseHealthInputs {
+        let ci_report = temp.join("gate_report.json");
+        let doctor_report = temp.join("doctor.json");
+        let robot_health_report = temp.join("robot_health.json");
+        let installer_report = temp.join("installer.json");
+        let release_checklist = temp.join("RELEASE_CHECKLIST.md");
+
+        write_release_health_ci_report(&ci_report, release_health_all_ci_results(GateStatus::Pass));
+        write_release_health_fixture(&doctor_report, r#"{"status":"ok"}"#);
+        write_release_health_fixture(&robot_health_report, r#"{"status":"ok"}"#);
+        write_release_health_fixture(&installer_report, r#"{"status":"ok"}"#);
+        write_release_health_fixture(&release_checklist, "# Release Checklist\n");
+
+        ReleaseHealthInputs {
+            ci_report,
+            doctor_report: Some(doctor_report),
+            robot_health_report: Some(robot_health_report),
+            installer_report: Some(installer_report),
+            release_checklist,
+            offline: false,
+            waivers: Vec::new(),
+        }
+    }
+
+    fn release_health_component(
+        report: &ReleaseHealthReport,
+        id: ReleaseHealthComponentId,
+    ) -> &ReleaseHealthComponent {
+        report
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .expect("component should exist")
+    }
+
     #[test]
     fn test_gate_category_serialization() {
         assert_eq!(
@@ -2150,6 +2958,131 @@ mod tests {
 
         assert!(json.contains("\"schema_version\": \"am_ci_gate_report.v1\""));
         assert!(json.contains("\"decision\": \"go\""));
+    }
+
+    #[test]
+    fn release_health_all_required_evidence_passes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inputs = release_health_inputs_for_temp(temp.path());
+
+        let report = build_release_health_report(&inputs);
+
+        assert_eq!(report.decision, ReleaseHealthDecision::Go);
+        assert!(report.release_eligible);
+        assert_eq!(report.components.len(), 7);
+        assert!(
+            report
+                .components
+                .iter()
+                .all(|component| component.status == ReleaseHealthStatus::Pass),
+            "{:?}",
+            report.components
+        );
+        assert!(
+            report
+                .artifact_paths
+                .iter()
+                .any(|path| path.ends_with("gate_report.json")),
+            "CI report should be surfaced as evidence"
+        );
+    }
+
+    #[test]
+    fn release_health_failed_perf_gate_blocks_release() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inputs = release_health_inputs_for_temp(temp.path());
+        let results = release_health_all_ci_results(GateStatus::Pass)
+            .into_iter()
+            .map(|result| {
+                if result.name == "Perf migration guardrails" {
+                    release_health_gate_result(&result.name, GateStatus::Fail)
+                } else {
+                    result
+                }
+            })
+            .collect();
+        write_release_health_ci_report(&inputs.ci_report, results);
+
+        let report = build_release_health_report(&inputs);
+        let perf = release_health_component(&report, ReleaseHealthComponentId::PerfBudgets);
+
+        assert_eq!(report.decision, ReleaseHealthDecision::NoGo);
+        assert_eq!(perf.status, ReleaseHealthStatus::Fail);
+        assert!(perf.blocking);
+        assert!(perf.summary.contains("Perf migration guardrails"));
+    }
+
+    #[test]
+    fn release_health_skipped_e2e_gate_blocks_release() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inputs = release_health_inputs_for_temp(temp.path());
+        let results = release_health_all_ci_results(GateStatus::Pass)
+            .into_iter()
+            .map(|result| {
+                if result.name == "E2E full matrix" {
+                    release_health_gate_result(&result.name, GateStatus::Skip)
+                } else {
+                    result
+                }
+            })
+            .collect();
+        write_release_health_ci_report(&inputs.ci_report, results);
+
+        let report = build_release_health_report(&inputs);
+        let e2e = release_health_component(&report, ReleaseHealthComponentId::E2eSmoke);
+
+        assert_eq!(report.decision, ReleaseHealthDecision::NoGo);
+        assert_eq!(e2e.status, ReleaseHealthStatus::Skipped);
+        assert!(e2e.blocking);
+        assert!(e2e.summary.contains("E2E full matrix"));
+    }
+
+    #[test]
+    fn release_health_offline_missing_live_evidence_is_skipped_and_blocking() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut inputs = release_health_inputs_for_temp(temp.path());
+        inputs.doctor_report = None;
+        inputs.robot_health_report = None;
+        inputs.installer_report = None;
+        inputs.offline = true;
+
+        let report = build_release_health_report(&inputs);
+        let doctor = release_health_component(&report, ReleaseHealthComponentId::Doctor);
+        let robot = release_health_component(&report, ReleaseHealthComponentId::RobotHealth);
+        let installer =
+            release_health_component(&report, ReleaseHealthComponentId::InstallerProvenance);
+
+        assert_eq!(report.decision, ReleaseHealthDecision::NoGo);
+        assert_eq!(doctor.status, ReleaseHealthStatus::Skipped);
+        assert_eq!(robot.status, ReleaseHealthStatus::Skipped);
+        assert_eq!(installer.status, ReleaseHealthStatus::Skipped);
+        assert!(doctor.blocking);
+        assert!(robot.blocking);
+        assert!(installer.blocking);
+    }
+
+    #[test]
+    fn release_health_waiver_clears_one_missing_component() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut inputs = release_health_inputs_for_temp(temp.path());
+        inputs.installer_report = None;
+        inputs.waivers.push(ReleaseHealthWaiver {
+            component: ReleaseHealthComponentId::InstallerProvenance,
+            reason: "release candidate uses existing installer artifact proof".to_string(),
+        });
+
+        let report = build_release_health_report(&inputs);
+        let installer =
+            release_health_component(&report, ReleaseHealthComponentId::InstallerProvenance);
+
+        assert_eq!(report.decision, ReleaseHealthDecision::GoWithWaivers);
+        assert!(report.release_eligible);
+        assert_eq!(installer.status, ReleaseHealthStatus::Waived);
+        assert_eq!(
+            installer.original_status,
+            Some(ReleaseHealthStatus::Missing)
+        );
+        assert!(!installer.blocking);
     }
 
     #[test]

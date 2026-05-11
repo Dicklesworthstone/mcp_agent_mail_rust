@@ -445,6 +445,12 @@ pub enum Commands {
         #[arg(long, short = 'p')]
         parallel: bool,
     },
+    /// Release readiness evidence and operator verdicts.
+    #[command(name = "release")]
+    Release {
+        #[command(subcommand)]
+        action: ReleaseCommand,
+    },
     /// Run native CLI benchmarks.
     #[command(name = "bench")]
     Bench {
@@ -687,6 +693,49 @@ pub enum Commands {
     Service {
         #[command(subcommand)]
         action: ServiceCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReleaseCommand {
+    /// Compose release evidence into one go/no-go health verdict.
+    Health {
+        /// CI gate report from `am ci --report`.
+        #[arg(
+            long = "ci-report",
+            default_value = "tests/artifacts/ci/gate_report.json"
+        )]
+        ci_report: PathBuf,
+        /// Doctor evidence report from `am doctor --json` or `am doctor health`.
+        #[arg(long = "doctor-report")]
+        doctor_report: Option<PathBuf>,
+        /// Robot health evidence report from `am robot health --format json`.
+        #[arg(long = "robot-health-report")]
+        robot_health_report: Option<PathBuf>,
+        /// Installer/checksum/provenance evidence report.
+        #[arg(long = "installer-report")]
+        installer_report: Option<PathBuf>,
+        /// Release checklist path.
+        #[arg(
+            long = "release-checklist",
+            default_value = "docs/RELEASE_CHECKLIST.md"
+        )]
+        release_checklist: PathBuf,
+        /// Do not expect live-only evidence unless an artifact path is provided.
+        #[arg(long, default_value_t = false)]
+        offline: bool,
+        /// Explicitly waive a component: component=reason. Repeatable.
+        #[arg(long = "waive")]
+        waivers: Vec<String>,
+        /// Write JSON report to this path.
+        #[arg(long, short = 'r')]
+        report: Option<PathBuf>,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2837,6 +2886,7 @@ fn execute(cli: Cli) -> CliResult<()> {
             json,
             parallel,
         } => handle_ci(quick, report, format, json, parallel),
+        Commands::Release { action } => handle_release(action),
         Commands::Bench {
             quick,
             format,
@@ -14932,6 +14982,94 @@ fn handle_check(
     parallel: bool,
 ) -> CliResult<()> {
     handle_quality_gate_command(quick, report_path, format, json, parallel)
+}
+
+fn handle_release(action: ReleaseCommand) -> CliResult<()> {
+    match action {
+        ReleaseCommand::Health {
+            ci_report,
+            doctor_report,
+            robot_health_report,
+            installer_report,
+            release_checklist,
+            offline,
+            waivers,
+            report,
+            format,
+            json,
+        } => handle_release_health(
+            ci_report,
+            doctor_report,
+            robot_health_report,
+            installer_report,
+            release_checklist,
+            offline,
+            waivers,
+            report,
+            format,
+            json,
+        ),
+    }
+}
+
+fn handle_release_health(
+    ci_report: PathBuf,
+    doctor_report: Option<PathBuf>,
+    robot_health_report: Option<PathBuf>,
+    installer_report: Option<PathBuf>,
+    release_checklist: PathBuf,
+    offline: bool,
+    raw_waivers: Vec<String>,
+    report_path: Option<PathBuf>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let waivers = raw_waivers
+        .iter()
+        .map(|raw| ci::ReleaseHealthWaiver::parse_cli(raw))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CliError::InvalidArgument)?;
+
+    let inputs = ci::ReleaseHealthInputs {
+        ci_report,
+        doctor_report,
+        robot_health_report,
+        installer_report,
+        release_checklist,
+        offline,
+        waivers,
+    };
+    let report = ci::build_release_health_report(&inputs);
+
+    if let Some(ref path) = report_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                CliError::Other(format!("failed to create report directory: {err}"))
+            })?;
+        }
+        report.write_to_file(path).map_err(|err| {
+            CliError::Other(format!("failed to write release health report: {err}"))
+        })?;
+        if fmt == output::CliOutputFormat::Table {
+            ftui_runtime::ftui_println!("Report written to: {}", path.display());
+        } else {
+            ftui_runtime::ftui_eprintln!("Report written to: {}", path.display());
+        }
+    }
+
+    let data = serde_json::to_value(&report)
+        .map_err(|err| CliError::Other(format!("JSON serialization failed: {err}")))?;
+    output::emit_output(&data, fmt, || {
+        ci::print_release_health_summary(&report);
+    });
+
+    if report.release_eligible {
+        Ok(())
+    } else {
+        ftui_runtime::ftui_eprintln!("Release health failed: {}", report.decision_reason);
+        Err(CliError::ExitCode(1))
+    }
 }
 
 fn handle_quality_gate_command(
@@ -29443,6 +29581,81 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(!quick);
                 assert!(report.is_none());
                 assert!(!parallel);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_release_health_inputs() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "release",
+            "health",
+            "--ci-report",
+            "tests/artifacts/ci/gate_report.json",
+            "--doctor-report",
+            "tests/artifacts/release/doctor.json",
+            "--robot-health-report",
+            "tests/artifacts/release/robot_health.json",
+            "--installer-report",
+            "tests/artifacts/release/installer.json",
+            "--release-checklist",
+            "docs/RELEASE_CHECKLIST.md",
+            "--offline",
+            "--waive",
+            "installer=existing proof",
+            "--report",
+            "tests/artifacts/release/health.json",
+            "--format",
+            "json",
+        ])
+        .expect("failed to parse release health");
+
+        match cli.command.expect("expected command") {
+            Commands::Release {
+                action:
+                    ReleaseCommand::Health {
+                        ci_report,
+                        doctor_report,
+                        robot_health_report,
+                        installer_report,
+                        release_checklist,
+                        offline,
+                        waivers,
+                        report,
+                        format,
+                        json,
+                    },
+            } => {
+                assert_eq!(
+                    ci_report,
+                    PathBuf::from("tests/artifacts/ci/gate_report.json")
+                );
+                assert_eq!(
+                    doctor_report,
+                    Some(PathBuf::from("tests/artifacts/release/doctor.json"))
+                );
+                assert_eq!(
+                    robot_health_report,
+                    Some(PathBuf::from("tests/artifacts/release/robot_health.json"))
+                );
+                assert_eq!(
+                    installer_report,
+                    Some(PathBuf::from("tests/artifacts/release/installer.json"))
+                );
+                assert_eq!(
+                    release_checklist,
+                    PathBuf::from("docs/RELEASE_CHECKLIST.md")
+                );
+                assert!(offline);
+                assert_eq!(waivers, vec!["installer=existing proof"]);
+                assert_eq!(
+                    report,
+                    Some(PathBuf::from("tests/artifacts/release/health.json"))
+                );
+                assert_eq!(format, Some(output::CliOutputFormat::Json));
+                assert!(!json);
             }
             other => panic!("unexpected command: {other:?}"),
         }
