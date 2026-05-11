@@ -33,7 +33,7 @@ done
 
 WORK="$(e2e_mktemp "e2e_boot_check")"
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
-SCENARIOS_TOTAL=6
+SCENARIOS_TOTAL=7
 SCENARIOS_PASSED=0
 SCENARIOS_FAILED=0
 
@@ -173,6 +173,38 @@ with open(sys.argv[1], encoding="utf-8") as handle:
         except json.JSONDecodeError:
             pass
 print(count)
+PY
+}
+
+event_field_value() {
+    local scenario="$1"
+    local event_name="$2"
+    local field_name="$3"
+    local events
+    events="$(scenario_dir "${scenario}")/events.jsonl"
+    if [ ! -f "${events}" ]; then
+        return
+    fi
+    python3 - "${events}" "${event_name}" "${field_name}" <<'PY'
+import json
+import re
+import sys
+
+events, event_name, field_name = sys.argv[1:]
+field = re.escape(field_name)
+pattern = re.compile(rf"(?:^| ){field}=(\"[^\"]*\"|[^ ]+)")
+with open(events, encoding="utf-8") as handle:
+    for line in handle:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") != event_name:
+            continue
+        match = pattern.search(event.get("raw", ""))
+        if match:
+            print(match.group(1).strip('"'))
+            break
 PY
 }
 
@@ -450,6 +482,32 @@ scenario_corrupt_repo_warn_mode_does_not_crash() {
     fi
 }
 
+scenario_full_archive_sweep_within_5s_for_50_projects() {
+    local scenario="$1"
+    local storage="${WORK}/${scenario}/storage"
+    local duration_ms total_projects
+    mkdir -p "${storage}/projects"
+    for idx in {1..50}; do
+        init_clean_repo "${scenario}" "${storage}/projects/healthy_${idx}" || return 1
+    done
+
+    if ! run_server_case "${scenario}" "${storage}" "warn"; then
+        e2e_fail "${scenario}: 50-project archive server starts"
+        return 1
+    fi
+
+    total_projects="$(event_field_value "${scenario}" "boot_check_completed" "total_projects")"
+    duration_ms="$(event_field_value "${scenario}" "boot_check_completed" "duration_ms")"
+    e2e_assert_eq "${scenario}: full sweep reports 50 projects" "50" "${total_projects}"
+    e2e_assert_eq "${scenario}: no boot findings logged" "0" "$(event_count "${scenario}" "boot_check_finding")"
+    if [[ "${duration_ms}" =~ ^[0-9]+$ ]] && [ "${duration_ms}" -lt 5000 ]; then
+        e2e_pass "${scenario}: full archive sweep duration ${duration_ms}ms < 5000ms"
+    else
+        e2e_fail "${scenario}: full archive sweep duration must be < 5000ms"
+        e2e_diff "${scenario}: full archive sweep duration" "<5000" "${duration_ms:-missing}"
+    fi
+}
+
 run_scenario() {
     local scenario="$1"
     local title="$2"
@@ -497,6 +555,9 @@ run_scenario "s5_auto_repair_without_gate_logs_error_and_demotes" \
 run_scenario "s6_corrupt_repo_warn_mode_does_not_crash" \
     "Corrupt repo warn mode does not crash" \
     scenario_corrupt_repo_warn_mode_does_not_crash
+run_scenario "s7_full_archive_sweep_within_5s_for_50_projects" \
+    "Full archive sweep within 5s for 50 projects" \
+    scenario_full_archive_sweep_within_5s_for_50_projects
 
 log_summary "boot_check" "${SCENARIOS_TOTAL}" "${SCENARIOS_PASSED}" "${SCENARIOS_FAILED}" \
     "${E2E_ARTIFACT_DIR}" "bash tests/e2e/test_boot_check.sh" >>"${BOOT_EVENTS}"
