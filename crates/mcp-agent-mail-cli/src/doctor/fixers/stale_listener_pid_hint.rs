@@ -278,7 +278,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let hint = td.path().join("listener.pid");
         fs::write(&hint, "999999999\n").unwrap();
-        let findings = detect(&[hint.clone()], DEFAULT_STALE_SECONDS);
+        let findings = detect(std::slice::from_ref(&hint), DEFAULT_STALE_SECONDS);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].reason, StaleReason::DeadPid);
         assert_eq!(findings[0].recorded_pid, Some(999_999_999));
@@ -293,7 +293,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let hint = td.path().join("listener.pid");
         fs::write(&hint, "").unwrap();
-        let findings = detect(&[hint.clone()], 0);
+        let findings = detect(std::slice::from_ref(&hint), 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].reason, StaleReason::Stale);
         assert_eq!(findings[0].recorded_pid, None);
@@ -343,7 +343,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let hint = td.path().join("listener.pid");
         fs::write(&hint, "999999999\n").unwrap();
-        let findings = detect(&[hint.clone()], DEFAULT_STALE_SECONDS);
+        let findings = detect(std::slice::from_ref(&hint), DEFAULT_STALE_SECONDS);
         assert_eq!(findings.len(), 1);
 
         let run_id = "2026-05-10T08-30-00Z__stalepid";
@@ -378,7 +378,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let hint = td.path().join("listener.pid");
         fs::write(&hint, "999999999\n").unwrap();
-        let findings = detect(&[hint.clone()], DEFAULT_STALE_SECONDS);
+        let findings = detect(std::slice::from_ref(&hint), DEFAULT_STALE_SECONDS);
         let run_id = "2026-05-10T08-30-02Z__roundtrip";
         let ctx = ctx_for(&td, run_id);
         let _ = fix(&ctx, &findings[0]).unwrap();

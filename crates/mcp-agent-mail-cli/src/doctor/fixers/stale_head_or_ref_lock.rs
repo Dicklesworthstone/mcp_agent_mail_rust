@@ -140,7 +140,14 @@ pub fn detect(archive_roots: &[PathBuf], stale_seconds: u64) -> Vec<StaleHeadOrR
             continue; // not a git archive
         }
         // 1. HEAD.lock
-        check_single_lock(&git_dir.join("HEAD.lock"), LockKind::Head, archive, now, stale_seconds, &mut out);
+        check_single_lock(
+            &git_dir.join("HEAD.lock"),
+            LockKind::Head,
+            archive,
+            now,
+            stale_seconds,
+            &mut out,
+        );
         // 2. packed-refs.lock
         check_single_lock(
             &git_dir.join("packed-refs.lock"),
@@ -212,12 +219,7 @@ fn walk_refs(
         };
         if ft.is_dir() {
             walk_refs(&path, depth + 1, archive, now, stale_seconds, out);
-        } else if ft.is_file()
-            && path
-                .extension()
-                .map(|e| e == "lock")
-                .unwrap_or(false)
-        {
+        } else if ft.is_file() && path.extension().map(|e| e == "lock").unwrap_or(false) {
             check_single_lock(&path, LockKind::Ref, archive, now, stale_seconds, out);
         }
     }
@@ -325,7 +327,7 @@ mod tests {
         let archive = make_archive(&td, "alpha");
         // HEAD.lock with threshold 0 → always stale.
         fs::write(archive.join(".git/HEAD.lock"), "").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, LockKind::Head);
     }
@@ -335,7 +337,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let archive = make_archive(&td, "alpha");
         fs::write(archive.join(".git/packed-refs.lock"), "").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, LockKind::PackedRefs);
     }
@@ -345,12 +347,10 @@ mod tests {
         let td = TempDir::new().unwrap();
         let archive = make_archive(&td, "alpha");
         fs::write(archive.join(".git/refs/heads/main.lock"), "").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, LockKind::Ref);
-        assert!(findings[0]
-            .lock_path
-            .ends_with("refs/heads/main.lock"));
+        assert!(findings[0].lock_path.ends_with("refs/heads/main.lock"));
     }
 
     #[test]
@@ -371,7 +371,7 @@ mod tests {
         fs::write(archive.join(".git/packed-refs.lock"), "").unwrap();
         fs::write(archive.join(".git/refs/heads/main.lock"), "").unwrap();
         fs::write(archive.join(".git/refs/heads/develop.lock"), "").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         assert_eq!(findings.len(), 4);
     }
 
@@ -395,9 +395,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let archive = make_archive(&td, "alpha");
         // Build a deeply nested ref tree beyond MAX_REFS_DEPTH.
-        let deep = archive
-            .join(".git/refs")
-            .join("a/b/c/d/e/f/g/h"); // 8 levels deep
+        let deep = archive.join(".git/refs").join("a/b/c/d/e/f/g/h"); // 8 levels deep
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("locked.lock"), "").unwrap();
         let findings = detect(&[archive], 0);
@@ -414,7 +412,7 @@ mod tests {
         let archive = make_archive(&td, "alpha");
         let lock_path = archive.join(".git/HEAD.lock");
         fs::write(&lock_path, "").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         assert_eq!(findings.len(), 1);
         let run_id = "2026-05-10T09-00-00Z__headlock";
         let ctx = ctx_for(&td, run_id);
@@ -433,7 +431,7 @@ mod tests {
         let archive = make_archive(&td, "alpha");
         let lock_path = archive.join(".git/refs/heads/main.lock");
         fs::write(&lock_path, "").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         let run_id = "2026-05-10T09-00-01Z__reflock";
         let ctx = ctx_for(&td, run_id);
         let outcome = fix(&ctx, &findings[0]).expect("fix");
@@ -454,13 +452,12 @@ mod tests {
         let archive = make_archive(&td, "alpha");
         let lock_path = archive.join(".git/refs/heads/main.lock");
         fs::write(&lock_path, "abc").unwrap();
-        let findings = detect(&[archive.clone()], 0);
+        let findings = detect(std::slice::from_ref(&archive), 0);
         let run_id = "2026-05-10T09-00-02Z__roundtrip";
         let ctx = ctx_for(&td, run_id);
         let _ = fix(&ctx, &findings[0]).unwrap();
         drop(ctx);
-        let summary =
-            crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
+        let summary = crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
         assert_eq!(summary.actions_replayed, 1);
         assert!(lock_path.exists());
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), "abc");
