@@ -67,7 +67,7 @@ Dedicated `tests/*.rs` harness count by crate:
 
 | Crate | Integration/conformance test files |
 |---|---:|
-| `mcp-agent-mail-db` | 31 |
+| `mcp-agent-mail-db` | 32 |
 | `mcp-agent-mail-cli` | 16 |
 | `mcp-agent-mail-server` | 15 |
 | `mcp-agent-mail-tools` | 6 |
@@ -119,9 +119,9 @@ Dedicated `tests/*.rs` harness count by crate:
 **Cluster: schema, migrations, pool, cache, queries, explorer**
 
 - Heavy inline coverage in [queries.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/queries.rs), [pool.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/pool.rs), [cache.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/cache.rs), [migrate.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/migrate.rs), [schema.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/schema.rs), [mail_explorer.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/mail_explorer.rs), and related files.
-- Dedicated harnesses include [query_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/query_integration.rs), [migration_tests.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/migration_tests.rs), [schema_migration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/schema_migration.rs), [pool_exhaustion.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/pool_exhaustion.rs), [cache_golden.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/cache_golden.rs), [mail_explorer.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/mail_explorer.rs), and [atc_experience_lifecycle.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/atc_experience_lifecycle.rs).
-- Coverage profile: strong mix of `Behavioral`, `Contract`, and some `Stress/Perf`.
-- Obvious note: DB coverage is one of the deepest in the workspace and already exercises migrations, lifecycle transitions, and failure handling, not just SQL shape.
+- Dedicated harnesses include [query_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/query_integration.rs), [migration_tests.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/migration_tests.rs), [schema_migration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/schema_migration.rs), [schema_invariants.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/schema_invariants.rs), [pool_exhaustion.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/pool_exhaustion.rs), [cache_golden.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/cache_golden.rs), [mail_explorer.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/mail_explorer.rs), and [atc_experience_lifecycle.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/atc_experience_lifecycle.rs).
+- Coverage profile: strong mix of `Behavioral`, `Contract`, and some `Stress/Perf`, plus R0/R1 real-SQLite stateful invariant coverage for relational drift.
+- Obvious note: DB coverage is one of the deepest in the workspace and already exercises migrations, lifecycle transitions, and failure handling, not just SQL shape. [schema_invariants.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/schema_invariants.rs) covers orphan recipients, message/thread consistency via `messages.thread_id`, ack/read ordering, reservation TTL/release drift, contact endpoints, and product links through one reusable invariant source. Build-slot expiry is explicitly marked as `build_slots:file_backed_external` because build slots are file-backed in `mcp-agent-mail-tools`, not relational rows in the DB schema.
 
 **Cluster: search scope, ranking, filter/pagination, planner, quality**
 

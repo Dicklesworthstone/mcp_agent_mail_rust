@@ -40,6 +40,7 @@ pub mod coalesce;
 pub mod error;
 pub mod forensics;
 pub mod integrity;
+pub mod invariants;
 pub mod mail_explorer;
 pub mod mailbox_verdict;
 pub mod migrate;
@@ -201,6 +202,11 @@ pub use integrity::{
     MailboxIntegrityVerdict, attempt_vacuum_recovery, full_check, incremental_check,
     inspect_mailbox_integrity, integrity_details_are_suspect, integrity_metrics, is_full_check_due,
     quick_check,
+};
+pub use invariants::{
+    SCHEMA_INVARIANT_REPLAY_COMMAND, SCHEMA_INVARIANT_SCOPES, SchemaInvariantFinding,
+    SchemaInvariantKind, SchemaInvariantReport, check_schema_invariants,
+    check_schema_invariants_conn,
 };
 pub use mailbox_verdict::{
     DURABILITY_TRANSITIONS, DurabilityState, DurabilityTransition, MailboxArchiveDriftState,
