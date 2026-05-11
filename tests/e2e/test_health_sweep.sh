@@ -47,6 +47,9 @@ DASH_URL=""
 API_URL=""
 SCENARIO_WORK=""
 SCENARIO_XDG=""
+SCENARIO_HOME=""
+SCENARIO_DB_PATH=""
+SCENARIO_STORAGE_ROOT=""
 SCENARIOS_TOTAL=6
 SCENARIOS_PASSED=0
 SCENARIOS_FAILED=0
@@ -131,19 +134,146 @@ set_dashboard_urls() {
     API_URL="${BASE_URL}/api/"
 }
 
+am_cli_bin() {
+    if [ -x "${CARGO_TARGET_DIR}/debug/am" ]; then
+        printf '%s\n' "${CARGO_TARGET_DIR}/debug/am"
+        return 0
+    fi
+    if [ -x "${PROJECT_ROOT}/target/debug/am" ]; then
+        printf '%s\n' "${PROJECT_ROOT}/target/debug/am"
+        return 0
+    fi
+    command -v am 2>/dev/null || true
+}
+
+prepare_health_server_env() {
+    local scenario="$1"
+
+    SCENARIO_WORK="${WORK}/${scenario}"
+    SCENARIO_XDG="${SCENARIO_WORK}/xdg_data"
+    SCENARIO_HOME="${SCENARIO_WORK}/home"
+    SCENARIO_DB_PATH="${SCENARIO_WORK}/mail.sqlite3"
+    SCENARIO_STORAGE_ROOT="${SCENARIO_WORK}/storage"
+    TOKEN="health-sweep-${scenario}-$(e2e_seeded_hex)"
+    mkdir -p "${SCENARIO_WORK}" "${SCENARIO_XDG}" "${SCENARIO_HOME}" "${SCENARIO_STORAGE_ROOT}"
+}
+
+ensure_health_db_schema() {
+    local scenario="$1"
+    local label="$2"
+    local am_bin
+    am_bin="$(am_cli_bin)"
+    if [ -z "${am_bin}" ] || [ ! -x "${am_bin}" ]; then
+        e2e_fail "${scenario}: am CLI binary not found for DB seeding"
+        return 1
+    fi
+
+    local out_dir
+    out_dir="$(scenario_dir "${scenario}")/subprocesses/${label}_migrate"
+    mkdir -p "${out_dir}" "$(dirname "${SCENARIO_DB_PATH}")"
+    if [ ! -f "${SCENARIO_DB_PATH}" ]; then
+        : >"${SCENARIO_DB_PATH}"
+    fi
+
+    local rc=0
+    set +e
+    AM_INTERFACE_MODE=cli \
+        DATABASE_URL="sqlite://${SCENARIO_DB_PATH}" \
+        STORAGE_ROOT="${SCENARIO_STORAGE_ROOT}" \
+        XDG_DATA_HOME="${SCENARIO_XDG}" \
+        HOME="${SCENARIO_HOME}" \
+        WORKTREES_ENABLED=false \
+        timeout 20 "${am_bin}" migrate >"${out_dir}/stdout" 2>"${out_dir}/stderr"
+    rc=$?
+    set -e
+    printf '%s\n' "${rc}" >"${out_dir}/exit"
+
+    if [ "${rc}" -ne 0 ]; then
+        e2e_fail "${scenario}: DB schema initialization failed with exit ${rc}"
+        return 1
+    fi
+}
+
+seed_project_for_repo() {
+    local scenario="$1"
+    local label="$2"
+    local repo="$3"
+
+    ensure_health_db_schema "${scenario}" "seed_${label}" || return 1
+
+    local out_dir
+    out_dir="$(scenario_dir "${scenario}")/subprocesses/seed_${label}_project"
+    mkdir -p "${out_dir}"
+
+    local rc=0
+    set +e
+    python3 - "${SCENARIO_DB_PATH}" "${SCENARIO_STORAGE_ROOT}" "${repo}" \
+        >"${out_dir}/stdout" 2>"${out_dir}/stderr" <<'PY'
+import pathlib
+import sqlite3
+import sys
+import time
+
+db_path = sys.argv[1]
+storage_root = pathlib.Path(sys.argv[2])
+human_key = sys.argv[3]
+
+def slugify(value: str) -> str:
+    out = []
+    prev_dash = False
+    for ch in value.strip():
+        if "A" <= ch <= "Z":
+            ch = ch.lower()
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    slug = "".join(out).strip("-")
+    return slug or "project"
+
+slug = slugify(human_key)
+now_us = int(time.time() * 1_000_000)
+storage_root.joinpath("projects", slug).mkdir(parents=True, exist_ok=True)
+
+conn = sqlite3.connect(db_path)
+try:
+    conn.execute(
+        """
+        INSERT INTO projects (slug, human_key, created_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(slug) DO UPDATE SET human_key = excluded.human_key
+        """,
+        (slug, human_key, now_us),
+    )
+    conn.commit()
+finally:
+    conn.close()
+
+print(slug)
+PY
+    rc=$?
+    set -e
+    printf '%s\n' "${rc}" >"${out_dir}/exit"
+
+    if [ "${rc}" -ne 0 ]; then
+        e2e_fail "${scenario}: project seed failed for ${repo}"
+        return 1
+    fi
+
+    cat "${out_dir}/stdout"
+}
+
 start_health_server() {
     local scenario="$1"
     shift
 
-    SCENARIO_WORK="${WORK}/${scenario}"
-    SCENARIO_XDG="${SCENARIO_WORK}/xdg_data"
-    local home_dir="${SCENARIO_WORK}/home"
-    local db_path="${SCENARIO_WORK}/mail.sqlite3"
-    local storage_root="${SCENARIO_WORK}/storage"
-    TOKEN="health-sweep-${scenario}-$(e2e_seeded_hex)"
-    mkdir -p "${SCENARIO_WORK}" "${SCENARIO_XDG}" "${home_dir}" "${storage_root}"
+    if [ -z "${SCENARIO_WORK}" ] || [ "${SCENARIO_WORK}" != "${WORK}/${scenario}" ]; then
+        prepare_health_server_env "${scenario}"
+    fi
 
-    if ! e2e_start_server_with_pty "${db_path}" "${storage_root}" "${scenario}" \
+    if ! e2e_start_server_with_pty "${SCENARIO_DB_PATH}" "${SCENARIO_STORAGE_ROOT}" "${scenario}" \
         "HTTP_PATH=/api" \
         "HTTP_BEARER_TOKEN=${TOKEN}" \
         "TUI_ENABLED=true" \
@@ -153,8 +283,9 @@ start_health_server() {
         "CONSOLE_POLL_INTERVAL_MS=100" \
         "AM_HEALTH_SWEEP_INTERVAL_SEC=1" \
         "AM_HEALTH_SWEEP_BATCH=50" \
+        "WORKTREES_ENABLED=false" \
         "XDG_DATA_HOME=${SCENARIO_XDG}" \
-        "HOME=${home_dir}" \
+        "HOME=${SCENARIO_HOME}" \
         "$@"; then
         return 1
     fi
@@ -346,37 +477,6 @@ wait_for_log_count() {
     return 1
 }
 
-ensure_project_for_repo() {
-    local scenario="$1"
-    local label="$2"
-    local repo="$3"
-    local case_id="${scenario}_ensure_${label}"
-    local args_json
-    args_json="{\"human_key\":\"$(_e2e_json_escape "${repo}")\"}"
-
-    if ! e2e_rpc_call "${case_id}" "${API_URL}" "ensure_project" "${args_json}" "Authorization: Bearer ${TOKEN}"; then
-        e2e_fail "${scenario}: ensure_project failed for ${repo}"
-        return 1
-    fi
-
-    python3 - "${E2E_ARTIFACT_DIR}/${case_id}/response.json" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-result = data.get("result") or {}
-content = result.get("content") or []
-text = "{}"
-if content and isinstance(content[0], dict):
-    text = content[0].get("text") or "{}"
-payload = json.loads(text)
-slug = payload.get("slug")
-if not slug:
-    raise SystemExit("missing slug in ensure_project response")
-print(slug)
-PY
-}
-
 open_system_health() {
     local scenario="$1"
     sleep 1
@@ -388,8 +488,9 @@ scenario_default_interval_runs_periodically() {
     local scenario="$1"
     local repo="${WORK}/${scenario}/repo-clean"
     init_clean_repo "${scenario}" "${repo}" || return 1
+    prepare_health_server_env "${scenario}"
+    seed_project_for_repo "${scenario}" "clean" "${repo}" >/dev/null || return 1
     start_health_server "${scenario}" || return 1
-    ensure_project_for_repo "${scenario}" "clean" "${repo}" >/dev/null || return 1
     open_system_health "${scenario}" || return 1
 
     wait_for_log_count "${scenario}" "git_ref_integrity_completed" 2 18 >/dev/null || return 1
@@ -405,8 +506,9 @@ scenario_disabled_env_no_sweeps() {
     local scenario="$1"
     local repo="${WORK}/${scenario}/repo-clean"
     init_clean_repo "${scenario}" "${repo}" || return 1
+    prepare_health_server_env "${scenario}"
+    seed_project_for_repo "${scenario}" "clean" "${repo}" >/dev/null || return 1
     start_health_server "${scenario}" "AM_HEALTH_SWEEP_ENABLED=false" || return 1
-    ensure_project_for_repo "${scenario}" "clean" "${repo}" >/dev/null || return 1
     open_system_health "${scenario}" || return 1
     sleep 2
 
@@ -422,8 +524,9 @@ scenario_panel_visible_after_findings() {
     local scenario="$1"
     local repo="${WORK}/${scenario}/repo-orphan-stash"
     init_orphan_stash_repo "${scenario}" "${repo}" || return 1
+    prepare_health_server_env "${scenario}"
+    seed_project_for_repo "${scenario}" "stash" "${repo}" >/dev/null || return 1
     start_health_server "${scenario}" || return 1
-    ensure_project_for_repo "${scenario}" "stash" "${repo}" >/dev/null || return 1
     open_system_health "${scenario}" || return 1
 
     wait_for_log_count "${scenario}" "git_ref_integrity_finding" 1 15 >/dev/null || return 1
@@ -444,8 +547,9 @@ scenario_banner_visible_after_findings() {
     local scenario="$1"
     local repo="${WORK}/${scenario}/repo-dangling-branch"
     init_dangling_branch_repo "${scenario}" "${repo}" || return 1
+    prepare_health_server_env "${scenario}"
+    seed_project_for_repo "${scenario}" "branch" "${repo}" >/dev/null || return 1
     start_health_server "${scenario}" || return 1
-    ensure_project_for_repo "${scenario}" "branch" "${repo}" >/dev/null || return 1
     open_system_health "${scenario}" || return 1
 
     wait_for_log_count "${scenario}" "git_ref_integrity_finding" 1 15 >/dev/null || return 1
@@ -460,9 +564,10 @@ scenario_dismissal_takes_effect_next_cycle() {
     local scenario="$1"
     local repo="${WORK}/${scenario}/repo-orphan-stash"
     init_orphan_stash_repo "${scenario}" "${repo}" || return 1
-    start_health_server "${scenario}" || return 1
+    prepare_health_server_env "${scenario}"
     local slug
-    slug="$(ensure_project_for_repo "${scenario}" "stash" "${repo}")" || return 1
+    slug="$(seed_project_for_repo "${scenario}" "stash" "${repo}")" || return 1
+    start_health_server "${scenario}" || return 1
     open_system_health "${scenario}" || return 1
 
     wait_for_log_count "${scenario}" "git_ref_integrity_finding" 1 15 >/dev/null || return 1
@@ -491,8 +596,9 @@ scenario_am_git_binary_suppresses_banner_only() {
     local scenario="$1"
     local repo="${WORK}/${scenario}/repo-orphan-stash"
     init_orphan_stash_repo "${scenario}" "${repo}" || return 1
+    prepare_health_server_env "${scenario}"
+    seed_project_for_repo "${scenario}" "stash" "${repo}" >/dev/null || return 1
     start_health_server "${scenario}" "AM_GIT_BINARY=/usr/bin/git" || return 1
-    ensure_project_for_repo "${scenario}" "stash" "${repo}" >/dev/null || return 1
     open_system_health "${scenario}" || return 1
 
     wait_for_log_count "${scenario}" "git_ref_integrity_finding" 1 15 >/dev/null || return 1
