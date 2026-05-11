@@ -233,7 +233,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let p = td.path().join("config.toml.bak");
         write_with_mode(&p, r#"{"token":"abcdef"}"#, 0o644);
-        let findings = detect(&[p.clone()]);
+        let findings = detect(std::slice::from_ref(&p));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, p);
         assert_eq!(findings[0].current_mode & 0o777, 0o644);
@@ -252,7 +252,7 @@ mod tests {
         ] {
             let p = td.path().join(format!("file{suffix}"));
             write_with_mode(&p, body, 0o644);
-            let findings = detect(&[p.clone()]);
+            let findings = detect(std::slice::from_ref(&p));
             assert_eq!(
                 findings.len(),
                 1,
@@ -314,17 +314,13 @@ mod tests {
         let td = TempDir::new().unwrap();
         let p = td.path().join("config.toml.bak");
         write_with_mode(&p, r#"{"token":"abc"}"#, 0o644);
-        let findings = detect(&[p.clone()]);
+        let findings = detect(std::slice::from_ref(&p));
         let run_id = "2026-05-11T07-00-00Z__chmod";
         let ctx = ctx_for(&td, run_id);
         let outcome = fix(&ctx, &findings[0]).expect("fix");
         assert_eq!(outcome.actions_taken, 1);
         let new_mode = fs::metadata(&p).unwrap().permissions().mode();
-        assert_eq!(
-            new_mode & 0o777,
-            0o600,
-            "fixer must chmod to 0o600"
-        );
+        assert_eq!(new_mode & 0o777, 0o600, "fixer must chmod to 0o600");
         // Quarantine list is empty for Chmod ops.
         assert!(outcome.quarantined_paths.is_empty());
     }
@@ -353,7 +349,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let p = td.path().join("config.toml.bak");
         write_with_mode(&p, r#"{"token":"abc"}"#, 0o644);
-        let findings = detect(&[p.clone()]);
+        let findings = detect(std::slice::from_ref(&p));
         let run_id = "2026-05-11T07-00-02Z__roundtrip";
         let ctx = ctx_for(&td, run_id);
         let _ = fix(&ctx, &findings[0]).unwrap();
@@ -364,8 +360,7 @@ mod tests {
         );
         drop(ctx);
         // Undo should restore to 0o644.
-        let summary =
-            crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
+        let summary = crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
         assert_eq!(summary.actions_replayed, 1);
         let restored = fs::metadata(&p).unwrap().permissions().mode();
         assert_eq!(

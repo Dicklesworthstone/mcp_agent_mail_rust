@@ -23,6 +23,7 @@ pub mod stale_archive_lock;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
 pub mod world_readable_token_bak;
+pub mod wrong_mcp_url_json;
 
 use serde::Serialize;
 
