@@ -531,6 +531,63 @@ fn golden_denial_message_format_contract() {
 }
 
 #[test]
+fn golden_cli_mode_denial_for_mcp_only_serve() {
+    let mut env = base_env();
+    env.push(("AM_INTERFACE_MODE".to_string(), "cli".to_string()));
+    let am = am_bin();
+    let target_dir = am.parent().expect("target dir");
+    let mcp_bin = target_dir.join("mcp-agent-mail");
+
+    if !mcp_bin.exists() {
+        eprintln!("SKIP: MCP binary not found.");
+        return;
+    }
+
+    let out = run_mcp(&["serve"], &env);
+    let serr = stderr_str(&out);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "CLI mode denial for `serve` must exit with code 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout_str(&out).is_empty(),
+        "CLI mode denial for `serve` must not write to stdout"
+    );
+    assert!(
+        serr.contains("\"serve\" is not available in CLI mode"),
+        "CLI mode denial must name the MCP-only command.\nActual stderr:\n{serr}"
+    );
+    assert!(
+        serr.contains("unset AM_INTERFACE_MODE"),
+        "CLI mode denial must explain how to return to MCP mode.\nActual stderr:\n{serr}"
+    );
+    assert!(
+        serr.contains("mcp-agent-mail serve-http"),
+        "CLI mode denial must list the CLI HTTP equivalent.\nActual stderr:\n{serr}"
+    );
+
+    let snapshot_name = "mcp_cli_mode_deny_serve.txt";
+    maybe_update_golden_snapshot(snapshot_name, &serr);
+    let golden = load_golden_snapshot(snapshot_name).unwrap_or_else(|| {
+        panic!(
+            "missing golden snapshot {snapshot_name}. \
+             Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_cli_mode_denial_for_mcp_only_serve -- --nocapture` to generate it."
+        )
+    });
+    let norm_golden = normalize_snapshot_text(&golden);
+    let norm_actual = normalize_snapshot_text(&serr);
+    assert_snapshot_match(
+        "CLI mode denial 'serve'",
+        &norm_golden,
+        &norm_actual,
+        "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_cli_mode_denial_for_mcp_only_serve -- --nocapture` to update.",
+    );
+}
+
+#[test]
 fn golden_cli_help_snapshot_stability() {
     let env = base_env();
 

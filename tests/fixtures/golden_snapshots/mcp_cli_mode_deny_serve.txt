@@ -1,0 +1,9 @@
+Error: "serve" is not available in CLI mode (AM_INTERFACE_MODE=cli).
+
+To start the MCP server:
+unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)
+mcp-agent-mail serve ...
+
+CLI equivalents:
+mcp-agent-mail serve-http ...
+mcp-agent-mail serve-stdio ...
