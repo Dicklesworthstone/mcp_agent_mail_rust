@@ -6,7 +6,15 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["ts", "level", "target", "name", "fields"],
-  "x-event-names": ["boot_check_started", "boot_check_finding", "boot_check_completed", "boot_check_aborted", "boot_check_auto_repair_gate_violated"],
+  "x-event-names": [
+    "boot_check_started",
+    "boot_check_finding",
+    "boot_check_completed",
+    "boot_check_aborted",
+    "boot_check_auto_repair_attempted",
+    "boot_check_auto_repair_failed",
+    "boot_check_auto_repair_gate_violated"
+  ],
   "x-planned": true,
   "x-drift-required-fields": [],
   "properties": {
@@ -33,7 +41,14 @@
         "detail": { "type": "string" },
         "findings_count": { "type": "integer", "minimum": 0 },
         "auto_repaired_count": { "type": "integer", "minimum": 0 },
-        "degraded": { "type": "boolean" }
+        "degraded": { "type": "boolean" },
+        "actions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "before_state": { "type": "object" },
+        "after_state": { "type": "object" },
+        "error": { "type": "string" }
       }
     }
   }

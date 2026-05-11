@@ -1,0 +1,23 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "warn",
+  "target": "mcp_agent_mail::boot_check",
+  "name": "boot_check_auto_repair_attempted",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "startup.boot_check",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 44,
+    "outcome": "success",
+    "git_version": "libgit2",
+    "mode": "auto_repair",
+    "project": "project-a",
+    "actions": ["backup_refs", "prune_orphan_refs", "repack_archive"],
+    "before_state": {
+      "orphan_refs": 1
+    },
+    "after_state": {
+      "orphan_refs": 0
+    }
+  }
+}

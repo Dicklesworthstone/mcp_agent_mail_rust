@@ -299,3 +299,38 @@ fn schemas_validate_positive_and_negative_samples() -> Result<(), Box<dyn Error>
     }
     Ok(())
 }
+
+#[test]
+fn boot_check_schema_has_positive_fixture_for_each_event_name() -> Result<(), Box<dyn Error>> {
+    let schema_path = repo_root()?.join("docs/schemas/git_251/boot_check.schema.json");
+    let schema = read_json(&schema_path)?;
+    let schema_object = object(&schema, "schema")?;
+    let expected = string_array(schema_object.get("x-event-names"))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !expected.is_empty(),
+        "boot_check schema must list event names"
+    );
+
+    let dir = fixture_dir(&schema_path)?;
+    let mut observed = BTreeSet::new();
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("valid_"))
+        {
+            continue;
+        }
+        let event = read_json(&path)?;
+        let event_name = event
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("valid boot_check fixture missing name")?;
+        observed.insert(event_name.to_string());
+    }
+
+    assert_eq!(observed, expected);
+    Ok(())
+}

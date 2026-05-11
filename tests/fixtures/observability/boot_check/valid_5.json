@@ -1,0 +1,15 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "error",
+  "target": "mcp_agent_mail::boot_check",
+  "name": "boot_check_auto_repair_gate_violated",
+  "fields": {
+    "repo_slug": "startup",
+    "caller": "server.startup",
+    "args_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "duration_ms": 0,
+    "outcome": "error",
+    "git_version": "n/a",
+    "mode": "auto_repair"
+  }
+}
