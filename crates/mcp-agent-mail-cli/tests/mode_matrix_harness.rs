@@ -675,6 +675,71 @@ fn golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects() {
 }
 
 #[test]
+fn golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects() -> Result<(), String> {
+    let cases = [
+        ("setup", "mcp_deny_setup.txt"),
+        ("robot", "mcp_deny_robot.txt"),
+    ];
+    let am = am_bin();
+    let target_dir = am
+        .parent()
+        .ok_or_else(|| format!("target dir unavailable for am binary {}", am.display()))?;
+    let mcp_bin = target_dir.join("mcp-agent-mail");
+
+    if !mcp_bin.exists() {
+        eprintln!("SKIP: MCP binary not found.");
+        return Ok(());
+    }
+
+    for (command, snapshot_name) in cases {
+        let (root, env) = isolated_env_without_precreated_root(command);
+
+        assert!(
+            !root.exists(),
+            "isolated root should not exist before wrong-surface denial for {command}: {}",
+            root.display()
+        );
+
+        let out = run_mcp(&[command], &env);
+        let serr = stderr_str(&out);
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "MCP mode denial for CLI-only `{command}` must exit with code 2, got {:?}",
+            out.status.code()
+        );
+        assert!(
+            stdout_str(&out).is_empty(),
+            "MCP mode denial for CLI-only `{command}` must not write to stdout"
+        );
+        assert!(
+            !root.exists(),
+            "wrong-surface `{command}` denial must not create mailbox or config state under {}",
+            root.display()
+        );
+
+        maybe_update_golden_snapshot(snapshot_name, &serr);
+        let golden = load_golden_snapshot(snapshot_name).ok_or_else(|| {
+            format!(
+                "missing golden snapshot {snapshot_name}. \
+                 Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects -- --nocapture` to generate it."
+            )
+        })?;
+        let norm_golden = normalize_snapshot_text(&golden);
+        let norm_actual = normalize_snapshot_text(&serr);
+        assert_snapshot_match(
+            &format!("MCP mode denial '{command}'"),
+            &norm_golden,
+            &norm_actual,
+            "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects -- --nocapture` to update.",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn golden_cli_help_snapshot_stability() {
     let env = base_env();
 
