@@ -1,0 +1,85 @@
+{
+  "schema": "boot_check_bench.v1",
+  "generated_at": "2026-05-11T17:07:36.334154695+00:00",
+  "command": "rch exec -- cargo bench -p mcp-agent-mail-storage --bench boot_check_bench",
+  "budgets": {
+    "unit": "microseconds",
+    "single_project_100_commits_p95_us": 100000,
+    "full_archive_50_projects_p95_us": 5000000,
+    "auto_repair_orphan_stash_p95_us": 500000
+  },
+  "samples": [
+    {
+      "name": "single_project_100_commits",
+      "mode": "warn",
+      "projects": 1,
+      "commits_per_project": 100,
+      "samples_us": [
+        542,
+        547,
+        548,
+        548,
+        567,
+        753,
+        849,
+        853,
+        964
+      ],
+      "p50_us": 567,
+      "p95_us": 964,
+      "max_us": 964,
+      "budget_us": 100000,
+      "budget_passed": true,
+      "findings_count": 0,
+      "auto_repaired_count": 0
+    },
+    {
+      "name": "full_archive_50_projects",
+      "mode": "warn",
+      "projects": 50,
+      "commits_per_project": 1,
+      "samples_us": [
+        22333,
+        23056,
+        23354,
+        24008,
+        24650,
+        26511,
+        28593,
+        30059,
+        31444
+      ],
+      "p50_us": 24650,
+      "p95_us": 31444,
+      "max_us": 31444,
+      "budget_us": 5000000,
+      "budget_passed": true,
+      "findings_count": 0,
+      "auto_repaired_count": 0
+    },
+    {
+      "name": "auto_repair_orphan_stash",
+      "mode": "auto_repair",
+      "projects": 1,
+      "commits_per_project": 1,
+      "samples_us": [
+        27077,
+        27093,
+        27220,
+        27404,
+        27460,
+        27538,
+        27721,
+        27882,
+        54410
+      ],
+      "p50_us": 27460,
+      "p95_us": 54410,
+      "max_us": 54410,
+      "budget_us": 500000,
+      "budget_passed": true,
+      "findings_count": 0,
+      "auto_repaired_count": 1
+    }
+  ]
+}

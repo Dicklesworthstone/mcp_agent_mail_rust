@@ -4610,6 +4610,7 @@ dependencies = [
  "asupersync",
  "base64 0.22.1",
  "chrono",
+ "criterion",
  "fastmcp-core",
  "fs2",
  "git2",

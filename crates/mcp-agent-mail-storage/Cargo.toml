@@ -34,8 +34,13 @@ default = ["mcp-agent-mail-db/default"]
 portable = ["mcp-agent-mail-db/portable"]
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile = "3"
 toml.workspace = true
+
+[[bench]]
+name = "boot_check_bench"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
