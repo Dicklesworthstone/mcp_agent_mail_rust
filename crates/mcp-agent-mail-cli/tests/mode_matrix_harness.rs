@@ -110,6 +110,38 @@ fn base_env() -> Vec<(String, String)> {
     ]
 }
 
+fn isolated_env_without_precreated_root(label: &str) -> (PathBuf, Vec<(String, String)>) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "mode_matrix_{label}_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    let env = vec![
+        (
+            "DATABASE_URL".to_string(),
+            format!("sqlite:///{}/test.sqlite3", root.display()),
+        ),
+        (
+            "STORAGE_ROOT".to_string(),
+            root.join("storage").display().to_string(),
+        ),
+        ("HOME".to_string(), root.join("home").display().to_string()),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            root.join("xdg_config").display().to_string(),
+        ),
+        ("AGENT_NAME".to_string(), "TestAgent".to_string()),
+        ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
+        ("HTTP_PORT".to_string(), "1".to_string()),
+        ("HTTP_PATH".to_string(), "/mcp/".to_string()),
+    ];
+    (root, env)
+}
+
 fn stdout_str(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
@@ -584,6 +616,61 @@ fn golden_cli_mode_denial_for_mcp_only_serve() {
         &norm_golden,
         &norm_actual,
         "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_cli_mode_denial_for_mcp_only_serve -- --nocapture` to update.",
+    );
+}
+
+#[test]
+fn golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects() {
+    let (root, env) = isolated_env_without_precreated_root("mcp_deny_doctor");
+    let am = am_bin();
+    let target_dir = am.parent().expect("target dir");
+    let mcp_bin = target_dir.join("mcp-agent-mail");
+
+    if !mcp_bin.exists() {
+        eprintln!("SKIP: MCP binary not found.");
+        return;
+    }
+
+    assert!(
+        !root.exists(),
+        "isolated root should not exist before wrong-surface denial: {}",
+        root.display()
+    );
+
+    let out = run_mcp(&["doctor"], &env);
+    let serr = stderr_str(&out);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "MCP mode denial for CLI-only `doctor` must exit with code 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout_str(&out).is_empty(),
+        "MCP mode denial for CLI-only `doctor` must not write to stdout"
+    );
+    assert!(
+        !root.exists(),
+        "wrong-surface denial must not create mailbox or config state under {}",
+        root.display()
+    );
+
+    let snapshot_name = "mcp_deny_doctor.txt";
+    maybe_update_golden_snapshot(snapshot_name, &serr);
+    let golden = load_golden_snapshot(snapshot_name).unwrap_or_else(|| {
+        panic!(
+            "missing golden snapshot {snapshot_name}. \
+             Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects -- --nocapture` to generate it."
+        )
+    });
+    let norm_golden = normalize_snapshot_text(&golden);
+    let norm_actual = normalize_snapshot_text(&serr);
+    assert_snapshot_match(
+        "MCP mode denial 'doctor'",
+        &norm_golden,
+        &norm_actual,
+        "Run `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects -- --nocapture` to update.",
     );
 }
 
