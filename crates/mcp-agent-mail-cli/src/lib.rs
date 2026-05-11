@@ -35304,6 +35304,8 @@ http_headers = { Authorization = "Bearer secret" }
         let (db_path, proj_alpha_key, _proj_beta_key, created_at_us) = seed_products_cli_db(&root);
 
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for orphaned-link fixture");
         conn.execute_sync(
             "INSERT INTO products (id, product_uid, name, created_at) VALUES (?, ?, ?, ?)",
             &[
@@ -35365,6 +35367,92 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             status_json["projects"][0]["slug"].as_str(),
             Some(mcp_agent_mail_core::compute_project_slug(&proj_alpha_key).as_str())
+        );
+    }
+
+    #[test]
+    fn products_status_reports_orphaned_project_links() {
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_db::sqlmodel::Value;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        let (db_path, _proj_alpha_key, _proj_beta_key, created_at_us) = seed_products_cli_db(&root);
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for orphaned-link fixture");
+        conn.execute_sync(
+            "INSERT INTO products (id, product_uid, name, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(101),
+                Value::Text("prod-orphaned-project".to_string()),
+                Value::Text("Orphaned Project Product".to_string()),
+                Value::BigInt(created_at_us),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(101),
+                Value::BigInt(999),
+                Value::BigInt(created_at_us),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let pool = mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(root.path().to_path_buf()),
+            min_connections: 1,
+            max_connections: 1,
+            acquire_timeout_ms: 5_000,
+            max_lifetime_ms: 60_000,
+            run_migrations: false,
+            warmup_connections: 0,
+            cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+        })
+        .unwrap();
+        let cx = asupersync::Cx::for_request();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Status {
+                product_key: "prod-orphaned-project".to_string(),
+                format: None,
+                json: true,
+            },
+        );
+        res.unwrap();
+        let status_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(status_json["projects"][0]["id"].as_i64(), Some(999));
+        assert_eq!(
+            status_json["projects"][0]["slug"].as_str(),
+            Some("[unknown-project-999]")
+        );
+        assert_eq!(status_json["diagnostics"]["degraded"].as_bool(), Some(true));
+
+        let partial_failures = status_json["diagnostics"]["partial_failures"]
+            .as_array()
+            .expect("partial failures array");
+        assert_eq!(partial_failures.len(), 1);
+        assert_eq!(partial_failures[0]["project_id"].as_i64(), Some(999));
+        assert_eq!(
+            partial_failures[0]["reason_code"].as_str(),
+            Some("linked_project_missing")
+        );
+        assert_eq!(
+            partial_failures[0]["remediation_command"].as_str(),
+            Some("am doctor reconstruct")
         );
     }
 
@@ -57855,6 +57943,24 @@ async fn handle_products_with(
                         return Err(CliError::Other(format!("internal panic: {}", p.message())));
                     }
                 };
+            let partial_failures = projects
+                .iter()
+                .filter_map(|project| {
+                    let project_id = project.id.unwrap_or(0);
+                    let placeholder = format!("[unknown-project-{project_id}]");
+                    if project.slug == placeholder && project.human_key == placeholder {
+                        Some(serde_json::json!({
+                            "project_id": project_id,
+                            "reason_code": "linked_project_missing",
+                            "reason": "product_project_links references a project id with no projects row",
+                            "remediation_command": "am doctor reconstruct",
+                            "verification_command": format!("am products status {} --json", product_key),
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
 
             let payload = serde_json::json!({
                 "product": {
@@ -57868,6 +57974,10 @@ async fn handle_products_with(
                     "slug": p.slug,
                     "human_key": p.human_key,
                 })).collect::<Vec<_>>(),
+                "diagnostics": {
+                    "degraded": !partial_failures.is_empty(),
+                    "partial_failures": partial_failures,
+                },
             });
 
             output::emit_output(&payload, fmt, || {
@@ -57934,6 +58044,42 @@ async fn handle_products_with(
                     &["id", "slug", "human_key"],
                     proj_rows,
                 );
+
+                let partial_rows = payload
+                    .get("diagnostics")
+                    .and_then(|v| v.get("partial_failures"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|failure| {
+                        vec![
+                            failure
+                                .get("project_id")
+                                .cloned()
+                                .unwrap_or_default()
+                                .to_string(),
+                            failure
+                                .get("reason_code")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            failure
+                                .get("remediation_command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                if !partial_rows.is_empty() {
+                    ftui_runtime::ftui_println!();
+                    print_table(
+                        Some("Partial Failures"),
+                        &["project_id", "reason_code", "remediation_command"],
+                        partial_rows,
+                    );
+                }
             });
             Ok(())
         }

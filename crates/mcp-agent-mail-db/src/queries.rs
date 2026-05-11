@@ -388,7 +388,29 @@ fn map_sql_outcome<T>(out: Outcome<T, SqlError>) -> Outcome<T, DbError> {
 }
 
 fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> {
-    ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
+    let id = row.get(0).and_then(value_as_i64);
+    let slug = row
+        .get(1)
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::Internal("missing slug in project row".to_string()))?;
+    let human_key = row
+        .get(2)
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| DbError::Internal("missing human_key in project row".to_string()))?;
+    let created_at = row.get(3).and_then(value_as_i64).unwrap_or(0);
+
+    Ok(ProjectRow {
+        id,
+        slug,
+        human_key,
+        created_at,
+    })
 }
 
 fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ProjectRow {
@@ -10464,10 +10486,10 @@ pub async fn list_product_projects(
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                match ProjectRow::from_row(&r) {
+            for r in &rows {
+                match decode_project_row(r) {
                     Ok(row) => out.push(row),
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(e) => return Outcome::Err(e),
                 }
             }
             Outcome::Ok(out)
@@ -16126,6 +16148,58 @@ mod tests {
             assert_eq!(ensured.id, by_human_key.id);
             assert_eq!(ensured.slug, by_slug.slug);
             assert_eq!(human_key, by_human_key.human_key);
+        });
+    }
+
+    #[test]
+    fn project_lookup_tolerates_null_created_at_metadata() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("project_null_created_at.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open nullable project schema connection");
+        init_conn
+            .execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at INTEGER)")
+            .expect("create nullable project table");
+        init_conn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, NULL)",
+                &[
+                    Value::BigInt(1),
+                    Value::Text("null-created-at".to_string()),
+                    Value::Text("/tmp/null-created-at".to_string()),
+                ],
+            )
+            .expect("insert project with missing created_at metadata");
+        crate::close_db_conn(init_conn, "project null created_at test init connection");
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool_without_startup_init(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let project = get_project_by_slug(&cx, &pool, "null-created-at")
+                .await
+                .into_result()
+                .expect("lookup project with nullable created_at metadata");
+
+            assert_eq!(project.id, Some(1));
+            assert_eq!(project.slug, "null-created-at");
+            assert_eq!(project.human_key, "/tmp/null-created-at");
+            assert_eq!(project.created_at, 0);
         });
     }
 

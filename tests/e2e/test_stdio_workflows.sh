@@ -13,7 +13,7 @@
 #   5. Search and thread summarisation pipeline
 #   6. Build slot acquire → renew → release cycle
 #   7. Concurrent reservation conflict detection and force-release
-#   8. Product bus: ensure_product → link → cross-product inbox
+#   8. Product bus: ensure_product → link → cross-product inbox/search + partial-failure artifacts
 #
 # Logging: step-indexed, assertion-level pass/fail, last-known state on failure.
 
@@ -48,7 +48,7 @@ send_session() {
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="${WORK}/storage" RUST_LOG=error WORKTREES_ENABLED=true \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -500,9 +500,12 @@ e2e_save_artifact "case_07b_conflict.txt" "$RESP7B"
 CONFLICT7_TEXT="$(extract_tool_result "$RESP7B" 74)"
 CONFLICT7_COUNT="$(echo "$CONFLICT7_TEXT" | python3 -c "
 import sys, json
-d = json.loads(sys.stdin.read())
-conflicts = d.get('conflicts', [])
-print(len(conflicts))
+try:
+    d = json.loads(sys.stdin.read())
+    conflicts = d.get('conflicts', [])
+    print(len(conflicts))
+except Exception:
+    print(0)
 " 2>/dev/null)"
 if [ "$CONFLICT7_COUNT" -ge 1 ] 2>/dev/null; then
     e2e_pass "conflict: BluePeak got $CONFLICT7_COUNT conflict(s)"
@@ -555,7 +558,7 @@ REQS8=(
     "{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"tools/call\",\"params\":{\"name\":\"products_link\",\"arguments\":{\"product_key\":\"E2E Product\",\"project_key\":\"/tmp/e2e_wf_product_b\"}}}"
     '{"jsonrpc":"2.0","id":85,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_wf_product_a","program":"e2e","model":"test","name":"CoralBay"}}}'
     '{"jsonrpc":"2.0","id":86,"method":"tools/call","params":{"name":"register_agent","arguments":{"project_key":"/tmp/e2e_wf_product_b","program":"e2e","model":"test","name":"MistyCove"}}}'
-    '{"jsonrpc":"2.0","id":87,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_wf_product_a","sender_name":"CoralBay","to":["MistyCove"],"subject":"Cross-project ping","body_md":"Testing product bus routing."}}}'
+    '{"jsonrpc":"2.0","id":87,"method":"tools/call","params":{"name":"send_message","arguments":{"project_key":"/tmp/e2e_wf_product_a","sender_name":"CoralBay","to":["MistyCove"],"subject":"Cross-project ping","body_md":"Testing product bus routing.","thread_id":"e2e-product-thread"}}}'
     "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"agent_name\":\"MistyCove\",\"limit\":5}}}"
     "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"query\":\"cross-project\",\"limit\":10}}}"
 )
@@ -564,7 +567,7 @@ RESP8="$(send_session "$DB8" "${REQS8[@]}")"
 e2e_save_artifact "case_08_product.txt" "$RESP8"
 
 # 8a: product created
-if [ "$(is_error "$RESP8" 80)" = "OK" ]; then
+if [ "$(is_error "$RESP8A" 80)" = "OK" ]; then
     e2e_pass "product: ensure_product succeeded"
 else
     e2e_fail "product: ensure_product returned error"
@@ -605,6 +608,108 @@ if [ -n "$SEARCH8_TEXT" ] && [ "$SEARCH8_TEXT" != "" ]; then
 else
     e2e_fail "product: search_messages_product returned empty"
 fi
+
+# 8f: product partial-failure artifact drill. This injects an orphaned product
+# link directly into the isolated E2E DB, then proves healthy linked projects
+# still return useful product-wide search and summary responses with explicit
+# degraded diagnostics for the missing project.
+ORPHAN8_PROJECT_ID=880099
+PRODUCT8_ID="$(sqlite3 "$DB8" "SELECT id FROM products WHERE name = 'E2E Product' OR product_uid = '$PRODUCT_UID' LIMIT 1;" 2>/dev/null | head -n 1)"
+if [ -n "$PRODUCT8_ID" ]; then
+    sqlite3 "$DB8" "PRAGMA foreign_keys=OFF; INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) VALUES ($PRODUCT8_ID, $ORPHAN8_PROJECT_ID, 1700000000000000);" 2>/dev/null || true
+fi
+
+e2e_save_artifact "case_08_project_a.log" "project_key=/tmp/e2e_wf_product_a
+state=healthy
+expected_signal=Cross-project ping
+thread_id=e2e-product-thread"
+e2e_save_artifact "case_08_project_b.log" "project_key=/tmp/e2e_wf_product_b
+state=healthy_no_matching_body
+expected_agent=MistyCove"
+e2e_save_artifact "case_08_orphan_project.log" "project_id=$ORPHAN8_PROJECT_ID
+state=orphaned_product_project_link
+reason_code=linked_project_missing
+remediation_command=am doctor reconstruct"
+
+REQS8C=(
+    "$INIT_REQ"
+    "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"query\":\"cross-project\",\"limit\":10,\"include_body_md\":true}}}"
+    "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_thread_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"thread_id\":\"e2e-product-thread\",\"include_examples\":true,\"llm_mode\":false,\"per_thread_limit\":10}}}"
+)
+RESP8C="$(send_session "$DB8" "${REQS8C[@]}")"
+e2e_save_artifact "case_08c_partial_failure.txt" "$RESP8C"
+
+SEARCH8C_TEXT="$(extract_tool_result "$RESP8C" 90)"
+SUMMARY8C_TEXT="$(extract_tool_result "$RESP8C" 91)"
+e2e_save_artifact "case_08c_search_partial_failure.json" "$SEARCH8C_TEXT"
+e2e_save_artifact "case_08c_summary_partial_failure.json" "$SUMMARY8C_TEXT"
+
+PARTIAL8_PROOF="$(python3 - "$SEARCH8C_TEXT" "$SUMMARY8C_TEXT" "$ORPHAN8_PROJECT_ID" <<'PY'
+import json
+import sys
+
+search_raw, summary_raw, orphan_raw = sys.argv[1:4]
+orphan_id = int(orphan_raw)
+
+def load(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+def has_partial_failure(doc):
+    failures = doc.get("partial_failures")
+    if not isinstance(failures, list):
+        return False
+    return any(
+        item.get("project_id") == orphan_id
+        and item.get("reason_code") == "linked_project_missing"
+        and item.get("remediation_command") == "am doctor reconstruct"
+        for item in failures
+        if isinstance(item, dict)
+    )
+
+def degraded(doc):
+    diag = doc.get("diagnostics")
+    return isinstance(diag, dict) and diag.get("degraded") is True
+
+search = load(search_raw)
+summary = load(summary_raw)
+proof = {
+    "search_has_partial_failure": has_partial_failure(search),
+    "search_degraded": degraded(search),
+    "search_has_healthy_result": any(
+        isinstance(item, dict) and item.get("subject") == "Cross-project ping"
+        for item in search.get("result", [])
+    ),
+    "summary_has_partial_failure": has_partial_failure(summary),
+    "summary_degraded": degraded(summary),
+    "summary_has_healthy_thread": (
+        summary.get("thread_id") == "e2e-product-thread"
+        and summary.get("summary", {}).get("total_messages", 0) >= 1
+    ),
+}
+print(json.dumps(proof, sort_keys=True))
+PY
+)"
+e2e_save_artifact "case_08c_partial_failure_proof.json" "$PARTIAL8_PROOF"
+
+if [ "$(is_error "$RESP8C" 90)" = "OK" ]; then
+    e2e_pass "product partial: search_messages_product no error"
+else
+    e2e_fail "product partial: search_messages_product returned error"
+fi
+
+if [ "$(is_error "$RESP8C" 91)" = "OK" ]; then
+    e2e_pass "product partial: summarize_thread_product no error"
+else
+    e2e_fail "product partial: summarize_thread_product returned error"
+fi
+
+e2e_assert_contains "product partial: search reports orphaned link" "$PARTIAL8_PROOF" "\"search_has_partial_failure\": true"
+e2e_assert_contains "product partial: search keeps healthy result" "$PARTIAL8_PROOF" "\"search_has_healthy_result\": true"
+e2e_assert_contains "product partial: summary reports orphaned link" "$PARTIAL8_PROOF" "\"summary_has_partial_failure\": true"
+e2e_assert_contains "product partial: summary keeps healthy thread" "$PARTIAL8_PROOF" "\"summary_has_healthy_thread\": true"
 
 # =========================================================================
 # Summary

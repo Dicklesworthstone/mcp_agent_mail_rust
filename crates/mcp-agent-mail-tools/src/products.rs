@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::llm;
 use crate::messaging::InboxMessage;
-use crate::search::{ExampleMessage, SingleThreadResponse};
+use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
     legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_project,
@@ -206,6 +206,70 @@ fn parse_product_search_limit(limit: Option<i32>) -> usize {
         _ => 20,
     };
     max_results_raw.unsigned_abs() as usize
+}
+
+fn missing_linked_project_placeholder(project_id: i64) -> String {
+    format!("[unknown-project-{project_id}]")
+}
+
+fn project_is_missing_link_target(project: &mcp_agent_mail_db::ProjectRow) -> bool {
+    let project_id = project.id.unwrap_or(0);
+    let placeholder = missing_linked_project_placeholder(project_id);
+    project.slug == placeholder && project.human_key == placeholder
+}
+
+fn product_partial_failures_for_projects(
+    projects: &[mcp_agent_mail_db::ProjectRow],
+) -> Vec<ProductPartialFailure> {
+    projects
+        .iter()
+        .filter(|project| project_is_missing_link_target(project))
+        .map(|project| {
+            let project_id = project.id.unwrap_or(0);
+            ProductPartialFailure {
+                project_id,
+                reason_code: "linked_project_missing".to_string(),
+                reason: "product_project_links references a project id with no projects row"
+                    .to_string(),
+                remediation_command: "am doctor reconstruct".to_string(),
+            }
+        })
+        .collect()
+}
+
+fn merge_product_partial_failure_diagnostics(
+    diagnostics: Option<crate::search::SearchDiagnostics>,
+    partial_failures: &[ProductPartialFailure],
+    operation_label: &str,
+) -> Option<crate::search::SearchDiagnostics> {
+    if partial_failures.is_empty() {
+        return diagnostics;
+    }
+
+    let mut diagnostics = diagnostics.unwrap_or_else(|| crate::search::SearchDiagnostics {
+        degraded: true,
+        fallback_mode: Some("product_partial_failure".to_string()),
+        timeout_stage: None,
+        budget_tier: None,
+        budget_remaining_ms: None,
+        budget_exhausted: None,
+        remediation_hints: Vec::new(),
+    });
+    diagnostics.degraded = true;
+    if diagnostics.fallback_mode.is_none() {
+        diagnostics.fallback_mode = Some("product_partial_failure".to_string());
+    }
+    let hint = format!(
+        "Run `am doctor reconstruct` and re-run {operation_label} to verify missing linked projects are restored."
+    );
+    if !diagnostics
+        .remediation_hints
+        .iter()
+        .any(|existing| existing == &hint)
+    {
+        diagnostics.remediation_hints.push(hint);
+    }
+    Some(diagnostics)
 }
 
 async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
@@ -405,6 +469,14 @@ pub struct ProductSearchItem {
     pub body_md: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductPartialFailure {
+    pub project_id: i64,
+    pub reason_code: String,
+    pub reason: String,
+    pub remediation_command: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductSearchResponse {
     pub result: Vec<ProductSearchItem>,
@@ -414,6 +486,20 @@ pub struct ProductSearchResponse {
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<crate::search::SearchDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_failures: Vec<ProductPartialFailure>,
+}
+
+/// Product thread summary response wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductThreadSummaryResponse {
+    pub thread_id: String,
+    pub summary: ThreadSummary,
+    pub examples: Vec<ExampleMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<crate::search::SearchDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_failures: Vec<ProductPartialFailure>,
 }
 
 /// Search across all projects linked to a product.
@@ -482,6 +568,7 @@ pub async fn search_messages_product(
             assistance: None,
             next_cursor: None,
             diagnostics: None,
+            partial_failures: Vec::new(),
         };
         let response = serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
@@ -530,6 +617,10 @@ pub async fn search_messages_product(
     } else {
         None
     };
+    let product_projects = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    )?;
+    let partial_failures = product_partial_failures_for_projects(&product_projects);
     phase.mark("argument_filter_resolution");
 
     // Build planner query with product scope and facets
@@ -582,13 +673,18 @@ pub async fn search_messages_product(
         "row_materialization"
     });
 
-    let diagnostics = crate::search::derive_search_diagnostics(planner_response.explain.as_ref());
+    let diagnostics = merge_product_partial_failure_diagnostics(
+        crate::search::derive_search_diagnostics(planner_response.explain.as_ref()),
+        &partial_failures,
+        "product search",
+    );
     phase.mark("diagnostics_derivation");
     let response = ProductSearchResponse {
         result,
         assistance: planner_response.assistance,
         next_cursor: planner_response.next_cursor,
         diagnostics,
+        partial_failures,
     };
     let response = serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
@@ -749,10 +845,11 @@ pub async fn summarize_thread_product(
     let projects = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
+    let partial_failures = product_partial_failures_for_projects(&projects);
 
     let msg_limit = parse_product_thread_limit(per_thread_limit)?;
     let mut rows: Vec<ThreadMessageRow> = Vec::with_capacity(msg_limit);
-    for p in projects {
+    for p in &projects {
         let project_id = p.id.unwrap_or(0);
         let msgs = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_thread_messages(
@@ -822,10 +919,17 @@ pub async fn summarize_thread_product(
         }
     }
 
-    let response = SingleThreadResponse {
+    let diagnostics = merge_product_partial_failure_diagnostics(
+        None,
+        &partial_failures,
+        "product thread summary",
+    );
+    let response = ProductThreadSummaryResponse {
         thread_id,
         summary,
         examples,
+        diagnostics,
+        partial_failures,
     };
 
     serde_json::to_string(&response)
@@ -1180,6 +1284,7 @@ mod tests {
             assistance: None,
             next_cursor: None,
             diagnostics: None,
+            partial_failures: Vec::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
@@ -1216,6 +1321,7 @@ mod tests {
             assistance: None,
             next_cursor: None,
             diagnostics: None,
+            partial_failures: Vec::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
@@ -1231,6 +1337,7 @@ mod tests {
             assistance: None,
             next_cursor: Some("cursor-1".to_string()),
             diagnostics: None,
+            partial_failures: Vec::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"next_cursor\":\"cursor-1\""));
@@ -1256,6 +1363,7 @@ mod tests {
                         .to_string(),
                 ],
             }),
+            partial_failures: Vec::new(),
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -1357,6 +1465,195 @@ mod tests {
                             || message.contains("NOT_FOUND"),
                         "expected missing-product error, got: {message}"
                     );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn search_messages_product_reports_orphaned_linked_project() {
+        use mcp_agent_mail_db::sqlmodel::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-search-orphaned-link.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let pool = get_db_pool().expect("db pool");
+
+                    let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-search-healthy",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure healthy project failed: {other:?}"),
+                    };
+                    let sender = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        "BlueLake",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register sender failed: {other:?}"),
+                    };
+                    let recipient = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        "RedPeak",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register recipient failed: {other:?}"),
+                    };
+                    let product = match mcp_agent_mail_db::queries::ensure_product(
+                        &cx,
+                        &pool,
+                        None,
+                        Some("prod-search-orphaned-link"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(product) => product,
+                        other => panic!("ensure product failed: {other:?}"),
+                    };
+                    match mcp_agent_mail_db::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product.id.unwrap_or(0),
+                        &[healthy_project.id.unwrap_or(0)],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("link healthy product project failed: {other:?}"),
+                    }
+
+                    let direct =
+                        mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                            .expect("open direct fixture db");
+                    direct
+                        .execute_raw("PRAGMA foreign_keys = OFF")
+                        .expect("disable foreign keys for orphaned product link fixture");
+                    direct
+                        .execute_sync(
+                            "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
+                            &[
+                                Value::BigInt(product.id.unwrap_or(0)),
+                                Value::BigInt(999),
+                                Value::BigInt(mcp_agent_mail_db::now_micros()),
+                            ],
+                        )
+                        .expect("insert orphaned product project link");
+                    drop(direct);
+
+                    match mcp_agent_mail_db::queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        sender.id.unwrap_or(0),
+                        "Healthy project needle",
+                        "search body from healthy linked project",
+                        Some("PRODUCT-SEARCH-ORPHANED"),
+                        "normal",
+                        false,
+                        "[]",
+                        &[(recipient.id.unwrap_or(0), "to")],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("create healthy message failed: {other:?}"),
+                    }
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = search_messages_product(
+                        &ctx,
+                        "prod-search-orphaned-link".to_string(),
+                        "needle".to_string(),
+                        Some(10),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(true),
+                    )
+                    .await
+                    .expect("search_messages_product should keep healthy linked results");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse product search json");
+                    let results = value["result"].as_array().expect("result array");
+                    assert_eq!(results.len(), 1, "expected healthy result: {value}");
+                    assert_eq!(results[0]["subject"], "Healthy project needle");
+                    assert_eq!(
+                        results[0]["project_id"].as_i64(),
+                        healthy_project.id
+                    );
+                    assert!(
+                        results[0]["body_md"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("healthy linked project")),
+                        "expected body from healthy project: {value}"
+                    );
+
+                    let partial_failures = value["partial_failures"]
+                        .as_array()
+                        .expect("partial failures array");
+                    assert_eq!(partial_failures.len(), 1);
+                    assert_eq!(partial_failures[0]["project_id"].as_i64(), Some(999));
+                    assert_eq!(
+                        partial_failures[0]["reason_code"].as_str(),
+                        Some("linked_project_missing")
+                    );
+                    assert_eq!(
+                        partial_failures[0]["remediation_command"].as_str(),
+                        Some("am doctor reconstruct")
+                    );
+                    assert_eq!(value["diagnostics"]["degraded"].as_bool(), Some(true));
                 });
             },
         );
@@ -1657,7 +1954,7 @@ mod tests {
                     )
                     .await
                     .expect("summarize_thread_product should succeed");
-                    let parsed: SingleThreadResponse =
+                    let parsed: crate::search::SingleThreadResponse =
                         serde_json::from_str(&response).expect("parse product summary");
 
                     assert_eq!(parsed.summary.total_messages, 2);
@@ -1671,6 +1968,357 @@ mod tests {
                     assert_eq!(parsed.examples.len(), 2);
                     assert_eq!(parsed.examples[0].subject, "second latest");
                     assert_eq!(parsed.examples[1].subject, "first latest");
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn summarize_thread_product_reports_orphaned_linked_project() {
+        use mcp_agent_mail_db::sqlmodel::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-summary-orphaned-link.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let pool = get_db_pool().expect("db pool");
+
+                    let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-summary-healthy",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure healthy project failed: {other:?}"),
+                    };
+                    let sender = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        "BlueLake",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register sender failed: {other:?}"),
+                    };
+                    let recipient = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        "RedPeak",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register recipient failed: {other:?}"),
+                    };
+                    let product = match mcp_agent_mail_db::queries::ensure_product(
+                        &cx,
+                        &pool,
+                        None,
+                        Some("prod-summary-orphaned-link"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(product) => product,
+                        other => panic!("ensure product failed: {other:?}"),
+                    };
+                    match mcp_agent_mail_db::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product.id.unwrap_or(0),
+                        &[healthy_project.id.unwrap_or(0)],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("link healthy product project failed: {other:?}"),
+                    }
+
+                    let direct =
+                        mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                            .expect("open direct fixture db");
+                    direct
+                        .execute_raw("PRAGMA foreign_keys = OFF")
+                        .expect("disable foreign keys for orphaned product link fixture");
+                    direct
+                        .execute_sync(
+                            "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
+                            &[
+                                Value::BigInt(product.id.unwrap_or(0)),
+                                Value::BigInt(1_001),
+                                Value::BigInt(mcp_agent_mail_db::now_micros()),
+                            ],
+                        )
+                        .expect("insert orphaned product project link");
+                    drop(direct);
+
+                    match mcp_agent_mail_db::queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        sender.id.unwrap_or(0),
+                        "Healthy project summary",
+                        "- healthy summary point",
+                        Some("PRODUCT-SUMMARY-ORPHANED"),
+                        "normal",
+                        false,
+                        "[]",
+                        &[(recipient.id.unwrap_or(0), "to")],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("create healthy message failed: {other:?}"),
+                    }
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = summarize_thread_product(
+                        &ctx,
+                        "prod-summary-orphaned-link".to_string(),
+                        "PRODUCT-SUMMARY-ORPHANED".to_string(),
+                        Some(true),
+                        Some(false),
+                        None,
+                        Some(10),
+                    )
+                    .await
+                    .expect("summarize_thread_product should keep healthy linked results");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse product summary json");
+
+                    assert_eq!(
+                        value["thread_id"].as_str(),
+                        Some("PRODUCT-SUMMARY-ORPHANED")
+                    );
+                    assert_eq!(value["summary"]["total_messages"].as_i64(), Some(1));
+                    assert_eq!(
+                        value["summary"]["key_points"]
+                            .as_array()
+                            .and_then(|points| points.first())
+                            .and_then(serde_json::Value::as_str),
+                        Some("healthy summary point")
+                    );
+                    assert_eq!(value["examples"].as_array().map(Vec::len), Some(1));
+                    assert_eq!(value["examples"][0]["subject"], "Healthy project summary");
+
+                    let partial_failures = value["partial_failures"]
+                        .as_array()
+                        .expect("partial failures array");
+                    assert_eq!(partial_failures.len(), 1);
+                    assert_eq!(partial_failures[0]["project_id"].as_i64(), Some(1_001));
+                    assert_eq!(
+                        partial_failures[0]["reason_code"].as_str(),
+                        Some("linked_project_missing")
+                    );
+                    assert_eq!(
+                        partial_failures[0]["remediation_command"].as_str(),
+                        Some("am doctor reconstruct")
+                    );
+                    assert_eq!(value["diagnostics"]["degraded"].as_bool(), Some(true));
+                    assert!(
+                        value["diagnostics"]["remediation_hints"]
+                            .as_array()
+                            .is_some_and(|hints| hints.iter().any(|hint| hint
+                                .as_str()
+                                .is_some_and(|text| text.contains("product thread summary")))),
+                        "expected product thread summary remediation hint: {value}"
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_skips_linked_projects_without_matching_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-inbox-missing-agent.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let pool = get_db_pool().expect("db pool");
+
+                    let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-inbox-healthy",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure healthy project failed: {other:?}"),
+                    };
+                    let missing_agent_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-inbox-missing-agent",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure missing-agent project failed: {other:?}"),
+                    };
+
+                    let sender = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        "BlueLake",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register sender failed: {other:?}"),
+                    };
+                    let recipient = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        "RedPeak",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register recipient failed: {other:?}"),
+                    };
+                    match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        missing_agent_project.id.unwrap_or(0),
+                        "GoldRiver",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("register unrelated project agent failed: {other:?}"),
+                    }
+
+                    let product = match mcp_agent_mail_db::queries::ensure_product(
+                        &cx,
+                        &pool,
+                        None,
+                        Some("prod-missing-agent"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(product) => product,
+                        other => panic!("ensure product failed: {other:?}"),
+                    };
+                    match mcp_agent_mail_db::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product.id.unwrap_or(0),
+                        &[
+                            healthy_project.id.unwrap_or(0),
+                            missing_agent_project.id.unwrap_or(0),
+                        ],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("link product projects failed: {other:?}"),
+                    }
+
+                    match mcp_agent_mail_db::queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        healthy_project.id.unwrap_or(0),
+                        sender.id.unwrap_or(0),
+                        "Healthy project message",
+                        "body from healthy linked project",
+                        Some("PRODUCT-MISSING-AGENT"),
+                        "normal",
+                        false,
+                        "[]",
+                        &[(recipient.id.unwrap_or(0), "to")],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("create healthy message failed: {other:?}"),
+                    }
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = fetch_inbox_product(
+                        &ctx,
+                        "prod-missing-agent".to_string(),
+                        "RedPeak".to_string(),
+                        Some(10),
+                        Some(false),
+                        Some(true),
+                        None,
+                    )
+                    .await
+                    .expect("fetch_inbox_product should ignore linked projects without RedPeak");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse inbox json");
+                    let messages = value.as_array().expect("messages array");
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0]["subject"], "Healthy project message");
+                    assert_eq!(messages[0]["from"], "BlueLake");
+                    assert_eq!(
+                        messages[0]["project_id"].as_i64(),
+                        Some(healthy_project.id.unwrap_or(0))
+                    );
+                    assert!(
+                        messages[0]["body_md"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("healthy linked project")),
+                        "expected healthy project body in product inbox: {value}"
+                    );
                 });
             },
         );
