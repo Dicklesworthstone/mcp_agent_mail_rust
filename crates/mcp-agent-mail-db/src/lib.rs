@@ -1,7 +1,7 @@
 //! Database layer for MCP Agent Mail
 //!
 //! This crate provides:
-//! - `SQLite` database operations via `sqlmodel` on frankensqlite
+//! - `SQLite` database operations via `sqlmodel` on canonical SQLite
 //! - Connection pooling
 //! - Schema migrations
 //! - Search V3 retrieval integration (frankensearch lexical/semantic/hybrid)
@@ -309,20 +309,19 @@ pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Runtime DB traffic uses `FrankenConnection` to enable pure-Rust `SQLite` with
-/// `BEGIN CONCURRENT` write paths.
-pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
+/// Runtime mailbox traffic uses canonical SQLite. FrankenSQLite remains
+/// available to targeted tests and experiments, but it must not own the live
+/// mailbox file until its B-tree/index corruption bugs are fixed upstream.
+pub type DbConn = sqlmodel_sqlite::SqliteConnection;
 
 /// The connection type used by canonical verification and recovery flows.
 ///
-/// Canonical verification and recovery use native SQLite so corruption verdicts
-/// are not self-referential with the runtime FrankenSQLite path.
+/// Kept as a distinct alias at call sites that are specifically doing
+/// verification/recovery work.
 pub type CanonicalDbConn = sqlmodel_sqlite::SqliteConnection;
 
-pub fn close_db_conn(conn: DbConn, context: &'static str) {
-    if let Err(error) = conn.close_sync() {
-        tracing::warn!(context, error = %error, "failed to close database connection");
-    }
+pub fn close_db_conn(conn: DbConn, _context: &'static str) {
+    drop(conn);
 }
 
 pub struct DbConnGuard {

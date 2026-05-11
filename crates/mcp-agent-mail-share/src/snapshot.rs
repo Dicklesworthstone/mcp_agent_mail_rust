@@ -288,20 +288,20 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
 
     let source_str = source.display().to_string();
 
-    // Create destination with FrankenSQLite. Page size must be chosen before
-    // page 1 is initialized, so honor any requested destination page_size here.
+    // Page size must be chosen before page 1 is initialized, so honor any
+    // requested destination page_size before the first destination write.
     let dest_str = staged_dest.display().to_string();
-    let dst_conn = if let Some(page_size) = destination_page_size_bytes(destination_pragmas)? {
-        DbConn::open_file_with_page_size(&dest_str, page_size).map_err(|e| ShareError::Sqlite {
-            message: format!(
-                "cannot create destination DB {dest_str} with page size {page_size}: {e}"
-            ),
-        })?
-    } else {
-        DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
-            message: format!("cannot create destination DB {dest_str}: {e}"),
-        })?
-    };
+    let dst_conn = DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot create destination DB {dest_str}: {e}"),
+    })?;
+    if let Some(page_size) = destination_page_size_bytes(destination_pragmas)? {
+        let pragma = format!("PRAGMA page_size = {page_size}");
+        dst_conn
+            .execute_raw(&pragma)
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("cannot set destination DB {dest_str} page size {page_size}: {e}"),
+            })?;
+    }
     for pragma in destination_pragmas {
         dst_conn
             .execute_raw(pragma)
@@ -314,15 +314,9 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
         message: format!("cannot open source DB {source_str}: {e}"),
     })?;
     let transfer_result = transfer_tables_frank(&src, &dst_conn);
-    let src_close_result = src.close_sync().map_err(|e| ShareError::Sqlite {
-        message: format!("failed to close source DB {source_str}: {e}"),
-    });
-    let dst_close_result = dst_conn.close_sync().map_err(|e| ShareError::Sqlite {
-        message: format!("failed to close destination DB {dest_str}: {e}"),
-    });
     transfer_result?;
-    src_close_result?;
-    dst_close_result?;
+    drop(src);
+    drop(dst_conn);
     std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)

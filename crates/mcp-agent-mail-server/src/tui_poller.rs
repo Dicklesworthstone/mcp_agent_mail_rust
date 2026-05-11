@@ -1348,9 +1348,8 @@ fn refill_missing_detail_lists_from_sqlite(
     let Ok(conn) = crate::open_best_effort_sync_db_connection(sqlite_path) else {
         return;
     };
-    // Wrap in DbConnGuard so the connection is closed via close_sync() at scope
-    // exit. Without this, every refill emits the FrankenConnection drop_close
-    // WARN ("Connection dropped without explicit close()") in the TUI poll loop.
+    // Wrap in DbConnGuard so the best-effort live connection closes at scope
+    // exit.
     let conn = guard_db_conn(conn, "tui_poller::refill_missing_detail_lists");
 
     if snapshot.agents > 0 && snapshot.agents_list.is_empty() {

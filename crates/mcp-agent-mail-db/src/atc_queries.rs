@@ -213,19 +213,6 @@ impl RollupConn for sqlmodel_pool::PooledConnection<crate::DbConn> {
     }
 }
 
-impl RollupConn for crate::CanonicalDbConn {
-    fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
-        self.query_sync(sql, params)
-            .map_err(|error| error.to_string())
-    }
-
-    fn rollup_execute_sync(&self, sql: &str, params: &[Value]) -> Result<(), String> {
-        self.execute_sync(sql, params)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-}
-
 fn row_text_idx(row: &Row, idx: usize) -> String {
     row.get(idx)
         .and_then(|v| match v {
