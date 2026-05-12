@@ -164,6 +164,25 @@ fn elapsed_ms_saturating(start: Instant) -> u64 {
     ms
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn count_drift_ratio(abs_diff: usize, max_count: usize) -> f64 {
+    if max_count == 0 {
+        0.0
+    } else {
+        abs_diff as f64 / max_count as f64
+    }
+}
+
+fn normalized_count_drift_threshold(threshold: f64) -> f64 {
+    if threshold.is_nan() || threshold <= 0.0 {
+        0.0
+    } else if threshold >= 1.0 {
+        1.0
+    } else {
+        threshold
+    }
+}
+
 fn check_index_health(
     health: &IndexHealth,
     findings: &mut Vec<ConsistencyFinding>,
@@ -285,14 +304,10 @@ fn check_doc_counts(
     } else {
         let abs_diff = db_count.abs_diff(index_count);
         let max_count = db_count.max(index_count);
-        // drift as percentage (0..100), using integer math then convert at the end
-        let drift_pct = (abs_diff * 100) / max_count;
-        // Threshold is 0.0..=1.0, multiply by 100 for percentage comparison
-        // This is always a small positive value (0..100), so truncation is safe
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let threshold_pct = (config.count_drift_threshold * 100.0) as usize;
+        let drift_ratio = count_drift_ratio(abs_diff, max_count);
+        let threshold = normalized_count_drift_threshold(config.count_drift_threshold);
 
-        let severity = if drift_pct > threshold_pct {
+        let severity = if drift_ratio > threshold {
             *rebuild_recommended = true;
             Severity::Error
         } else {
@@ -303,9 +318,10 @@ fn check_doc_counts(
             category: "count_mismatch".to_owned(),
             severity,
             message: format!(
-                "Document count mismatch: DB has {db_count}, index has {index_count} ({drift_pct}% drift)",
+                "Document count mismatch: DB has {db_count}, index has {index_count} ({:.2}% drift)",
+                drift_ratio * 100.0,
             ),
-            suggestion: Some(if drift_pct > threshold_pct {
+            suggestion: Some(if drift_ratio > threshold {
                 "Significant drift detected. Run a full reindex.".to_owned()
             } else {
                 "Minor drift detected. Incremental updates should resolve this.".to_owned()
@@ -768,6 +784,40 @@ mod tests {
             .find(|f| f.category == "count_mismatch");
         assert!(mismatch.is_some());
         assert_eq!(mismatch.unwrap().severity, Severity::Error);
+    }
+
+    #[test]
+    fn consistency_count_mismatch_fractional_threshold_is_not_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(tmp.path());
+        let scope = IndexScope::Global;
+        let schema = SchemaHash("abc123456789".to_owned());
+
+        // DB has 1000, index has 949 — 5.1% drift. The threshold comparison
+        // must not truncate this to 5% and treat it as acceptable.
+        let source = MockSource::new(1000);
+        let lifecycle = MockLifecycle::healthy(949);
+
+        let report = check_consistency(
+            &source,
+            &lifecycle,
+            &layout,
+            &scope,
+            &schema,
+            &ConsistencyConfig {
+                count_drift_threshold: 0.05,
+            },
+        )
+        .unwrap();
+
+        assert!(report.rebuild_recommended);
+        let mismatch = report
+            .findings
+            .iter()
+            .find(|f| f.category == "count_mismatch")
+            .expect("count mismatch finding");
+        assert_eq!(mismatch.severity, Severity::Error);
+        assert!(mismatch.message.contains("5.10% drift"));
     }
 
     #[test]
