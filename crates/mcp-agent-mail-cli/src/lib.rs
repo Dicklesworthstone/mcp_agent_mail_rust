@@ -2210,6 +2210,9 @@ pub enum DoctorCommand {
     /// incident recovery. Prints before/after stats.
     #[command(name = "pack-archive")]
     PackArchive {
+        /// Only inspect bloat signals and print safe maintenance guidance.
+        #[arg(long)]
+        plan: bool,
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
@@ -5788,7 +5791,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             force,
             format,
         } => handle_doctor_fix_orphan_refs(project, all, apply, force, format),
-        DoctorCommand::PackArchive { json } => handle_doctor_pack_archive(json),
+        DoctorCommand::PackArchive { plan, json } => handle_doctor_pack_archive(plan, json),
         DoctorCommand::Artifacts {
             format,
             json,
@@ -5841,7 +5844,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
     }
 }
 
-fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
+fn handle_doctor_pack_archive(plan_only: bool, json: bool) -> CliResult<()> {
     let config = mcp_agent_mail_core::Config::from_env();
     let git_dir =
         mcp_agent_mail_server::maintenance::resolve_archive_git_dir(&config).ok_or_else(|| {
@@ -5850,6 +5853,22 @@ fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
                 config.storage_root.display()
             ))
         })?;
+
+    let plan = mcp_agent_mail_server::maintenance::plan_archive_maintenance(
+        &config.storage_root,
+        &git_dir,
+    );
+    if plan_only {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).unwrap_or_default()
+            );
+        } else {
+            render_archive_maintenance_plan(&plan);
+        }
+        return Ok(());
+    }
 
     let report = mcp_agent_mail_server::maintenance::run_maintenance(&git_dir);
 
@@ -5864,6 +5883,7 @@ fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
             "disk_bytes_before": report.disk_bytes_before,
             "disk_bytes_after": report.disk_bytes_after,
             "error": report.error,
+            "plan_before": plan,
         });
         println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
     } else {
@@ -5925,6 +5945,102 @@ fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
         Ok(())
     } else {
         Err(CliError::Other("maintenance failed".into()))
+    }
+}
+
+fn render_archive_maintenance_plan(
+    plan: &mcp_agent_mail_server::maintenance::ArchiveMaintenancePlan,
+) {
+    output::section("Archive Pack Plan:");
+    output::kv("Storage root", &plan.storage_root);
+    output::kv("Git dir", &plan.git_dir);
+    output::kv("Verdict", &format!("{:?}", plan.verdict));
+    output::kv("Global archive", &format_bytes(plan.global_archive_bytes));
+    output::kv(
+        "Git objects",
+        &plan
+            .git_objects_bytes
+            .map_or_else(|| "-".to_string(), format_bytes),
+    );
+    output::kv(
+        "Loose objects",
+        &plan
+            .loose_objects
+            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+    );
+    output::kv(
+        "Pack files",
+        &plan
+            .pack_file_count
+            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+    );
+    output::kv("Pack bytes", &format_bytes(plan.pack_file_bytes));
+
+    ftui_runtime::ftui_println!("");
+    output::section("  Thresholds:");
+    let mut thresholds =
+        output::CliTable::new(vec!["METRIC", "VALUE", "WATCH", "CRITICAL", "VERDICT"]);
+    for threshold in &plan.threshold_verdicts {
+        thresholds.add_row(vec![
+            threshold.metric.clone(),
+            threshold
+                .value
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            threshold.watch_at.to_string(),
+            threshold.critical_at.to_string(),
+            format!("{:?}", threshold.verdict),
+        ]);
+    }
+    thresholds.render();
+
+    ftui_runtime::ftui_println!("");
+    output::section("  Largest Projects:");
+    if plan.project_sizes.is_empty() {
+        output::emit_empty(
+            output::CliOutputFormat::Table,
+            "No project archives were found.",
+        );
+    } else {
+        let mut table = output::CliTable::new(vec!["PROJECT", "SIZE", "FILES"]);
+        for project in plan.project_sizes.iter().take(8) {
+            table.add_row(vec![
+                project.project_slug.clone(),
+                format_bytes(project.bytes),
+                project.files.to_string(),
+            ]);
+        }
+        table.render();
+    }
+
+    ftui_runtime::ftui_println!("");
+    output::section("  Top Artifact Categories:");
+    if plan.top_artifact_categories.is_empty() {
+        output::emit_empty(
+            output::CliOutputFormat::Table,
+            "No artifact categories were found.",
+        );
+    } else {
+        let mut table = output::CliTable::new(vec!["CATEGORY", "SIZE", "FILES"]);
+        for category in &plan.top_artifact_categories {
+            table.add_row(vec![
+                category.category.clone(),
+                format_bytes(category.bytes),
+                category.files.to_string(),
+            ]);
+        }
+        table.render();
+    }
+
+    ftui_runtime::ftui_println!("");
+    output::section("  Safe Commands:");
+    for command in &plan.safe_commands {
+        let mode = if command.mutates_archive {
+            "stateful"
+        } else {
+            "read-only"
+        };
+        ftui_runtime::ftui_println!("  - {mode}: {}", command.command);
+        ftui_runtime::ftui_println!("    {}", command.purpose);
     }
 }
 

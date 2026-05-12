@@ -306,7 +306,34 @@ am doctor backups --format toon
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
-## 14. Capture a quick benchmark baseline [read-only]
+## 14. Plan archive pack maintenance [read-only]
+
+**Goal:** Measure mailbox archive bloat without changing the Git archive.
+
+```bash
+am doctor pack-archive --plan
+am doctor pack-archive --plan --json
+git -C "$STORAGE_ROOT" count-objects -vH
+```
+
+**Expected output:** The planner reports global archive size, per-project
+archive sizes, loose-object and packfile counts, pack ages, top artifact
+categories, threshold verdicts, and exact safe follow-up commands.
+
+**Safety:** The planner is read-only. It never runs `git maintenance`, never
+prunes objects, and never deletes user data. If the verdict recommends action,
+preserve the JSON output as evidence before running the stateful command:
+
+```bash
+am doctor pack-archive --json
+```
+
+`pack-archive` uses Git's loose-object and incremental-repack maintenance. That
+can rewrite packfiles and temporarily increase disk usage while Git builds new
+packs, but it does not prune live archive data. Do not run lower-level cleanup
+commands unless a human has separately approved the exact command and risk.
+
+## 15. Capture a quick benchmark baseline [read-only]
 
 **Goal:** Get a fast performance snapshot before or after a change.
 

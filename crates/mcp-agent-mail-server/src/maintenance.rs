@@ -9,11 +9,13 @@
 //! - `AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS` — override the 1800s default
 
 use mcp_agent_mail_core::Config;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, info, warn};
 
@@ -24,6 +26,15 @@ static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
 const STARTUP_DELAY_SECS: u64 = 15;
 const MIN_INTERVAL_SECS: u64 = 60;
 const MAINTENANCE_COMMAND_TIMEOUT_SECS: u64 = 20 * 60;
+const PLAN_TOP_LIMIT: usize = 8;
+const LOOSE_OBJECTS_WATCH_AT: u64 = 1_000;
+const LOOSE_OBJECTS_CRITICAL_AT: u64 = 10_000;
+const PACK_FILES_WATCH_AT: u64 = 16;
+const PACK_FILES_CRITICAL_AT: u64 = 64;
+const GIT_OBJECTS_BYTES_WATCH_AT: u64 = 512 * 1024 * 1024;
+const GIT_OBJECTS_BYTES_CRITICAL_AT: u64 = 2 * 1024 * 1024 * 1024;
+const GLOBAL_ARCHIVE_BYTES_WATCH_AT: u64 = 2 * 1024 * 1024 * 1024;
+const GLOBAL_ARCHIVE_BYTES_CRITICAL_AT: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct MaintenanceReport {
@@ -35,6 +46,86 @@ pub struct MaintenanceReport {
     pub disk_bytes_after: Option<u64>,
     pub success: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveMaintenanceVerdict {
+    Ok,
+    Watch,
+    MaintenanceRecommended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdVerdict {
+    Unknown,
+    Ok,
+    Watch,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveThresholdVerdict {
+    pub metric: String,
+    pub value: Option<u64>,
+    pub watch_at: u64,
+    pub critical_at: u64,
+    pub verdict: ThresholdVerdict,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveProjectSize {
+    pub project_slug: String,
+    pub bytes: u64,
+    pub files: u64,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveArtifactCategory {
+    pub category: String,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveMaintenanceCommand {
+    pub purpose: String,
+    pub command: String,
+    pub mutates_archive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveMaintenancePlan {
+    pub storage_root: String,
+    pub git_dir: String,
+    pub verdict: ArchiveMaintenanceVerdict,
+    pub global_archive_bytes: u64,
+    pub git_objects_bytes: Option<u64>,
+    pub loose_objects: Option<u64>,
+    pub pack_file_count: Option<u64>,
+    pub pack_file_bytes: u64,
+    pub oldest_pack_age_secs: Option<u64>,
+    pub newest_pack_age_secs: Option<u64>,
+    pub project_sizes: Vec<ArchiveProjectSize>,
+    pub top_artifact_categories: Vec<ArchiveArtifactCategory>,
+    pub threshold_verdicts: Vec<ArchiveThresholdVerdict>,
+    pub safe_commands: Vec<ArchiveMaintenanceCommand>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PathSummary {
+    bytes: u64,
+    files: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PackFileSummary {
+    count: u64,
+    bytes: u64,
+    oldest_age_secs: Option<u64>,
+    newest_age_secs: Option<u64>,
 }
 
 pub fn start(config: &Config) {
@@ -152,6 +243,62 @@ pub fn resolve_archive_git_dir(config: &Config) -> Option<PathBuf> {
         return Some(storage_root.clone());
     }
     None
+}
+
+/// Build a read-only bloat and safety plan for the archive repository.
+pub fn plan_archive_maintenance(storage_root: &Path, git_dir: &Path) -> ArchiveMaintenancePlan {
+    let global_archive = summarize_path_recursive(storage_root);
+    let git_objects_bytes = measure_objects_disk_usage(git_dir);
+    let loose_objects = count_loose_objects(git_dir);
+    let pack_summary = summarize_pack_files(git_dir);
+    let project_sizes = collect_project_sizes(storage_root);
+    let top_artifact_categories = collect_artifact_categories(storage_root);
+
+    let pack_file_count = pack_summary.map(|summary| summary.count);
+    let threshold_verdicts = vec![
+        threshold_verdict(
+            "loose_objects",
+            loose_objects,
+            LOOSE_OBJECTS_WATCH_AT,
+            LOOSE_OBJECTS_CRITICAL_AT,
+        ),
+        threshold_verdict(
+            "pack_file_count",
+            pack_file_count,
+            PACK_FILES_WATCH_AT,
+            PACK_FILES_CRITICAL_AT,
+        ),
+        threshold_verdict(
+            "git_objects_bytes",
+            git_objects_bytes,
+            GIT_OBJECTS_BYTES_WATCH_AT,
+            GIT_OBJECTS_BYTES_CRITICAL_AT,
+        ),
+        threshold_verdict(
+            "global_archive_bytes",
+            Some(global_archive.bytes),
+            GLOBAL_ARCHIVE_BYTES_WATCH_AT,
+            GLOBAL_ARCHIVE_BYTES_CRITICAL_AT,
+        ),
+    ];
+    let verdict = archive_verdict(&threshold_verdicts);
+
+    ArchiveMaintenancePlan {
+        storage_root: storage_root.display().to_string(),
+        git_dir: git_dir.display().to_string(),
+        verdict,
+        global_archive_bytes: global_archive.bytes,
+        git_objects_bytes,
+        loose_objects,
+        pack_file_count,
+        pack_file_bytes: pack_summary.map_or(0, |summary| summary.bytes),
+        oldest_pack_age_secs: pack_summary.and_then(|summary| summary.oldest_age_secs),
+        newest_pack_age_secs: pack_summary.and_then(|summary| summary.newest_age_secs),
+        project_sizes,
+        top_artifact_categories,
+        threshold_verdicts,
+        safe_commands: safe_maintenance_commands(storage_root),
+    }
 }
 
 /// Run the maintenance tasks on a given archive git directory.
@@ -324,6 +471,42 @@ fn count_pack_files(git_dir: &Path) -> Option<u64> {
     Some(count)
 }
 
+fn summarize_pack_files(git_dir: &Path) -> Option<PackFileSummary> {
+    let pack_dir = git_dir.join("objects").join("pack");
+    if !pack_dir.is_dir() {
+        return Some(PackFileSummary::default());
+    }
+
+    let now = SystemTime::now();
+    let mut summary = PackFileSummary::default();
+    for entry in std::fs::read_dir(&pack_dir).ok()?.flatten() {
+        if entry.path().extension().is_none_or(|ext| ext != "pack") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        summary.count += 1;
+        summary.bytes = summary.bytes.saturating_add(metadata.len());
+        if let Ok(modified) = metadata.modified()
+            && let Ok(age) = now.duration_since(modified)
+        {
+            let age_secs = age.as_secs();
+            summary.oldest_age_secs = Some(
+                summary
+                    .oldest_age_secs
+                    .map_or(age_secs, |oldest| oldest.max(age_secs)),
+            );
+            summary.newest_age_secs = Some(
+                summary
+                    .newest_age_secs
+                    .map_or(age_secs, |newest| newest.min(age_secs)),
+            );
+        }
+    }
+    Some(summary)
+}
+
 fn measure_objects_disk_usage(git_dir: &Path) -> Option<u64> {
     let objects_dir = git_dir.join("objects");
     if !objects_dir.is_dir() {
@@ -333,21 +516,230 @@ fn measure_objects_disk_usage(git_dir: &Path) -> Option<u64> {
 }
 
 fn dir_size_recursive(path: &Path) -> u64 {
-    let mut total = 0u64;
+    summarize_path_recursive(path).bytes
+}
+
+fn summarize_path_recursive(path: &Path) -> PathSummary {
+    let mut summary = PathSummary::default();
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return summary;
+    };
+    if metadata.is_file() {
+        return PathSummary {
+            bytes: metadata.len(),
+            files: 1,
+        };
+    }
+    if !metadata.is_dir() {
+        return summary;
+    }
     let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
+        return summary;
     };
     for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else {
             continue;
         };
         if ft.is_file() {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            summary.files = summary.files.saturating_add(1);
+            summary.bytes = summary
+                .bytes
+                .saturating_add(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0));
         } else if ft.is_dir() {
-            total += dir_size_recursive(&entry.path());
+            let child = summarize_path_recursive(&entry.path());
+            summary.files = summary.files.saturating_add(child.files);
+            summary.bytes = summary.bytes.saturating_add(child.bytes);
         }
     }
-    total
+    summary
+}
+
+fn collect_project_sizes(storage_root: &Path) -> Vec<ArchiveProjectSize> {
+    let projects_dir = storage_root.join("projects");
+    let Ok(entries) = std::fs::read_dir(&projects_dir) else {
+        return Vec::new();
+    };
+
+    let mut projects = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let summary = summarize_path_recursive(&entry.path());
+            Some(ArchiveProjectSize {
+                project_slug: entry.file_name().to_string_lossy().into_owned(),
+                bytes: summary.bytes,
+                files: summary.files,
+                path: entry.path().display().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| a.project_slug.cmp(&b.project_slug))
+    });
+    projects
+}
+
+fn collect_artifact_categories(storage_root: &Path) -> Vec<ArchiveArtifactCategory> {
+    let mut categories = BTreeMap::<String, PathSummary>::new();
+    collect_project_artifact_categories(storage_root, &mut categories);
+    collect_root_artifact_categories(storage_root, &mut categories);
+
+    let mut categories = categories
+        .into_iter()
+        .map(|(category, summary)| ArchiveArtifactCategory {
+            category,
+            bytes: summary.bytes,
+            files: summary.files,
+        })
+        .collect::<Vec<_>>();
+    categories.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| a.category.cmp(&b.category))
+    });
+    categories.truncate(PLAN_TOP_LIMIT);
+    categories
+}
+
+fn collect_project_artifact_categories(
+    storage_root: &Path,
+    categories: &mut BTreeMap<String, PathSummary>,
+) {
+    let projects_dir = storage_root.join("projects");
+    let Ok(project_entries) = std::fs::read_dir(projects_dir) else {
+        return;
+    };
+    for project in project_entries.flatten() {
+        if !project.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let category = if name == "project.json" {
+                "project_metadata".to_string()
+            } else {
+                name
+            };
+            add_category_summary(
+                categories,
+                category,
+                summarize_path_recursive(&entry.path()),
+            );
+        }
+    }
+}
+
+fn collect_root_artifact_categories(
+    storage_root: &Path,
+    categories: &mut BTreeMap<String, PathSummary>,
+) {
+    let Ok(entries) = std::fs::read_dir(storage_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if matches!(name.as_str(), ".git" | "projects") {
+            continue;
+        }
+        let category = match name.as_str() {
+            "storage.sqlite3" | "storage.sqlite3-shm" | "storage.sqlite3-wal" => "database",
+            ".setup-self-heal" => "setup_self_heal",
+            other => other,
+        }
+        .to_string();
+        add_category_summary(
+            categories,
+            category,
+            summarize_path_recursive(&entry.path()),
+        );
+    }
+}
+
+fn add_category_summary(
+    categories: &mut BTreeMap<String, PathSummary>,
+    category: String,
+    summary: PathSummary,
+) {
+    let entry = categories.entry(category).or_default();
+    entry.bytes = entry.bytes.saturating_add(summary.bytes);
+    entry.files = entry.files.saturating_add(summary.files);
+}
+
+fn threshold_verdict(
+    metric: &str,
+    value: Option<u64>,
+    watch_at: u64,
+    critical_at: u64,
+) -> ArchiveThresholdVerdict {
+    let verdict = match value {
+        Some(value) if value >= critical_at => ThresholdVerdict::Critical,
+        Some(value) if value >= watch_at => ThresholdVerdict::Watch,
+        Some(_) => ThresholdVerdict::Ok,
+        None => ThresholdVerdict::Unknown,
+    };
+    ArchiveThresholdVerdict {
+        metric: metric.to_string(),
+        value,
+        watch_at,
+        critical_at,
+        verdict,
+    }
+}
+
+fn archive_verdict(thresholds: &[ArchiveThresholdVerdict]) -> ArchiveMaintenanceVerdict {
+    if thresholds
+        .iter()
+        .any(|threshold| threshold.verdict == ThresholdVerdict::Critical)
+    {
+        return ArchiveMaintenanceVerdict::MaintenanceRecommended;
+    }
+    if thresholds
+        .iter()
+        .any(|threshold| threshold.verdict == ThresholdVerdict::Watch)
+    {
+        return ArchiveMaintenanceVerdict::Watch;
+    }
+    ArchiveMaintenanceVerdict::Ok
+}
+
+fn safe_maintenance_commands(storage_root: &Path) -> Vec<ArchiveMaintenanceCommand> {
+    let storage_root = shell_arg(storage_root);
+    vec![
+        ArchiveMaintenanceCommand {
+            purpose: "Re-run this read-only planner as JSON".to_string(),
+            command: format!("STORAGE_ROOT={storage_root} am doctor pack-archive --plan --json"),
+            mutates_archive: false,
+        },
+        ArchiveMaintenanceCommand {
+            purpose: "Inspect native Git object counts without changing files".to_string(),
+            command: format!("git -C {storage_root} count-objects -vH"),
+            mutates_archive: false,
+        },
+        ArchiveMaintenanceCommand {
+            purpose: "Run safe Git maintenance through Agent Mail".to_string(),
+            command: format!("STORAGE_ROOT={storage_root} am doctor pack-archive --json"),
+            mutates_archive: true,
+        },
+    ]
+}
+
+fn shell_arg(path: &Path) -> String {
+    let value = path.display().to_string();
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        return value;
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -514,5 +906,68 @@ mod tests {
         let report = run_maintenance(&git_dir);
         assert_eq!(report.loose_before, Some(0));
         assert_eq!(report.pack_count_before, Some(0));
+    }
+
+    #[test]
+    fn plan_archive_maintenance_reports_projects_categories_and_verdicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = create_fake_git_objects_dir(tmp.path());
+        let loose_dir = git_dir.join("objects").join("ef");
+        fs::create_dir_all(&loose_dir).unwrap();
+        for idx in 0..LOOSE_OBJECTS_WATCH_AT {
+            fs::write(loose_dir.join(format!("{idx:038x}")), b"x").unwrap();
+        }
+
+        let project = tmp.path().join("projects").join("data-projects-demo");
+        fs::create_dir_all(project.join("messages").join("2026")).unwrap();
+        fs::create_dir_all(project.join("agents").join("BlueLake")).unwrap();
+        fs::create_dir_all(project.join("file_reservations")).unwrap();
+        fs::write(project.join("project.json"), b"{\"slug\":\"demo\"}").unwrap();
+        fs::write(project.join("messages").join("2026").join("m.md"), b"hello").unwrap();
+        fs::write(
+            project.join("agents").join("BlueLake").join("profile.json"),
+            b"{}",
+        )
+        .unwrap();
+        fs::write(project.join("file_reservations").join("r.json"), b"{}").unwrap();
+        fs::write(tmp.path().join("storage.sqlite3"), b"sqlite").unwrap();
+
+        let plan = plan_archive_maintenance(tmp.path(), &git_dir);
+
+        assert!(plan.global_archive_bytes > 0);
+        assert_eq!(plan.loose_objects, Some(LOOSE_OBJECTS_WATCH_AT + 3));
+        assert_eq!(plan.verdict, ArchiveMaintenanceVerdict::Watch);
+        assert!(plan.project_sizes.iter().any(|project| {
+            project.project_slug == "data-projects-demo" && project.bytes > 0 && project.files > 0
+        }));
+        assert!(
+            plan.top_artifact_categories
+                .iter()
+                .any(|category| category.category == "messages" && category.bytes > 0)
+        );
+        assert!(plan.threshold_verdicts.iter().any(|threshold| {
+            threshold.metric == "loose_objects" && threshold.verdict == ThresholdVerdict::Watch
+        }));
+        assert!(plan.safe_commands.iter().any(|command| {
+            !command.mutates_archive && command.command.contains("pack-archive --plan --json")
+        }));
+        assert!(plan.safe_commands.iter().any(|command| {
+            command.mutates_archive && command.command.contains("pack-archive --json")
+        }));
+    }
+
+    #[test]
+    fn plan_archive_maintenance_reports_pack_age_and_is_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = create_fake_git_objects_dir(tmp.path());
+        let loose_before = count_loose_objects(&git_dir);
+
+        let plan = plan_archive_maintenance(tmp.path(), &git_dir);
+
+        assert_eq!(plan.pack_file_count, Some(1));
+        assert!(plan.pack_file_bytes > 0);
+        assert!(plan.oldest_pack_age_secs.is_some());
+        assert!(plan.newest_pack_age_secs.is_some());
+        assert_eq!(count_loose_objects(&git_dir), loose_before);
     }
 }
