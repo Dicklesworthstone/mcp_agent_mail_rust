@@ -1472,18 +1472,31 @@ fn build_manifest(
 ) -> Value {
     let now = chrono::Utc::now().to_rfc3339();
 
+    let redact_project_paths = scrub_summary.preset != crate::ScrubPreset::Archive.as_str();
     let requested: Vec<Value> = scope
         .identifiers
         .iter()
-        .map(|s| Value::String(s.clone()))
+        .map(|s| {
+            let value = if redact_project_paths {
+                crate::scrub::redact_manifest_project_identifier(s)
+            } else {
+                s.clone()
+            };
+            Value::String(value)
+        })
         .collect();
     let included: Vec<Value> = scope
         .projects
         .iter()
         .map(|p| {
+            let human_key = if redact_project_paths {
+                crate::scrub::redacted_project_human_key(&p.slug)
+            } else {
+                p.human_key.clone()
+            };
             serde_json::json!({
                 "slug": p.slug,
-                "human_key": p.human_key,
+                "human_key": human_key,
             })
         })
         .collect();
@@ -4017,6 +4030,66 @@ mod tests {
         let actual = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
 
         assert_repo_golden("share/bundle/manifest_standard.json", &actual);
+    }
+
+    #[test]
+    fn manifest_redacts_non_archive_project_paths_but_keeps_public_slugs() {
+        let scope = ProjectScopeResult {
+            projects: vec![crate::scope::ProjectRecord {
+                id: 7,
+                slug: "project-alpha".to_string(),
+                human_key: "/home/ubuntu/private/project-alpha".to_string(),
+            }],
+            identifiers: vec![
+                "/home/ubuntu/private/project-alpha".to_string(),
+                "project-alpha".to_string(),
+            ],
+            removed_count: 0,
+            remaining: test_remaining_counts(),
+        };
+        let mut scrub = test_scrub_summary();
+        scrub.preset = "standard".to_string();
+        let attachments = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 0,
+                copied: 0,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 0,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65_536,
+                detach_threshold: 26_214_400,
+            },
+            items: Vec::new(),
+        };
+        let manifest = build_manifest(
+            &scope,
+            &scrub,
+            &attachments,
+            None,
+            crate::DEFAULT_CHUNK_THRESHOLD,
+            crate::DEFAULT_CHUNK_SIZE,
+            &[],
+            true,
+            "mailbox.sqlite3",
+            "db-sha256",
+            12_345,
+            None,
+            &HashMap::new(),
+        );
+
+        let text = serde_json::to_string(&manifest).unwrap();
+        assert!(!text.contains("/home/ubuntu/private/project-alpha"));
+        assert_eq!(
+            manifest["project_scope"]["included"][0]["human_key"],
+            "[project path redacted: project-alpha]"
+        );
+        assert_eq!(
+            manifest["project_scope"]["requested"][0],
+            "[project identifier redacted]"
+        );
+        assert_eq!(manifest["project_scope"]["requested"][1], "project-alpha");
     }
 
     #[test]

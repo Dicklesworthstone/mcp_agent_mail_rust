@@ -599,8 +599,11 @@ pub fn create_snapshot_context(
     scrub_preset: crate::ScrubPreset,
 ) -> Result<SnapshotContext, ShareError> {
     create_sqlite_snapshot(source, snapshot_path, true)?;
-    let scope = crate::apply_project_scope(snapshot_path, project_filters)?;
+    let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
     let scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
+    if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
+        crate::scrub::redact_scope_project_human_keys(&mut scope);
+    }
     let finalize = crate::finalize_export_db(snapshot_path)?;
 
     Ok(SnapshotContext {
@@ -1208,6 +1211,10 @@ mod tests {
             create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
         assert!(context.snapshot_path.exists());
         assert!(!context.scope.projects.is_empty());
+        assert_eq!(
+            context.scope.projects[0].human_key,
+            "[project path redacted: myproj]"
+        );
         assert!(context.scrub_summary.secrets_replaced >= 0);
 
         let output = dir.path().join("bundle");
@@ -1433,6 +1440,7 @@ mod tests {
         let snapshot = dir.path().join("snapshot.sqlite3");
         let context =
             create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Archive).unwrap();
+        assert_eq!(context.scope.projects[0].human_key, "/test/proj");
 
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(output.join("viewer/data")).unwrap();

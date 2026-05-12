@@ -16,6 +16,12 @@ use crate::{ScrubPreset, ShareError};
 
 type Conn = DbConn;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectPathRedaction {
+    original: String,
+    replacement: String,
+}
+
 /// Keys to remove from attachment metadata dicts during scrubbing.
 const ATTACHMENT_REDACT_KEYS: &[&str] = &[
     "download_url",
@@ -90,6 +96,7 @@ struct ScrubConfig {
     body_placeholder: Option<&'static str>,
     drop_attachments: bool,
     scrub_secrets: bool,
+    redact_project_paths: bool,
     clear_ack_state: bool,
     clear_recipient_state: bool,
     drop_recipient_metadata: bool,
@@ -104,6 +111,7 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             body_placeholder: None,
             drop_attachments: false,
             scrub_secrets: true,
+            redact_project_paths: true,
             clear_ack_state: true,
             clear_recipient_state: true,
             drop_recipient_metadata: false,
@@ -115,6 +123,7 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             body_placeholder: Some("[Message body redacted]"),
             drop_attachments: true,
             scrub_secrets: true,
+            redact_project_paths: true,
             clear_ack_state: true,
             clear_recipient_state: false,
             drop_recipient_metadata: true,
@@ -126,6 +135,7 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             body_placeholder: None,
             drop_attachments: false,
             scrub_secrets: false,
+            redact_project_paths: false,
             clear_ack_state: false,
             clear_recipient_state: false,
             drop_recipient_metadata: false,
@@ -259,6 +269,24 @@ pub fn scrub_snapshot(
             0
         };
 
+        let project_path_redactions = if cfg.redact_project_paths {
+            redact_project_paths(&conn)?
+        } else {
+            Vec::new()
+        };
+        if !project_path_redactions.is_empty() {
+            redact_project_paths_in_text_column(
+                &conn,
+                RedactTextColumn::AgentTaskDescription,
+                &project_path_redactions,
+            )?;
+            redact_project_paths_in_text_column(
+                &conn,
+                RedactTextColumn::SiblingSuggestionRationale,
+                &project_path_redactions,
+            )?;
+        }
+
         // Iterate messages and scrub in chunks to avoid OOM
         let mut secrets_replaced: i64 = 0;
         let mut attachments_sanitized: i64 = 0;
@@ -307,6 +335,10 @@ pub fn scrub_snapshot(
                     body = b;
                     body_replacements = br;
                 }
+                if !project_path_redactions.is_empty() {
+                    subject = redact_project_paths_in_text(&subject, &project_path_redactions);
+                    body = redact_project_paths_in_text(&body, &project_path_redactions);
+                }
                 secrets_replaced += subj_replacements + body_replacements;
 
                 // Parse attachments JSON
@@ -333,6 +365,19 @@ pub fn scrub_snapshot(
                         attachments_updated = true;
                     }
                     if keys_removed > 0 {
+                        attachments_updated = true;
+                    }
+                }
+                if !project_path_redactions.is_empty() && !attachments_data.is_empty() {
+                    let sanitized = redact_project_paths_in_value(
+                        &Value::Array(attachments_data.clone()),
+                        0,
+                        &project_path_redactions,
+                    );
+                    if let Value::Array(arr) = sanitized
+                        && arr != attachments_data
+                    {
+                        attachments_data = arr;
                         attachments_updated = true;
                     }
                 }
@@ -582,6 +627,7 @@ const fn scrub_mutates_export_artifacts(cfg: &ScrubConfig) -> bool {
     cfg.redact_body
         || cfg.drop_attachments
         || cfg.scrub_secrets
+        || cfg.redact_project_paths
         || cfg.clear_ack_state
         || cfg.clear_recipient_state
         || cfg.drop_recipient_metadata
@@ -642,6 +688,219 @@ fn empty_recipients_json() -> String {
         "bcc": Vec::<String>::new(),
     })
     .to_string()
+}
+
+pub(crate) fn redacted_project_human_key(slug: &str) -> String {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        "[project path redacted]".to_string()
+    } else {
+        format!("[project path redacted: {slug}]")
+    }
+}
+
+pub(crate) fn redact_scope_project_human_keys(scope: &mut crate::scope::ProjectScopeResult) {
+    for project in &mut scope.projects {
+        project.human_key = redacted_project_human_key(&project.slug);
+    }
+}
+
+pub(crate) fn redact_manifest_project_identifier(identifier: &str) -> String {
+    let trimmed = identifier.trim();
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.starts_with('~') {
+        "[project identifier redacted]".to_string()
+    } else {
+        identifier.to_string()
+    }
+}
+
+fn project_path_redaction_for(slug: &str, human_key: &str) -> Option<ProjectPathRedaction> {
+    let original = human_key.trim();
+    if original.is_empty()
+        || original == "/"
+        || original == "\\"
+        || !(original.contains('/') || original.contains('\\') || original.starts_with('~'))
+    {
+        return None;
+    }
+
+    let replacement = redacted_project_human_key(slug);
+    if original == replacement {
+        return None;
+    }
+
+    Some(ProjectPathRedaction {
+        original: original.to_string(),
+        replacement,
+    })
+}
+
+fn redact_project_paths_in_text(input: &str, redactions: &[ProjectPathRedaction]) -> String {
+    let mut out = input.to_string();
+    for redaction in redactions {
+        out = out.replace(&redaction.original, &redaction.replacement);
+    }
+    out
+}
+
+fn redact_project_paths_in_value(
+    value: &Value,
+    depth: usize,
+    redactions: &[ProjectPathRedaction],
+) -> Value {
+    if depth > 256 {
+        return value.clone();
+    }
+    match value {
+        Value::String(s) => Value::String(redact_project_paths_in_text(s, redactions)),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|item| redact_project_paths_in_value(item, depth + 1, redactions))
+                .collect(),
+        ),
+        Value::Object(obj) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, val) in obj {
+                redacted.insert(
+                    key.clone(),
+                    redact_project_paths_in_value(val, depth + 1, redactions),
+                );
+            }
+            Value::Object(redacted)
+        }
+        other => other.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RedactTextColumn {
+    AgentTaskDescription,
+    SiblingSuggestionRationale,
+}
+
+impl RedactTextColumn {
+    const fn table(self) -> &'static str {
+        match self {
+            Self::AgentTaskDescription => "agents",
+            Self::SiblingSuggestionRationale => "project_sibling_suggestions",
+        }
+    }
+
+    const fn column(self) -> &'static str {
+        match self {
+            Self::AgentTaskDescription => "task_description",
+            Self::SiblingSuggestionRationale => "rationale",
+        }
+    }
+
+    const fn select_sql(self) -> &'static str {
+        match self {
+            Self::AgentTaskDescription => "SELECT id, task_description FROM agents ORDER BY id ASC",
+            Self::SiblingSuggestionRationale => {
+                "SELECT id, rationale FROM project_sibling_suggestions ORDER BY id ASC"
+            }
+        }
+    }
+
+    const fn update_sql(self) -> &'static str {
+        match self {
+            Self::AgentTaskDescription => "UPDATE agents SET task_description = ? WHERE id = ?",
+            Self::SiblingSuggestionRationale => {
+                "UPDATE project_sibling_suggestions SET rationale = ? WHERE id = ?"
+            }
+        }
+    }
+}
+
+fn redact_project_paths_in_text_column(
+    conn: &Conn,
+    target: RedactTextColumn,
+    redactions: &[ProjectPathRedaction],
+) -> Result<(), ShareError> {
+    let table = target.table();
+    let column = target.column();
+    if redactions.is_empty() || !column_exists(conn, table, column)? {
+        return Ok(());
+    }
+
+    let rows = conn
+        .query_sync(target.select_sql(), &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("SELECT {table}.{column} failed: {e}"),
+        })?;
+
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| {
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let value: String = row.get_named(column).unwrap_or_default();
+            (id, value)
+        })
+        .collect();
+
+    for (id, original) in values {
+        let redacted = redact_project_paths_in_text(&original, redactions);
+        if redacted != original {
+            exec_count(
+                conn,
+                target.update_sql(),
+                &[SqlValue::Text(redacted), SqlValue::BigInt(id)],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn redact_project_paths(conn: &Conn) -> Result<Vec<ProjectPathRedaction>, ShareError> {
+    if !column_exists(conn, "projects", "human_key")? {
+        return Ok(Vec::new());
+    }
+
+    let has_slug = column_exists(conn, "projects", "slug")?;
+    let select_sql = if has_slug {
+        "SELECT id, slug, human_key FROM projects ORDER BY id ASC"
+    } else {
+        "SELECT id, human_key FROM projects ORDER BY id ASC"
+    };
+
+    let rows = conn
+        .query_sync(select_sql, &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("SELECT projects failed: {e}"),
+        })?;
+
+    let projects: Vec<(i64, String, String)> = rows
+        .iter()
+        .map(|row| {
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let slug = if has_slug {
+                row.get_named("slug").unwrap_or_default()
+            } else {
+                format!("project-{id}")
+            };
+            let human_key: String = row.get_named("human_key").unwrap_or_default();
+            (id, slug, human_key)
+        })
+        .collect();
+
+    let mut redactions = Vec::new();
+    for (id, slug, human_key) in projects {
+        let redacted = redacted_project_human_key(&slug);
+        if let Some(redaction) = project_path_redaction_for(&slug, &human_key) {
+            redactions.push(redaction);
+        }
+        if human_key != redacted {
+            exec_count(
+                conn,
+                "UPDATE projects SET human_key = ? WHERE id = ?",
+                &[SqlValue::Text(redacted), SqlValue::BigInt(id)],
+            )?;
+        }
+    }
+    redactions.sort_by_key(|redaction| std::cmp::Reverse(redaction.original.len()));
+
+    Ok(redactions)
 }
 
 #[cfg(test)]
@@ -1050,6 +1309,254 @@ mod tests {
             .unwrap();
         let remaining: i64 = attachment_rows[0].get_named("cnt").unwrap_or(0);
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn strict_privacy_corpus_redacts_paths_and_preserves_product_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+
+        conn.execute_raw(
+            "UPDATE projects SET human_key = '/home/ubuntu/private/acme-client' WHERE id = 1",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (2, 1, 'PeerAgent', '', '', '', '', '', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "UPDATE messages \
+             SET subject = 'Deploy sk-abcdef0123456789012345', \
+                 body_md = 'Bearer dGVzdF90b2tlbl9uZXN0ZWQxMjM0NTY3ODkw from /home/ubuntu/private/acme-client', \
+                 ack_required = 1, \
+                 attachments = '[{\"type\":\"file\",\"path\":\"/home/ubuntu/private/acme-client/secrets.txt\",\"download_url\":\"https://signed.example.com\",\"authorization\":\"Bearer abcdefghijklmnopqrstuvwxyz123456\",\"metadata\":{\"token\":\"ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\"}}]' \
+             WHERE id = 1",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE inbox_stats (
+                agent_id INTEGER PRIMARY KEY,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                last_message_ts INTEGER
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservation_releases (
+                reservation_id INTEGER PRIMARY KEY,
+                released_ts INTEGER NOT NULL
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE products (
+                id INTEGER PRIMARY KEY,
+                product_uid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE product_project_links (
+                id INTEGER PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO inbox_stats VALUES (1, 9, 4, 2, 123456)")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO file_reservations VALUES (10, 1, 1, '/home/ubuntu/private/acme-client/src/*.rs', 1, 'contains ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789', '', '', NULL)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO file_reservation_releases VALUES (10, 777)")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agent_links VALUES (10, 1, 1, 1, 2, 'accepted', 'Contact for /home/ubuntu/private/acme-client', '', '', NULL)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO products VALUES (10, 'prod-public', 'Public Product', '')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO product_project_links VALUES (10, 10, 1, '')")
+            .unwrap();
+
+        let summary = scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
+        assert_eq!(summary.file_reservations_removed, 1);
+        assert_eq!(summary.agent_links_removed, 1);
+        assert_eq!(summary.recipients_cleared, 1);
+        assert_eq!(summary.bodies_redacted, 1);
+        assert_eq!(summary.attachments_cleared, 1);
+
+        crate::build_materialized_views(&db, false).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT subject, body_md, attachments, recipients_json, p.human_key \
+                 FROM messages m JOIN projects p ON p.id = m.project_id \
+                 WHERE m.id = 1",
+                &[],
+            )
+            .unwrap();
+        let subject: String = rows[0].get_named("subject").unwrap();
+        let body_md: String = rows[0].get_named("body_md").unwrap();
+        let attachments: String = rows[0].get_named("attachments").unwrap();
+        let recipients_json: String = rows[0].get_named("recipients_json").unwrap();
+        let human_key: String = rows[0].get_named("human_key").unwrap();
+        assert_eq!(subject, "Deploy [REDACTED]");
+        assert_eq!(body_md, "[Message body redacted]");
+        assert_eq!(attachments, "[]");
+        assert_eq!(
+            serde_json::from_str::<Value>(&recipients_json).unwrap(),
+            serde_json::json!({"to":[],"cc":[],"bcc":[]})
+        );
+        assert_eq!(human_key, "[project path redacted: test]");
+
+        fn table_count(conn: &Conn, table: &str) -> i64 {
+            let rows = conn
+                .query_sync(&format!("SELECT COUNT(*) AS cnt FROM {table}"), &[])
+                .unwrap();
+            rows[0].get_named("cnt").unwrap_or(0)
+        }
+
+        assert_eq!(table_count(&conn, "message_recipients"), 0);
+        assert_eq!(table_count(&conn, "inbox_stats"), 0);
+        assert_eq!(table_count(&conn, "file_reservations"), 0);
+        assert_eq!(table_count(&conn, "file_reservation_releases"), 0);
+        assert_eq!(table_count(&conn, "agent_links"), 0);
+
+        let product_rows = conn
+            .query_sync(
+                "SELECT p.product_uid, p.name, l.project_id \
+                 FROM products p JOIN product_project_links l ON l.product_id = p.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(product_rows.len(), 1);
+        let product_uid: String = product_rows[0].get_named("product_uid").unwrap();
+        let product_name: String = product_rows[0].get_named("name").unwrap();
+        let product_project_id: i64 = product_rows[0].get_named("project_id").unwrap();
+        assert_eq!(product_uid, "prod-public");
+        assert_eq!(product_name, "Public Product");
+        assert_eq!(product_project_id, 1);
+
+        let output = dir.path().join("site");
+        crate::render_static_site(
+            &db,
+            &output,
+            &crate::StaticRenderConfig {
+                redaction: crate::ExportRedactionPolicy::from_preset(ScrubPreset::Strict),
+                ..crate::StaticRenderConfig::default()
+            },
+        )
+        .unwrap();
+        let rendered_paths = [
+            "viewer/pages/projects.html",
+            "viewer/pages/projects/test/index.html",
+            "viewer/pages/messages/1.html",
+            "viewer/data/navigation.json",
+            "viewer/data/search_index.json",
+        ];
+        let rendered = rendered_paths
+            .iter()
+            .map(|path| std::fs::read_to_string(output.join(path)).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for private in [
+            "/home/ubuntu/private/acme-client",
+            "sk-abcdef0123456789012345",
+            "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+            "PeerAgent",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "strict static export leaked private token: {private}"
+            );
+        }
+        assert!(rendered.contains("[project path redacted: test]"));
+        assert!(rendered.contains("data-redaction-reason=\"body_redacted\""));
+    }
+
+    #[test]
+    fn standard_privacy_redacts_project_paths_in_retained_text_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+
+        conn.execute_raw(
+            "UPDATE projects SET human_key = '/home/ubuntu/private/acme-client' WHERE id = 1",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "UPDATE agents \
+             SET task_description = 'Working in /home/ubuntu/private/acme-client' \
+             WHERE id = 1",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "UPDATE messages \
+             SET subject = 'Open /home/ubuntu/private/acme-client', \
+                 body_md = 'See /home/ubuntu/private/acme-client/src/lib.rs', \
+                 attachments = '[{\"type\":\"file\",\"path\":\"/home/ubuntu/private/acme-client/secrets.txt\",\"metadata\":{\"note\":\"from /home/ubuntu/private/acme-client\"}}]' \
+             WHERE id = 1",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE project_sibling_suggestions (
+                id INTEGER PRIMARY KEY,
+                project_a_id INTEGER NOT NULL,
+                project_b_id INTEGER NOT NULL,
+                score REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'suggested',
+                rationale TEXT NOT NULL DEFAULT '',
+                created_ts TEXT NOT NULL DEFAULT '',
+                evaluated_ts TEXT NOT NULL DEFAULT '',
+                confirmed_ts TEXT,
+                dismissed_ts TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO project_sibling_suggestions \
+             (id, project_a_id, project_b_id, score, rationale) \
+             VALUES (1, 1, 1, 0.9, 'same checkout at /home/ubuntu/private/acme-client')",
+        )
+        .unwrap();
+
+        scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+
+        let rows = conn
+            .query_sync(
+                "SELECT p.human_key, a.task_description, m.subject, m.body_md, m.attachments, s.rationale \
+                 FROM projects p \
+                 JOIN agents a ON a.project_id = p.id \
+                 JOIN messages m ON m.project_id = p.id \
+                 JOIN project_sibling_suggestions s ON s.project_a_id = p.id \
+                 WHERE p.id = 1",
+                &[],
+            )
+            .unwrap();
+        let rendered = [
+            rows[0].get_named::<String>("human_key").unwrap(),
+            rows[0].get_named::<String>("task_description").unwrap(),
+            rows[0].get_named::<String>("subject").unwrap(),
+            rows[0].get_named::<String>("body_md").unwrap(),
+            rows[0].get_named::<String>("attachments").unwrap(),
+            rows[0].get_named::<String>("rationale").unwrap(),
+        ]
+        .join("\n");
+
+        assert!(
+            !rendered.contains("/home/ubuntu/private/acme-client"),
+            "standard scrub must not retain raw local project paths: {rendered}"
+        );
+        assert!(rendered.contains("[project path redacted: test]"));
+        assert!(rendered.contains("secrets.txt"));
     }
 
     /// Conformance test against the Python fixture for all 3 presets.
