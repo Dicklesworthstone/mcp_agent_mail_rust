@@ -775,6 +775,78 @@ fn golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects() -> Result<()
 }
 
 #[test]
+fn cli_mode_opt_in_allows_cli_help_and_invalid_mode_is_side_effect_free() -> Result<(), String> {
+    let am = am_bin();
+    let target_dir = am
+        .parent()
+        .ok_or_else(|| format!("target dir unavailable for am binary {}", am.display()))?;
+    let mcp_bin = target_dir.join("mcp-agent-mail");
+
+    if !mcp_bin.exists() {
+        eprintln!("SKIP: MCP binary not found.");
+        return Ok(());
+    }
+
+    let (cli_root, mut cli_env) = isolated_env_without_precreated_root("cli_opt_in");
+    cli_env.push(("AM_INTERFACE_MODE".to_string(), "cli".to_string()));
+
+    let cli_cases: &[(&[&str], &str)] = &[
+        (&["--help"], "mcp-agent-mail"),
+        (&["share", "--help"], "Usage:"),
+    ];
+    for (args, required_stdout) in cli_cases {
+        let out = run_mcp(args, &cli_env);
+        let sout = stdout_str(&out);
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "CLI opt-in command {:?} must exit 0, got {:?}",
+            args,
+            out.status.code()
+        );
+        assert!(
+            sout.contains(required_stdout),
+            "CLI opt-in command {:?} stdout must contain {required_stdout:?}.\nActual stdout:\n{sout}",
+            args
+        );
+    }
+    assert!(
+        !cli_root.exists(),
+        "CLI opt-in help commands must not create mailbox or config state under {}",
+        cli_root.display()
+    );
+
+    let (invalid_root, mut invalid_env) =
+        isolated_env_without_precreated_root("invalid_interface_mode");
+    invalid_env.push(("AM_INTERFACE_MODE".to_string(), "wat".to_string()));
+
+    let out = run_mcp(&["--help"], &invalid_env);
+    let serr = stderr_str(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid AM_INTERFACE_MODE must exit with usage code 2, got {:?}",
+        out.status.code()
+    );
+    assert!(
+        stdout_str(&out).is_empty(),
+        "invalid AM_INTERFACE_MODE must not write to stdout"
+    );
+    assert!(
+        serr.contains("AM_INTERFACE_MODE") && serr.contains("wat"),
+        "invalid mode denial must name AM_INTERFACE_MODE and the rejected value.\nActual stderr:\n{serr}"
+    );
+    assert!(
+        !invalid_root.exists(),
+        "invalid AM_INTERFACE_MODE denial must not create mailbox or config state under {}",
+        invalid_root.display()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn golden_cli_help_snapshot_stability() {
     let env = base_env();
 
@@ -858,6 +930,31 @@ fn golden_usage_error_format() {
             expected_fragment
         );
     }
+}
+
+#[test]
+fn docs_dual_mode_guidance_matches_mode_matrix_contract() {
+    let readme = include_str!("../../../README.md");
+    let runbook = include_str!("../../../docs/OPERATOR_RUNBOOK.md");
+    let spec = include_str!("../../../docs/SPEC-interface-mode-switch.md");
+
+    assert!(
+        readme.contains("mcp-agent-mail")
+            && readme.contains("stdio transport")
+            && readme.contains("AM_INTERFACE_MODE=cli mcp-agent-mail"),
+        "README must document MCP stdio default and CLI opt-in mode"
+    );
+    assert!(
+        runbook.contains("MCP server: `mcp-agent-mail`")
+            && runbook.contains("CLI: `am`")
+            && runbook.contains("deny on `stderr` and exit with code `2`"),
+        "operator runbook must preserve the CLI-vs-server wrong-surface guidance"
+    );
+    assert!(
+        spec.contains("For operator CLI commands, use: am {command}")
+            && spec.contains("AM_INTERFACE_MODE=wat mcp-agent-mail --help"),
+        "interface mode spec must preserve denial remediation and invalid-mode test vector"
+    );
 }
 
 /// Verify that the matrix rows cover all top-level CLI subcommands.
