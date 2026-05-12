@@ -967,6 +967,35 @@ fn enrich_status_with_search_index(
     data.search_index = Some(health);
 }
 
+fn enrich_envelope_with_search_index_alert<T: Serialize>(
+    mut env: RobotEnvelope<T>,
+    health: Option<&LexicalBackfillHealth>,
+) -> RobotEnvelope<T> {
+    let Some(health) = health else {
+        return env;
+    };
+    let probe_status = search_index_probe_status(health);
+    if probe_status == "ok" {
+        return env;
+    }
+
+    let severity = if probe_status == "fail" {
+        "error"
+    } else {
+        "warn"
+    };
+    let remediation = health
+        .safe_remediation
+        .clone()
+        .unwrap_or_else(|| "am robot health --format json".to_string());
+    env = env.with_alert(
+        severity,
+        format!("Search V3 lexical index state is {}", health.state),
+        Some(remediation.clone()),
+    );
+    env.with_action(remediation)
+}
+
 /// File reservation entry for status/reservation display.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReservationEntry {
@@ -11149,8 +11178,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 since.as_deref(),
                 20,
             )?;
+            let search_index = data.search_index.clone();
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(project_slug);
+            env = enrich_envelope_with_search_index_alert(env, search_index.as_ref());
             format_output(&env, format)?
         }
         RobotSubcommand::Reservations {
@@ -15595,6 +15626,57 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_results"], 0);
         assert!(v["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn robot_search_envelope_alerts_on_degraded_search_index() {
+        let health = LexicalBackfillHealth {
+            state: "partial".into(),
+            db_identity: "/tmp/mail.sqlite3".into(),
+            index_dir: "/tmp/search_index".into(),
+            indexed_messages: 2,
+            source_messages: Some(5),
+            skipped_messages: 3,
+            last_backfill_at_micros: Some(123_456),
+            rebuild_in_progress: false,
+            active_db_identity: None,
+            stale_reason: Some("indexed message count 2 differs from source count 5".into()),
+            safe_remediation: Some("am robot search rollback".into()),
+        };
+        let data = SearchData {
+            query: "rollback".into(),
+            total_results: 0,
+            results: vec![],
+            route: None,
+            assistance: None,
+            guidance: None,
+            next_cursor: None,
+            plan_diagnostic: None,
+            search_index: Some(health.clone()),
+            by_thread: vec![],
+            by_agent: vec![],
+            by_importance: vec![],
+        };
+
+        let env = enrich_envelope_with_search_index_alert(
+            RobotEnvelope::new("robot search", OutputFormat::Json, data),
+            Some(&health),
+        );
+        let json = serde_json::to_value(&env).unwrap();
+
+        assert_eq!(json["search_index"]["state"], "partial");
+        assert_eq!(json["_alerts"][0]["severity"], "warn");
+        assert_eq!(
+            json["_alerts"][0]["summary"],
+            "Search V3 lexical index state is partial"
+        );
+        assert_eq!(json["_alerts"][0]["action"], "am robot search rollback");
+        assert_eq!(json["_actions"][0], "am robot search rollback");
+
+        let toon = format_output(&env, OutputFormat::Toon).unwrap();
+        assert!(toon.contains("search_index"));
+        assert!(toon.contains("partial"));
+        assert!(toon.contains("am robot search rollback"));
     }
 
     #[test]

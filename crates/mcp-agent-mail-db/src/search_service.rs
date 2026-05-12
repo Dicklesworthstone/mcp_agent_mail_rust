@@ -4664,14 +4664,24 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_reports_stale_state_file_for_other_db() {
+    fn lexical_backfill_health_reports_stale_after_reconstruct_db_path_change() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_lexical_bootstrap_tracking();
         let root = tempfile::tempdir().expect("tempdir");
         let pool = temp_file_pool(root.path(), "mail.sqlite3");
-        write_backfill_health_state(root.path(), "/tmp/other-mail.sqlite3", 3, 9, 3, 9);
+        write_backfill_health_state(
+            root.path(),
+            root.path()
+                .join("pre-reconstruct-mail.sqlite3")
+                .to_str()
+                .expect("utf8 path"),
+            3,
+            9,
+            3,
+            9,
+        );
 
         let health = lexical_backfill_health(&pool);
 
@@ -4682,6 +4692,40 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("backfill marker belongs"))
         );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_unavailable_for_failed_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        let index_dir = root.path().join("search_index");
+        std::fs::create_dir_all(&index_dir).expect("search index dir");
+        std::fs::write(
+            index_dir.join("backfill_state.json"),
+            serde_json::json!({
+                "schema_version": 999,
+                "db_path": pool.sqlite_path(),
+            })
+            .to_string(),
+        )
+        .expect("write bad backfill state");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "unavailable");
+        assert_eq!(health.indexed_messages, 0);
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unsupported backfill state schema version"))
+        );
+        assert!(health.safe_remediation.is_some());
         reset_lexical_bootstrap_tracking();
     }
 
