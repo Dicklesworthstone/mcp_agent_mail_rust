@@ -754,7 +754,7 @@ mod tests {
         );
         let recipient = combined
             .lines()
-            .find(|line| line.contains("public key:"))
+            .find(|line| line.to_ascii_lowercase().contains("public key:"))
             .and_then(|line| line.split_whitespace().last())
             .map(|s| s.to_string())?;
         Some((identity_path, recipient))
@@ -833,6 +833,124 @@ mod tests {
         .unwrap();
 
         let key_path = bundle_dir.join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+        let sig_path = bundle_dir.join("manifest.sig.json");
+        let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
+        sig.public_key
+    }
+
+    const PRIVACY_RAW_MARKERS: &[&str] = &[
+        "/home/ubuntu/private/acme-client",
+        "sk-abcdef0123456789012345",
+        "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+        "Bearer dGVzdF90b2tlbl9uZXN0ZWQxMjM0NTY3ODkw",
+        "PeerAgent",
+    ];
+
+    fn assert_text_omits_privacy_markers(label: &str, text: &str) {
+        for marker in PRIVACY_RAW_MARKERS {
+            assert!(
+                !text.contains(marker),
+                "{label} leaked private privacy-corpus marker: {marker}"
+            );
+        }
+    }
+
+    fn assert_bytes_omit_privacy_markers(label: &str, bytes: &[u8]) {
+        for marker in PRIVACY_RAW_MARKERS {
+            let marker_bytes = marker.as_bytes();
+            assert!(
+                !bytes
+                    .windows(marker_bytes.len())
+                    .any(|window| window == marker_bytes),
+                "{label} leaked private privacy-corpus marker: {marker}"
+            );
+        }
+    }
+
+    fn write_privacy_proof_bundle_fixture(bundle_dir: &Path) -> String {
+        std::fs::create_dir_all(bundle_dir.join("viewer/vendor")).unwrap();
+        std::fs::create_dir_all(bundle_dir.join("viewer/data")).unwrap();
+
+        let db_bytes = b"redacted mailbox proof for br-lmcob.13";
+        std::fs::write(bundle_dir.join("mailbox.sqlite3"), db_bytes).unwrap();
+        std::fs::write(
+            bundle_dir.join("index.html"),
+            r#"<!doctype html><meta name="agent-mail-schema" content="0.1.0"><main data-fixture="br-lmcob.13" data-product="prod-public">[project path redacted: acme-client]</main>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/index.html"),
+            r#"<main data-fixture="br-lmcob.13">privacy proof viewer</main>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/vendor/app.js"),
+            br#"window.AGENT_MAIL_PRIVACY_FIXTURE="br-lmcob.13";"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/data/messages.json"),
+            r#"[{"id":1,"subject":"Deploy [REDACTED]","body":"[Message body redacted]","project":"acme-client","product_uid":"prod-public"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("viewer/data/meta.json"),
+            r#"{"schema_version":"0.1.0","privacy_fixture":"br-lmcob.13","scrub_preset":"strict","product_uid":"prod-public"}"#,
+        )
+        .unwrap();
+
+        let app_js = std::fs::read(bundle_dir.join("viewer/vendor/app.js")).unwrap();
+        let viewer_index = std::fs::read(bundle_dir.join("viewer/index.html")).unwrap();
+        let mut sri_entries = serde_json::Map::new();
+        sri_entries.insert(
+            "vendor/app.js".to_string(),
+            serde_json::Value::String(format!("sha256-{}", base64_encode(&sha256_bytes(&app_js)))),
+        );
+        sri_entries.insert(
+            "viewer/index.html".to_string(),
+            serde_json::Value::String(format!(
+                "sha256-{}",
+                base64_encode(&sha256_bytes(&viewer_index))
+            )),
+        );
+
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "bundle_type": "privacy-proof",
+            "privacy_fixture": {
+                "id": "br-lmcob.13",
+                "public_proof": {
+                    "project_slug": "acme-client",
+                    "project_human_key": "[project path redacted: acme-client]",
+                    "product_uid": "prod-public",
+                    "scrub_preset": "strict"
+                }
+            },
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": db_bytes.len(),
+                "sha256": hex_sha256(db_bytes),
+            },
+            "viewer": {
+                "sri": sri_entries,
+                "data": {
+                    "messages": "viewer/data/messages.json",
+                    "meta": "viewer/data/meta.json"
+                }
+            },
+        });
+        let manifest_path = bundle_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let key_path = bundle_dir
+            .parent()
+            .unwrap_or(bundle_dir)
+            .join("privacy_fixture_signing.key");
         std::fs::write(&key_path, test_key_bytes()).unwrap();
         let sig_path = bundle_dir.join("manifest.sig.json");
         let sig = sign_manifest(&manifest_path, &key_path, &sig_path, false).unwrap();
@@ -1833,6 +1951,118 @@ mod tests {
         assert_eq!(
             manifest.get("bundle_type").and_then(|v| v.as_str()),
             Some("full")
+        );
+
+        let verify = verify_bundle(&extracted, Some(&explicit_pubkey)).unwrap();
+        assert!(verify.sri_checked);
+        assert!(verify.sri_valid);
+        assert!(verify.signature_checked);
+        assert!(verify.signature_verified);
+        assert_eq!(verify.key_source.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn age_roundtrip_privacy_proof_bundle_preserves_redacted_replay_artifacts() {
+        if check_age_available().is_err() {
+            eprintln!("Skipping: age CLI not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some((identity_path, recipient)) = try_generate_age_identity(dir.path()) else {
+            eprintln!("Skipping: age-keygen not available");
+            return;
+        };
+
+        let source = dir.path().join("privacy_bundle_source");
+        std::fs::create_dir_all(&source).unwrap();
+        let explicit_pubkey = write_privacy_proof_bundle_fixture(&source);
+
+        let exported_text = [
+            "manifest.json",
+            "index.html",
+            "viewer/index.html",
+            "viewer/data/messages.json",
+            "viewer/data/meta.json",
+        ]
+        .iter()
+        .map(|relative| std::fs::read_to_string(source.join(relative)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_text_omits_privacy_markers("privacy proof source bundle", &exported_text);
+        for public_marker in [
+            "br-lmcob.13",
+            "prod-public",
+            "[project path redacted: acme-client]",
+            "\"schema_version\": \"0.1.0\"",
+        ] {
+            assert!(
+                exported_text.contains(public_marker),
+                "privacy proof source bundle should retain public marker: {public_marker}"
+            );
+        }
+
+        let zip_path = dir.path().join("privacy_bundle.zip");
+        crate::package_directory_as_zip(&source, &zip_path).unwrap();
+        let original_zip = std::fs::read(&zip_path).unwrap();
+        assert_bytes_omit_privacy_markers("privacy proof zip", &original_zip);
+
+        let encrypted = encrypt_with_age(&zip_path, std::slice::from_ref(&recipient)).unwrap();
+        let ciphertext = std::fs::read(&encrypted).unwrap();
+        assert_bytes_omit_privacy_markers("privacy proof age payload", &ciphertext);
+        for public_marker in [
+            "br-lmcob.13".as_bytes(),
+            b"prod-public".as_slice(),
+            b"[project path redacted: acme-client]".as_slice(),
+        ] {
+            assert!(
+                !ciphertext
+                    .windows(public_marker.len())
+                    .any(|window| window == public_marker),
+                "age ciphertext should not expose plaintext marker"
+            );
+        }
+
+        let decrypted_zip_path = dir.path().join("privacy_bundle.decrypted.zip");
+        decrypt_with_age(&encrypted, &decrypted_zip_path, Some(&identity_path), None).unwrap();
+        let decrypted_zip = std::fs::read(&decrypted_zip_path).unwrap();
+        assert_eq!(
+            decrypted_zip, original_zip,
+            "decrypted privacy proof bundle should match original zip bytes"
+        );
+
+        let extracted = dir.path().join("privacy_bundle_extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        extract_zip_archive(&decrypted_zip_path, &extracted);
+
+        let manifest_text = std::fs::read_to_string(extracted.join("manifest.json")).unwrap();
+        assert_text_omits_privacy_markers("decrypted privacy manifest", &manifest_text);
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest.get("schema_version").and_then(|v| v.as_str()),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            manifest["privacy_fixture"]["public_proof"]["product_uid"],
+            "prod-public"
+        );
+        assert_eq!(
+            manifest["privacy_fixture"]["public_proof"]["project_human_key"],
+            "[project path redacted: acme-client]"
+        );
+
+        let decrypted_exported_text = [
+            "index.html",
+            "viewer/index.html",
+            "viewer/data/messages.json",
+            "viewer/data/meta.json",
+        ]
+        .iter()
+        .map(|relative| std::fs::read_to_string(extracted.join(relative)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_text_omits_privacy_markers(
+            "decrypted privacy static artifacts",
+            &decrypted_exported_text,
         );
 
         let verify = verify_bundle(&extracted, Some(&explicit_pubkey)).unwrap();

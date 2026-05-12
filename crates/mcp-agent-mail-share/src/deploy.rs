@@ -2888,6 +2888,10 @@ mod tests {
 
     impl TestHttpServer {
         fn spawn(include_isolation_headers: bool) -> Self {
+            Self::spawn_with_root_body(include_isolation_headers, "<html></html>".to_string())
+        }
+
+        fn spawn_with_root_body(include_isolation_headers: bool, root_body: String) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             listener
                 .set_nonblocking(true)
@@ -2897,11 +2901,18 @@ mod tests {
             let stop_flag = Arc::clone(&stop);
             let requests = Arc::new(AtomicUsize::new(0));
             let request_counter = Arc::clone(&requests);
+            let root_body = Arc::new(root_body);
+            let root_body_for_thread = Arc::clone(&root_body);
             let handle = std::thread::spawn(move || {
                 while !stop_flag.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            serve_connection(stream, include_isolation_headers, &request_counter);
+                            serve_connection(
+                                stream,
+                                include_isolation_headers,
+                                &request_counter,
+                                root_body_for_thread.as_str(),
+                            );
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
@@ -2943,6 +2954,7 @@ mod tests {
         mut stream: TcpStream,
         include_isolation_headers: bool,
         requests: &AtomicUsize,
+        root_body: &str,
     ) {
         let mut buf = [0_u8; 4096];
         let read = match stream.read(&mut buf) {
@@ -2984,7 +2996,7 @@ mod tests {
                         "same-origin".to_string(),
                     );
                 }
-                (200_u16, "<html></html>".to_string(), h)
+                (200_u16, root_body.to_string(), h)
             }
             "/viewer/" => (200_u16, "<html>viewer</html>".to_string(), BTreeMap::new()),
             "/manifest.json" => (
@@ -3035,6 +3047,62 @@ mod tests {
         std::fs::write(dir.join("viewer/styles.css"), "body{}").unwrap();
         std::fs::write(dir.join("viewer/data/messages.json"), "[]").unwrap();
         std::fs::write(dir.join("viewer/data/meta.json"), "{}").unwrap();
+    }
+
+    const PRIVACY_RAW_MARKERS: &[&str] = &[
+        "/home/ubuntu/private/acme-client",
+        "sk-abcdef0123456789012345",
+        "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+        "Bearer dGVzdF90b2tlbl9uZXN0ZWQxMjM0NTY3ODkw",
+        "PeerAgent",
+    ];
+
+    fn assert_text_omits_privacy_markers(label: &str, text: &str) {
+        for marker in PRIVACY_RAW_MARKERS {
+            assert!(
+                !text.contains(marker),
+                "{label} leaked private privacy-corpus marker: {marker}"
+            );
+        }
+    }
+
+    fn create_privacy_verify_bundle(dir: &Path, index_html: &str) {
+        create_minimal_bundle(dir);
+        std::fs::write(dir.join("index.html"), index_html).unwrap();
+        std::fs::write(
+            dir.join("viewer/data/messages.json"),
+            r#"[{"id":1,"subject":"Deploy [REDACTED]","body":"[Message body redacted]","project":"acme-client","product_uid":"prod-public"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("viewer/data/meta.json"),
+            r#"{"schema_version":"0.1.0","privacy_fixture":"br-lmcob.13","scrub_preset":"strict","product_uid":"prod-public"}"#,
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "generated_at": "2026-05-12T00:00:00Z",
+            "privacy_fixture": {
+                "id": "br-lmcob.13",
+                "public_proof": {
+                    "project_slug": "acme-client",
+                    "project_human_key": "[project path redacted: acme-client]",
+                    "product_uid": "prod-public",
+                    "scrub_preset": "strict"
+                }
+            },
+            "viewer": {
+                "data": {
+                    "messages": "viewer/data/messages.json",
+                    "meta": "viewer/data/meta.json"
+                }
+            }
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     // ── validate_bundle ─────────────────────────────────────────────
@@ -4583,7 +4651,7 @@ mod tests {
             },
         };
 
-        let report = run_verify_live(&opts);
+        let report = crate::probe::with_internal_probe_targets_allowed(|| run_verify_live(&opts));
         assert_eq!(report.exit_code(), 0);
         assert_eq!(report.summary.failed, 0);
         assert!(report.stages.remote.ran);
@@ -4616,6 +4684,93 @@ mod tests {
     }
 
     #[test]
+    fn run_verify_live_privacy_bundle_report_is_replayable_and_redacted() {
+        let index_html = r#"<!doctype html><meta name="agent-mail-schema" content="0.1.0"><main data-fixture="br-lmcob.13" data-product="prod-public">[project path redacted: acme-client]</main>"#;
+        let server = TestHttpServer::spawn_with_root_body(true, index_html.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("privacy-bundle");
+        create_privacy_verify_bundle(&bundle, index_html);
+
+        let opts = VerifyLiveOptions {
+            url: server.base_url(),
+            bundle_path: Some(bundle.clone()),
+            security_audit: true,
+            strict: false,
+            fail_fast: false,
+            probe_config: crate::probe::ProbeConfig {
+                timeout: Duration::from_secs(2),
+                retries: 0,
+                retry_delay: Duration::from_millis(1),
+                ..crate::probe::ProbeConfig::default()
+            },
+        };
+
+        let report = crate::probe::with_internal_probe_targets_allowed(|| run_verify_live(&opts));
+        assert_eq!(report.schema_version, "1.0.0");
+        assert_eq!(report.exit_code(), 0, "verify-live report: {report:#?}");
+        assert_eq!(report.summary.failed, 0);
+        assert_eq!(
+            report.bundle_path.as_deref(),
+            Some(bundle.to_str().unwrap())
+        );
+        assert!(
+            report
+                .stages
+                .local
+                .checks
+                .iter()
+                .any(|c| c.id == "bundle.manifest_schema_version" && c.passed)
+        );
+        assert!(
+            report
+                .stages
+                .remote
+                .checks
+                .iter()
+                .any(|c| c.id == "remote.content_match" && c.passed)
+        );
+        assert!(
+            report
+                .stages
+                .security
+                .checks
+                .iter()
+                .any(|c| c.id == "security.coop_value" && c.passed)
+        );
+
+        let report_json = serde_json::to_string_pretty(&report).unwrap();
+        let report_path = dir.path().join("verify-live-report.json");
+        std::fs::write(&report_path, &report_json).unwrap();
+        let parsed: VerifyLiveReport =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(parsed.schema_version, "1.0.0");
+        assert_eq!(parsed.url, report.url);
+        assert_eq!(parsed.summary.total, report.summary.total);
+
+        let replay_text = [
+            std::fs::read_to_string(bundle.join("manifest.json")).unwrap(),
+            std::fs::read_to_string(bundle.join("index.html")).unwrap(),
+            std::fs::read_to_string(bundle.join("viewer/data/messages.json")).unwrap(),
+            std::fs::read_to_string(bundle.join("viewer/data/meta.json")).unwrap(),
+            report_json,
+        ]
+        .join("\n");
+        assert_text_omits_privacy_markers("verify-live replay artifacts", &replay_text);
+        for public_marker in [
+            "br-lmcob.13",
+            "prod-public",
+            "[project path redacted: acme-client]",
+            "\"schema_version\": \"0.1.0\"",
+            "\"schema_version\": \"1.0.0\"",
+        ] {
+            assert!(
+                replay_text.contains(public_marker),
+                "verify-live replay artifacts should retain public marker: {public_marker}"
+            );
+        }
+    }
+
+    #[test]
     fn run_verify_live_integration_strict_warn_exit_one() {
         let server = TestHttpServer::spawn(false);
         let opts = VerifyLiveOptions {
@@ -4632,7 +4787,7 @@ mod tests {
             },
         };
 
-        let report = run_verify_live(&opts);
+        let report = crate::probe::with_internal_probe_targets_allowed(|| run_verify_live(&opts));
         assert_eq!(report.verdict, VerifyVerdict::Warn);
         assert_eq!(report.exit_code(), 1);
         assert!(

@@ -10,6 +10,8 @@
 //! - Status code, header, and body capture
 //! - Deterministic request sequencing
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufRead, Read as _, Write as _};
@@ -17,6 +19,33 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+thread_local! {
+    static ALLOW_INTERNAL_PROBE_TARGETS: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_internal_probe_targets_allowed<R>(f: impl FnOnce() -> R) -> R {
+    struct InternalProbeOverrideGuard {
+        previous: bool,
+    }
+
+    impl Drop for InternalProbeOverrideGuard {
+        fn drop(&mut self) {
+            ALLOW_INTERNAL_PROBE_TARGETS.with(|slot| slot.set(self.previous));
+        }
+    }
+
+    ALLOW_INTERNAL_PROBE_TARGETS.with(|slot| {
+        let guard = InternalProbeOverrideGuard {
+            previous: slot.replace(true),
+        };
+        let result = f();
+        drop(guard);
+        result
+    })
+}
 
 // ── Error types ─────────────────────────────────────────────────────────
 
@@ -343,6 +372,17 @@ fn probe_ip_is_internal(ip: std::net::IpAddr) -> bool {
     }
 }
 
+fn internal_probe_targets_allowed_for_tests() -> bool {
+    #[cfg(test)]
+    {
+        ALLOW_INTERNAL_PROBE_TARGETS.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn probe_ipv4_is_internal(ip: std::net::Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_unspecified() || ip.is_link_local()
 }
@@ -388,7 +428,7 @@ fn probe_single_get(
 
     // Reject probes to private/loopback/link-local addresses (SSRF protection).
     let ip = resolved.ip();
-    if probe_ip_is_internal(ip) {
+    if probe_ip_is_internal(ip) && !internal_probe_targets_allowed_for_tests() {
         return Err(ProbeError::ConnectionError {
             detail: format!(
                 "probing private/internal address {} is not allowed",
@@ -1245,7 +1285,10 @@ mod tests {
             ..ProbeConfig::default()
         };
 
-        let resp = probe_get(&format!("http://127.0.0.1:{port}/start"), &config).unwrap();
+        let resp = with_internal_probe_targets_allowed(|| {
+            probe_get(&format!("http://127.0.0.1:{port}/start"), &config)
+        })
+        .unwrap();
         handle.join().expect("join server");
 
         assert_eq!(resp.status, 200);
@@ -1264,7 +1307,10 @@ mod tests {
             ..ProbeConfig::default()
         };
 
-        let resp = probe_get(&format!("http://127.0.0.1:{port}/ua"), &config).unwrap();
+        let resp = with_internal_probe_targets_allowed(|| {
+            probe_get(&format!("http://127.0.0.1:{port}/ua"), &config)
+        })
+        .unwrap();
         let request = requests.recv().expect("receive request");
         handle.join().expect("join server");
 
