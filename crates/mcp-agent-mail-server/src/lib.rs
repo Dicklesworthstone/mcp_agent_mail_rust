@@ -4233,6 +4233,19 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     )
 }
 
+fn dispatch_panic_error(method: &str, payload: &(dyn std::any::Any + Send)) -> McpError {
+    let detail = payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+
+    McpError::new(
+        McpErrorCode::InternalError,
+        format!("Blocking dispatch panicked while handling {method}: {detail}"),
+    )
+}
+
 const DEFAULT_DISPATCH_HARD_GRACE_SECS: u64 = 30;
 const MIN_DISPATCH_HARD_GRACE_SECS: u64 = 5;
 const MAX_DISPATCH_HARD_GRACE_SECS: u64 = 300;
@@ -4267,10 +4280,14 @@ where
     F: FnOnce(DispatchCancel) -> Result<T, McpError> + Send + 'static,
 {
     let worker_cancel = cancel.clone();
+    let worker_method = method.clone();
     let closure_permit = Arc::clone(&shared_permit);
     let spawn_future = asupersync::runtime::spawn_blocking(move || {
         let _permit_guard = SharedPermitGuard(closure_permit);
-        work(worker_cancel)
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(worker_cancel))) {
+            Ok(result) => result,
+            Err(payload) => Err(dispatch_panic_error(&worker_method, payload.as_ref())),
+        }
     });
 
     if dispatch_timeout_secs == 0 {
@@ -15135,6 +15152,35 @@ mod tests {
                     "hard grace timeout must force-release the permit"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn dispatch_worker_panic_returns_error_and_releases_permit() {
+        let permit = DispatchPermit::try_acquire().expect("permit available");
+        let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+        assert!(before >= 1);
+
+        let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+            "test/panic".to_string(),
+            0,
+            Cx::for_request_with_budget(Budget::INFINITE),
+            DispatchCancel::new(),
+            Arc::new(Mutex::new(Some(permit))),
+            move |_cancel| -> Result<(), McpError> {
+                std::panic::panic_any("synthetic blocking panic");
+            },
+        ));
+
+        let error = result.expect_err("blocking worker panic should become an MCP error");
+        let error_text = format!("{error:?}");
+        assert!(error_text.contains("Blocking dispatch panicked"));
+        assert!(error_text.contains("test/panic"));
+        assert!(error_text.contains("synthetic blocking panic"));
+        assert_eq!(
+            DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+            before - 1,
+            "panic path must release the dispatch permit"
         );
     }
 

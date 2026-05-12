@@ -149,7 +149,7 @@ debug = 2                # Full debug info for development
 [profile.release]
 lto = "thin"             # Cross-crate optimization (80% of full LTO, much faster compile)
 codegen-units = 1        # Single codegen unit for maximum optimization
-panic = "abort"          # No unwinding overhead (smaller + faster binary)
+panic = "unwind"         # Keep long-running server workers from aborting the process on panics
 opt-level = 3            # Maximum optimization for speed
 strip = "symbols"        # Remove debug symbols from production binary
 
