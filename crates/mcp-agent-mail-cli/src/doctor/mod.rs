@@ -380,7 +380,8 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         mcp_config_candidates: default_mcp_config_candidates(),
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
-        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+        // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
+        stale_seconds_override: None,
     };
 
     let run_id = format!(
@@ -518,7 +519,8 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         mcp_config_candidates: default_mcp_config_candidates(),
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
-        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+        // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
+        stale_seconds_override: None,
     };
 
     let outcome = match fixers::detect_only(fm_id, &inputs) {

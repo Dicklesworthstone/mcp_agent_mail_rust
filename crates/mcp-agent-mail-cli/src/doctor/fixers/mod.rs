@@ -203,10 +203,19 @@ pub struct DispatchInputs {
     /// Inputs for the known-bad-git detect-only FM (system git path,
     /// version string, AM_GIT_BINARY override). `None` skips the FM.
     pub git_detect: Option<known_bad_git_no_override::DetectInputs>,
-    /// Mtime-based staleness threshold for archive-lock and ref-lock
-    /// detectors. Use `stale_archive_lock::DEFAULT_STALE_SECONDS` for
-    /// production.
-    pub stale_seconds: u64,
+    /// Optional override for the per-FM mtime-based staleness threshold.
+    ///
+    /// `None` (the production default) means each stale-* FM uses its
+    /// own canonical `DEFAULT_STALE_SECONDS` const (e.g. 300s for
+    /// archive-lock, 120s for ref-lock, 600s for listener-pid-hint).
+    /// `Some(secs)` forces a single override across all three. Tests
+    /// use `Some(0)` to fire detectors immediately, but production
+    /// callers should leave this at `None` so each FM gets the right
+    /// canonical default — pass-19 closed a drift bug where the handler
+    /// hardcoded `stale_archive_lock::DEFAULT_STALE_SECONDS` (300s) and
+    /// applied it to ref-lock (canonical 120s) and listener-pid (600s)
+    /// alike.
+    pub stale_seconds_override: Option<u64>,
 }
 
 /// Outcome of `dispatch_only`: aggregated counts plus serializable
@@ -254,7 +263,10 @@ pub fn dispatch_only(
     };
 
     if fm_id == stale_archive_lock::FM_ID {
-        let findings = stale_archive_lock::detect(&inputs.archive_roots, inputs.stale_seconds);
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_archive_lock::DEFAULT_STALE_SECONDS);
+        let findings = stale_archive_lock::detect(&inputs.archive_roots, stale_secs);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -264,7 +276,10 @@ pub fn dispatch_only(
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
     } else if fm_id == stale_head_or_ref_lock::FM_ID {
-        let findings = stale_head_or_ref_lock::detect(&inputs.archive_roots, inputs.stale_seconds);
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_head_or_ref_lock::DEFAULT_STALE_SECONDS);
+        let findings = stale_head_or_ref_lock::detect(&inputs.archive_roots, stale_secs);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -274,8 +289,10 @@ pub fn dispatch_only(
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
     } else if fm_id == stale_listener_pid_hint::FM_ID {
-        let findings =
-            stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, inputs.stale_seconds);
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_listener_pid_hint::DEFAULT_STALE_SECONDS);
+        let findings = stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, stale_secs);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -363,17 +380,26 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
     };
 
     let raw_findings: Vec<Finding> = if fm_id == stale_archive_lock::FM_ID {
-        stale_archive_lock::detect(&inputs.archive_roots, inputs.stale_seconds)
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_archive_lock::DEFAULT_STALE_SECONDS);
+        stale_archive_lock::detect(&inputs.archive_roots, stale_secs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == stale_head_or_ref_lock::FM_ID {
-        stale_head_or_ref_lock::detect(&inputs.archive_roots, inputs.stale_seconds)
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_head_or_ref_lock::DEFAULT_STALE_SECONDS);
+        stale_head_or_ref_lock::detect(&inputs.archive_roots, stale_secs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == stale_listener_pid_hint::FM_ID {
-        stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, inputs.stale_seconds)
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_listener_pid_hint::DEFAULT_STALE_SECONDS);
+        stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, stale_secs)
             .iter()
             .map(|f| f.to_finding())
             .collect()

@@ -67,7 +67,7 @@ fn dispatch_only_stale_archive_lock_quarantines_via_mutate() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
-        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+        stale_seconds_override: None,
     };
 
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
@@ -118,7 +118,7 @@ fn dispatch_only_unknown_fm_id_returns_error() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
-        stale_seconds: 300,
+        stale_seconds_override: None,
     };
     let result = fixers::dispatch_only("fm-not-a-real-fixer-id-xxx", &ctx, &inputs);
     assert!(matches!(result, Err(fixers::DispatchError::UnknownFm(_))));
@@ -139,7 +139,7 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
-        stale_seconds: fixers::stale_archive_lock::DEFAULT_STALE_SECONDS,
+        stale_seconds_override: None,
     };
 
     let outcome =
@@ -163,6 +163,84 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
 }
 
 #[test]
+fn canonical_stale_seconds_differ_per_fm() {
+    // Pass-19 invariant. The three stale-* FMs each declare their own
+    // canonical default; the dispatcher routes each FM's detect() call
+    // through `inputs.stale_seconds_override.unwrap_or(<this>::DEFAULT)`.
+    // If any two collapse to the same value, the routing argument
+    // weakens and the prior single-threshold drift bug becomes
+    // re-introducable. This test pins the pairwise-distinct invariant.
+    let archive = fixers::stale_archive_lock::DEFAULT_STALE_SECONDS;
+    let ref_lock = fixers::stale_head_or_ref_lock::DEFAULT_STALE_SECONDS;
+    let listener = fixers::stale_listener_pid_hint::DEFAULT_STALE_SECONDS;
+    assert_eq!(archive, 300, "archive-lock canonical threshold");
+    assert_eq!(ref_lock, 120, "ref-lock canonical threshold (stricter)");
+    assert_eq!(listener, 600, "listener-pid canonical threshold (longer)");
+    assert_ne!(archive, ref_lock);
+    assert_ne!(archive, listener);
+    assert_ne!(ref_lock, listener);
+}
+
+#[test]
+fn detect_only_routes_ref_lock_through_canonical_120s_default() {
+    // Plant a HEAD.lock with mtime 200 seconds ago — older than ref-lock's
+    // canonical 120s threshold but younger than archive-lock's 300s. With
+    // the pre-pass-19 unified-threshold bug, detect_only would have used
+    // archive-lock's 300s and returned 0 findings here. Pass-19 routes
+    // through each FM's own canonical default, so this returns 1.
+    use std::fs::FileTimes;
+    use std::time::{Duration, SystemTime};
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = td.path().join("alpha");
+    fs::create_dir_all(archive.join(".git")).expect("mkdir .git");
+    let head_lock = archive.join(".git").join("HEAD.lock");
+    fs::write(&head_lock, "").expect("plant HEAD.lock");
+
+    // Backdate mtime to 200 seconds ago using std::fs::FileTimes
+    // (stable since 1.75; nightly toolchain in this project).
+    let two_hundred_secs_ago = SystemTime::now() - Duration::from_secs(200);
+    let f = std::fs::File::options()
+        .write(true)
+        .open(&head_lock)
+        .expect("reopen for set_times");
+    let times = FileTimes::new()
+        .set_accessed(two_hundred_secs_ago)
+        .set_modified(two_hundred_secs_ago);
+    f.set_times(times).expect("set_times");
+    drop(f);
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: vec![archive],
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        stale_seconds_override: None,
+    };
+
+    let outcome =
+        fixers::detect_only(fixers::stale_head_or_ref_lock::FM_ID, &inputs).expect("detect_only");
+    assert_eq!(
+        outcome.findings_count, 1,
+        "200s-old HEAD.lock must flag with ref-lock's 120s canonical (pre-pass-19 bug would return 0)"
+    );
+
+    // Sanity check: feed the SAME archive to archive-lock — its 300s
+    // threshold means a 200s-old lock body file shouldn't qualify there.
+    // (archive-lock looks for .git/index.lock specifically, which we
+    // didn't plant, so the assertion is vacuous but documents intent.)
+    let archive_outcome =
+        fixers::detect_only(fixers::stale_archive_lock::FM_ID, &inputs).expect("detect_only");
+    assert_eq!(
+        archive_outcome.findings_count, 0,
+        "no .git/index.lock planted → archive-lock returns 0"
+    );
+}
+
+#[test]
 fn detect_only_unknown_fm_id_returns_error() {
     let inputs = DispatchInputs {
         repo_root: PathBuf::from("/tmp"),
@@ -172,7 +250,7 @@ fn detect_only_unknown_fm_id_returns_error() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
-        stale_seconds: 300,
+        stale_seconds_override: None,
     };
     let err =
         fixers::detect_only("fm-also-not-real-xxx", &inputs).expect_err("unknown id should error");
@@ -195,7 +273,7 @@ fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
-        stale_seconds: 300,
+        stale_seconds_override: None,
     };
     let err = fixers::dispatch_only(fixers::wrong_mcp_url_json::FM_ID, &ctx, &inputs)
         .expect_err("missing input should error");
