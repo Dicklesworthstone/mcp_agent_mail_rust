@@ -559,14 +559,13 @@ pub async fn search_messages_product(
     let product_id = product.id.unwrap_or(0);
     phase.mark("product_scope_resolution");
 
-    let product_projects = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
-    )?;
-    let partial_failures = product_partial_failures_for_projects(&product_projects);
-    phase.mark("product_project_scope_resolution");
-
     let trimmed = query.trim();
     if trimmed.is_empty() {
+        let product_projects = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+        )?;
+        let partial_failures = product_partial_failures_for_projects(&product_projects);
+        phase.mark("product_project_scope_resolution");
         phase.set_rows_returned(0);
         phase.mark("empty_query_short_circuit");
         let diagnostics =
@@ -626,6 +625,11 @@ pub async fn search_messages_product(
         None
     };
     phase.mark("argument_filter_resolution");
+    let product_projects = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    )?;
+    let partial_failures = product_partial_failures_for_projects(&product_projects);
+    phase.mark("product_project_scope_resolution");
 
     // Build planner query with product scope and facets
     let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
