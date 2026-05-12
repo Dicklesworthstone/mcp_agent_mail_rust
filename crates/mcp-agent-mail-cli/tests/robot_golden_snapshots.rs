@@ -79,6 +79,7 @@ fn status_envelope() -> RobotEnvelope<StatusData> {
             }],
             anomalies: Vec::new(),
             recommendations: Vec::new(),
+            reservation_forecast: None,
             recovery: None,
         },
     )

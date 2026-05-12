@@ -807,6 +807,8 @@ pub struct StatusData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recommendations: Vec<OperatorRecommendation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation_forecast: Option<ReservationForecast>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatus>,
 }
 
@@ -888,6 +890,49 @@ pub struct ReservationEntry {
     pub remaining: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
+}
+
+/// Expiry bucket highlighting reservation TTL herds.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationExpiryBucket {
+    pub window: String,
+    pub from_seconds: i64,
+    pub until_seconds: i64,
+    pub count: usize,
+    pub agents: Vec<String>,
+    pub paths: Vec<String>,
+    pub safe_command: String,
+    pub evidence: String,
+}
+
+/// Hot path where active exclusive reservations already overlap.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReservationConflictHotspot {
+    pub path: String,
+    pub conflict_pairs: usize,
+    pub agents: Vec<String>,
+    pub overlapping_paths: Vec<String>,
+    pub safe_command: String,
+    pub evidence: String,
+}
+
+/// Advisory reservation forecast for robot reservations/status output.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReservationForecast {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expiry_herds: Vec<ReservationExpiryBucket>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflict_hotspots: Vec<ReservationConflictHotspot>,
+}
+
+impl ReservationForecast {
+    fn is_empty(&self) -> bool {
+        self.expiry_herds.is_empty() && self.conflict_hotspots.is_empty()
+    }
+
+    fn into_option(self) -> Option<Self> {
+        (!self.is_empty()).then_some(self)
+    }
 }
 
 /// Summary entry for a thread (used in status and overview).
@@ -3912,6 +3957,19 @@ fn build_status_with_phase(
     };
     mark_tail_latency_phase(&mut phase, "sqlite_my_reservations");
 
+    let reservation_forecast = build_reservations(
+        conn,
+        project_id,
+        project_slug,
+        agent.clone(),
+        true,
+        false,
+        Some(10),
+    )?
+    .0
+    .forecast;
+    mark_tail_latency_phase(&mut phase, "sqlite_reservation_forecast");
+
     // 6. Top threads (3 most recently active)
     let top_threads_rows = conn
         .query_sync(
@@ -4059,6 +4117,7 @@ fn build_status_with_phase(
         top_threads,
         anomalies,
         recommendations,
+        reservation_forecast,
         recovery,
     };
 
@@ -4218,6 +4277,7 @@ fn build_recovery_only_status(
         top_threads: vec![],
         anomalies,
         recommendations,
+        reservation_forecast: None,
         recovery: Some(recovery),
     };
 
@@ -6065,6 +6125,8 @@ struct ReservationsData {
     expiring_soon: Vec<ReservationEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     playbooks: Vec<ReservationPlaybook>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forecast: Option<ReservationForecast>,
 }
 
 /// Format remaining seconds with warning markers.
@@ -6124,6 +6186,144 @@ fn build_reservation_conflict_playbooks(
             }
         })
         .collect()
+}
+
+fn reservation_forecast_expiry_buckets(
+    project_slug: &str,
+    all_active: &[ReservationEntry],
+) -> Vec<ReservationExpiryBucket> {
+    const BUCKETS: &[(i64, i64, &str, u32)] = &[
+        (0, 5 * 60, "0-5m", 5),
+        (5 * 60, 15 * 60, "5-15m", 15),
+        (15 * 60, 60 * 60, "15-60m", 60),
+    ];
+
+    let project_arg = robot_shell_arg(project_slug);
+    let mut buckets = Vec::new();
+    for (from_seconds, until_seconds, label, expiring_minutes) in BUCKETS {
+        let entries: Vec<_> = all_active
+            .iter()
+            .filter(|entry| {
+                entry.remaining_seconds >= *from_seconds && entry.remaining_seconds < *until_seconds
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+
+        let mut agents: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.agent.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        agents.truncate(10);
+
+        let mut paths: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        paths.truncate(10);
+
+        buckets.push(ReservationExpiryBucket {
+            window: (*label).to_string(),
+            from_seconds: *from_seconds,
+            until_seconds: *until_seconds,
+            count: entries.len(),
+            agents,
+            paths,
+            safe_command: format!(
+                "am robot reservations --project {project_arg} --expiring {expiring_minutes} --all"
+            ),
+            evidence: format!(
+                "robot://reservations/expiry-herd?project={project_slug}&window={label}&count={}",
+                entries.len()
+            ),
+        });
+    }
+    buckets
+}
+
+fn reservation_forecast_conflict_hotspots(
+    project_slug: &str,
+    conflicts: &[ReservationConflict],
+) -> Vec<ReservationConflictHotspot> {
+    #[derive(Default)]
+    struct HotspotAccumulator {
+        conflict_pairs: usize,
+        agents: std::collections::BTreeSet<String>,
+        overlapping_paths: std::collections::BTreeSet<String>,
+    }
+
+    let mut by_path: std::collections::BTreeMap<String, HotspotAccumulator> =
+        std::collections::BTreeMap::new();
+    for conflict in conflicts {
+        for (path, agent, other_path, other_agent) in [
+            (
+                &conflict.path_a,
+                &conflict.agent_a,
+                &conflict.path_b,
+                &conflict.agent_b,
+            ),
+            (
+                &conflict.path_b,
+                &conflict.agent_b,
+                &conflict.path_a,
+                &conflict.agent_a,
+            ),
+        ] {
+            let acc = by_path.entry(path.clone()).or_default();
+            acc.conflict_pairs += 1;
+            acc.agents.insert(agent.clone());
+            acc.agents.insert(other_agent.clone());
+            acc.overlapping_paths.insert(other_path.clone());
+        }
+    }
+
+    let project_arg = robot_shell_arg(project_slug);
+    let mut hotspots: Vec<_> = by_path
+        .into_iter()
+        .map(|(path, acc)| {
+            let mut agents: Vec<_> = acc.agents.into_iter().collect();
+            agents.truncate(10);
+            let mut overlapping_paths: Vec<_> = acc.overlapping_paths.into_iter().collect();
+            overlapping_paths.truncate(10);
+            ReservationConflictHotspot {
+                evidence: format!(
+                    "robot://reservations/conflict-hotspot?project={project_slug}&path={path}&pairs={}",
+                    acc.conflict_pairs
+                ),
+                safe_command: format!(
+                    "am robot reservations --project {project_arg} --conflicts --all"
+                ),
+                path,
+                conflict_pairs: acc.conflict_pairs,
+                agents,
+                overlapping_paths,
+            }
+        })
+        .collect();
+    hotspots.sort_by(|left, right| {
+        right
+            .conflict_pairs
+            .cmp(&left.conflict_pairs)
+            .then(left.path.cmp(&right.path))
+    });
+    hotspots.truncate(5);
+    hotspots
+}
+
+fn build_reservation_forecast(
+    project_slug: &str,
+    all_active: &[ReservationEntry],
+    conflicts: &[ReservationConflict],
+) -> ReservationForecast {
+    ReservationForecast {
+        expiry_herds: reservation_forecast_expiry_buckets(project_slug, all_active),
+        conflict_hotspots: reservation_forecast_conflict_hotspots(project_slug, conflicts),
+    }
 }
 
 fn build_reservations(
@@ -6286,6 +6486,8 @@ fn build_reservations(
         all_active.clone()
     };
     let scoped_playbooks = build_reservation_conflict_playbooks(project_slug, &scoped_conflicts);
+    let scoped_forecast =
+        build_reservation_forecast(project_slug, &scoped_all_active, &scoped_conflicts);
 
     // Build actions
     let mut actions = Vec::new();
@@ -6320,6 +6522,11 @@ fn build_reservations(
                 conflicts: scoped_conflicts,
                 expiring_soon: vec![],
                 playbooks: scoped_playbooks,
+                forecast: ReservationForecast {
+                    expiry_herds: vec![],
+                    conflict_hotspots: scoped_forecast.conflict_hotspots,
+                }
+                .into_option(),
             },
             actions,
         ));
@@ -6334,12 +6541,14 @@ fn build_reservations(
                 conflicts: scoped_conflicts,
                 expiring_soon: scoped_expiring_soon,
                 playbooks: scoped_playbooks,
+                forecast: scoped_forecast.into_option(),
             },
             actions,
         ));
     }
 
     let playbooks = build_reservation_conflict_playbooks(project_slug, &conflicts);
+    let forecast = build_reservation_forecast(project_slug, &all_active, &conflicts);
     Ok((
         ReservationsData {
             my_reservations,
@@ -6347,6 +6556,7 @@ fn build_reservations(
             conflicts,
             expiring_soon,
             playbooks,
+            forecast: forecast.into_option(),
         },
         actions,
     ))
@@ -13306,6 +13516,7 @@ mod tests {
                 suggested_subject: "[reservation-conflict] BlueLake / RedFox".into(),
                 suggested_body: "Please coordinate before editing overlapping reservations.".into(),
             }],
+            forecast: None,
         };
 
         let json = serde_json::to_value(&data).unwrap();
@@ -13979,6 +14190,7 @@ mod tests {
             top_threads: vec![],
             anomalies: vec![],
             recommendations: vec![],
+            reservation_forecast: None,
             recovery: None,
         };
         let json = serde_json::to_string(&data).unwrap();
@@ -14011,6 +14223,7 @@ mod tests {
                 playbooks: vec![],
             }],
             recommendations: vec![],
+            reservation_forecast: None,
             recovery: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
@@ -14381,6 +14594,46 @@ mod tests {
                 .unwrap()
                 .contains("--ack-overdue")
         );
+    }
+
+    #[test]
+    fn build_status_reports_reservation_forecast() {
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, last_active_ts)
+             VALUES (3, 1, 'Writer', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert writer");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'crates/**', 1, 'reader', ?, ?, NULL),
+                (2, 1, 3, 'crates/mcp-agent-mail-cli/src/robot.rs', 1, 'writer', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 240_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 260_000_000),
+            ],
+        )
+        .expect("insert reservations");
+
+        let (status, _actions) =
+            build_status(&conn, 1, "demo", Some((2, "Reader".into()))).expect("build status");
+        let forecast = status
+            .reservation_forecast
+            .expect("status should include reservation forecast");
+        assert_eq!(forecast.expiry_herds[0].window, "0-5m");
+        assert_eq!(forecast.expiry_herds[0].count, 2);
+        assert_eq!(
+            forecast.expiry_herds[0].safe_command,
+            "am robot reservations --project demo --expiring 5 --all"
+        );
+        assert_eq!(forecast.conflict_hotspots[0].path, "crates/**");
+        assert_eq!(forecast.conflict_hotspots[0].conflict_pairs, 1);
     }
 
     #[test]
@@ -14851,6 +15104,7 @@ mod tests {
             top_threads: vec![],
             anomalies: anomalies.clone(),
             recommendations: vec![],
+            reservation_forecast: None,
             recovery: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
@@ -18610,6 +18864,85 @@ mod tests {
     }
 
     #[test]
+    fn build_reservations_forecasts_expiry_herds_and_conflict_hotspots() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/**', 1, 'a', ?, ?, NULL),
+                (2, 1, 2, 'src/lib.rs', 1, 'b', ?, ?, NULL),
+                (3, 1, 3, 'docs/**', 0, 'c', ?, ?, NULL),
+                (4, 1, 3, 'crates/**', 1, 'd', ?, ?, NULL),
+                (5, 1, 2, 'expired/**', 1, 'e', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 120_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 240_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 240_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 20 * MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+            ],
+        )
+        .expect("insert reservations");
+
+        let (data, _actions) =
+            build_reservations(&conn, 1, "proj with space", None, true, false, Some(10))
+                .expect("build reservations");
+
+        let forecast = data.forecast.expect("forecast should be present");
+        let immediate = forecast
+            .expiry_herds
+            .iter()
+            .find(|bucket| bucket.window == "0-5m")
+            .expect("0-5m expiry bucket");
+        assert_eq!(immediate.count, 3);
+        assert_eq!(immediate.agents, vec!["Alice", "Bob", "Carol"]);
+        assert!(immediate.paths.contains(&"src/**".to_string()));
+        assert!(!immediate.paths.contains(&"expired/**".to_string()));
+        assert_eq!(
+            immediate.safe_command,
+            "am robot reservations --project 'proj with space' --expiring 5 --all"
+        );
+        assert!(immediate.evidence.contains("count=3"));
+
+        let later = forecast
+            .expiry_herds
+            .iter()
+            .find(|bucket| bucket.window == "15-60m")
+            .expect("15-60m expiry bucket");
+        assert_eq!(later.count, 1);
+        assert_eq!(later.paths, vec!["crates/**"]);
+
+        let hotspot = forecast
+            .conflict_hotspots
+            .iter()
+            .find(|hotspot| hotspot.path == "src/**")
+            .expect("src conflict hotspot");
+        assert_eq!(hotspot.conflict_pairs, 1);
+        assert_eq!(hotspot.agents, vec!["Alice", "Bob"]);
+        assert_eq!(hotspot.overlapping_paths, vec!["src/lib.rs"]);
+        assert_eq!(
+            hotspot.safe_command,
+            "am robot reservations --project 'proj with space' --conflicts --all"
+        );
+        assert!(hotspot.evidence.contains("pairs=1"));
+        assert!(
+            forecast
+                .conflict_hotspots
+                .iter()
+                .all(|hotspot| !hotspot.agents.contains(&"Carol".to_string())),
+            "shared reservations must not create conflict hotspots: {:?}",
+            forecast.conflict_hotspots
+        );
+    }
+
+    #[test]
     fn build_reservations_keeps_orphaned_agent_rows_visible() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
@@ -20313,6 +20646,7 @@ mod tests {
             top_threads: vec![],
             anomalies: vec![],
             recommendations: vec![],
+            reservation_forecast: None,
             recovery: Some(RecoveryStatus {
                 mode: "recovering".into(),
                 owner: "pid 100 (active)".into(),
