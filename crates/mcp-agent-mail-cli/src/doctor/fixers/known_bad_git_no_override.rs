@@ -41,6 +41,7 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
+use mcp_agent_mail_core::git_binary::{GitVersion, KnownBadEntry, match_known_bad};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -48,11 +49,17 @@ pub const FM_ID: &str = "fm-environment_toolchain-known-bad-git-no-override";
 const FM_SEVERITY: &str = "P0";
 const FM_SUBSYSTEM: &str = "environment_toolchain";
 
-/// Known-bad git versions. Today: just 2.51.0 from the
-/// AGENTS.md / RECOVERY_RUNBOOK. Extensible: append future bad
-/// releases here. Each entry is the canonical version string the
-/// `git --version` output produces (with no `v` prefix, no `-rcN`).
-const KNOWN_BAD_GIT_VERSIONS: &[&str] = &["2.51.0"];
+// Pass-20: the canonical known-bad-git registry lives in
+// `mcp_agent_mail_core::git_binary` and is data-driven via
+// `data/known_bad_git_versions.json` plus the operator-extensible
+// `AM_EXTRA_KNOWN_BAD_GIT_JSON` and `AM_IGNORE_KNOWN_BAD_GIT` env
+// vars. The fixer used to carry a hardcoded `["2.51.0"]` list,
+// which silently drifted away from the registry: an operator
+// extending the JSON would see the core path refuse the bad
+// binary, but `am doctor --fix --only ...` would still report
+// "no findings". Routing detection through `match_known_bad`
+// makes that drift structurally impossible — same defect class
+// as pass-18 (BACKUP_SUFFIX_HINTS) and pass-19 (stale_seconds).
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KnownBadGitNoOverrideFinding {
@@ -63,6 +70,11 @@ pub struct KnownBadGitNoOverrideFinding {
     /// Why the override is invalid: env unset, points at non-existent,
     /// points at non-executable, or points at a still-bad version.
     pub reason: OverrideStatus,
+    /// Canonical metadata for the matched known-bad entry (code,
+    /// severity, remediation_ref). Pass-20: surfaced from the core
+    /// registry so agents see the full operator-extensible match
+    /// data, not just a boolean.
+    pub matched_entry: Option<KnownBadEntry>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -108,6 +120,12 @@ impl KnownBadGitNoOverrideFinding {
                     OverrideStatus::StillBad => "am_git_binary_still_bad_version",
                 },
                 "remediation_doc": "docs/RECOVERY_RUNBOOK.md#git-2-51-0-index-race",
+                // Pass-20: full canonical known-bad-entry metadata —
+                // code (e.g. "GIT_2_51_0_INDEX_RACE"), severity
+                // ("fail" / "warn"), fingerprint, remediation_ref.
+                // Agents that extend AM_EXTRA_KNOWN_BAD_GIT_JSON pick
+                // up custom entries here automatically.
+                "matched_entry": self.matched_entry,
             }),
             remediation: FindingRemediation {
                 // Detect-only: command points at `explain` because there's
@@ -143,30 +161,45 @@ pub struct DetectInputs {
     pub am_git_binary_env: Option<String>,
 }
 
-/// Detector. PURE — no shell-outs, no writes, no env-var reads. All
-/// inputs are provided by the caller, which is responsible for
-/// invoking `git --version` and reading `AM_GIT_BINARY` (those are
-/// I/O concerns that the caller wires up).
+/// Detector. PURE w.r.t. caller-supplied version + env state; reads
+/// from the process-static known-bad catalog cache in
+/// `mcp_agent_mail_core::git_binary`. No shell-outs, no writes here.
+///
+/// Pass-20: consults `match_known_bad(GitVersion)` instead of the
+/// fixer's old local `["2.51.0"]` list. This routes through the
+/// canonical operator-extensible registry (embedded JSON +
+/// `AM_EXTRA_KNOWN_BAD_GIT_JSON` + `AM_IGNORE_KNOWN_BAD_GIT`
+/// suppress list). Same detector, same FM contract — the
+/// difference is that operators who add new bad versions via the
+/// JSON file get them flagged by `--only` automatically, no
+/// fixer-side patch needed.
 pub fn detect(inputs: &DetectInputs) -> Vec<KnownBadGitNoOverrideFinding> {
-    // 1. Is the system git on the known-bad list?
-    if !KNOWN_BAD_GIT_VERSIONS.contains(&inputs.system_git_version.as_str()) {
+    // 1. Parse the version string. Lax — tolerates `2.51.0`, `2.51.0-rc1`,
+    //    `2.51.0.windows.1`, `2.51.0+build.42`.
+    let Some(version) = GitVersion::parse_lax(&inputs.system_git_version) else {
         return Vec::new();
-    }
+    };
 
-    // 2. Examine the override.
-    let reason = classify_override(inputs.am_git_binary_env.as_deref());
+    // 2. Is this version in the canonical known-bad catalog (after
+    //    suppress-list filtering)?
+    let Some(entry) = match_known_bad(version) else {
+        return Vec::new();
+    };
 
-    if let Some(reason) = reason {
-        vec![KnownBadGitNoOverrideFinding {
-            system_git_path: inputs.system_git_path.clone(),
-            system_git_version: inputs.system_git_version.clone(),
-            am_git_binary_env: inputs.am_git_binary_env.clone(),
-            reason,
-        }]
-    } else {
-        // Override is valid → safe → no finding.
-        Vec::new()
-    }
+    // 3. Examine the override.
+    let Some(reason) = classify_override(inputs.am_git_binary_env.as_deref()) else {
+        // Override is valid → safe → no finding even though the
+        // system git is known-bad.
+        return Vec::new();
+    };
+
+    vec![KnownBadGitNoOverrideFinding {
+        system_git_path: inputs.system_git_path.clone(),
+        system_git_version: inputs.system_git_version.clone(),
+        am_git_binary_env: inputs.am_git_binary_env.clone(),
+        reason,
+        matched_entry: Some(entry.clone()),
+    }]
 }
 
 /// Return `Some(reason)` if the override is invalid, `None` if valid.
@@ -289,6 +322,7 @@ mod tests {
             system_git_version: "2.51.0".into(),
             am_git_binary_env: None,
             reason: OverrideStatus::Unset,
+            matched_entry: None,
         };
         let g = f.to_finding();
         assert_eq!(g.severity, "P0");
@@ -309,6 +343,7 @@ mod tests {
             system_git_version: "2.51.0".into(),
             am_git_binary_env: None,
             reason: OverrideStatus::Unset,
+            matched_entry: None,
         };
         let t = f.manual_remediation_text();
         assert!(t.contains("AM_GIT_BINARY"));
@@ -323,6 +358,7 @@ mod tests {
             system_git_version: "2.51.0".into(),
             am_git_binary_env: Some("/nonexistent".into()),
             reason: OverrideStatus::PathMissing,
+            matched_entry: None,
         };
         let g = f.to_finding();
         let s = serde_json::to_string(&g).unwrap();
@@ -330,5 +366,61 @@ mod tests {
         assert!(s.contains("\"severity\":\"P0\""));
         assert!(s.contains("am_git_binary_path_missing"));
         assert!(s.contains("RECOVERY_RUNBOOK"));
+    }
+
+    #[test]
+    fn detector_routes_through_core_registry_and_surfaces_entry() {
+        // Pass-20 invariant. The detector consults
+        // `mcp_agent_mail_core::git_binary::match_known_bad`, which
+        // returns the canonical KnownBadEntry. Confirm a finding for
+        // the embedded-catalog 2.51.0 entry surfaces the entry's
+        // `code` field (e.g. "GIT_2_51_0_INDEX_RACE") so agents that
+        // call `--only fm-... --list` get the operator-extensible
+        // match metadata, not just a boolean.
+        let inputs = DetectInputs {
+            system_git_path: "/usr/bin/git".into(),
+            system_git_version: "2.51.0".into(),
+            am_git_binary_env: None,
+        };
+        let findings = detect(&inputs);
+        assert_eq!(findings.len(), 1, "2.51.0 is in the embedded catalog");
+        let entry = findings[0]
+            .matched_entry
+            .as_ref()
+            .expect("detector must populate matched_entry from core registry");
+        assert!(
+            !entry.code.is_empty(),
+            "KnownBadEntry.code must not be empty"
+        );
+        // The embedded catalog ships the 2.51.0 entry as
+        // GIT_2_51_0_INDEX_RACE — pin that so a future entry rename
+        // is a deliberate change.
+        assert_eq!(entry.code, "GIT_2_51_0_INDEX_RACE");
+        assert!(!entry.summary.is_empty());
+        assert!(!entry.remediation_ref.is_empty());
+        // And the to_finding() evidence must include the entry.
+        let g = findings[0].to_finding();
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(
+            s.contains("GIT_2_51_0_INDEX_RACE"),
+            "evidence JSON must include the canonical entry code"
+        );
+    }
+
+    #[test]
+    fn detector_returns_empty_for_unparseable_version() {
+        // GitVersion::parse_lax requires at least major.minor; a bare
+        // word like "garbage" parses to None and the detector returns
+        // empty (defensive — corrupt input from a non-git binary).
+        let inputs = DetectInputs {
+            system_git_path: "/usr/bin/git".into(),
+            system_git_version: "garbage".into(),
+            am_git_binary_env: None,
+        };
+        let findings = detect(&inputs);
+        assert!(
+            findings.is_empty(),
+            "unparseable version must NOT flag (no panic, no false positive)"
+        );
     }
 }
