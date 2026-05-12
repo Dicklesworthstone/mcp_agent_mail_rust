@@ -46,9 +46,10 @@ send_session() {
     local srv_work
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
+    local storage_root="${SESSION_STORAGE_ROOT:-${WORK}/storage}"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="${WORK}/storage" RUST_LOG=error WORKTREES_ENABLED=true \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="$storage_root" RUST_LOG=error WORKTREES_ENABLED=true \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -148,6 +149,34 @@ try:
 except Exception:
     print('')
 " "$field" 2>/dev/null
+}
+
+sqlite_exec() {
+    local db_path="$1"
+    local sql="$2"
+    python3 - "$db_path" "$sql" <<'PY'
+import sqlite3
+import sys
+
+db_path, sql = sys.argv[1:3]
+with sqlite3.connect(db_path) as conn:
+    conn.executescript(sql)
+PY
+}
+
+sqlite_scalar() {
+    local db_path="$1"
+    local sql="$2"
+    python3 - "$db_path" "$sql" <<'PY'
+import sqlite3
+import sys
+
+db_path, sql = sys.argv[1:3]
+with sqlite3.connect(db_path) as conn:
+    row = conn.execute(sql).fetchone()
+if row is not None and row[0] is not None:
+    print(row[0])
+PY
 }
 
 # =========================================================================
@@ -515,7 +544,7 @@ fi
 
 # Phase C: make RedLake stale and force-release
 STALE_TS=$(($(date +%s) * 1000000 - 7200 * 1000000))
-sqlite3 "$DB7" "UPDATE agents SET last_active_ts = $STALE_TS WHERE name = 'RedLake';" 2>/dev/null || true
+sqlite_exec "$DB7" "UPDATE agents SET last_active_ts = $STALE_TS WHERE name = 'RedLake';" || true
 
 if [ -n "$RES7_ID" ]; then
     REQS7C=(
@@ -609,14 +638,16 @@ else
     e2e_fail "product: search_messages_product returned empty"
 fi
 
-# 8f: product partial-failure artifact drill. This injects an orphaned product
-# link directly into the isolated E2E DB, then proves healthy linked projects
-# still return useful product-wide search and summary responses with explicit
-# degraded diagnostics for the missing project.
-ORPHAN8_PROJECT_ID=880099
-PRODUCT8_ID="$(sqlite3 "$DB8" "SELECT id FROM products WHERE name = 'E2E Product' OR product_uid = '$PRODUCT_UID' LIMIT 1;" 2>/dev/null | head -n 1)"
-if [ -n "$PRODUCT8_ID" ]; then
-    sqlite3 "$DB8" "PRAGMA foreign_keys=OFF; INSERT OR IGNORE INTO product_project_links (product_id, project_id, created_at) VALUES ($PRODUCT8_ID, $ORPHAN8_PROJECT_ID, 1700000000000000);" 2>/dev/null || true
+# 8f: product partial-failure artifact drill. This changes one linked project
+# to the same placeholder shape produced for a missing linked project row, then
+# proves the healthy linked project still returns useful product-wide search and
+# summary responses with explicit degraded diagnostics.
+ORPHAN8_PROJECT_ID="$(sqlite_scalar "$DB8" "SELECT ppl.project_id FROM product_project_links ppl JOIN products pr ON pr.id = ppl.product_id JOIN projects p ON p.id = ppl.project_id WHERE pr.name = 'E2E Product' AND p.human_key = '/tmp/e2e_wf_product_b' LIMIT 1;")"
+if [ -n "$ORPHAN8_PROJECT_ID" ]; then
+    PLACEHOLDER8="[unknown-project-$ORPHAN8_PROJECT_ID]"
+    sqlite_exec "$DB8" "UPDATE projects SET slug = '$PLACEHOLDER8', human_key = '$PLACEHOLDER8' WHERE id = $ORPHAN8_PROJECT_ID;" || true
+else
+    e2e_fail "product partial: missing linked project id for placeholder injection"
 fi
 
 e2e_save_artifact "case_08_project_a.log" "project_key=/tmp/e2e_wf_product_a
@@ -624,10 +655,11 @@ state=healthy
 expected_signal=Cross-project ping
 thread_id=e2e-product-thread"
 e2e_save_artifact "case_08_project_b.log" "project_key=/tmp/e2e_wf_product_b
-state=healthy_no_matching_body
+state=linked_project_placeholder_metadata
+expected_partial_failure=true
 expected_agent=MistyCove"
 e2e_save_artifact "case_08_orphan_project.log" "project_id=$ORPHAN8_PROJECT_ID
-state=orphaned_product_project_link
+state=placeholder_missing_project_metadata
 reason_code=linked_project_missing
 remediation_command=am doctor reconstruct"
 
@@ -636,7 +668,7 @@ REQS8C=(
     "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"query\":\"cross-project\",\"limit\":10,\"include_body_md\":true}}}"
     "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_thread_product\",\"arguments\":{\"product_key\":\"E2E Product\",\"thread_id\":\"e2e-product-thread\",\"include_examples\":true,\"llm_mode\":false,\"per_thread_limit\":10}}}"
 )
-RESP8C="$(send_session "$DB8" "${REQS8C[@]}")"
+RESP8C="$(SESSION_STORAGE_ROOT="${WORK}/product_partial_storage" send_session "$DB8" "${REQS8C[@]}")"
 e2e_save_artifact "case_08c_partial_failure.txt" "$RESP8C"
 
 SEARCH8C_TEXT="$(extract_tool_result "$RESP8C" 90)"
