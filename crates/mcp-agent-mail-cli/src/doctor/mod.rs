@@ -620,17 +620,29 @@ fn default_listener_pid_candidates(storage_root: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Top-level (non-recursive) `*.bak` / `*.tmp` / `*.orig` files under the
-/// operator's storage root, plus the canonical config dir for
-/// mcp-agent-mail. Top-level only — recursion is intentionally avoided to
-/// keep latency bounded.
-fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {
+/// Top-level (non-recursive) backup-suffixed files under the operator's
+/// storage root, Agent Mail config dirs, and common MCP client config
+/// dirs. Top-level only — recursion is intentionally avoided to keep
+/// latency bounded.
+///
+/// The accepted suffix set is the canonical
+/// `fixers::world_readable_token_bak::BACKUP_SUFFIX_HINTS` — referencing
+/// the module's `pub const` directly (instead of duplicating the list)
+/// keeps the enumeration here structurally aligned with the detector's
+/// accept-set. If the detector broadens the accept-set, this enumeration
+/// picks it up automatically.
+fn token_backup_candidates(storage_root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = vec![storage_root.to_path_buf()];
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home {
         roots.push(home.join(".config").join("mcp-agent-mail"));
         roots.push(home.join(".mcp_agent_mail"));
+        roots.push(home.join(".codex"));
+        roots.push(home.join(".claude"));
+        roots.push(home.join(".cursor"));
+        roots.push(home.join(".windsurf"));
+        roots.push(home.join(".gemini"));
     }
-    let suffixes = [".bak", ".tmp", ".orig"];
+    let suffixes = fixers::world_readable_token_bak::BACKUP_SUFFIX_HINTS;
     let mut out = Vec::new();
     for root in roots {
         let Ok(rd) = std::fs::read_dir(&root) else {
@@ -647,6 +659,11 @@ fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    token_backup_candidates(storage_root, home.as_deref())
 }
 
 /// Common MCP client JSON config paths (per-client, no recursion).
@@ -1941,6 +1958,98 @@ mod tests {
         assert!(s.contains(".doctor"));
         // Storage root is conditional; XDG paths are conditional. Just assert
         // the per-repo scopes are always present.
+    }
+
+    #[test]
+    fn token_backup_candidates_references_canonical_suffix_list() {
+        // Pass-18: the handler must enumerate via the module's canonical
+        // `BACKUP_SUFFIX_HINTS` so widening the detector's accept-set
+        // automatically widens the enumeration. Plant one file per
+        // canonical suffix; assert every one is returned.
+        let root = tempfile::tempdir().unwrap();
+        for suffix in fixers::world_readable_token_bak::BACKUP_SUFFIX_HINTS {
+            // Strip the leading dot for the filename stem.
+            let name = format!("config.toml{suffix}");
+            fs::write(root.path().join(&name), "HTTP_BEARER_TOKEN=secret").unwrap();
+        }
+        let candidates = token_backup_candidates(root.path(), None);
+        let names = candidates
+            .iter()
+            .filter(|p| p.starts_with(root.path()))
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for suffix in fixers::world_readable_token_bak::BACKUP_SUFFIX_HINTS {
+            let expected = format!("config.toml{suffix}");
+            assert!(
+                names.contains(expected.as_str()),
+                "handler enumeration must cover canonical suffix `{suffix}` (got: {names:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn default_token_backup_candidates_covers_detector_suffixes() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "config.toml.bak",
+            "config.toml.tmp",
+            "config.toml.backup",
+            "config.toml.orig",
+            "config.toml.old",
+        ] {
+            fs::write(root.path().join(name), "HTTP_BEARER_TOKEN=secret").unwrap();
+        }
+        fs::write(root.path().join("config.toml"), "HTTP_BEARER_TOKEN=secret").unwrap();
+
+        let candidates = token_backup_candidates(root.path(), None);
+        let names = candidates
+            .iter()
+            .filter(|path| path.starts_with(root.path()))
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for expected in [
+            "config.toml.bak",
+            "config.toml.tmp",
+            "config.toml.backup",
+            "config.toml.orig",
+            "config.toml.old",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing backup candidate {expected}: {names:?}"
+            );
+        }
+        assert!(!names.contains("config.toml"));
+    }
+
+    #[test]
+    fn default_token_backup_candidates_scans_common_client_config_dirs() {
+        let storage_root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let client_dirs = [".codex", ".claude", ".cursor", ".windsurf", ".gemini"];
+        for dir in client_dirs {
+            let root = home.path().join(dir);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("mcp.json.bak"), "HTTP_BEARER_TOKEN=secret").unwrap();
+        }
+
+        let candidates = token_backup_candidates(storage_root.path(), Some(home.path()));
+        let candidate_strings = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for dir in client_dirs {
+            let expected = home.path().join(dir).join("mcp.json.bak");
+            assert!(
+                candidates.contains(&expected),
+                "missing backup candidate {} in:\n{}",
+                expected.display(),
+                candidate_strings
+            );
+        }
     }
 
     #[test]

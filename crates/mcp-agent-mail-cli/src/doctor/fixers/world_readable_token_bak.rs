@@ -6,8 +6,9 @@
 //!
 //! The MCP agent-mail installer and the `am doctor repair` /
 //! `am doctor archive-normalize` paths sometimes leave `.bak`, `.tmp`,
-//! or `.backup` files alongside config files when they rewrite tokens
-//! or URLs. Example: `~/.codex/config.toml.20260321_155159.bak`
+//! `.backup`, `.orig`, or `.old` files alongside config files when they
+//! rewrite tokens or URLs. Example:
+//! `~/.codex/config.toml.20260321_155159.bak`
 //! containing the previous bearer token. If the backup is left with
 //! the same permission bits as the original (often 0o644 — group-
 //! and world-readable on most installs), the token is exposed to any
@@ -15,7 +16,8 @@
 //!
 //! The original config file is typically chmod'd to 0o600 by the
 //! writer; the backup inherits 0o644 from the umask. So we look for
-//! `.bak` / `.tmp` / `.backup` files in known MCP config directories
+//! `.bak` / `.tmp` / `.backup` / `.orig` / `.old` files in known MCP config
+//! directories
 //! that:
 //! 1. Contain token-shape content (a long base64-ish string or a
 //!    JSON key like `"authorization"` / `"bearer"` / `"token"`).
@@ -69,7 +71,15 @@ const TOKEN_SHAPE_PATTERNS: &[&str] = &[
 
 /// Suffixes treated as backup files. We only flag these — the live
 /// config file's permissions are the writer's responsibility.
-const BACKUP_SUFFIX_HINTS: &[&str] = &[".bak", ".tmp", ".backup", ".orig", ".old"];
+///
+/// `pub` so callers (e.g., `doctor::default_token_backup_candidates`)
+/// can enumerate candidates from this single source of truth instead
+/// of duplicating the list. Drift between the detector's accept-set
+/// and the handler's enumeration-set is the kind of bug that quietly
+/// leaves a real `.backup` token-bearing file out of every `--only`
+/// run forever — promoting this `const` to `pub` makes that
+/// structurally impossible.
+pub const BACKUP_SUFFIX_HINTS: &[&str] = &[".bak", ".tmp", ".backup", ".orig", ".old"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WorldReadableTokenBakFinding {
@@ -115,7 +125,7 @@ impl WorldReadableTokenBakFinding {
 /// `candidate_paths` is the list of files to scan. Caller is
 /// responsible for enumerating MCP config directories (e.g.,
 /// `~/.codex/`, `~/.claude/`, `~/.config/mcp-agent-mail/`) and
-/// passing the `.bak`/`.tmp`/`.backup` files to this function.
+/// passing backup-suffixed files to this function.
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WorldReadableTokenBakFinding> {
     let mut out = Vec::new();
     for path in candidate_paths {
@@ -125,7 +135,7 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WorldReadableTokenBakFinding> 
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if !BACKUP_SUFFIX_HINTS.iter().any(|s| name.contains(s)) {
+        if !BACKUP_SUFFIX_HINTS.iter().any(|s| name.ends_with(s)) {
             continue;
         }
         let meta = match fs::symlink_metadata(path) {
@@ -271,6 +281,18 @@ mod tests {
         assert!(
             findings.is_empty(),
             "live config files must not be flagged here"
+        );
+    }
+
+    #[test]
+    fn detector_requires_backup_hint_as_suffix() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.bakery");
+        write_with_mode(&p, r#"{"token":"abc"}"#, 0o644);
+        let findings = detect(&[p]);
+        assert!(
+            findings.is_empty(),
+            "backup hints are suffixes, not arbitrary substrings"
         );
     }
 
