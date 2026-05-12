@@ -910,6 +910,238 @@ fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
     stable_direct_surface_index_dir(pool)
 }
 
+/// Read-only snapshot of the lexical Search V3 backfill/index state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LexicalBackfillHealth {
+    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `in_memory`, or `unavailable`.
+    pub state: String,
+    /// Current SQLite identity used to scope the process-global lexical bridge.
+    pub db_identity: String,
+    /// Index directory inspected for the persisted backfill state marker.
+    pub index_dir: String,
+    /// Message documents recorded in the persisted lexical index state.
+    pub indexed_messages: u64,
+    /// Message rows observed by the backfill when the marker was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_messages: Option<u64>,
+    /// Difference between source and indexed counts when the index is behind.
+    pub skipped_messages: u64,
+    /// Timestamp from the persisted backfill state marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_backfill_at_micros: Option<i64>,
+    /// Reserved for future active rebuild tracking; currently always false for read-only probes.
+    pub rebuild_in_progress: bool,
+    /// Process-global active SQLite identity, if the bridge was initialized in this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_db_identity: Option<String>,
+    /// Human-readable reason when the state is not fresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Safe operator action for recovering from the reported state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_remediation: Option<String>,
+}
+
+impl LexicalBackfillHealth {
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self.state.as_str(), "fresh" | "in_memory")
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LexicalBackfillStateFile {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    db_path: String,
+    #[serde(default)]
+    db_stats: LexicalBackfillStateStats,
+    #[serde(default)]
+    index_stats: LexicalBackfillStateStats,
+    #[serde(default)]
+    updated_at_micros: i64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LexicalBackfillStateStats {
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    max_id: u64,
+}
+
+fn read_lexical_backfill_state_file(
+    path: &std::path::Path,
+) -> Result<Option<LexicalBackfillStateFile>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let state = serde_json::from_str::<LexicalBackfillStateFile>(&raw)
+        .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
+    if state.schema_version != 1 {
+        return Err(format!(
+            "unsupported backfill state schema version {} in {}",
+            state.schema_version,
+            path.display()
+        ));
+    }
+    Ok(Some(state))
+}
+
+/// Inspect the Search V3 lexical index state without initializing or backfilling the bridge.
+#[must_use]
+pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
+    let sqlite_key = sqlite_key_for_pool(pool);
+    let index_dir = direct_surface_index_dir(pool);
+    let index_dir_display = index_dir.display().to_string();
+    let active_key = lexical_active_db_key()
+        .lock()
+        .map_or(None, |guard| guard.clone());
+
+    if pool.sqlite_path() == ":memory:" {
+        return LexicalBackfillHealth {
+            state: "in_memory".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(
+                "lexical backfill cannot inspect pooled sqlite:///:memory: contents".to_string(),
+            ),
+            safe_remediation: Some(
+                "Use file-backed storage for durable Search V3 lexical diagnostics".to_string(),
+            ),
+        };
+    }
+
+    let cached_bootstrap = lexical_bootstrap_state()
+        .lock()
+        .ok()
+        .and_then(|state| state.get(&sqlite_key).cloned());
+    if let Some(Err(error)) = cached_bootstrap {
+        return LexicalBackfillHealth {
+            state: "unavailable".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(error),
+            safe_remediation: Some("Retry search bootstrap or run `am doctor health`".to_string()),
+        };
+    }
+
+    let backfill_marker_present = has_run_lexical_backfill(&sqlite_key).unwrap_or(false);
+    let state_path = index_dir.join("backfill_state.json");
+    let state = match read_lexical_backfill_state_file(&state_path) {
+        Ok(state) => state,
+        Err(error) => {
+            return LexicalBackfillHealth {
+                state: "unavailable".to_string(),
+                db_identity: sqlite_key,
+                index_dir: index_dir_display,
+                indexed_messages: 0,
+                source_messages: None,
+                skipped_messages: 0,
+                last_backfill_at_micros: None,
+                rebuild_in_progress: false,
+                active_db_identity: active_key,
+                stale_reason: Some(error),
+                safe_remediation: Some(
+                    "Run `am robot search <query>` to retry lexical bridge initialization"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+
+    let Some(state) = state else {
+        let reason = if backfill_marker_present {
+            "lexical backfill is marked complete in this process, but no persisted state marker exists"
+        } else {
+            "lexical backfill has not completed for this database"
+        };
+        return LexicalBackfillHealth {
+            state: "delayed".to_string(),
+            db_identity: sqlite_key,
+            index_dir: index_dir_display,
+            indexed_messages: 0,
+            source_messages: None,
+            skipped_messages: 0,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            active_db_identity: active_key,
+            stale_reason: Some(reason.to_string()),
+            safe_remediation: Some(
+                "Run `am robot search <query>` or wait for startup search backfill, then recheck `am robot health --format json`"
+                    .to_string(),
+            ),
+        };
+    };
+
+    let source_messages = state.db_stats.count;
+    let indexed_messages = state.index_stats.count;
+    let skipped_messages = source_messages.saturating_sub(indexed_messages);
+    let stale_reason = if state.db_path != pool.sqlite_path() {
+        Some(format!(
+            "backfill marker belongs to {}, current database is {}",
+            state.db_path,
+            pool.sqlite_path()
+        ))
+    } else if active_key
+        .as_deref()
+        .is_some_and(|active| active != sqlite_key.as_str())
+    {
+        Some(format!(
+            "process-global lexical bridge is active for a different database: {}",
+            active_key.as_deref().unwrap_or_default()
+        ))
+    } else if indexed_messages != source_messages {
+        Some(format!(
+            "indexed message count {indexed_messages} differs from source count {source_messages}"
+        ))
+    } else if state.index_stats.max_id != state.db_stats.max_id {
+        Some(format!(
+            "indexed max message id {} differs from source max id {}",
+            state.index_stats.max_id, state.db_stats.max_id
+        ))
+    } else {
+        None
+    };
+    let health_state = match stale_reason.as_deref() {
+        None => "fresh",
+        Some(reason) if reason.starts_with("backfill marker belongs") => "stale",
+        Some(reason) if reason.starts_with("process-global lexical bridge") => "stale",
+        Some(_) => "partial",
+    };
+
+    LexicalBackfillHealth {
+        state: health_state.to_string(),
+        db_identity: sqlite_key,
+        index_dir: index_dir_display,
+        indexed_messages,
+        source_messages: Some(source_messages),
+        skipped_messages,
+        last_backfill_at_micros: Some(state.updated_at_micros),
+        rebuild_in_progress: false,
+        active_db_identity: active_key,
+        stale_reason,
+        safe_remediation: (health_state != "fresh").then(|| {
+            "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string()
+        }),
+    }
+}
+
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
     DbError::Sqlite(format!("search lexical bridge bootstrap failed: {err}"))
 }
@@ -4332,6 +4564,163 @@ mod tests {
         assert_ne!(chosen, root.path().join("search_index"));
         assert!(chosen.starts_with(std::env::temp_dir().join("mcp-agent-mail-search-index")));
         assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
+    }
+
+    fn write_backfill_health_state(
+        root: &std::path::Path,
+        db_path: &str,
+        db_count: u64,
+        db_max_id: u64,
+        index_count: u64,
+        index_max_id: u64,
+    ) {
+        let index_dir = root.join("search_index");
+        std::fs::create_dir_all(&index_dir).expect("search index dir");
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "db_path": db_path,
+            "db_fingerprint": {
+                "len_bytes": 1,
+                "modified_micros": 2
+            },
+            "db_stats": {
+                "count": db_count,
+                "max_id": db_max_id
+            },
+            "message_watermark": {
+                "sequence": 3,
+                "max_id": db_max_id
+            },
+            "index_meta_fingerprint": {
+                "len_bytes": 4,
+                "modified_micros": 5
+            },
+            "index_stats": {
+                "count": index_count,
+                "max_id": index_max_id
+            },
+            "updated_at_micros": 123_456
+        });
+        std::fs::write(
+            index_dir.join("backfill_state.json"),
+            serde_json::to_string_pretty(&payload).expect("state json"),
+        )
+        .expect("write backfill state");
+    }
+
+    fn temp_file_pool(root: &std::path::Path, db_file: &str) -> DbPool {
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", root.join(db_file).display()),
+            storage_root: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        crate::DbPool::new(&config).expect("pool")
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_fresh_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "fresh");
+        assert_eq!(health.source_messages, Some(3));
+        assert_eq!(health.indexed_messages, 3);
+        assert_eq!(health.skipped_messages, 0);
+        assert!(health.stale_reason.is_none());
+        assert!(health.safe_remediation.is_none());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_partial_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 5, 11, 2, 8);
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "partial");
+        assert_eq!(health.source_messages, Some(5));
+        assert_eq!(health.indexed_messages, 2);
+        assert_eq!(health.skipped_messages, 3);
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("differs from source count"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_stale_state_file_for_other_db() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), "/tmp/other-mail.sqlite3", 3, 9, 3, 9);
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("backfill marker belongs"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_delayed_without_state_file() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "delayed");
+        assert_eq!(health.source_messages, None);
+        assert_eq!(health.indexed_messages, 0);
+        assert!(health.safe_remediation.is_some());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_in_memory_pool() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "in_memory");
+        assert_eq!(health.source_messages, None);
+        assert!(health.db_identity.starts_with(":memory:@"));
+        reset_lexical_bootstrap_tracking();
     }
 
     #[test]

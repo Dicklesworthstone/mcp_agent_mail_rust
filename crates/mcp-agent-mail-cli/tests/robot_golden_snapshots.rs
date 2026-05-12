@@ -81,6 +81,7 @@ fn status_envelope() -> RobotEnvelope<StatusData> {
             recommendations: Vec::new(),
             reservation_forecast: None,
             recovery: None,
+            search_index: None,
         },
     )
     .with_alert(
@@ -322,6 +323,7 @@ fn search_data(
         guidance: None,
         next_cursor: None,
         plan_diagnostic: None,
+        search_index: None,
         by_thread: vec![FacetEntry {
             value: "br-search-golden".to_string(),
             count: total_results,

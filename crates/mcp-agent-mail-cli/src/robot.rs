@@ -25,6 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::CliError;
+use mcp_agent_mail_db::search_service::LexicalBackfillHealth;
 
 const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
@@ -810,6 +811,8 @@ pub struct StatusData {
     pub reservation_forecast: Option<ReservationForecast>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<LexicalBackfillHealth>,
 }
 
 /// Recovery state surfaced in `robot status` when the mailbox is degraded or recovering.
@@ -876,6 +879,92 @@ pub struct RecoveryAdmissionSnapshot {
     pub attempts_in_window: usize,
     /// Whether loop suppression is active (too many failures).
     pub suppressed: bool,
+}
+
+fn robot_search_index_health_from_config(
+    config: &mcp_agent_mail_core::Config,
+) -> Result<LexicalBackfillHealth, String> {
+    let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    pool_cfg.database_url = config.database_url.clone();
+    pool_cfg.storage_root = Some(config.storage_root.clone());
+    pool_cfg.run_migrations = false;
+    pool_cfg.warmup_connections = 0;
+    let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
+        .map_err(|err| format!("db pool init failed: {err}"))?;
+    Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
+        &pool,
+    ))
+}
+
+fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
+    match health.state.as_str() {
+        "fresh" | "in_memory" => "ok",
+        "delayed" | "partial" => "degraded",
+        _ => "fail",
+    }
+}
+
+fn search_index_probe_detail(health: &LexicalBackfillHealth) -> String {
+    let reason = health
+        .stale_reason
+        .as_deref()
+        .unwrap_or("lexical Search V3 backfill state is current");
+    format!(
+        "state={} indexed={} source={} skipped={} index_dir={} reason={}",
+        health.state,
+        health.indexed_messages,
+        health
+            .source_messages
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+        health.skipped_messages,
+        health.index_dir,
+        reason
+    )
+}
+
+fn enrich_status_with_search_index(
+    data: &mut StatusData,
+    actions: &mut Vec<String>,
+    health: LexicalBackfillHealth,
+) {
+    let probe_status = search_index_probe_status(&health);
+    if probe_status != "ok" {
+        let severity = if probe_status == "fail" {
+            "error"
+        } else {
+            "warn"
+        };
+        if data.health == "ok" {
+            data.health = if severity == "error" {
+                "error".to_string()
+            } else {
+                "degraded".to_string()
+            };
+        } else if severity == "error" && data.health != "recovering" {
+            data.health = "error".to_string();
+        }
+        let headline = format!("Search V3 lexical index state is {}", health.state);
+        let remediation = health
+            .safe_remediation
+            .clone()
+            .unwrap_or_else(|| "am robot health --format json".to_string());
+        data.anomalies.push(AnomalyCard {
+            severity: severity.to_string(),
+            confidence: 1.0,
+            category: "search_index".to_string(),
+            headline,
+            rationale: health
+                .stale_reason
+                .clone()
+                .unwrap_or_else(|| search_index_probe_detail(&health)),
+            remediation: remediation.clone(),
+            playbooks: vec![],
+        });
+        if !actions.contains(&remediation) {
+            actions.push(remediation);
+        }
+    }
+    data.search_index = Some(health);
 }
 
 /// File reservation entry for status/reservation display.
@@ -4119,6 +4208,7 @@ fn build_status_with_phase(
         recommendations,
         reservation_forecast,
         recovery,
+        search_index: None,
     };
 
     Ok((data, actions))
@@ -4279,6 +4369,7 @@ fn build_recovery_only_status(
         recommendations,
         reservation_forecast: None,
         recovery: Some(recovery),
+        search_index: None,
     };
 
     Some((data, actions, project_slug, agent_name))
@@ -5353,6 +5444,8 @@ pub struct SearchData {
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<LexicalBackfillHealth>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub by_thread: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -5423,6 +5516,9 @@ fn build_search(
             guidance: Some(empty_search_guidance()),
             next_cursor: None,
             plan_diagnostic: None,
+            search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
+                pool,
+            )),
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -5548,6 +5644,9 @@ fn build_search(
         guidance,
         next_cursor,
         plan_diagnostic,
+        search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
+            pool,
+        )),
         by_thread,
         by_agent,
         by_importance,
@@ -10880,13 +10979,18 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
                     let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
                     let agent = scope.agent.clone();
-                    let (data, actions) = build_status_with_snapshot_cache(
+                    let (mut data, mut actions) = build_status_with_snapshot_cache(
                         scope.conn(),
                         scope.project_id,
                         &scope.project_slug,
                         agent,
                         Some(&mut phase),
                     )?;
+                    let config = mcp_agent_mail_core::Config::from_env();
+                    if let Ok(search_index) = robot_search_index_health_from_config(&config) {
+                        enrich_status_with_search_index(&mut data, &mut actions, search_index);
+                        phase.mark("search_index_health");
+                    }
                     render_status_output(
                         cmd_name,
                         format,
@@ -11249,6 +11353,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let archive_db_parity_degraded = archive_db_parity.degraded;
             probes.push(archive_db_parity.probe);
 
+            // 1e. Search V3 lexical index/backfill state (read-only).
+            let search_index = robot_search_index_health_from_config(&config);
+            let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
+                match search_index {
+                    Ok(snapshot) => {
+                        let status = search_index_probe_status(&snapshot);
+                        probes.push(HealthProbe {
+                            name: "search_index".into(),
+                            status: status.into(),
+                            latency_ms: 0.0,
+                            detail: search_index_probe_detail(&snapshot),
+                        });
+                        (Some(snapshot), status == "fail", status != "ok")
+                    }
+                    Err(error) => {
+                        probes.push(HealthProbe {
+                            name: "search_index".into(),
+                            status: "fail".into(),
+                            latency_ms: 0.0,
+                            detail: format!("Cannot inspect Search V3 lexical index: {error}"),
+                        });
+                        (None, true, true)
+                    }
+                };
+
             // 2. Circuit breaker status
             let db_health = mcp_agent_mail_db::db_health_status();
             let open_circuits: Vec<String> = db_health
@@ -11355,11 +11484,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || db_file_sanity_unhealthy
                 || db_schema_unhealthy
                 || archive_db_parity_unhealthy
+                || search_index_unhealthy
                 || backpressure_unhealthy
             {
                 "unhealthy"
             } else if db_file_sanity_degraded
                 || archive_db_parity_degraded
+                || search_index_degraded
                 || !integrity_ok
                 || !circuits_ok
                 || backpressure_degraded
@@ -11377,6 +11508,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 health_level: String,
                 probes: Vec<HealthProbe>,
                 circuits: Vec<CircuitEntry>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                search_index: Option<LexicalBackfillHealth>,
             }
 
             #[derive(Serialize)]
@@ -11395,6 +11528,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     health_level: health_str,
                     probes,
                     circuits: circuit_entries,
+                    search_index: search_index_snapshot,
                 },
             );
 
@@ -11426,6 +11560,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     "Archive parity could not be fully proven from the current mailbox state",
                     None,
                 );
+            }
+            if search_index_unhealthy {
+                env = env.with_alert(
+                    "error",
+                    "Search V3 lexical index is unavailable or stale",
+                    None,
+                );
+            } else if search_index_degraded {
+                env = env.with_alert("warn", "Search V3 lexical index is not fully fresh", None);
             }
             if !circuits_ok && let Some(rec) = &db_health.recommendation {
                 env = env.with_alert("error", rec, None);
@@ -11467,6 +11610,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 env = env.with_action(
                     "Run `am doctor check` and `am doctor archive-verify --json` before reconstructing or trusting mailbox reads",
                 );
+            }
+            if search_index_degraded {
+                env = env.with_action("Run `am robot search <query>` to refresh Search V3 lexical backfill, then recheck `am robot health --format json`");
             }
             if config.integrity_check_interval_hours > 0
                 && mcp_agent_mail_db::is_full_check_due(config.integrity_check_interval_hours)
@@ -13212,6 +13358,7 @@ mod tests {
             guidance: None,
             next_cursor: None,
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![FacetEntry {
                 value: "FEAT-123".into(),
                 count: 2,
@@ -14192,6 +14339,7 @@ mod tests {
             recommendations: vec![],
             reservation_forecast: None,
             recovery: None,
+            search_index: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"health\":\"ok\""));
@@ -14225,6 +14373,7 @@ mod tests {
             recommendations: vec![],
             reservation_forecast: None,
             recovery: None,
+            search_index: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
             "warn",
@@ -15106,6 +15255,7 @@ mod tests {
             recommendations: vec![],
             reservation_forecast: None,
             recovery: None,
+            search_index: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
             "info",
@@ -15404,6 +15554,7 @@ mod tests {
             guidance: None,
             next_cursor: None,
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![FacetEntry {
                 value: "AUTH-1".into(),
                 count: 5,
@@ -15434,6 +15585,7 @@ mod tests {
             guidance: None,
             next_cursor: None,
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -15488,6 +15640,7 @@ mod tests {
             }),
             next_cursor: Some("s3feccccccccccccd:i42".into()),
             plan_diagnostic: None,
+            search_index: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -20660,6 +20813,7 @@ mod tests {
                 deferred_write_backlog: None,
                 admission: None,
             }),
+            search_index: None,
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["health"], "recovering");
