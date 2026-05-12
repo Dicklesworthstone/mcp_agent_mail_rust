@@ -26,6 +26,19 @@ pub struct CapabilitiesReport {
     pub subsystems: Vec<&'static str>,
     pub detectors: Vec<Detector>,
     pub fixers: Vec<Fixer>,
+    /// Per-FM fixers registered with `fixers::registry()` (pass-14+).
+    ///
+    /// These are the fixers reachable via
+    /// `am doctor fix --only <fm-id>`. Distinct from the `fixers` field
+    /// above, which lists the legacy multi-detector flow (`am doctor fix`).
+    ///
+    /// Agents discovering the contract should prefer `fm_fixers` for
+    /// per-FM dispatch — each entry carries the canonical id,
+    /// `op_pattern`, severity, subsystem, and auto-fixability that
+    /// `--only <fm-id>` will honor at runtime.
+    pub fm_fixers: Vec<super::fixers::FixerSpec>,
+    /// `fm_fixers.len()` — useful for at-a-glance contract sizing.
+    pub fm_fixer_count: usize,
     pub manual_remediations: Vec<ManualRemediation>,
     pub exit_codes: serde_json::Map<String, serde_json::Value>,
     pub env_vars: serde_json::Map<String, serde_json::Value>,
@@ -154,6 +167,9 @@ pub fn build_report(tool_version: String, write_scopes: Vec<PathBuf>) -> Capabil
         env_vars.insert(k.to_string(), json!(v));
     }
 
+    let fm_fixers = super::fixers::registry();
+    let fm_fixer_count = fm_fixers.len();
+
     CapabilitiesReport {
         schema_version: "1.0",
         tool: "am",
@@ -167,6 +183,8 @@ pub fn build_report(tool_version: String, write_scopes: Vec<PathBuf>) -> Capabil
         subsystems: SUBSYSTEMS.to_vec(),
         detectors: build_detector_list(),
         fixers: build_fixer_list(),
+        fm_fixers,
+        fm_fixer_count,
         manual_remediations: build_manual_remediation_list(),
         exit_codes,
         env_vars,

@@ -238,7 +238,110 @@ fn capabilities_serializes_to_json_with_schema_version_at_root() {
     assert_eq!(v["tool"], "am");
     assert!(v["detectors"].is_array());
     assert!(v["fixers"].is_array());
+    assert!(v["fm_fixers"].is_array());
+    assert!(v["fm_fixer_count"].is_number());
     assert!(v["exit_codes"].is_object());
     assert!(v["subsystems"].is_array());
     assert_eq!(v["subsystems"].as_array().unwrap().len(), 11);
+}
+
+#[test]
+fn capabilities_fm_fixers_mirror_registry_exactly() {
+    // Pass-17: capabilities --json must surface the FixerSpec registry
+    // so agents can discover `--only <fm-id>` targets in one round-trip
+    // without falling back to `am doctor fixers`. The two surfaces must
+    // agree on ids, count, and op_pattern.
+    use mcp_agent_mail_cli::doctor::fixers::registry;
+
+    let report = build_report("test".into(), Vec::new());
+    let canonical = registry();
+
+    assert_eq!(
+        report.fm_fixer_count,
+        canonical.len(),
+        "fm_fixer_count must match registry().len()"
+    );
+    assert_eq!(
+        report.fm_fixers.len(),
+        canonical.len(),
+        "fm_fixers and registry() must have the same length"
+    );
+
+    // Pairwise comparison by id — the registry is alphabetically sorted
+    // (pass-14 invariant), so capabilities should preserve that order.
+    let canonical_ids: Vec<&str> = canonical.iter().map(|s| s.id).collect();
+    let exposed_ids: Vec<&str> = report.fm_fixers.iter().map(|s| s.id).collect();
+    assert_eq!(
+        exposed_ids, canonical_ids,
+        "fm_fixers order must match registry() (alphabetical by id)"
+    );
+
+    // Each exposed entry must declare a canonical op_pattern + valid severity.
+    let allowed_ops: &[&str] = &[
+        "Op::WriteFile",
+        "Op::AppendFile",
+        "Op::Rename",
+        "Op::Chmod",
+        "Op::DbExec",
+        "Op::DbMigrate",
+        "Op::SymlinkAtomic",
+        "detect-only",
+    ];
+    for spec in &report.fm_fixers {
+        assert!(
+            allowed_ops.contains(&spec.op_pattern),
+            "fm_fixer {} declares non-canonical op_pattern {}",
+            spec.id,
+            spec.op_pattern,
+        );
+        assert!(
+            ["P0", "P1", "P2", "P3"].contains(&spec.severity),
+            "fm_fixer {} declares non-canonical severity {}",
+            spec.id,
+            spec.severity,
+        );
+        // detect-only FMs must have auto_fixable=false; all others true.
+        let expected_auto = spec.op_pattern != "detect-only";
+        assert_eq!(
+            spec.auto_fixable, expected_auto,
+            "fm_fixer {} auto_fixable={} but op_pattern={}",
+            spec.id, spec.auto_fixable, spec.op_pattern,
+        );
+    }
+}
+
+#[test]
+fn capabilities_fm_fixers_serialize_with_all_registry_fields() {
+    // Each FixerSpec field must round-trip through JSON so agents that
+    // only call `capabilities --json` can dispatch `--only <fm-id>`
+    // with full per-fixer metadata (severity, subsystem, op_pattern,
+    // source_module).
+    let report = build_report("test".into(), Vec::new());
+    let s = serde_json::to_string(&report).expect("serialize");
+    let v: serde_json::Value = serde_json::from_str(&s).expect("re-parse");
+
+    let arr = v["fm_fixers"]
+        .as_array()
+        .expect("fm_fixers must be an array");
+    assert!(
+        !arr.is_empty(),
+        "fm_fixers must be non-empty (pass-14 registry has 6 entries)"
+    );
+
+    for entry in arr {
+        for required_field in [
+            "id",
+            "severity",
+            "subsystem",
+            "op_pattern",
+            "auto_fixable",
+            "one_line_description",
+            "source_module",
+        ] {
+            assert!(
+                entry.get(required_field).is_some(),
+                "fm_fixer entry missing required field `{required_field}`: {entry}"
+            );
+        }
+    }
 }
