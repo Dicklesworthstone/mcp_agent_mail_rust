@@ -559,16 +559,24 @@ pub async fn search_messages_product(
     let product_id = product.id.unwrap_or(0);
     phase.mark("product_scope_resolution");
 
+    let product_projects = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    )?;
+    let partial_failures = product_partial_failures_for_projects(&product_projects);
+    phase.mark("product_project_scope_resolution");
+
     let trimmed = query.trim();
     if trimmed.is_empty() {
         phase.set_rows_returned(0);
         phase.mark("empty_query_short_circuit");
+        let diagnostics =
+            merge_product_partial_failure_diagnostics(None, &partial_failures, "product search");
         let response = ProductSearchResponse {
             result: Vec::new(),
             assistance: None,
             next_cursor: None,
-            diagnostics: None,
-            partial_failures: Vec::new(),
+            diagnostics,
+            partial_failures,
         };
         let response = serde_json::to_string(&response)
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
@@ -617,10 +625,6 @@ pub async fn search_messages_product(
     } else {
         None
     };
-    let product_projects = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
-    )?;
-    let partial_failures = product_partial_failures_for_projects(&product_projects);
     phase.mark("argument_filter_resolution");
 
     // Build planner query with product scope and facets
@@ -1654,6 +1658,53 @@ mod tests {
                         Some("am doctor reconstruct")
                     );
                     assert_eq!(value["diagnostics"]["degraded"].as_bool(), Some(true));
+
+                    let blank_response = search_messages_product(
+                        &ctx,
+                        "prod-search-orphaned-link".to_string(),
+                        "   ".to_string(),
+                        Some(10),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                    )
+                    .await
+                    .expect("blank product search should still report product diagnostics");
+                    let blank_value: serde_json::Value =
+                        serde_json::from_str(&blank_response).expect("parse blank search json");
+                    assert_eq!(
+                        blank_value["result"].as_array().map(Vec::len),
+                        Some(0)
+                    );
+                    let blank_partial_failures = blank_value["partial_failures"]
+                        .as_array()
+                        .expect("blank query partial failures array");
+                    assert_eq!(blank_partial_failures.len(), 1);
+                    assert_eq!(
+                        blank_partial_failures[0]["project_id"].as_i64(),
+                        Some(999)
+                    );
+                    assert_eq!(
+                        blank_value["diagnostics"]["degraded"].as_bool(),
+                        Some(true)
+                    );
                 });
             },
         );
