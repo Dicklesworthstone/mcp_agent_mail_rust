@@ -19,7 +19,7 @@ use mcp_agent_mail_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlmodel_core::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1377,6 +1377,18 @@ pub struct AgentHealthView {
     pub decision_count: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<AgentHealthMetricRow>,
+}
+
+/// robot agents — read-only identity lifecycle diagnostic.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentLifecycleDiagnostic {
+    pub reason_code: String,
+    pub severity: String,
+    pub agent: String,
+    pub summary: String,
+    pub detail: String,
+    pub evidence: String,
+    pub safe_command: String,
 }
 
 /// robot agents — agent roster entry.
@@ -8100,6 +8112,404 @@ fn build_agents_with_snapshot_cache(
     Ok(agents)
 }
 
+#[derive(Debug, Clone)]
+struct AgentLifecycleDbRow {
+    id: i64,
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveAgentProfile {
+    dir_name: String,
+    name: String,
+    program: Option<String>,
+    model: Option<String>,
+    path: PathBuf,
+}
+
+fn build_agent_lifecycle_diagnostics(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    project_human_key: &str,
+    storage_root: &Path,
+) -> Result<Vec<AgentLifecycleDiagnostic>, CliError> {
+    let project_arg = robot_shell_arg(project_slug);
+    let mut diagnostics = Vec::new();
+    let db_agents = fetch_agent_lifecycle_db_rows(conn, project_id)?;
+    let db_agents_by_name = db_agents
+        .iter()
+        .map(|agent| (agent.name.to_ascii_lowercase(), agent))
+        .collect::<HashMap<_, _>>();
+
+    append_duplicate_db_agent_diagnostics(&mut diagnostics, &db_agents, project_slug, &project_arg);
+    append_malformed_db_agent_diagnostics(&mut diagnostics, &db_agents, &project_arg);
+
+    if let Some(project_dir) = archive_project_dir_for_key(storage_root, project_human_key)
+        .or_else(|| archive_project_dir_for_key(storage_root, project_slug))
+    {
+        let archive_profiles = collect_archive_agent_profiles(&project_dir);
+        append_archive_profile_diagnostics(
+            &mut diagnostics,
+            &db_agents,
+            &db_agents_by_name,
+            &archive_profiles,
+            &project_arg,
+        );
+    } else if !db_agents.is_empty() {
+        diagnostics.push(AgentLifecycleDiagnostic {
+            reason_code: "archive_project_missing".to_string(),
+            severity: "warn".to_string(),
+            agent: "*".to_string(),
+            summary: "Archive project directory is missing for DB agents".to_string(),
+            detail: format!(
+                "Project `{project_slug}` has {} DB agent row(s), but no matching Git archive project directory was found under {}.",
+                db_agents.len(),
+                storage_root.display()
+            ),
+            evidence: format!("storage_root={}", storage_root.display()),
+            safe_command: "am doctor reconstruct --dry-run --json".to_string(),
+        });
+    }
+
+    append_pane_identity_diagnostics(
+        conn,
+        project_id,
+        project_human_key,
+        &db_agents_by_name,
+        &mut diagnostics,
+        &project_arg,
+    );
+
+    diagnostics.sort_by(|left, right| {
+        left.reason_code
+            .cmp(&right.reason_code)
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.evidence.cmp(&right.evidence))
+    });
+    Ok(diagnostics)
+}
+
+fn fetch_agent_lifecycle_db_rows(
+    conn: &DbConn,
+    project_id: i64,
+) -> Result<Vec<AgentLifecycleDbRow>, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT id, name, program, model, last_active_ts
+             FROM agents
+             WHERE project_id = ?
+             ORDER BY lower(name), last_active_ts DESC, id DESC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("agent lifecycle query failed: {e}")))?;
+
+    Ok(rows
+        .iter()
+        .map(|row| AgentLifecycleDbRow {
+            id: row.get_named("id").unwrap_or(0),
+            name: row.get_named("name").unwrap_or_default(),
+            program: row.get_named("program").unwrap_or_default(),
+            model: row.get_named("model").unwrap_or_default(),
+            last_active_ts: row.get_named("last_active_ts").unwrap_or(0),
+        })
+        .collect())
+}
+
+fn append_duplicate_db_agent_diagnostics(
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    db_agents: &[AgentLifecycleDbRow],
+    project_slug: &str,
+    project_arg: &str,
+) {
+    let mut groups = BTreeMap::<String, Vec<&AgentLifecycleDbRow>>::new();
+    for agent in db_agents {
+        groups
+            .entry(agent.name.to_ascii_lowercase())
+            .or_default()
+            .push(agent);
+    }
+    for agents in groups.values().filter(|agents| agents.len() > 1) {
+        let names = agents
+            .iter()
+            .map(|agent| format!("{}#{}", agent.name, agent.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let newest = agents
+            .iter()
+            .max_by_key(|agent| agent.last_active_ts)
+            .copied()
+            .unwrap_or(agents[0]);
+        diagnostics.push(AgentLifecycleDiagnostic {
+            reason_code: "duplicate_logical_agent".to_string(),
+            severity: "warn".to_string(),
+            agent: newest.name.clone(),
+            summary: "Duplicate case-insensitive DB agent rows".to_string(),
+            detail: format!(
+                "Project `{project_slug}` has {} DB rows for the same logical agent name; robot output keeps the newest row.",
+                agents.len()
+            ),
+            evidence: names,
+            safe_command: format!("am robot agents --project {project_arg} --format json"),
+        });
+    }
+}
+
+fn append_malformed_db_agent_diagnostics(
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    db_agents: &[AgentLifecycleDbRow],
+    project_arg: &str,
+) {
+    for agent in db_agents {
+        if mcp_agent_mail_core::models::normalize_agent_name(&agent.name).is_none() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "malformed_agent_name".to_string(),
+                severity: "warn".to_string(),
+                agent: agent.name.clone(),
+                summary: "Agent name does not match adjective+noun rules".to_string(),
+                detail: "The DB row is readable, but the name cannot be normalized by the current agent-name validator.".to_string(),
+                evidence: format!("agent_id={}", agent.id),
+                safe_command: format!(
+                    "am agents register --project {project_arg} --program {} --model {}",
+                    robot_shell_arg(&agent.program),
+                    robot_shell_arg(&agent.model)
+                ),
+            });
+        }
+    }
+}
+
+fn collect_archive_agent_profiles(project_dir: &Path) -> Vec<ArchiveAgentProfile> {
+    let agents_dir = project_dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return Vec::new();
+    };
+
+    let mut profiles = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path().join("profile.json");
+        if !path.is_file() {
+            profiles.push(ArchiveAgentProfile {
+                name: dir_name.clone(),
+                dir_name,
+                program: None,
+                model: None,
+                path,
+            });
+            continue;
+        }
+        let profile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        profiles.push(ArchiveAgentProfile {
+            name: profile
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&dir_name)
+                .to_string(),
+            dir_name,
+            program: profile
+                .as_ref()
+                .and_then(|value| value.get("program"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            model: profile
+                .as_ref()
+                .and_then(|value| value.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            path,
+        });
+    }
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    profiles
+}
+
+fn append_archive_profile_diagnostics(
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    db_agents: &[AgentLifecycleDbRow],
+    db_agents_by_name: &HashMap<String, &AgentLifecycleDbRow>,
+    archive_profiles: &[ArchiveAgentProfile],
+    project_arg: &str,
+) {
+    let archive_by_name = archive_profiles
+        .iter()
+        .map(|profile| (profile.name.to_ascii_lowercase(), profile))
+        .collect::<HashMap<_, _>>();
+
+    for agent in db_agents {
+        let Some(profile) = archive_by_name.get(&agent.name.to_ascii_lowercase()) else {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "db_only_missing_profile".to_string(),
+                severity: "warn".to_string(),
+                agent: agent.name.clone(),
+                summary: "DB agent row has no archive profile artifact".to_string(),
+                detail: "The agent exists in SQLite but its Git-backed `agents/<name>/profile.json` artifact was not found.".to_string(),
+                evidence: format!("agent_id={}", agent.id),
+                safe_command: format!(
+                    "am agents register --project {project_arg} --program {} --model {} --name {}",
+                    robot_shell_arg(&agent.program),
+                    robot_shell_arg(&agent.model),
+                    robot_shell_arg(&agent.name)
+                ),
+            });
+            continue;
+        };
+
+        let mut mismatches = Vec::new();
+        if !profile.dir_name.eq_ignore_ascii_case(&agent.name) {
+            mismatches.push(format!("dir_name={}", profile.dir_name));
+        }
+        if let Some(program) = &profile.program
+            && !program.eq_ignore_ascii_case(&agent.program)
+        {
+            mismatches.push(format!("program={program}"));
+        }
+        if let Some(model) = &profile.model
+            && model != &agent.model
+        {
+            mismatches.push(format!("model={model}"));
+        }
+        if !mismatches.is_empty() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "profile_metadata_mismatch".to_string(),
+                severity: "warn".to_string(),
+                agent: agent.name.clone(),
+                summary: "Archive profile metadata disagrees with the DB row".to_string(),
+                detail: "The profile artifact exists, but one or more fields differ from the current SQLite agent row.".to_string(),
+                evidence: format!("{}; path={}", mismatches.join(", "), profile.path.display()),
+                safe_command: format!(
+                    "am agents register --project {project_arg} --program {} --model {} --name {}",
+                    robot_shell_arg(&agent.program),
+                    robot_shell_arg(&agent.model),
+                    robot_shell_arg(&agent.name)
+                ),
+            });
+        }
+    }
+
+    for profile in archive_profiles {
+        if db_agents_by_name.contains_key(&profile.name.to_ascii_lowercase()) {
+            continue;
+        }
+        diagnostics.push(AgentLifecycleDiagnostic {
+            reason_code: "archive_only_profile".to_string(),
+            severity: "warn".to_string(),
+            agent: profile.name.clone(),
+            summary: "Archive profile has no matching DB agent row".to_string(),
+            detail: "The Git archive contains an agent profile that the current SQLite index does not list for this project.".to_string(),
+            evidence: profile.path.display().to_string(),
+            safe_command: "am doctor reconstruct --dry-run --json".to_string(),
+        });
+    }
+}
+
+fn append_pane_identity_diagnostics(
+    conn: &DbConn,
+    project_id: i64,
+    project_human_key: &str,
+    db_agents_by_name: &HashMap<String, &AgentLifecycleDbRow>,
+    diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
+    project_arg: &str,
+) {
+    let identities = mcp_agent_mail_core::list_identities(project_human_key);
+    if identities.is_empty() {
+        return;
+    }
+
+    let mut panes_by_agent = BTreeMap::<String, Vec<String>>::new();
+    for (pane_id, agent_name) in &identities {
+        panes_by_agent
+            .entry(agent_name.to_ascii_lowercase())
+            .or_default()
+            .push(pane_id.clone());
+
+        if mcp_agent_mail_core::models::normalize_agent_name(agent_name).is_none() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "malformed_pane_identity".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name.clone(),
+                summary: "Pane identity file points at a malformed agent name".to_string(),
+                detail: "The pane identity file is readable, but its agent name does not match the current validator.".to_string(),
+                evidence: format!("pane_id={pane_id}"),
+                safe_command: format!("am robot agents --project {project_arg} --format json"),
+            });
+        }
+
+        if db_agents_by_name.contains_key(&agent_name.to_ascii_lowercase()) {
+            continue;
+        }
+
+        let other_projects = agent_projects_elsewhere(conn, project_id, agent_name);
+        if other_projects.is_empty() {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "pane_identity_unknown_agent".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name.clone(),
+                summary: "Pane identity file points at an unknown agent".to_string(),
+                detail: "The pane identity exists for this project, but the named agent is not registered in the project DB.".to_string(),
+                evidence: format!("pane_id={pane_id}"),
+                safe_command: format!("am agents register --project {project_arg} --program codex-cli --model unknown --name {}", robot_shell_arg(agent_name)),
+            });
+        } else {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "cross_project_identity_mismatch".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name.clone(),
+                summary: "Pane identity likely belongs to another project".to_string(),
+                detail: "The pane identity name is absent from this project but exists in another project.".to_string(),
+                evidence: format!("pane_id={pane_id}; other_projects={}", other_projects.join(",")),
+                safe_command: format!("am agents register --project {project_arg} --program codex-cli --model unknown --name {}", robot_shell_arg(agent_name)),
+            });
+        }
+    }
+
+    for (agent_name, pane_ids) in panes_by_agent {
+        if pane_ids.len() > 1 {
+            diagnostics.push(AgentLifecycleDiagnostic {
+                reason_code: "duplicate_pane_identity".to_string(),
+                severity: "warn".to_string(),
+                agent: agent_name,
+                summary: "Multiple pane identity files point at the same agent".to_string(),
+                detail: "This can indicate duplicate client sessions or stale pane identity files; diagnostics are read-only and did not remove anything.".to_string(),
+                evidence: format!("pane_ids={}", pane_ids.join(",")),
+                safe_command: format!("am robot agents --project {project_arg} --format json"),
+            });
+        }
+    }
+}
+
+fn agent_projects_elsewhere(conn: &DbConn, project_id: i64, agent_name: &str) -> Vec<String> {
+    let rows = conn.query_sync(
+        "SELECT p.slug
+         FROM agents a
+         JOIN projects p ON p.id = a.project_id
+         WHERE a.project_id != ? AND a.name = ? COLLATE NOCASE
+         ORDER BY a.last_active_ts DESC, a.id DESC
+         LIMIT 3",
+        &[
+            Value::BigInt(project_id),
+            Value::Text(agent_name.to_string()),
+        ],
+    );
+    rows.ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get_named::<String>("slug").ok())
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 struct RobotAgentAckStats {
     on_time_count: u64,
@@ -11761,16 +12171,46 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 health.as_deref(),
                 threshold,
             )?;
+            let project_human_key = project_human_key_sync(scope.conn(), scope.project_id)?
+                .unwrap_or_else(|| scope.project_slug.clone());
+            let diagnostics = build_agent_lifecycle_diagnostics(
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
+                &project_human_key,
+                &mcp_agent_mail_core::Config::get().storage_root,
+            )?;
 
             #[derive(Serialize)]
             struct AgentsData {
                 count: usize,
                 agents: Vec<AgentRow>,
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                diagnostics: Vec<AgentLifecycleDiagnostic>,
             }
 
             let count = agents.len();
-            let mut env = RobotEnvelope::new(cmd_name, format, AgentsData { count, agents });
+            let mut env = RobotEnvelope::new(
+                cmd_name,
+                format,
+                AgentsData {
+                    count,
+                    agents,
+                    diagnostics: diagnostics.clone(),
+                },
+            );
             env._meta.project = Some(scope.project_slug);
+            let mut actions = HashSet::new();
+            for diagnostic in diagnostics {
+                env = env.with_alert(
+                    &diagnostic.severity,
+                    format!("{}: {}", diagnostic.reason_code, diagnostic.summary),
+                    Some(diagnostic.safe_command.clone()),
+                );
+                if actions.insert(diagnostic.safe_command.clone()) {
+                    env = env.with_action(diagnostic.safe_command);
+                }
+            }
             format_output(&env, format)?
         }
         RobotSubcommand::Contacts => {
@@ -17252,6 +17692,134 @@ mod tests {
         assert_eq!(rows[0].name, "rubyprairie");
         assert_eq!(rows[0].program, "codex-cli");
         assert_eq!(rows[0].msg_count, 2);
+    }
+
+    #[test]
+    fn build_agent_lifecycle_diagnostics_reports_identity_drift_without_deleting() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_agent_lifecycle.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        let project_key = temp_dir
+            .path()
+            .join("project-alpha")
+            .to_string_lossy()
+            .into_owned();
+        let storage_root = temp_dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("project-alpha");
+        let xdg_config_home = temp_dir.path().join("xdg-config");
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key)
+             VALUES (1, 'project-alpha', ?), (2, 'project-beta', '/tmp/project-beta')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                project_key.clone(),
+            )],
+        )
+        .expect("insert projects");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES
+                (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 1000),
+                (2, 1, 'bluelake', 'codex-cli', 'gpt-5', 2000),
+                (3, 1, 'bad_name', 'codex-cli', 'gpt-5', 1500),
+                (4, 2, 'SilverCove', 'codex-cli', 'gpt-5', 2500)",
+            &empty,
+        )
+        .expect("insert agents");
+
+        let blue_profile_dir = project_dir.join("agents").join("BlueLake");
+        let archive_only_dir = project_dir.join("agents").join("AmberValley");
+        std::fs::create_dir_all(&blue_profile_dir).expect("create blue profile dir");
+        std::fs::create_dir_all(&archive_only_dir).expect("create archive-only profile dir");
+        let blue_profile_path = blue_profile_dir.join("profile.json");
+        let archive_only_path = archive_only_dir.join("profile.json");
+        std::fs::write(
+            &blue_profile_path,
+            r#"{"name":"BlueLake","program":"old-cli","model":"gpt-5"}"#,
+        )
+        .expect("write blue profile");
+        std::fs::write(
+            &archive_only_path,
+            r#"{"name":"AmberValley","program":"codex-cli","model":"gpt-5"}"#,
+        )
+        .expect("write archive-only profile");
+
+        let xdg_config_home_text = xdg_config_home.to_string_lossy().into_owned();
+        let stale_identity_path = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", xdg_config_home_text.as_str())],
+            || {
+                mcp_agent_mail_core::write_identity(&project_key, "%1", "BlueLake")
+                    .expect("write pane 1");
+                mcp_agent_mail_core::write_identity(&project_key, "%2", "BlueLake")
+                    .expect("write pane 2");
+                mcp_agent_mail_core::write_identity(&project_key, "%3", "SilverCove")
+                    .expect("write pane 3");
+                mcp_agent_mail_core::write_identity(&project_key, "%4", "bad name")
+                    .expect("write pane 4")
+            },
+        );
+
+        let diagnostics = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", xdg_config_home_text.as_str())],
+            || {
+                build_agent_lifecycle_diagnostics(
+                    &conn,
+                    1,
+                    "project-alpha",
+                    &project_key,
+                    &storage_root,
+                )
+                .expect("build diagnostics")
+            },
+        );
+        let codes = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.reason_code.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(codes.contains("duplicate_logical_agent"));
+        assert!(codes.contains("malformed_agent_name"));
+        assert!(codes.contains("profile_metadata_mismatch"));
+        assert!(codes.contains("archive_only_profile"));
+        assert!(codes.contains("db_only_missing_profile"));
+        assert!(codes.contains("duplicate_pane_identity"));
+        assert!(codes.contains("cross_project_identity_mismatch"));
+        assert!(codes.contains("malformed_pane_identity"));
+        assert!(codes.contains("pane_identity_unknown_agent"));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.safe_command.contains("cleanup"))
+        );
+        assert!(blue_profile_path.exists());
+        assert!(archive_only_path.exists());
+        assert!(stale_identity_path.exists());
     }
 
     #[test]
