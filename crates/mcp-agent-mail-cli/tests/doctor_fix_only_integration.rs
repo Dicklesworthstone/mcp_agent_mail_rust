@@ -67,6 +67,7 @@ fn dispatch_only_stale_archive_lock_quarantines_via_mutate() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
+        gitignore_target: None,
         stale_seconds_override: None,
     };
 
@@ -118,6 +119,7 @@ fn dispatch_only_unknown_fm_id_returns_error() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
+        gitignore_target: None,
         stale_seconds_override: None,
     };
     let result = fixers::dispatch_only("fm-not-a-real-fixer-id-xxx", &ctx, &inputs);
@@ -139,6 +141,7 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
+        gitignore_target: None,
         stale_seconds_override: None,
     };
 
@@ -218,6 +221,7 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
+        gitignore_target: None,
         stale_seconds_override: None,
     };
 
@@ -241,6 +245,85 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
 }
 
 #[test]
+fn dispatch_only_missing_gitignore_appends_via_chokepoint() {
+    // Pass-21: end-to-end exercise of the Op::AppendFile FM. Plant a
+    // .gitignore lacking `.doctor/`; route through dispatch_only;
+    // assert the chokepoint appended the canonical pattern AND
+    // recorded the action in actions.jsonl.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let gi = td.path().join(".gitignore");
+    fs::write(&gi, "target/\nnode_modules/\n").expect("plant .gitignore");
+
+    let run_id = "2026-05-12T00-00-00Z__gitignore";
+    let fm_id = fixers::missing_gitignore_entry::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: Some(gi.clone()),
+        stale_seconds_override: None,
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(outcome.fm_id, fm_id);
+    assert_eq!(outcome.findings_count, 1);
+    assert_eq!(outcome.actions_taken, 1);
+    assert_eq!(outcome.actions_skipped, 0);
+
+    let body = fs::read_to_string(&gi).expect("read .gitignore");
+    assert!(body.contains(".doctor/"));
+    assert!(body.contains("target/"));
+
+    // Chokepoint must have recorded the action.
+    drop(ctx);
+    let actions_path = td
+        .path()
+        .join(".doctor")
+        .join("runs")
+        .join(run_id)
+        .join("actions.jsonl");
+    let actions = fs::read_to_string(&actions_path).expect("read actions.jsonl");
+    assert!(
+        actions.contains("AppendFile"),
+        "actions.jsonl must record an AppendFile op (got: {actions})"
+    );
+}
+
+#[test]
+fn dispatch_only_missing_gitignore_requires_target_path() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let fm_id = fixers::missing_gitignore_entry::FM_ID;
+    let ctx = build_ctx(&td, "2026-05-12T00-00-00Z__gi_missing", fm_id);
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: None,
+        stale_seconds_override: None,
+    };
+    let err = fixers::dispatch_only(fm_id, &ctx, &inputs)
+        .expect_err("missing input must surface as DispatchError");
+    assert!(matches!(
+        err,
+        fixers::DispatchError::MissingInput {
+            field: "gitignore_target",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn detect_only_unknown_fm_id_returns_error() {
     let inputs = DispatchInputs {
         repo_root: PathBuf::from("/tmp"),
@@ -250,6 +333,7 @@ fn detect_only_unknown_fm_id_returns_error() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
+        gitignore_target: None,
         stale_seconds_override: None,
     };
     let err =
@@ -273,6 +357,7 @@ fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
         git_detect: None,
+        gitignore_target: None,
         stale_seconds_override: None,
     };
     let err = fixers::dispatch_only(fixers::wrong_mcp_url_json::FM_ID, &ctx, &inputs)

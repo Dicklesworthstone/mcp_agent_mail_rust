@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod known_bad_git_no_override;
+pub mod missing_gitignore_entry;
 pub mod stale_archive_lock;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
@@ -121,6 +122,15 @@ pub struct FixerSpec {
 pub fn registry() -> Vec<FixerSpec> {
     vec![
         FixerSpec {
+            id: missing_gitignore_entry::FM_ID,
+            severity: "P2",
+            subsystem: "archive_state_files",
+            op_pattern: "Op::AppendFile",
+            auto_fixable: true,
+            one_line_description: "Repo .gitignore missing `.doctor/` so per-run artifacts get committed",
+            source_module: "doctor::fixers::missing_gitignore_entry",
+        },
+        FixerSpec {
             id: stale_archive_lock::FM_ID,
             severity: "P1",
             subsystem: "archive_state_files",
@@ -203,6 +213,10 @@ pub struct DispatchInputs {
     /// Inputs for the known-bad-git detect-only FM (system git path,
     /// version string, AM_GIT_BINARY override). `None` skips the FM.
     pub git_detect: Option<known_bad_git_no_override::DetectInputs>,
+    /// Path to the repo `.gitignore` for the
+    /// `missing_gitignore_entry` FM. `None` skips the FM. Typically
+    /// `<repo_root>/.gitignore`.
+    pub gitignore_target: Option<std::path::PathBuf>,
     /// Optional override for the per-FM mtime-based staleness threshold.
     ///
     /// `None` (the production default) means each stale-* FM uses its
@@ -343,6 +357,22 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == missing_gitignore_entry::FM_ID {
+        let gitignore = inputs
+            .gitignore_target
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: missing_gitignore_entry::FM_ID,
+                field: "gitignore_target",
+            })?;
+        let findings = missing_gitignore_entry::detect(gitignore);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = missing_gitignore_entry::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else {
         return Err(DispatchError::UnknownFm(fm_id.to_string()));
     }
@@ -432,6 +462,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == missing_gitignore_entry::FM_ID {
+        let gitignore = inputs
+            .gitignore_target
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: missing_gitignore_entry::FM_ID,
+                field: "gitignore_target",
+            })?;
+        missing_gitignore_entry::detect(gitignore)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else {
         return Err(DispatchError::UnknownFm(fm_id.to_string()));
     };
@@ -467,7 +509,7 @@ mod tests {
     fn registry_is_non_empty_and_alphabetically_sorted() {
         // Pass-14: every FM-level fixer must register a FixerSpec.
         let r = registry();
-        assert!(r.len() >= 6, "registry has fewer fixers than expected");
+        assert!(r.len() >= 7, "registry has fewer fixers than expected");
         // Alphabetical sort by id helps `am doctor fixers` produce
         // stable output (operators rely on this for diffing).
         let ids: Vec<&str> = r.iter().map(|s| s.id).collect();

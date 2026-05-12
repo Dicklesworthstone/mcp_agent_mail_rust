@@ -367,10 +367,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         std::env::current_dir().map_err(|e| CliError::Other(format!("getting cwd: {e}")))?;
     let config = Config::from_env();
     let storage_root = config.storage_root.clone();
-    let canonical_mcp_url = format!(
-        "http://{}:{}{}",
-        config.http_host, config.http_port, config.http_path
-    );
+    let canonical_mcp_url = canonical_mcp_url_for_config(&config);
 
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
@@ -380,6 +377,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         mcp_config_candidates: default_mcp_config_candidates(),
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
+        gitignore_target: Some(repo_root.join(".gitignore")),
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
     };
@@ -506,10 +504,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         std::env::current_dir().map_err(|e| CliError::Other(format!("getting cwd: {e}")))?;
     let config = Config::from_env();
     let storage_root = config.storage_root.clone();
-    let canonical_mcp_url = format!(
-        "http://{}:{}{}",
-        config.http_host, config.http_port, config.http_path
-    );
+    let canonical_mcp_url = canonical_mcp_url_for_config(&config);
 
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
@@ -519,6 +514,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         mcp_config_candidates: default_mcp_config_candidates(),
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
+        gitignore_target: Some(repo_root.join(".gitignore")),
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
     };
@@ -682,6 +678,10 @@ fn default_mcp_config_candidates() -> Vec<PathBuf> {
         v.push(home.join(".cline.mcp.json"));
     }
     v
+}
+
+fn canonical_mcp_url_for_config(config: &Config) -> String {
+    crate::check_inbox_server_url(&config.http_host, config.http_port, &config.http_path)
 }
 
 /// Shell out to `git --version`, read `AM_GIT_BINARY`. Returns `None` if
@@ -1040,7 +1040,7 @@ pub(crate) fn create_support_bundle(
             value
                 .get("command")
                 .and_then(|command| command.as_str())
-                .map(ToString::to_string)
+                .map(|command| redact_support_text(command, &redaction))
         });
 
     if let Some(path) = latest_forensic.as_ref() {
@@ -1653,7 +1653,10 @@ fn support_key_is_secret(key: &str) -> bool {
     key.contains("token")
         || key.contains("secret")
         || key.contains("password")
+        || key.contains("api_key")
+        || key.contains("apikey")
         || key.contains("authorization")
+        || key.contains("bearer")
         || key == "database_url"
         || key == "http_bearer_token"
 }
@@ -1681,11 +1684,11 @@ fn redact_support_text(input: &str, ctx: &SupportRedactionContext) -> String {
             "Bearer <redacted-token>",
         ),
         (
-            r#"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|KEY|AUTH)[A-Z0-9_]*)\s*=\s*([^\s'"]+)"#,
+            r#"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|KEY|AUTH)[A-Z0-9_]*)\s*(?:=|:|\x{ff1a})\s*([^\s'"]+)"#,
             "$1=<redacted-secret>",
         ),
         (
-            r#"(?i)\bDATABASE_URL\s*=\s*([^\s'"]+)"#,
+            r#"(?i)\bDATABASE_URL\s*(?:=|:|\x{ff1a})\s*([^\s'"]+)"#,
             "DATABASE_URL=<redacted-database-url>",
         ),
         (
@@ -1963,6 +1966,36 @@ mod tests {
     }
 
     #[test]
+    fn canonical_mcp_url_uses_client_connect_host_for_wildcard_bind() {
+        let config = Config {
+            http_host: "0.0.0.0".to_string(),
+            http_port: 7777,
+            http_path: "/api/".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_mcp_url_for_config(&config),
+            "http://127.0.0.1:7777/api/"
+        );
+    }
+
+    #[test]
+    fn canonical_mcp_url_normalizes_unbracketed_ipv6_and_path() {
+        let config = Config {
+            http_host: "2001:db8::42".to_string(),
+            http_port: 7777,
+            http_path: "api".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_mcp_url_for_config(&config),
+            "http://[2001:db8::42]:7777/api/"
+        );
+    }
+
+    #[test]
     fn token_backup_candidates_references_canonical_suffix_list() {
         // Pass-18: the handler must enumerate via the module's canonical
         // `BACKUP_SUFFIX_HINTS` so widening the detector's accept-set
@@ -2093,6 +2126,83 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
         assert!(redacted.contains("<redacted-message-body>"));
         assert!(redacted.contains("<redacted-attachment-metadata>"));
         assert!(redacted.contains("<redacted-path>"));
+    }
+
+    #[test]
+    fn support_bundle_redaction_corpus_covers_field_and_content_variants() {
+        let ctx = SupportRedactionContext {
+            storage_root: PathBuf::from("/tmp/mail-storage"),
+            database_path: PathBuf::from("/tmp/mail-storage/storage.sqlite3"),
+            redact_subjects: true,
+        };
+        struct CorpusCase {
+            name: &'static str,
+            value: serde_json::Value,
+            forbidden: &'static [&'static str],
+            retained: &'static [&'static str],
+        }
+        let cases = vec![
+            CorpusCase {
+                name: "field-name secrets inside nested JSON",
+                value: serde_json::json!({
+                    "OPENAI_API_KEY": "sk-field-secret",
+                    "bearer_header": "Bearer field-token",
+                    "nested": {
+                        "password": "hunter2",
+                        "reason_code": "foreign_key_integrity",
+                        "artifact_path_kind": "doctor_forensic_manifest"
+                    }
+                }),
+                forbidden: &["sk-field-secret", "field-token", "hunter2"],
+                retained: &["foreign_key_integrity", "doctor_forensic_manifest"],
+            },
+            CorpusCase {
+                name: "safe command and query params redact values but keep command shape",
+                value: serde_json::json!({
+                    "safe_command": "am doctor support-bundle --bearer-token=command-secret --database-url sqlite://user:pass@example.invalid/mail?token=url-secret",
+                    "category": "recovery",
+                    "reason": "operator asked for sanitized bundle"
+                }),
+                forbidden: &["command-secret", "user:pass", "url-secret"],
+                retained: &["am doctor support-bundle", "recovery", "sanitized bundle"],
+            },
+            CorpusCase {
+                name: "free text logs with mixed separators",
+                value: serde_json::Value::String(
+                    "TOKEN\u{ff1a}unicode-secret\nDATABASE_URL: sqlite://user:pass@example.invalid/mail\nAuthorization: Bearer log-secret\nsubject=Sensitive title\nbody_md=Private body\nattachments=secret.png\npath=/tmp/mail-storage/storage.sqlite3\nsource_path_class=operator_supplied_log"
+                        .to_string(),
+                ),
+                forbidden: &[
+                    "unicode-secret",
+                    "user:pass",
+                    "log-secret",
+                    "Sensitive title",
+                    "Private body",
+                    "secret.png",
+                    "/tmp/mail-storage",
+                ],
+                retained: &["source_path_class=operator_supplied_log"],
+            },
+        ];
+
+        for case in cases {
+            let redacted = redact_support_json(case.value, &ctx, None);
+            let encoded = serde_json::to_string(&redacted).unwrap();
+            for forbidden in case.forbidden {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "{} leaked forbidden value {forbidden}: {encoded}",
+                    case.name
+                );
+            }
+            for retained in case.retained {
+                assert!(
+                    encoded.contains(retained),
+                    "{} lost non-sensitive detail {retained}: {encoded}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[test]
