@@ -21,8 +21,8 @@
 //!
 //! 1. Run `git --version` and parse the version string.
 //! 2. If the version matches a known-bad release (today: exactly
-//!    `2.51.0`), check whether `AM_GIT_BINARY` env var is set AND
-//!    points at an executable file.
+//!    `2.51.0`), check whether `AM_GIT_BINARY` env var is set, points
+//!    at an executable file, and reports a safe Git version when probed.
 //! 3. If the override is missing or invalid → emit P0 finding.
 //!
 //! ## Fix
@@ -67,6 +67,10 @@ pub struct KnownBadGitNoOverrideFinding {
     pub system_git_version: String,
     /// Value of `AM_GIT_BINARY` env var (None = unset).
     pub am_git_binary_env: Option<String>,
+    /// Parsed version string from `AM_GIT_BINARY --version` when the
+    /// caller could probe it. None means the path/env checks failed
+    /// first or the probe was unavailable.
+    pub am_git_binary_version: Option<String>,
     /// Why the override is invalid: env unset, points at non-existent,
     /// points at non-executable, or points at a still-bad version.
     pub reason: OverrideStatus,
@@ -113,6 +117,7 @@ impl KnownBadGitNoOverrideFinding {
                 "system_git_path": self.system_git_path.to_string_lossy(),
                 "system_git_version": self.system_git_version,
                 "am_git_binary_env": self.am_git_binary_env,
+                "am_git_binary_version": self.am_git_binary_version,
                 "reason": match self.reason {
                     OverrideStatus::Unset => "am_git_binary_unset",
                     OverrideStatus::PathMissing => "am_git_binary_path_missing",
@@ -159,6 +164,7 @@ pub struct DetectInputs {
     pub system_git_path: PathBuf,
     pub system_git_version: String,
     pub am_git_binary_env: Option<String>,
+    pub am_git_binary_version: Option<String>,
 }
 
 /// Detector. PURE w.r.t. caller-supplied version + env state; reads
@@ -187,7 +193,10 @@ pub fn detect(inputs: &DetectInputs) -> Vec<KnownBadGitNoOverrideFinding> {
     };
 
     // 3. Examine the override.
-    let Some(reason) = classify_override(inputs.am_git_binary_env.as_deref()) else {
+    let Some(reason) = classify_override(
+        inputs.am_git_binary_env.as_deref(),
+        inputs.am_git_binary_version.as_deref(),
+    ) else {
         // Override is valid → safe → no finding even though the
         // system git is known-bad.
         return Vec::new();
@@ -197,13 +206,17 @@ pub fn detect(inputs: &DetectInputs) -> Vec<KnownBadGitNoOverrideFinding> {
         system_git_path: inputs.system_git_path.clone(),
         system_git_version: inputs.system_git_version.clone(),
         am_git_binary_env: inputs.am_git_binary_env.clone(),
+        am_git_binary_version: inputs.am_git_binary_version.clone(),
         reason,
         matched_entry: Some(entry.clone()),
     }]
 }
 
 /// Return `Some(reason)` if the override is invalid, `None` if valid.
-fn classify_override(override_path: Option<&str>) -> Option<OverrideStatus> {
+fn classify_override(
+    override_path: Option<&str>,
+    override_version: Option<&str>,
+) -> Option<OverrideStatus> {
     use std::os::unix::fs::PermissionsExt;
     let Some(path_str) = override_path else {
         return Some(OverrideStatus::Unset);
@@ -218,12 +231,13 @@ fn classify_override(override_path: Option<&str>) -> Option<OverrideStatus> {
     if mode & 0o111 == 0 {
         return Some(OverrideStatus::NotExecutable);
     }
-    // We can't probe the binary's version without I/O. Caller is
-    // responsible for ensuring the override is a different binary
-    // than the system git. For test/safety: if the path equals a
-    // hard-coded known-bad system location, flag StillBad. Most
-    // operators set the override to a distinct path, so this is
-    // rare.
+    if override_version
+        .and_then(GitVersion::parse_lax)
+        .and_then(match_known_bad)
+        .is_some()
+    {
+        return Some(OverrideStatus::StillBad);
+    }
     None
 }
 
@@ -255,6 +269,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.50.1".into(),
             am_git_binary_env: None,
+            am_git_binary_version: None,
         };
         let findings = detect(&inputs);
         assert!(findings.is_empty(), "good git version must NOT flag");
@@ -270,6 +285,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: Some(safe_git.to_string_lossy().into_owned()),
+            am_git_binary_version: Some("2.50.1".into()),
         };
         let findings = detect(&inputs);
         assert!(findings.is_empty(), "valid override must NOT flag");
@@ -281,6 +297,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: None,
+            am_git_binary_version: None,
         };
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
@@ -293,6 +310,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: Some("/nonexistent/path/that/does/not/exist".into()),
+            am_git_binary_version: None,
         };
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
@@ -309,10 +327,30 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: Some(not_exec.to_string_lossy().into_owned()),
+            am_git_binary_version: None,
         };
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].reason, OverrideStatus::NotExecutable);
+    }
+
+    #[test]
+    fn detector_flags_bad_git_with_still_bad_override_version() {
+        let td = TempDir::new().unwrap();
+        let bad_git = td.path().join("bad_git");
+        std::fs::write(&bad_git, b"#!/bin/sh\necho git version 2.51.0\n").unwrap();
+        std::fs::set_permissions(&bad_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let inputs = DetectInputs {
+            system_git_path: "/usr/bin/git".into(),
+            system_git_version: "2.51.0".into(),
+            am_git_binary_env: Some(bad_git.to_string_lossy().into_owned()),
+            am_git_binary_version: Some("2.51.0".into()),
+        };
+
+        let findings = detect(&inputs);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].reason, OverrideStatus::StillBad);
     }
 
     #[test]
@@ -321,6 +359,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: None,
+            am_git_binary_version: None,
             reason: OverrideStatus::Unset,
             matched_entry: None,
         };
@@ -342,6 +381,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: None,
+            am_git_binary_version: None,
             reason: OverrideStatus::Unset,
             matched_entry: None,
         };
@@ -357,6 +397,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: Some("/nonexistent".into()),
+            am_git_binary_version: None,
             reason: OverrideStatus::PathMissing,
             matched_entry: None,
         };
@@ -381,6 +422,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "2.51.0".into(),
             am_git_binary_env: None,
+            am_git_binary_version: None,
         };
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1, "2.51.0 is in the embedded catalog");
@@ -416,6 +458,7 @@ mod tests {
             system_git_path: "/usr/bin/git".into(),
             system_git_version: "garbage".into(),
             am_git_binary_env: None,
+            am_git_binary_version: None,
         };
         let findings = detect(&inputs);
         assert!(

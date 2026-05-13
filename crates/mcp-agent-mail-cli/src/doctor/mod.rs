@@ -905,19 +905,27 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
     if !out.status.success() {
         return None;
     }
-    // `git version 2.51.0` → `2.51.0`
     let raw = String::from_utf8_lossy(&out.stdout);
-    let system_git_version = raw
-        .trim()
-        .strip_prefix("git version ")
-        .unwrap_or(raw.trim())
-        .to_string();
+    let system_git_version = git_version_text_from_stdout(&raw);
     let am_git_binary_env = std::env::var("AM_GIT_BINARY").ok();
+    let am_git_binary_version = am_git_binary_env
+        .as_deref()
+        .and_then(|path| Command::new(path).arg("--version").output().ok())
+        .filter(|output| output.status.success())
+        .map(|output| git_version_text_from_stdout(&String::from_utf8_lossy(&output.stdout)));
     Some(fixers::known_bad_git_no_override::DetectInputs {
         system_git_path,
         system_git_version,
         am_git_binary_env,
+        am_git_binary_version,
     })
+}
+
+fn git_version_text_from_stdout(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix("git version ")
+        .unwrap_or(raw.trim())
+        .to_string()
 }
 
 /// 6-char hex suffix derived from the FM id; keeps run-ids unique when
