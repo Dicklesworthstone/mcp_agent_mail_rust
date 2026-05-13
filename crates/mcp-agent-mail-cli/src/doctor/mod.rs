@@ -389,7 +389,15 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     );
     let run_dir = runs::scaffold_run_dir(&repo_root, &run_id)
         .map_err(|e| CliError::Other(format!("scaffolding run dir: {e}")))?;
-    runs::ensure_gitignore_entry(&repo_root).ok();
+    // Pass-22: the bypassing call to `runs::ensure_gitignore_entry` that
+    // used to live here is gone. The pass-21 FM
+    // `fm-archive-state-files-missing-doctor-gitignore-entry` now owns
+    // that mutation. Operators invoke it explicitly via
+    // `am doctor fix --only <id>` and get the full chokepoint
+    // guarantees (verbatim backup, hash-witnessed action, reversible
+    // via `am doctor undo`). Doing it here would silently mutate
+    // `.gitignore` on every unrelated --only run and the change
+    // wouldn't be undone by `am doctor undo` of that run-id.
     let actions_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

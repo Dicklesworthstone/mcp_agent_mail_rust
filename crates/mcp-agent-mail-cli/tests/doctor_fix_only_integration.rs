@@ -245,6 +245,57 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
 }
 
 #[test]
+fn dispatch_only_unrelated_fm_does_not_touch_gitignore() {
+    // Pass-22: regression test for the chokepoint-bypass that
+    // `runs::ensure_gitignore_entry` used to introduce in
+    // `handle_fix_only`. Even though pass-21 added the
+    // missing_gitignore_entry FM, the side-effect call in the
+    // handler meant an unrelated `--only` run (e.g. for
+    // stale_archive_lock) would silently mutate `.gitignore`
+    // outside the chokepoint. Pass-22 removed the side-effect;
+    // this test pins that — only the FM-targeted call is allowed
+    // to touch `.gitignore`.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = plant_stale_lock_archive(&td, "alpha");
+    // Plant a gitignore MISSING `.doctor/`. If the chokepoint
+    // bypass returned, the dispatcher would silently append; if
+    // it's truly gone, the file stays byte-identical.
+    let gi = td.path().join(".gitignore");
+    let original_body = "target/\nnode_modules/\n";
+    fs::write(&gi, original_body).expect("plant .gitignore");
+
+    let run_id = "2026-05-12T00-00-00Z__no_side_effect";
+    let fm_id = fixers::stale_archive_lock::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: vec![archive],
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        // Even with gitignore_target populated, dispatch for an
+        // unrelated FM must NOT invoke the gitignore detector.
+        gitignore_target: Some(gi.clone()),
+        stale_seconds_override: None,
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    // The stale-archive-lock FM should run normally.
+    assert_eq!(outcome.fm_id, fm_id);
+    assert!(outcome.actions_taken >= 1);
+
+    // The .gitignore must be byte-identical to what we planted.
+    let body = fs::read_to_string(&gi).expect("read .gitignore");
+    assert_eq!(
+        body, original_body,
+        "unrelated FM dispatch must not mutate .gitignore (pass-22 bypass-removal regression)"
+    );
+}
+
+#[test]
 fn dispatch_only_missing_gitignore_appends_via_chokepoint() {
     // Pass-21: end-to-end exercise of the Op::AppendFile FM. Plant a
     // .gitignore lacking `.doctor/`; route through dispatch_only;
