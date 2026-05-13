@@ -74,9 +74,18 @@ pub fn write_identity(
 ) -> std::io::Result<PathBuf> {
     let path = canonical_identity_path(project_key, pane_id);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_real_directory(parent)?;
     }
-    std::fs::write(&path, format!("{}\n", agent_name.trim()))?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite symlinked pane identity {}",
+                path.display()
+            ),
+        ));
+    }
+    write_identity_file_no_follow(&path, format!("{}\n", agent_name.trim()).as_bytes())?;
     Ok(path)
 }
 
@@ -191,6 +200,20 @@ pub fn resolve_identity_current_pane(project_key: &str) -> Option<String> {
     resolve_identity_for_pane(project_key, pane_id.as_deref())
 }
 
+/// Resolve the agent name for an explicit pane when supplied, otherwise for
+/// the current tmux pane.
+#[must_use]
+pub fn resolve_identity_with_optional_pane(
+    project_key: &str,
+    pane_id: Option<&str>,
+) -> Option<String> {
+    let trimmed = pane_id.map(str::trim).filter(|pane| !pane.is_empty());
+    if let Some(pane) = trimmed {
+        return resolve_identity_for_pane(project_key, Some(pane));
+    }
+    resolve_identity_current_pane(project_key)
+}
+
 /// Write identity for the current tmux pane.
 ///
 /// Uses [`get_composite_tmux_pane_id`] to obtain a session-unique composite
@@ -203,6 +226,21 @@ pub fn write_identity_current_pane(
 ) -> Option<std::io::Result<PathBuf>> {
     let pane_id = get_composite_tmux_pane_id();
     write_identity_for_pane(project_key, pane_id.as_deref(), agent_name)
+}
+
+/// Write identity for an explicit pane when supplied, otherwise for the
+/// current tmux pane.
+#[must_use]
+pub fn write_identity_with_optional_pane(
+    project_key: &str,
+    pane_id: Option<&str>,
+    agent_name: &str,
+) -> Option<std::io::Result<PathBuf>> {
+    let trimmed = pane_id.map(str::trim).filter(|pane| !pane.is_empty());
+    if let Some(pane) = trimmed {
+        return write_identity_for_pane(project_key, Some(pane), agent_name);
+    }
+    write_identity_current_pane(project_key, agent_name)
 }
 
 /// Remove stale identity files for panes that no longer exist.
@@ -329,6 +367,9 @@ pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 
 fn path_is_real_directory(path: &Path) -> bool {
+    if path_has_symlinked_parent(path).unwrap_or(true) {
+        return false;
+    }
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
@@ -338,6 +379,75 @@ fn dir_entry_is_real_directory(entry: &std::fs::DirEntry) -> bool {
 
 fn dir_entry_is_real_file(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|file_type| file_type.is_file())
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => current.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing parent traversal in {}", path.display()),
+                ));
+            }
+            std::path::Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "refusing symlinked pane identity directory {}",
+                                current.display()
+                            ),
+                        ));
+                    }
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("{} is not a directory", current.display()),
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_has_symlinked_parent(path: &Path) -> std::io::Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir | std::path::Component::ParentDir => {
+                current.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn file_name_matches_live_pane(file_name: &OsStr, live_panes: &[String]) -> bool {
@@ -385,13 +495,58 @@ fn sanitize_pane_id(pane_id: &str) -> String {
 /// Read and trim the contents of an identity file. Returns `None` if the
 /// file doesn't exist or is empty.
 fn read_identity_file(path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    if path_has_symlinked_parent(path).ok()? {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let content = read_identity_file_no_follow(path).ok()?;
     let trimmed = content.trim().to_string();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     }
+}
+
+#[cfg(unix)]
+fn read_identity_file_no_follow(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+#[cfg(not(unix))]
+fn read_identity_file_no_follow(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+#[cfg(unix)]
+fn write_identity_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(content)
+}
+
+#[cfg(not(unix))]
+fn write_identity_file_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, content)
 }
 
 #[must_use]
@@ -448,7 +603,25 @@ fn env_path(key: &str) -> Option<PathBuf> {
 }
 
 fn tmux_pane_env() -> Option<String> {
-    crate::config::process_env_value("TMUX_PANE").filter(|value| !value.trim().is_empty())
+    crate::config::process_env_value("TMUX_PANE").and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn tmux_command() -> std::process::Command {
+    #[cfg(test)]
+    if let Some(path) = crate::config::process_env_value("AM_TEST_TMUX_BIN")
+        .filter(|value| !value.trim().is_empty())
+    {
+        return std::process::Command::new(path);
+    }
+
+    std::process::Command::new("tmux")
 }
 
 #[cfg(test)]
@@ -493,7 +666,7 @@ fn list_live_tmux_panes() -> Vec<String> {
         return panes;
     }
 
-    let output = std::process::Command::new("tmux")
+    let output = tmux_command()
         .args([
             "list-panes",
             "-a",
@@ -529,8 +702,9 @@ fn list_live_tmux_panes() -> Vec<String> {
 
 /// Get a composite tmux pane identifier for the current pane.
 ///
-/// Runs `tmux display-message -p '#{session_name}:#{window_index}:#{pane_index}'`
-/// to produce a key like `main:0:2` that is unique across tmux sessions.
+/// Runs `tmux display-message -t $TMUX_PANE -p
+/// '#{session_name}:#{window_index}:#{pane_index}'` to produce a key like
+/// `main:0:2` that is unique across tmux sessions.
 ///
 /// Falls back to the bare `$TMUX_PANE` environment variable if the tmux
 /// command fails (e.g., tmux is not running, or `display-message` is
@@ -541,12 +715,18 @@ fn list_live_tmux_panes() -> Vec<String> {
 #[must_use]
 pub fn get_composite_tmux_pane_id() -> Option<String> {
     // Try the composite key first via tmux display-message.
-    let output = std::process::Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "#{session_name}:#{window_index}:#{pane_index}",
-        ])
+    let pane_target = tmux_pane_env();
+    let mut cmd = tmux_command();
+    cmd.arg("display-message");
+    if let Some(target) = pane_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.args(["-t", target]);
+    }
+    let output = cmd
+        .args(["-p", "#{session_name}:#{window_index}:#{pane_index}"])
         .output();
 
     if let Ok(out) = output
@@ -559,7 +739,7 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
     }
 
     // Fallback to bare $TMUX_PANE
-    tmux_pane_env()
+    pane_target
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +1006,23 @@ mod tests {
         assert!(read_identity_file(&path).is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_identity_file_ignores_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("identity-link");
+        std::fs::write(&target, "BlueLake\n").expect("write target");
+        symlink(&target, &link).expect("symlink identity");
+
+        assert!(
+            read_identity_file(&link).is_none(),
+            "pane identity reads must not follow symlink leaves"
+        );
+    }
+
     // -- list_identities (with isolated config dir) --------------------------
 
     #[test]
@@ -837,6 +1034,78 @@ mod tests {
 
         let resolved = resolve_identity(&unique_key, composite_pane);
         assert_eq!(resolved.as_deref(), Some("GreenOwl"));
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_refuses_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("symlink-write-project");
+        let pane = "%17";
+        let identity_path = canonical_identity_path(&unique_key, pane);
+        let parent = identity_path.parent().expect("identity parent");
+        std::fs::create_dir_all(parent).expect("create identity dir");
+        let target = config.tempdir.path().join("outside-identity-target");
+        std::fs::write(&target, "OriginalAgent\n").expect("write target");
+        symlink(&target, &identity_path).expect("symlink identity leaf");
+
+        let err = write_identity(&unique_key, pane, "BlueLake").expect_err("symlink refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "OriginalAgent\n"
+        );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_identity_refuses_symlinked_project_directory() {
+        use std::os::unix::fs::symlink;
+
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("symlink-parent-write-project");
+        let identity_root = config.tempdir.path().join(IDENTITY_DIR_NAME);
+        let project_dir = identity_root.join(project_hash(&unique_key));
+        let outside_dir = config.tempdir.path().join("outside-identity-dir");
+
+        std::fs::create_dir_all(&identity_root).expect("create identity root");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        symlink(&outside_dir, &project_dir).expect("symlink project identity dir");
+
+        let err = write_identity(&unique_key, "%17", "BlueLake")
+            .expect_err("symlinked project directory refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            !outside_dir.join("17").exists(),
+            "write_identity must not write through a symlinked project directory"
+        );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_identity_ignores_symlinked_project_directory() {
+        use std::os::unix::fs::symlink;
+
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("symlink-parent-read-project");
+        let identity_root = config.tempdir.path().join(IDENTITY_DIR_NAME);
+        let project_dir = identity_root.join(project_hash(&unique_key));
+        let outside_dir = config.tempdir.path().join("outside-identity-dir");
+
+        std::fs::create_dir_all(&identity_root).expect("create identity root");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        std::fs::write(outside_dir.join("17"), "BlueLake\n").expect("write outside identity");
+        symlink(&outside_dir, &project_dir).expect("symlink project identity dir");
+
+        assert!(
+            resolve_identity(&unique_key, "%17").is_none(),
+            "resolve_identity must not read through a symlinked project directory"
+        );
         drop(config);
     }
 
@@ -914,6 +1183,54 @@ mod tests {
         drop(config);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_identities_skips_symlinked_identity_root_parent() {
+        use std::os::unix::fs::symlink;
+
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(vec!["live-pane".to_string()]);
+        let unique_key = config.project_key("symlink-root-parent-project");
+        let agent_mail_parent = config.tempdir.path().join("agent-mail");
+        let outside_agent_mail = config.tempdir.path().join("outside-agent-mail");
+        let outside_project_dir = outside_agent_mail
+            .join("identity")
+            .join(project_hash(&unique_key));
+        let outside_stale = outside_project_dir.join("stale-pane");
+
+        std::fs::create_dir_all(&outside_project_dir).expect("create outside project dir");
+        std::fs::write(&outside_stale, "OtherAgent\n").expect("write outside identity");
+        symlink(&outside_agent_mail, &agent_mail_parent).expect("symlink identity root parent");
+
+        let scoped_removed = cleanup_stale_identities(&unique_key);
+        assert!(
+            scoped_removed.is_empty(),
+            "scoped cleanup must not walk through a symlinked identity root parent: \
+             {scoped_removed:?}"
+        );
+        assert!(
+            outside_stale.exists(),
+            "scoped cleanup must not remove files behind symlinked identity root parents"
+        );
+
+        let global_removed = cleanup_all_stale_identities();
+        assert!(
+            global_removed.is_empty(),
+            "global cleanup must not walk through a symlinked identity root parent: \
+             {global_removed:?}"
+        );
+        assert!(
+            outside_stale.exists(),
+            "global cleanup must not remove files behind symlinked identity root parents"
+        );
+        assert!(
+            list_identities(&unique_key).is_empty(),
+            "list_identities must not read through symlinked identity root parents"
+        );
+        drop(tmux);
+        drop(config);
+    }
+
     // -- write_identity_current_pane -----------------------------------------
 
     #[test]
@@ -921,6 +1238,84 @@ mod tests {
         assert!(resolve_identity_for_pane("/data/test", None).is_none());
         assert!(resolve_identity_for_pane("/data/test", Some("")).is_none());
         assert!(resolve_identity_for_pane("/data/test", Some("   ")).is_none());
+    }
+
+    #[test]
+    fn tmux_pane_env_is_trimmed_before_fallback() {
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", "/definitely/not/tmux"),
+                ("TMUX_PANE", "  %7  "),
+            ],
+            || {
+                assert_eq!(get_composite_tmux_pane_id().as_deref(), Some("%7"));
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composite_tmux_pane_id_targets_tmux_pane_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = TEST_CONFIG_BASE_DIR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tmux stub tempdir");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let tmux_path = bin_dir.join("tmux");
+        let arg_log = temp.path().join("tmux-args.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nif [ \"$1\" = \"display-message\" ] && [ \"$2\" = \"-t\" ] && [ \"$3\" = \"%7\" ] && [ \"$4\" = \"-p\" ]; then\n  printf 'agentmail:2:7\\n'\n  exit 0\nfi\nexit 1\n",
+            arg_log.display()
+        );
+        std::fs::write(&tmux_path, script).expect("write tmux stub");
+        let mut perms = std::fs::metadata(&tmux_path)
+            .expect("tmux stub metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmux_path, perms).expect("chmod tmux stub");
+
+        let tmux_bin = tmux_path.to_string_lossy().into_owned();
+        let arg_log = arg_log.to_string_lossy().into_owned();
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "%7")],
+            || {
+                assert_eq!(
+                    get_composite_tmux_pane_id().as_deref(),
+                    Some("agentmail:2:7")
+                );
+            },
+        );
+
+        let args = std::fs::read_to_string(arg_log).expect("read tmux arg log");
+        assert!(
+            args.contains("-t\n%7\n-p"),
+            "tmux display-message must target TMUX_PANE, got args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_pane_identity_helpers_do_not_consult_current_pane() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("explicit-pane-project");
+
+        write_identity_with_optional_pane(&project, Some("%42"), "BlueLake")
+            .expect("explicit pane should be used")
+            .expect("write explicit identity");
+
+        crate::config::with_process_env_overrides_for_test(&[("TMUX_PANE", "%7")], || {
+            assert_eq!(
+                resolve_identity_with_optional_pane(&project, Some("%42")).as_deref(),
+                Some("BlueLake")
+            );
+            assert!(
+                resolve_identity_with_optional_pane(&project, Some("%7")).is_none(),
+                "explicit pane must not fall back to TMUX_PANE when a different pane is supplied"
+            );
+        });
+        drop(config);
     }
 
     #[test]

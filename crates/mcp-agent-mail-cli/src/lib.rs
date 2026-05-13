@@ -27554,7 +27554,7 @@ fn service_install_systemd(
 ) -> CliResult<()> {
     let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
-    std::fs::create_dir_all(&unit_dir)?;
+    ensure_real_directory_tree(&unit_dir, "systemd user unit directory")?;
 
     let unit_path = unit_dir.join(SYSTEMD_UNIT_NAME);
 
@@ -27604,6 +27604,7 @@ fn service_install_systemd(
             .flatten(),
     );
 
+    ensure_real_file_target_path(&unit_path, "systemd unit")?;
     std::fs::write(&unit_path, &unit_content)?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
 
@@ -27706,7 +27707,7 @@ fn service_install_launchd(
 ) -> CliResult<()> {
     let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
     let agents_dir = PathBuf::from(&home).join("Library/LaunchAgents");
-    std::fs::create_dir_all(&agents_dir)?;
+    ensure_real_directory_tree(&agents_dir, "LaunchAgents directory")?;
 
     let plist_path = agents_dir.join(format!("{LAUNCHD_LABEL}.plist"));
 
@@ -27715,7 +27716,7 @@ fn service_install_launchd(
     validate_service_bind_addr(listen_host, listen_port)?;
 
     let log_dir = PathBuf::from(&home).join("Library/Logs/agent-mail");
-    std::fs::create_dir_all(&log_dir)?;
+    ensure_real_directory_tree(&log_dir, "LaunchAgent log directory")?;
     let uid = current_uid()?;
     let args_xml = build_launchd_args_xml(am_bin, listen_host, listen_port, no_auth);
 
@@ -27753,6 +27754,8 @@ fn service_install_launchd(
             .then_some(config.http_bearer_token.as_deref())
             .flatten(),
     );
+
+    ensure_real_file_target_path(&plist_path, "LaunchAgent plist")?;
 
     // Stop existing job first (ignore errors — may not be loaded).
     let _ = run_cmd(
@@ -28907,6 +28910,51 @@ mod tests {
         assert!(
             plist.contains("<string>tok&amp;en</string>"),
             "plist must XML-escape HTTP_BEARER_TOKEN: {plist}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_service_targets_reject_symlinked_plist() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = temp.path().join("outside.plist");
+        let linked_plist = temp.path().join("com.agent-mail.plist");
+        std::fs::write(&outside, "do not overwrite").expect("write outside");
+        symlink(&outside, &linked_plist).expect("symlink plist");
+
+        let err = ensure_real_file_target_path(&linked_plist, "LaunchAgent plist")
+            .expect_err("symlinked service plist target should be rejected");
+        let message = format!("{err}");
+        assert!(
+            message.contains("LaunchAgent plist") && message.contains("must not be a symlink"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside"),
+            "do not overwrite",
+            "service install must not write through a symlinked plist target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_service_directories_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_agents = temp.path().join("real-agents");
+        let linked_agents = temp.path().join("LaunchAgents");
+        std::fs::create_dir(&real_agents).expect("real agents dir");
+        symlink(&real_agents, &linked_agents).expect("symlink agents dir");
+
+        let err = ensure_real_directory_tree(&linked_agents, "LaunchAgents directory")
+            .expect_err("symlinked service directory should be rejected");
+        let message = format!("{err}");
+        assert!(
+            message.contains("LaunchAgents directory") && message.contains("must not be a symlink"),
+            "unexpected error: {message}"
         );
     }
 
