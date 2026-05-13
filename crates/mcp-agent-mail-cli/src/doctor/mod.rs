@@ -167,63 +167,97 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
 
 /// `am doctor explain <finding-id>` — drill into a single finding.
 ///
-/// Reads `.doctor/latest/report.json` and finds the matching entry. Returns
-/// the full finding (including `evidence`, `remediation`, etc.) as JSON.
+/// Two-stage lookup (pass-23):
+/// 1. Try `.doctor/latest/report.json` for a matching finding from the
+///    most recent run. If found, emit the full finding (with `evidence`,
+///    `remediation`, etc.) in `mode: "latest_run"`.
+/// 2. Fall back to `fixers::registry()` lookup. If the id matches a
+///    registered FM, emit its static `FixerSpec` (severity, subsystem,
+///    `op_pattern`, `auto_fixable`, `source_module`,
+///    `one_line_description`) in `mode: "registry"` — useful when no
+///    run has happened yet or the FM isn't currently triggering. This
+///    keeps `am doctor explain <fm-id>` informative regardless of run
+///    history.
+/// 3. If neither stage matches, exit 64 with a hint pointing operators
+///    at `am doctor fixers` (enumerate registry) and `am doctor --json`
+///    (list current findings).
 pub fn handle_explain(
     target: &std::path::Path,
     finding_id: &str,
     format: Option<CliOutputFormat>,
 ) -> CliResult<()> {
+    // Stage 1: try the latest-run report. Failures here (no symlink,
+    // no report, no matching finding) fall through to stage 2 rather
+    // than aborting — silently better UX for `explain` on a registered
+    // FM that simply hasn't fired in any run yet.
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
-    let resolved = std::fs::read_link(&latest)
+    let latest_envelope = std::fs::read_link(&latest)
         .ok()
         .map(|p| root.join(p))
-        .ok_or_else(|| {
-            eprintln!("error: no `.doctor/latest` symlink found. Run `am doctor` first.");
-            CliError::ExitCode(64)
-        })?;
-    let report_path = resolved.join("report.json");
-    if !report_path.exists() {
-        eprintln!(
-            "error: no report.json at {}. Run `am doctor` first.",
-            report_path.display()
-        );
-        return Err(CliError::ExitCode(64));
+        .and_then(|resolved| {
+            let report_path = resolved.join("report.json");
+            let body = std::fs::read_to_string(&report_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+            let findings = v.get("findings")?.as_array()?;
+            let matched = findings.iter().find(|f| {
+                f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
+                    || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
+            })?;
+            Some(serde_json::json!({
+                "schema_version": "1.0",
+                "mode": "latest_run",
+                "finding_id": finding_id,
+                "finding": matched,
+                "report_path": report_path.to_string_lossy(),
+                "next_actions": [
+                    format!("am doctor --fix --only {finding_id} --yes"),
+                    "am doctor capabilities --json".to_string(),
+                ],
+            }))
+        });
+
+    if let Some(envelope) = latest_envelope {
+        emit_explain_envelope(&envelope, format)?;
+        return Ok(());
     }
-    let s = std::fs::read_to_string(&report_path)
-        .map_err(|e| CliError::Other(format!("reading {}: {}", report_path.display(), e)))?;
-    let v: serde_json::Value = serde_json::from_str(&s)
-        .map_err(|e| CliError::Other(format!("parsing report.json: {e}")))?;
-    let findings = v
-        .get("findings")
-        .and_then(|f| f.as_array())
-        .ok_or_else(|| CliError::Other("report.json missing `findings` array".into()))?;
-    let matched = findings.iter().find(|f| {
-        f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
-            || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
-    });
-    let Some(finding) = matched else {
-        eprintln!(
-            "error: finding `{finding_id}` not found in latest run. Run `am doctor --json` to list all findings."
-        );
-        return Err(CliError::ExitCode(64));
-    };
 
-    let envelope = serde_json::json!({
-        "schema_version": "1.0",
-        "finding_id": finding_id,
-        "finding": finding,
-        "report_path": report_path.to_string_lossy(),
-        "next_actions": [
-            format!("am doctor --fix --only {finding_id} --yes"),
-            "am doctor capabilities --json".to_string(),
-        ],
-    });
+    // Stage 2: registry fallback. Useful for `explain <fm-id>` when
+    // the FM is registered but hasn't fired in any run.
+    let specs = fixers::registry();
+    if let Some(spec) = specs.iter().find(|s| s.id == finding_id) {
+        let envelope = serde_json::json!({
+            "schema_version": "1.0",
+            "mode": "registry",
+            "finding_id": finding_id,
+            "fixer_spec": spec,
+            "note": "No matching finding in latest run; showing the FM's static contract from the registry.",
+            "next_actions": [
+                format!("am doctor fix --only {finding_id} --list --json"),
+                format!("am doctor --fix --only {finding_id} --yes"),
+                "am doctor fixers --format json".to_string(),
+                "am doctor capabilities --json".to_string(),
+            ],
+        });
+        emit_explain_envelope(&envelope, format)?;
+        return Ok(());
+    }
 
+    // Stage 3: not in latest run, not in registry → truly unknown.
+    eprintln!("error: finding `{finding_id}` not found in latest run AND not a registered FM.");
+    eprintln!(
+        "       Run `am doctor fixers` to enumerate registered FM ids, or `am doctor --json` to list current findings."
+    );
+    Err(CliError::ExitCode(64))
+}
+
+fn emit_explain_envelope(
+    envelope: &serde_json::Value,
+    format: Option<CliOutputFormat>,
+) -> CliResult<()> {
     match format.unwrap_or(CliOutputFormat::Json) {
         CliOutputFormat::Json | CliOutputFormat::Toon | CliOutputFormat::Table => {
-            let pretty = serde_json::to_string_pretty(&envelope)
+            let pretty = serde_json::to_string_pretty(envelope)
                 .map_err(|e| CliError::Other(format!("serializing explain: {e}")))?;
             println!("{pretty}");
         }

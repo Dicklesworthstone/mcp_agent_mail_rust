@@ -3796,13 +3796,32 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
                 let checkpoint_ok =
                     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path).is_ok();
                 if checkpoint_ok {
-                    cleanup_startup_sqlite_sidecar_snapshot(pre_checkpoint_wal);
-                    cleanup_startup_sqlite_sidecar_snapshot(pre_checkpoint_shm);
+                    preserve_startup_sqlite_sidecar_snapshot(pre_checkpoint_wal);
+                    preserve_startup_sqlite_sidecar_snapshot(pre_checkpoint_shm);
                     eprintln!(
                         "[info] Checkpointed stale WAL file {} ({} bytes)",
                         wal_path.display(),
                         meta.len()
                     );
+                    if let Ok(after_meta) = std::fs::symlink_metadata(&wal_path)
+                        && after_meta.file_type().is_file()
+                        && mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(
+                            after_meta.len(),
+                        )
+                        && let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
+                            &wal_path,
+                            "checkpointed header-only/truncated WAL",
+                        )?
+                    {
+                        eprintln!(
+                            "[info] Quarantined checkpointed WAL file {} to {} ({} bytes; <= {} byte WAL header)",
+                            wal_path.display(),
+                            quarantined.display(),
+                            after_meta.len(),
+                            mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
+                        );
+                        wal_detached = true;
+                    }
                     // Also detach the SHM after a successful checkpoint —
                     // SQLite recreates it on next open, and a stale SHM can
                     // confuse FrankenSQLite.
@@ -3961,14 +3980,11 @@ fn copy_startup_sqlite_sidecar_snapshot(
     Ok(Some(snapshot))
 }
 
-fn cleanup_startup_sqlite_sidecar_snapshot(snapshot: Option<PathBuf>) {
-    if let Some(snapshot) = snapshot
-        && let Err(error) = std::fs::remove_file(&snapshot)
-    {
+fn preserve_startup_sqlite_sidecar_snapshot(snapshot: Option<PathBuf>) {
+    if let Some(snapshot) = snapshot {
         tracing::debug!(
             path = %snapshot.display(),
-            error = %error,
-            "failed to remove successful-startup sqlite sidecar snapshot"
+            "preserved successful-startup sqlite sidecar snapshot"
         );
     }
 }
@@ -4996,7 +5012,7 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
     run_startup_database_self_heal_with(
         &database_url,
         &storage_root,
-        || handle_doctor_repair_with(&database_url, &storage_root, &backup_dir, None, false, true),
+        || run_startup_doctor_repair_subprocess(&database_url, &storage_root, &backup_dir),
         |reconstruct_db_path| {
             handle_doctor_reconstruct_with(
                 Some(reconstruct_db_path),
@@ -5007,6 +5023,63 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
             )
         },
     )
+}
+
+fn run_startup_doctor_repair_subprocess(
+    database_url: &str,
+    storage_root: &Path,
+    backup_dir: &Path,
+) -> CliResult<()> {
+    let exe = std::env::current_exe().map_err(|error| {
+        CliError::Other(format!(
+            "failed to resolve current executable for startup database repair: {error}"
+        ))
+    })?;
+    let output = std::process::Command::new(&exe)
+        .arg("doctor")
+        .arg("repair")
+        .arg("--yes")
+        .arg("--backup-dir")
+        .arg(backup_dir)
+        .env("AM_INTERFACE_MODE", "cli")
+        .env("DATABASE_URL", database_url)
+        .env("STORAGE_ROOT", storage_root)
+        .env("TUI_ENABLED", "false")
+        .output()
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to run startup database repair subprocess {}: {error}",
+                exe.display()
+            ))
+        })?;
+    let output_text = startup_doctor_subprocess_output_text(&output);
+    replay_startup_doctor_subprocess_output(&output_text);
+    if !output.status.success() {
+        return Err(CliError::Other(format!(
+            "startup database repair subprocess exited with {}; output: {}",
+            output.status,
+            output_text.trim()
+        )));
+    }
+    Ok(())
+}
+
+fn startup_doctor_subprocess_output_text(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout.is_empty() {
+        stderr.into_owned()
+    } else if stderr.is_empty() {
+        stdout.into_owned()
+    } else {
+        format!("{stdout}\n{stderr}")
+    }
+}
+
+fn replay_startup_doctor_subprocess_output(output: &str) {
+    for line in output.lines() {
+        ftui_runtime::ftui_println!("{line}");
+    }
 }
 
 fn run_runtime_server_startup_prep_with<F, G>(
@@ -13161,6 +13234,47 @@ fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn doctor_quarantine_header_only_wal_sidecars(db_path: &Path) -> CliResult<()> {
+    if db_path.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+
+    let wal_path = sqlite_sidecar_path(db_path, "-wal");
+    let Ok(wal_meta) = std::fs::symlink_metadata(&wal_path) else {
+        return Ok(());
+    };
+    if !wal_meta.file_type().is_file()
+        || !mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(wal_meta.len())
+    {
+        return Ok(());
+    }
+
+    if let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
+        &wal_path,
+        "doctor repair header-only/truncated WAL",
+    )? {
+        ftui_runtime::ftui_println!(
+            "  Quarantined header-only/truncated WAL: {} -> {} ({} bytes)",
+            wal_path.display(),
+            quarantined.display(),
+            wal_meta.len()
+        );
+    }
+
+    let shm_path = sqlite_sidecar_path(db_path, "-shm");
+    if let Some(quarantined) =
+        quarantine_startup_sqlite_sidecar_if_exists(&shm_path, "doctor repair companion SHM")?
+    {
+        ftui_runtime::ftui_println!(
+            "  Quarantined companion SHM: {} -> {}",
+            shm_path.display(),
+            quarantined.display()
+        );
+    }
+
+    Ok(())
+}
+
 fn ensure_sqlite_backup_source_is_healthy(source_db: &Path, backup_path: &Path) -> CliResult<()> {
     if sqlite_file_is_healthy(source_db)? {
         return Ok(());
@@ -16481,6 +16595,594 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
 
 fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
     open_db_for_doctor_check_with_context(database_url).map(|opened| opened.conn)
+}
+
+const FORENSIC_TIMELINE_SCHEMA: &str = "forensic-timeline.v1";
+const FORENSIC_CHECKPOINT_SCHEMA: &str = "forensic-timeline-checkpoint.v1";
+const FORENSIC_RECOVERY_RUN_LIMIT: usize = 5;
+const FORENSIC_ARCHIVE_COMMIT_LIMIT: usize = 5;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicTimelineReport {
+    pub schema: &'static str,
+    pub checkpoint_status: String,
+    pub last_healthy_timestamp: Option<String>,
+    pub current: ForensicTimelineCurrent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<ForensicTimelineCheckpoint>,
+    pub changes_since_last_healthy: Vec<ForensicTimelineChange>,
+    pub recent_recovery_runs: Vec<ForensicRecoveryRun>,
+    pub archive_commits: ForensicArchiveCommitSummary,
+    pub artifacts: Vec<ForensicArtifactLink>,
+    pub next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicTimelineCurrent {
+    pub generated_at: String,
+    pub status: String,
+    pub binary_version: String,
+    pub schema_version: Option<String>,
+    pub storage_root: String,
+    pub database_path: String,
+    pub search_index_generation: ForensicSearchIndexGeneration,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicSearchIndexGeneration {
+    pub state: String,
+    pub db_identity: Option<String>,
+    pub index_dir: Option<String>,
+    pub indexed_messages: Option<u64>,
+    pub source_messages: Option<u64>,
+    pub skipped_messages: Option<u64>,
+    pub last_backfill_at_micros: Option<i64>,
+    pub rebuild_in_progress: bool,
+    pub stale_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicTimelineCheckpoint {
+    pub timestamp: String,
+    pub source_path: String,
+    pub current: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicTimelineChange {
+    pub field: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicRecoveryRun {
+    pub run_id: String,
+    pub kind: String,
+    pub artifact_path: String,
+    pub modified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicArchiveCommitSummary {
+    pub project_slug: String,
+    pub repo_path: String,
+    pub head: Option<String>,
+    pub recent: Vec<ForensicArchiveCommit>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicArchiveCommit {
+    pub commit: String,
+    pub timestamp: Option<String>,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ForensicArtifactLink {
+    pub kind: String,
+    pub path: String,
+}
+
+pub(crate) fn build_forensic_timeline_report(
+    database_url: &str,
+    storage_root: &Path,
+    status: &str,
+    checks: &[serde_json::Value],
+) -> ForensicTimelineReport {
+    let current = ForensicTimelineCurrent {
+        generated_at: Utc::now().to_rfc3339(),
+        status: status.to_string(),
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        schema_version: forensic_schema_version(database_url, checks),
+        storage_root: storage_root.display().to_string(),
+        database_path: forensic_database_path(database_url),
+        search_index_generation: forensic_search_index_generation(database_url, storage_root),
+    };
+    build_forensic_timeline_report_from_current(storage_root, current)
+}
+
+fn build_forensic_timeline_report_from_current(
+    storage_root: &Path,
+    current: ForensicTimelineCurrent,
+) -> ForensicTimelineReport {
+    let baseline = latest_healthy_forensic_checkpoint(storage_root);
+    let changes_since_last_healthy = baseline
+        .as_ref()
+        .map(|checkpoint| forensic_timeline_changes(&checkpoint.current, &current))
+        .unwrap_or_default();
+    let checkpoint_status = match (baseline.as_ref(), changes_since_last_healthy.is_empty()) {
+        (None, _) => "no_checkpoint",
+        (Some(_), true) => "matches_last_healthy",
+        (Some(_), false) => "changed_since_last_healthy",
+    }
+    .to_string();
+    let last_healthy_timestamp = baseline
+        .as_ref()
+        .map(|checkpoint| checkpoint.timestamp.clone());
+    let recent_recovery_runs = forensic_recent_recovery_runs(storage_root);
+    let archive_commits = forensic_archive_commit_summary(storage_root);
+    let artifacts = forensic_timeline_artifacts(storage_root, &baseline, &recent_recovery_runs);
+    let next_actions = forensic_timeline_next_actions(
+        &checkpoint_status,
+        &current,
+        &changes_since_last_healthy,
+        &recent_recovery_runs,
+    );
+
+    ForensicTimelineReport {
+        schema: FORENSIC_TIMELINE_SCHEMA,
+        checkpoint_status,
+        last_healthy_timestamp,
+        current,
+        baseline,
+        changes_since_last_healthy,
+        recent_recovery_runs,
+        archive_commits,
+        artifacts,
+        next_actions,
+    }
+}
+
+fn forensic_schema_version(database_url: &str, checks: &[serde_json::Value]) -> Option<String> {
+    doctor_check_detail(checks, "schema_version")
+        .map(parse_schema_version_detail)
+        .or_else(|| query_database_schema_version(database_url))
+}
+
+fn doctor_check_detail(checks: &[serde_json::Value], check_name: &str) -> Option<String> {
+    checks
+        .iter()
+        .find(|check| check.get("check").and_then(|value| value.as_str()) == Some(check_name))
+        .and_then(|check| check.get("detail"))
+        .and_then(|detail| detail.as_str())
+        .map(str::to_string)
+}
+
+fn parse_schema_version_detail(detail: String) -> String {
+    detail
+        .rsplit_once('=')
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or(detail)
+}
+
+fn query_database_schema_version(database_url: &str) -> Option<String> {
+    let conn = open_db_for_doctor_check(database_url).ok()?;
+    let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
+    rows.first()
+        .and_then(|row| row.get_named::<i64>("user_version").ok())
+        .map(|version| version.to_string())
+}
+
+fn forensic_database_path(database_url: &str) -> String {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    cfg.sqlite_path().map_or_else(
+        |_| forensic_safe_value("database_url", database_url),
+        |path| {
+            if path == ":memory:" {
+                path
+            } else {
+                resolve_sqlite_path_with_absolute_candidate(&path)
+            }
+        },
+    )
+}
+
+fn forensic_search_index_generation(
+    database_url: &str,
+    storage_root: &Path,
+) -> ForensicSearchIndexGeneration {
+    let mut cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    cfg.database_url = database_url.to_string();
+    cfg.storage_root = Some(storage_root.to_path_buf());
+    cfg.run_migrations = false;
+    cfg.warmup_connections = 0;
+
+    match mcp_agent_mail_db::create_pool_without_startup_init(&cfg)
+        .map(|pool| mcp_agent_mail_db::search_service::lexical_backfill_health(&pool))
+    {
+        Ok(health) => ForensicSearchIndexGeneration {
+            state: health.state,
+            db_identity: Some(forensic_safe_value("db_identity", &health.db_identity)),
+            index_dir: Some(health.index_dir),
+            indexed_messages: Some(health.indexed_messages),
+            source_messages: health.source_messages,
+            skipped_messages: Some(health.skipped_messages),
+            last_backfill_at_micros: health.last_backfill_at_micros,
+            rebuild_in_progress: health.rebuild_in_progress,
+            stale_reason: health
+                .stale_reason
+                .map(|value| forensic_safe_value("stale_reason", &value)),
+        },
+        Err(error) => ForensicSearchIndexGeneration {
+            state: "unavailable".to_string(),
+            db_identity: None,
+            index_dir: None,
+            indexed_messages: None,
+            source_messages: None,
+            skipped_messages: None,
+            last_backfill_at_micros: None,
+            rebuild_in_progress: false,
+            stale_reason: Some(forensic_safe_value(
+                "search_index_error",
+                &error.to_string(),
+            )),
+        },
+    }
+}
+
+fn latest_healthy_forensic_checkpoint(storage_root: &Path) -> Option<ForensicTimelineCheckpoint> {
+    let reports_dir = storage_root.join("doctor").join("reports");
+    if !path_is_real_directory(&reports_dir) {
+        return None;
+    }
+    let entries = std::fs::read_dir(&reports_dir).ok()?;
+    let mut latest: Option<(std::time::SystemTime, ForensicTimelineCheckpoint)> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(checkpoint) = read_forensic_checkpoint(&path) else {
+            continue;
+        };
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if latest.as_ref().is_none_or(|(seen, _)| modified > *seen) {
+            latest = Some((modified, checkpoint));
+        }
+    }
+
+    latest.map(|(_, checkpoint)| checkpoint)
+}
+
+fn read_forensic_checkpoint(path: &Path) -> Option<ForensicTimelineCheckpoint> {
+    if !path_is_real_file(path) {
+        return None;
+    }
+    let body = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    if !forensic_checkpoint_is_healthy(&value) {
+        return None;
+    }
+    let current = value.get("current").cloned().or_else(|| {
+        value
+            .get("forensic_timeline")
+            .and_then(|timeline| timeline.get("current"))
+            .cloned()
+    })?;
+    let timestamp = value
+        .get("generated_at")
+        .or_else(|| value.get("timestamp"))
+        .and_then(|ts| ts.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })?;
+
+    Some(ForensicTimelineCheckpoint {
+        timestamp,
+        source_path: path.display().to_string(),
+        current: redact_forensic_value(current),
+    })
+}
+
+fn forensic_checkpoint_is_healthy(value: &serde_json::Value) -> bool {
+    value
+        .get("schema")
+        .and_then(|schema| schema.as_str())
+        .is_some_and(|schema| {
+            schema == FORENSIC_CHECKPOINT_SCHEMA || schema == FORENSIC_TIMELINE_SCHEMA
+        })
+        && (value.get("healthy").and_then(|healthy| healthy.as_bool()) == Some(true)
+            || value
+                .get("current")
+                .and_then(|current| current.get("status"))
+                .and_then(|status| status.as_str())
+                == Some("ok")
+            || value
+                .get("forensic_timeline")
+                .and_then(|timeline| timeline.get("current"))
+                .and_then(|current| current.get("status"))
+                .and_then(|status| status.as_str())
+                == Some("ok"))
+}
+
+fn forensic_timeline_changes(
+    baseline_current: &serde_json::Value,
+    current: &ForensicTimelineCurrent,
+) -> Vec<ForensicTimelineChange> {
+    let current_value = serde_json::to_value(current).unwrap_or(serde_json::Value::Null);
+    let fields = [
+        "status",
+        "binary_version",
+        "schema_version",
+        "storage_root",
+        "database_path",
+        "search_index_generation.state",
+        "search_index_generation.db_identity",
+        "search_index_generation.index_dir",
+    ];
+    let mut changes = Vec::new();
+    for field in fields {
+        let before = forensic_json_path(baseline_current, field);
+        let after = forensic_json_path(&current_value, field);
+        if before != after {
+            changes.push(ForensicTimelineChange {
+                field: field.to_string(),
+                before: forensic_value_to_string(field, before.as_ref()),
+                after: forensic_value_to_string(field, after.as_ref()),
+            });
+        }
+    }
+    changes
+}
+
+fn forensic_json_path(value: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current.clone())
+}
+
+fn forensic_value_to_string(field: &str, value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => forensic_safe_value(field, text),
+        Some(serde_json::Value::Null) | None => "null".to_string(),
+        Some(other) => forensic_safe_value(field, &other.to_string()),
+    }
+}
+
+fn forensic_recent_recovery_runs(storage_root: &Path) -> Vec<ForensicRecoveryRun> {
+    let forensics_dir = storage_root.join("doctor").join("forensics");
+    let mut runs: Vec<(Option<std::time::SystemTime>, ForensicRecoveryRun)> = Vec::new();
+    if !path_is_real_directory(&forensics_dir) {
+        return Vec::new();
+    }
+    let Ok(families) = std::fs::read_dir(&forensics_dir) else {
+        return Vec::new();
+    };
+    for family_entry in families.flatten() {
+        let family_path = family_entry.path();
+        if !family_entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_dir())
+        {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(&family_path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if !child.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                continue;
+            }
+            let run_id = child.file_name().to_string_lossy().into_owned();
+            let Some(kind) = forensic_recovery_kind(&run_id) else {
+                continue;
+            };
+            let modified = child.metadata().ok().and_then(|meta| meta.modified().ok());
+            runs.push((
+                modified,
+                ForensicRecoveryRun {
+                    run_id,
+                    kind,
+                    artifact_path: path.display().to_string(),
+                    modified_at: modified.map(system_time_to_rfc3339),
+                },
+            ));
+        }
+    }
+    runs.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    runs.into_iter()
+        .take(FORENSIC_RECOVERY_RUN_LIMIT)
+        .map(|(_, run)| run)
+        .collect()
+}
+
+fn forensic_recovery_kind(run_id: &str) -> Option<String> {
+    if run_id.starts_with("repair-") {
+        Some("repair".to_string())
+    } else if run_id.starts_with("reconstruct-") {
+        Some("reconstruct".to_string())
+    } else {
+        None
+    }
+}
+
+fn forensic_archive_commit_summary(storage_root: &Path) -> ForensicArchiveCommitSummary {
+    let project_key = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let project_slug = resolve_project_identity(&project_key).slug;
+    let repo_path = storage_root.join("projects").join(&project_slug);
+    let head = git_output_text(&repo_path, &["rev-parse", "--short", "HEAD"]);
+    let recent = git_output_text(
+        &repo_path,
+        &[
+            "log",
+            &format!("-{}", FORENSIC_ARCHIVE_COMMIT_LIMIT),
+            "--pretty=format:%H%x09%cI%x09%s",
+        ],
+    )
+    .map(|body| {
+        body.lines()
+            .filter_map(parse_forensic_archive_commit)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    ForensicArchiveCommitSummary {
+        project_slug,
+        repo_path: repo_path.display().to_string(),
+        head,
+        recent,
+    }
+}
+
+fn parse_forensic_archive_commit(line: &str) -> Option<ForensicArchiveCommit> {
+    let mut parts = line.splitn(3, '\t');
+    let commit = parts.next()?.to_string();
+    let timestamp = parts.next().map(str::to_string);
+    let subject = parts.next().unwrap_or("").to_string();
+    Some(ForensicArchiveCommit {
+        commit,
+        timestamp,
+        subject: forensic_safe_value("archive_commit_subject", &subject),
+    })
+}
+
+fn forensic_timeline_artifacts(
+    storage_root: &Path,
+    baseline: &Option<ForensicTimelineCheckpoint>,
+    recovery_runs: &[ForensicRecoveryRun],
+) -> Vec<ForensicArtifactLink> {
+    let mut artifacts = Vec::new();
+    let reports_dir = storage_root.join("doctor").join("reports");
+    if path_is_real_directory(&reports_dir) {
+        artifacts.push(ForensicArtifactLink {
+            kind: "doctor_reports_dir".to_string(),
+            path: reports_dir.display().to_string(),
+        });
+    }
+    if let Some(checkpoint) = baseline {
+        artifacts.push(ForensicArtifactLink {
+            kind: "last_healthy_checkpoint".to_string(),
+            path: checkpoint.source_path.clone(),
+        });
+    }
+    if let Some(run) = recovery_runs.first() {
+        artifacts.push(ForensicArtifactLink {
+            kind: "latest_recovery_run".to_string(),
+            path: run.artifact_path.clone(),
+        });
+    }
+    artifacts
+}
+
+fn forensic_timeline_next_actions(
+    checkpoint_status: &str,
+    current: &ForensicTimelineCurrent,
+    changes: &[ForensicTimelineChange],
+    recovery_runs: &[ForensicRecoveryRun],
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    if checkpoint_status == "no_checkpoint" {
+        actions.push("am doctor check --json".to_string());
+    }
+    if !changes.is_empty() {
+        actions.push(
+            "am doctor check --json | jq '.forensic_timeline.changes_since_last_healthy'"
+                .to_string(),
+        );
+    }
+    if current.status != "ok" {
+        actions.push("am doctor support-bundle --json".to_string());
+    }
+    if let Some(run) = recovery_runs.first() {
+        actions.push(format!(
+            "am doctor reconstruct --dry-run # compare with {}",
+            run.run_id
+        ));
+    }
+    actions.sort();
+    actions.dedup();
+    actions
+}
+
+fn redact_forensic_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    if forensic_field_is_sensitive(&key) {
+                        (key, serde_json::Value::String("<redacted>".to_string()))
+                    } else {
+                        (key, redact_forensic_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(redact_forensic_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn forensic_safe_value(field: &str, value: &str) -> String {
+    if forensic_field_is_sensitive(field) || forensic_text_looks_sensitive(value) {
+        "<redacted>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn forensic_field_is_sensitive(field: &str) -> bool {
+    let field = field.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+    ]
+    .iter()
+    .any(|needle| field.contains(needle))
+}
+
+fn forensic_text_looks_sensitive(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "token=",
+        "token:",
+        "secret=",
+        "secret:",
+        "password=",
+        "authorization:",
+        "bearer ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn system_time_to_rfc3339(time: std::time::SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22359,7 +23061,7 @@ fn handle_doctor_check_with(
     // Forensic bundles directory pointer.
     {
         let forensics_dir = storage_root.join("doctor").join("forensics");
-        if forensics_dir.exists() {
+        if path_is_real_directory(&forensics_dir) {
             diagnostic_artifacts.push(ArtifactPointer::referenced(
                 "forensic_bundles_dir",
                 &forensics_dir.display().to_string(),
@@ -22371,7 +23073,7 @@ fn handle_doctor_check_with(
     // Doctor reports directory pointer.
     {
         let reports_dir = storage_root.join("doctor").join("reports");
-        if reports_dir.exists() {
+        if path_is_real_directory(&reports_dir) {
             diagnostic_artifacts.push(ArtifactPointer::referenced(
                 "doctor_reports_dir",
                 &reports_dir.display().to_string(),
@@ -22411,11 +23113,14 @@ fn handle_doctor_check_with(
         warn_count,
         diagnostic_artifacts,
     );
+    let forensic_timeline =
+        build_forensic_timeline_report(database_url, storage_root, overall_status, &checks);
     let payload = serde_json::json!({
         "healthy": all_ok,
         "summary": summary,
         "checks": checks,
         "diagnostic_payload": diagnostic_payload,
+        "forensic_timeline": forensic_timeline,
     });
 
     if matches!(fmt, output::CliOutputFormat::Table) {
@@ -26683,6 +27388,21 @@ fn build_systemd_exec_start(
     args.join(" ")
 }
 
+fn systemd_environment_line(key: &str, value: &str) -> String {
+    let assignment = format!("{key}={value}");
+    if assignment
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'))
+    {
+        format!(
+            "Environment=\"{}\"",
+            assignment.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    } else {
+        format!("Environment={assignment}")
+    }
+}
+
 fn xml_escape_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -26700,6 +27420,14 @@ fn xml_escape_text(value: &str) -> String {
 
 fn launchd_program_argument(value: &str) -> String {
     format!("        <string>{}</string>", xml_escape_text(value))
+}
+
+fn launchd_env_entry(key: &str, value: &str) -> String {
+    format!(
+        "        <key>{}</key>\n        <string>{}</string>",
+        xml_escape_text(key),
+        xml_escape_text(value)
+    )
 }
 
 fn build_launchd_args_xml(
@@ -26753,14 +27481,33 @@ fn resolve_absolute_database_url(database_url: &str, cwd: &Path) -> String {
 fn build_systemd_unit_content(
     exec_args: &str,
     working_dir: &Path,
+    home: &str,
     database_url: &str,
     storage_root: &Path,
+    http_host: &str,
+    http_port: u16,
+    http_path: &str,
+    http_bearer_token: Option<&str>,
 ) -> String {
     // StartLimit* + longer RestartSec: if WorkingDirectory is missing or the
     // binary is broken, systemd would otherwise hammer the journal in a tight
     // loop forever (reported as a silent crash-loop in #96). Five failures in
     // five minutes is enough to surface a real misconfiguration while still
     // tolerating transient issues.
+    let mut env_lines = vec![
+        systemd_environment_line("RUST_LOG", "info"),
+        systemd_environment_line("HOME", home),
+        systemd_environment_line("DATABASE_URL", database_url),
+        systemd_environment_line("STORAGE_ROOT", &storage_root.display().to_string()),
+        systemd_environment_line("HTTP_HOST", http_host),
+        systemd_environment_line("HTTP_PORT", &http_port.to_string()),
+        systemd_environment_line("HTTP_PATH", http_path),
+    ];
+    if let Some(token) = http_bearer_token.filter(|token| !token.is_empty()) {
+        env_lines.push(systemd_environment_line("HTTP_BEARER_TOKEN", token));
+    }
+    let env_lines = env_lines.join("\n");
+
     format!(
         r#"[Unit]
 Description=MCP Agent Mail Server
@@ -26774,15 +27521,12 @@ ExecStart={exec_args}
 WorkingDirectory={working_dir}
 Restart=on-failure
 RestartSec=30
-Environment=RUST_LOG=info
-Environment=DATABASE_URL={database_url}
-Environment=STORAGE_ROOT={storage_root}
+{env_lines}
 
 [Install]
 WantedBy=default.target
 "#,
         working_dir = working_dir.display(),
-        storage_root = storage_root.display(),
     )
 }
 
@@ -26838,8 +27582,15 @@ fn service_install_systemd(
     let unit_content = build_systemd_unit_content(
         &exec_args,
         &abs_storage_root,
+        &home,
         &abs_db_url,
         &abs_storage_root,
+        listen_host,
+        listen_port,
+        &config.http_path,
+        (!no_auth)
+            .then_some(config.http_bearer_token.as_deref())
+            .flatten(),
     );
 
     std::fs::write(&unit_path, &unit_content)?;
@@ -26869,8 +27620,13 @@ fn build_launchd_plist_content(
     args_xml: &str,
     log_dir: &Path,
     working_dir: &Path,
+    home: &str,
     database_url: &str,
     storage_root: &Path,
+    http_host: &str,
+    http_port: u16,
+    http_path: &str,
+    http_bearer_token: Option<&str>,
 ) -> String {
     // ThrottleInterval=30 mirrors the systemd unit's RestartSec=30 so a
     // crash-looping process doesn't hammer the logs on both macOS and Linux
@@ -26878,6 +27634,20 @@ fn build_launchd_plist_content(
     // genuinely misconfigured WorkingDirectory / binary would flood
     // ~/Library/Logs/agent-mail/ with thousands of entries per minute
     // before the operator noticed.
+    let mut env_entries = vec![
+        launchd_env_entry("RUST_LOG", "info"),
+        launchd_env_entry("HOME", home),
+        launchd_env_entry("DATABASE_URL", database_url),
+        launchd_env_entry("STORAGE_ROOT", &storage_root.display().to_string()),
+        launchd_env_entry("HTTP_HOST", http_host),
+        launchd_env_entry("HTTP_PORT", &http_port.to_string()),
+        launchd_env_entry("HTTP_PATH", http_path),
+    ];
+    if let Some(token) = http_bearer_token.filter(|token| !token.is_empty()) {
+        env_entries.push(launchd_env_entry("HTTP_BEARER_TOKEN", token));
+    }
+    let env_xml = env_entries.join("\n");
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -26907,20 +27677,13 @@ fn build_launchd_plist_content(
     <string>{log_dir}/stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-        <key>DATABASE_URL</key>
-        <string>{database_url}</string>
-        <key>STORAGE_ROOT</key>
-        <string>{storage_root}</string>
+{env_xml}
     </dict>
 </dict>
 </plist>
 "#,
         log_dir = xml_escape_text(log_dir.display().to_string().as_str()),
         working_dir = xml_escape_text(working_dir.display().to_string().as_str()),
-        database_url = xml_escape_text(database_url),
-        storage_root = xml_escape_text(storage_root.display().to_string().as_str()),
     )
 }
 
@@ -26974,8 +27737,15 @@ fn service_install_launchd(
         &args_xml,
         &log_dir,
         &abs_storage_root,
+        &home,
         &abs_db_url,
         &abs_storage_root,
+        listen_host,
+        listen_port,
+        &config.http_path,
+        (!no_auth)
+            .then_some(config.http_bearer_token.as_deref())
+            .flatten(),
     );
 
     // Stop existing job first (ignore errors — may not be loaded).
@@ -27857,12 +28627,21 @@ mod tests {
         let unit = build_systemd_unit_content(
             "/usr/local/bin/am serve-http --host 127.0.0.1 --port 8765 --no-tui",
             Path::new("/home/user/projects/myapp"),
+            "/home/user",
             "sqlite:///home/user/projects/myapp/storage.sqlite3",
             Path::new("/home/user/.local/share/mcp-agent-mail/git_mailbox_repo"),
+            "127.0.0.1",
+            8765,
+            "/mcp/",
+            Some("secret-token"),
         );
         assert!(
             unit.contains("WorkingDirectory=/home/user/projects/myapp"),
             "unit must contain absolute WorkingDirectory"
+        );
+        assert!(
+            unit.contains("Environment=HOME=/home/user"),
+            "unit must contain HOME"
         );
         assert!(
             unit.contains(
@@ -27876,6 +28655,14 @@ mod tests {
             ),
             "unit must contain absolute STORAGE_ROOT"
         );
+        assert!(
+            unit.contains("Environment=HTTP_PATH=/mcp/"),
+            "unit must preserve configured HTTP path"
+        );
+        assert!(
+            unit.contains("Environment=HTTP_BEARER_TOKEN=secret-token"),
+            "unit must preserve configured bearer token"
+        );
     }
 
     #[test]
@@ -27885,8 +28672,13 @@ mod tests {
         let unit = build_systemd_unit_content(
             "/usr/local/bin/am serve-http",
             Path::new("/tmp/wd"),
+            "/home/user",
             "sqlite:///tmp/wd/storage.sqlite3",
             Path::new("/tmp/wd"),
+            "127.0.0.1",
+            8765,
+            "/mcp/",
+            None,
         );
         assert!(
             unit.contains("StartLimitBurst=5"),
@@ -27899,6 +28691,39 @@ mod tests {
         assert!(
             unit.contains("RestartSec=30"),
             "unit must wait 30s between restarts to avoid journal spam: {unit}"
+        );
+        assert!(
+            !unit.contains("HTTP_BEARER_TOKEN"),
+            "unit must omit HTTP_BEARER_TOKEN when auth is disabled or no token is configured"
+        );
+    }
+
+    #[test]
+    fn build_systemd_unit_content_quotes_environment_values() {
+        let unit = build_systemd_unit_content(
+            "/tmp/am serve-http",
+            Path::new("/tmp/storage root"),
+            "/home/user name",
+            "sqlite:///tmp/storage root/storage.sqlite3",
+            Path::new("/tmp/storage root"),
+            "127.0.0.1",
+            8765,
+            "/mcp/?x=<y>",
+            Some("tok&en with spaces"),
+        );
+        assert!(
+            unit.contains("Environment=\"HOME=/home/user name\""),
+            "unit must quote HOME with spaces: {unit}"
+        );
+        assert!(
+            unit.contains(
+                "Environment=\"DATABASE_URL=sqlite:///tmp/storage root/storage.sqlite3\""
+            ),
+            "unit must quote DATABASE_URL with spaces: {unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"HTTP_BEARER_TOKEN=tok&en with spaces\""),
+            "unit must quote HTTP_BEARER_TOKEN with spaces: {unit}"
         );
     }
 
@@ -27936,8 +28761,13 @@ mod tests {
             "        <string>/usr/local/bin/am</string>",
             Path::new("/Users/dev/Library/Logs/agent-mail"),
             Path::new("/Users/dev/projects/myapp"),
+            "/Users/dev",
             "sqlite:///Users/dev/projects/myapp/storage.sqlite3",
             Path::new("/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo"),
+            "127.0.0.1",
+            8765,
+            "/mcp/",
+            Some("secret-token"),
         );
         assert!(
             plist.contains("<key>WorkingDirectory</key>"),
@@ -27965,6 +28795,18 @@ mod tests {
             ),
             "plist must contain absolute STORAGE_ROOT value"
         );
+        assert!(
+            plist.contains("<key>HOME</key>\n        <string>/Users/dev</string>"),
+            "plist must contain HOME for launchd jobs"
+        );
+        assert!(
+            plist.contains("<key>HTTP_PATH</key>\n        <string>/mcp/</string>"),
+            "plist must preserve configured HTTP path"
+        );
+        assert!(
+            plist.contains("<key>HTTP_BEARER_TOKEN</key>\n        <string>secret-token</string>"),
+            "plist must preserve configured bearer token"
+        );
     }
 
     #[test]
@@ -27977,8 +28819,13 @@ mod tests {
             "        <string>/usr/local/bin/am</string>",
             Path::new("/tmp/logs"),
             Path::new("/tmp/wd"),
+            "/Users/dev",
             "sqlite:///tmp/wd/storage.sqlite3",
             Path::new("/tmp/wd"),
+            "127.0.0.1",
+            8765,
+            "/mcp/",
+            None,
         );
         // Check the key+value pair together so an unrelated `<integer>30</integer>`
         // elsewhere (e.g. a future StartInterval) can't silently mask a
@@ -27986,6 +28833,44 @@ mod tests {
         assert!(
             plist.contains("<key>ThrottleInterval</key>\n    <integer>30</integer>"),
             "plist must set ThrottleInterval=30 as an adjacent key/value pair: {plist}"
+        );
+        assert!(
+            !plist.contains("HTTP_BEARER_TOKEN"),
+            "plist must omit HTTP_BEARER_TOKEN when auth is disabled or no token is configured"
+        );
+    }
+
+    #[test]
+    fn build_launchd_plist_escapes_environment_values() {
+        let plist = build_launchd_plist_content(
+            "        <string>/tmp/A&amp;B/am</string>",
+            Path::new("/Users/dev/Library/Logs/agent-mail"),
+            Path::new("/Users/dev/storage & root"),
+            "/Users/dev/home <dir>",
+            "sqlite:///Users/dev/storage & root/storage.sqlite3",
+            Path::new("/Users/dev/storage & root"),
+            "127.0.0.1",
+            8765,
+            "/mcp/?x=<y>",
+            Some("tok&en"),
+        );
+        assert!(
+            plist.contains("<string>/Users/dev/home &lt;dir&gt;</string>"),
+            "plist must XML-escape HOME: {plist}"
+        );
+        assert!(
+            plist.contains(
+                "<string>sqlite:///Users/dev/storage &amp; root/storage.sqlite3</string>"
+            ),
+            "plist must XML-escape DATABASE_URL: {plist}"
+        );
+        assert!(
+            plist.contains("<string>/mcp/?x=&lt;y&gt;</string>"),
+            "plist must XML-escape HTTP_PATH: {plist}"
+        );
+        assert!(
+            plist.contains("<string>tok&amp;en</string>"),
+            "plist must XML-escape HTTP_BEARER_TOKEN: {plist}"
         );
     }
 
@@ -30406,6 +31291,71 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             VerifyLane::CargoTest.command(),
             vec!["rch", "exec", "--", "cargo", "test", "--workspace"]
+        );
+    }
+
+    #[test]
+    fn rch_remote_proof_detects_remote_worker_marker() {
+        let command = vec![
+            "rch".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "cargo".to_string(),
+            "check".to_string(),
+        ];
+        let proof = classify_rch_remote_proof(
+            &command,
+            b"",
+            b"Selected worker: vmi1227854 at ubuntu@109.123.245.77\n[RCH] remote vmi1227854 (3.2s)\n",
+        );
+
+        assert!(proof.requires_remote_proof);
+        assert_eq!(proof.status, "remote");
+        assert_eq!(proof.failure_family, "none");
+        assert_eq!(proof.worker.as_deref(), Some("vmi1227854"));
+        assert_eq!(proof.adjusted_exit_code(0), 0);
+    }
+
+    #[test]
+    fn am_run_artifact_fails_closed_on_rch_local_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_dir = temp.path().join("artifacts");
+        let command_words = vec![
+            "rch".to_string(),
+            "exec".to_string(),
+            "--".to_string(),
+            "cargo".to_string(),
+            "check".to_string(),
+        ];
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo '[RCH] local (daemon unavailable)' >&2; exit 0"]);
+
+        let code = run_child_with_artifacts(
+            &mut cmd,
+            &command_words,
+            "verify-cargo-check",
+            &artifact_dir,
+        )
+        .unwrap();
+
+        assert_eq!(code, 1);
+        assert_eq!(
+            std::fs::read_to_string(artifact_dir.join("exit_code.txt"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        let result: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(artifact_dir.join("result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["exit_code"], 1);
+        assert_eq!(result["child_exit_code"], 0);
+        assert_eq!(result["rch_proof"]["status"], "local_fallback");
+        assert_eq!(result["rch_proof"]["failure_family"], "local_fallback");
+        assert!(
+            artifact_dir.join("rch_proof_failure.txt").exists(),
+            "fallback proof failure marker should be persisted"
         );
     }
 
@@ -37172,6 +38122,37 @@ startup_timeout_sec = 42
         );
     }
 
+    #[cfg(unix)]
+    fn successful_test_output(stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_doctor_subprocess_output_preserves_stdout_and_stderr() {
+        let output = successful_test_output(
+            b"Running database repair...\n  Forensics: /tmp/am-forensics/run-123\n",
+            b"repair warning\n",
+        );
+
+        let text = startup_doctor_subprocess_output_text(&output);
+
+        assert!(
+            text.contains("Forensics: /tmp/am-forensics/run-123"),
+            "stdout marker must remain parseable: {text}"
+        );
+        assert!(
+            text.contains("repair warning"),
+            "stderr context should be preserved: {text}"
+        );
+    }
+
     #[test]
     fn startup_post_repair_detail_surfaces_forensic_bundle_path() {
         let detail = startup_post_repair_detail_with_artifacts(
@@ -37214,6 +38195,8 @@ startup_timeout_sec = 42
              VALUES (999, 1, 'to')",
         )
         .expect("insert orphaned recipient");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint fixture rows");
     }
 
     fn seed_startup_self_heal_missing_agent_only_recipient(db_path: &Path) {
@@ -37399,6 +38382,72 @@ startup_timeout_sec = 42
                 DoctorDatabaseFixStrategy::None(_)
             ),
             "post-repair strategy should be clean"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_runs_doctor_repair_for_fk_orphans_without_panic() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup_fk_doctor_repair.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+        seed_startup_self_heal_fk_orphan(&db_path);
+
+        let action = startup_database_self_heal_action(&db_url, dir.path())
+            .expect("classify startup database issue");
+        assert!(
+            matches!(
+                action,
+                StartupDatabaseSelfHealAction::Repair(ref detail)
+                    if detail.contains("orphaned message recipient")
+            ),
+            "FK orphan fixture should enter startup repair path: {action:?}"
+        );
+
+        let repair_runs = std::cell::Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_startup_database_self_heal_with(
+                &db_url,
+                dir.path(),
+                || {
+                    repair_runs.set(repair_runs.get() + 1);
+                    ftui_runtime::ftui_println!(
+                        "  Forensics: {}",
+                        dir.path()
+                            .join("doctor/forensics/startup-fk-doctor-repair")
+                            .display()
+                    );
+                    handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+                },
+                |_| panic!("FK-only startup repair should not reconstruct"),
+            )
+        }));
+
+        assert!(
+            result.is_ok(),
+            "startup doctor repair replay should not panic"
+        );
+        result
+            .expect("panic already checked")
+            .expect("startup doctor repair replay should succeed");
+        assert_eq!(
+            repair_runs.get(),
+            1,
+            "startup repair runner should execute exactly once"
+        );
+        assert!(
+            matches!(
+                doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy after repair"),
+                DoctorDatabaseFixStrategy::None(_)
+            ),
+            "doctor repair should leave startup classification clean"
+        );
+        assert!(
+            backup_dir.exists(),
+            "doctor repair should leave backup artifacts for the replay"
         );
     }
 
@@ -47874,6 +48923,75 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn cleanup_stale_db_artifacts_detaches_wal_left_empty_by_successful_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-checkpointed-wal.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw("PRAGMA journal_mode=WAL")
+            .expect("enable wal");
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 0")
+            .expect("disable autocheckpoint");
+        conn.execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create marker");
+        conn.execute_raw("INSERT INTO marker(value) VALUES ('from-wal')")
+            .expect("insert marker");
+        assert!(wal_path.exists(), "fixture should leave a WAL sidecar");
+        assert!(
+            std::fs::metadata(&wal_path).expect("wal metadata").len()
+                > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES,
+            "fixture WAL should contain frame bytes before cleanup"
+        );
+        // Keep this connection open through cleanup so SQLite cannot auto-remove
+        // the fixture WAL on last-close before the startup path can snapshot it.
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup checkpointed wal");
+
+        let preserved_wal_snapshot = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("cleanup-checkpointed-wal.sqlite3-wal.startup-precheckpoint-")
+                })
+            })
+            .expect("preserved pre-checkpoint WAL snapshot");
+        assert!(
+            std::fs::metadata(&preserved_wal_snapshot)
+                .expect("pre-checkpoint WAL snapshot metadata")
+                .len()
+                > mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES,
+            "pre-checkpoint WAL snapshot should preserve the original frame bytes"
+        );
+
+        assert!(
+            !wal_path.exists(),
+            "checkpointed WAL should move out of the active SQLite path when it becomes header-only/truncated"
+        );
+        assert!(
+            !shm_path.exists(),
+            "SHM should move out of the active SQLite path after checkpointed WAL detach"
+        );
+
+        drop(conn);
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let rows = verify
+            .query_sync("SELECT value FROM marker", &[])
+            .expect("query marker");
+        let marker: String = rows[0].get_named("value").expect("marker value");
+        assert_eq!(
+            marker, "from-wal",
+            "successful checkpoint must preserve WAL frame contents in the main DB"
+        );
+    }
+
+    #[test]
     fn cleanup_stale_db_artifacts_quarantines_nonempty_wal_when_checkpoint_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup-failed-checkpoint.sqlite3");
@@ -50156,6 +51274,106 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_repair_quarantines_header_only_wal_before_orphan_cleanup() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_repair_header_only_wal.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'repair-header-wal', '/tmp/repair-header-wal', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES
+                (1, 1, 'Sender', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+                (2, 1, 'Recipient', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agents");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 1, 1, 'THREAD-HEADER-WAL', 'repair', 'body', 'normal', 1, 100, '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (1, 2, 'to', NULL, NULL),
+                (999, 2, 'to', NULL, NULL)",
+        )
+        .expect("insert valid + orphaned recipients");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint fixture rows");
+        drop(conn);
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair should clean header-only WAL before orphan cleanup");
+        let output = capture.drain_to_string();
+
+        assert!(
+            output.contains("Quarantined header-only/truncated WAL"),
+            "repair should report WAL quarantine before opening for cleanup: {output}"
+        );
+        assert!(
+            !wal_path.exists(),
+            "header-only WAL should move out of the active SQLite path"
+        );
+        assert!(
+            !shm_path.exists(),
+            "companion SHM should move out of the active SQLite path"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("doctor_repair_header_only_wal.sqlite3-wal.startup-quarantine-")),
+            "header-only WAL should be preserved under quarantine"
+        );
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let orphan_rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = 999",
+                &[],
+            )
+            .expect("orphan count");
+        assert_eq!(
+            orphan_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "repair should still clear orphaned recipients after WAL quarantine"
+        );
+    }
+
+    #[test]
     fn doctor_repair_recovers_corrupt_db_without_archive_from_sibling_backup() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -50865,6 +52083,7 @@ fn run_child_with_artifacts(
 
     std::fs::create_dir_all(artifact_dir)?;
     let started_at = Utc::now().to_rfc3339();
+    let requires_remote_proof = command_requires_rch_remote_proof(command_words);
     std::fs::write(
         artifact_dir.join("command.json"),
         serde_json::to_string_pretty(&serde_json::json!({
@@ -50872,6 +52091,7 @@ fn run_child_with_artifacts(
             "slot": slot,
             "command": command_words,
             "started_at": started_at,
+            "requires_remote_proof": requires_remote_proof,
         }))
         .map_err(|e| CliError::Format(e.to_string()))?,
     )?;
@@ -50898,8 +52118,35 @@ fn run_child_with_artifacts(
     stdout.write_all(&output.stdout)?;
     stderr.write_all(&output.stderr)?;
 
-    let exit_code = output.status.code().unwrap_or(1);
-    std::fs::write(artifact_dir.join("exit_code.txt"), format!("{exit_code}\n"))?;
+    let child_exit_code = output.status.code().unwrap_or(1);
+    let rch_proof = classify_rch_remote_proof(command_words, &output.stdout, &output.stderr);
+    let proof_exit_code = rch_proof.adjusted_exit_code(child_exit_code);
+    let mut context_artifacts = serde_json::Map::new();
+    if proof_exit_code != child_exit_code {
+        let message = format!(
+            "error: rch proof lane failed closed: {}",
+            rch_proof.failure_reason.as_deref().unwrap_or("unknown")
+        );
+        ftui_runtime::ftui_eprintln!("{message}");
+        std::fs::write(
+            artifact_dir.join("rch_proof_failure.txt"),
+            format!("{message}\n"),
+        )?;
+        context_artifacts = write_rch_context_artifacts(artifact_dir);
+    } else if rch_proof.requires_remote_proof && child_exit_code != 0 {
+        context_artifacts = write_rch_context_artifacts(artifact_dir);
+    }
+    std::fs::write(
+        artifact_dir.join("exit_code.txt"),
+        format!("{proof_exit_code}\n"),
+    )?;
+    let mut rch_proof_json = rch_proof.to_json();
+    if let Some(proof) = rch_proof_json.as_object_mut() {
+        proof.insert(
+            "context_artifacts".to_string(),
+            serde_json::Value::Object(context_artifacts),
+        );
+    }
     std::fs::write(
         artifact_dir.join("result.json"),
         serde_json::to_string_pretty(&serde_json::json!({
@@ -50908,14 +52155,197 @@ fn run_child_with_artifacts(
             "command": command_words,
             "started_at": started_at,
             "completed_at": Utc::now().to_rfc3339(),
-            "exit_code": exit_code,
+            "exit_code": proof_exit_code,
+            "child_exit_code": child_exit_code,
+            "rch_proof": rch_proof_json,
             "stdout_log": "stdout.log",
             "stderr_log": "stderr.log",
         }))
         .map_err(|e| CliError::Format(e.to_string()))?,
     )?;
 
-    Ok(exit_code)
+    Ok(proof_exit_code)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RchRemoteProof {
+    requires_remote_proof: bool,
+    status: &'static str,
+    failure_family: &'static str,
+    worker: Option<String>,
+    failure_reason: Option<String>,
+}
+
+impl RchRemoteProof {
+    fn adjusted_exit_code(&self, child_exit_code: i32) -> i32 {
+        if self.requires_remote_proof && child_exit_code == 0 && self.status != "remote" {
+            1
+        } else {
+            child_exit_code
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requires_remote_proof": self.requires_remote_proof,
+            "status": self.status,
+            "failure_family": self.failure_family,
+            "worker": self.worker,
+            "failure_reason": self.failure_reason,
+        })
+    }
+}
+
+fn command_requires_rch_remote_proof(command_words: &[String]) -> bool {
+    command_words
+        .first()
+        .is_some_and(|word| word.as_str() == "rch")
+        && command_words
+            .get(1)
+            .is_some_and(|word| word.as_str() == "exec")
+}
+
+fn classify_rch_remote_proof(
+    command_words: &[String],
+    stdout: &[u8],
+    stderr: &[u8],
+) -> RchRemoteProof {
+    let requires_remote_proof = command_requires_rch_remote_proof(command_words);
+    if !requires_remote_proof {
+        return RchRemoteProof {
+            requires_remote_proof,
+            status: "not_applicable",
+            failure_family: "none",
+            worker: None,
+            failure_reason: None,
+        };
+    }
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    let remote_marker = combined.contains("[RCH] remote ")
+        || combined.contains("Executing command remotely:")
+        || combined.contains("Remote command finished:");
+    let local_marker = combined.contains("[RCH] local (")
+        || combined.contains("falling back to local")
+        || combined.contains("local fallback");
+    let fallback_refused = combined.contains("refusing local fallback")
+        || combined.contains("remote required; refusing local fallback");
+
+    if local_marker && !fallback_refused {
+        return RchRemoteProof {
+            requires_remote_proof,
+            status: "local_fallback",
+            failure_family: "local_fallback",
+            worker: rch_worker_from_output(&combined),
+            failure_reason: Some("rch executed or advertised a local fallback".to_string()),
+        };
+    }
+
+    if remote_marker {
+        return RchRemoteProof {
+            requires_remote_proof,
+            status: "remote",
+            failure_family: "none",
+            worker: rch_worker_from_output(&combined),
+            failure_reason: None,
+        };
+    }
+
+    if fallback_refused {
+        return RchRemoteProof {
+            requires_remote_proof,
+            status: "local_fallback_refused",
+            failure_family: "local_fallback_refused",
+            worker: rch_worker_from_output(&combined),
+            failure_reason: Some(
+                "rch refused local fallback because remote execution was required".to_string(),
+            ),
+        };
+    }
+
+    let failure_family = if combined.contains("Sync failed")
+        || combined.contains("sync failed")
+        || combined.contains("rsync")
+        || combined.contains("transfer")
+    {
+        "remote_transport_or_sync_failure"
+    } else {
+        "rch_remote_status_unknown"
+    };
+
+    RchRemoteProof {
+        requires_remote_proof,
+        status: "unknown",
+        failure_family,
+        worker: rch_worker_from_output(&combined),
+        failure_reason: Some(
+            "rch command exited without a positive remote-execution marker".to_string(),
+        ),
+    }
+}
+
+fn rch_worker_from_output(output: &str) -> Option<String> {
+    for marker in ["[RCH] remote ", "Selected worker: "] {
+        if let Some(rest) = output.split(marker).nth(1) {
+            let worker = rest
+                .split([' ', '(', '\n', '\r'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(':');
+            if !worker.is_empty() {
+                return Some(worker.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn write_rch_context_artifacts(artifact_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let mut artifacts = serde_json::Map::new();
+    if write_command_output_artifact(
+        artifact_dir,
+        "rch_status_workers.json",
+        "rch",
+        &["status", "--workers", "--json"],
+    ) {
+        artifacts.insert(
+            "rch_status_workers".to_string(),
+            serde_json::Value::String("rch_status_workers.json".to_string()),
+        );
+    }
+    if write_command_output_artifact(artifact_dir, "rch_queue.json", "rch", &["queue", "--json"]) {
+        artifacts.insert(
+            "rch_queue".to_string(),
+            serde_json::Value::String("rch_queue.json".to_string()),
+        );
+    }
+    artifacts
+}
+
+fn write_command_output_artifact(
+    artifact_dir: &Path,
+    file_name: &str,
+    command: &str,
+    args: &[&str],
+) -> bool {
+    if let Ok(output) = std::process::Command::new(command).args(args).output() {
+        let payload = serde_json::json!({
+            "command": std::iter::once(command.to_string())
+                .chain(args.iter().map(|arg| (*arg).to_string()))
+                .collect::<Vec<_>>(),
+            "exit_code": output.status.code().unwrap_or(1),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        });
+        if let Ok(text) = serde_json::to_string_pretty(&payload) {
+            return std::fs::write(artifact_dir.join(file_name), text).is_ok();
+        }
+    }
+    false
 }
 
 #[allow(clippy::too_many_lines)]
@@ -54275,6 +55705,7 @@ pub(crate) struct DoctorRepairOptions {
     pub prune_orphan_recipients: bool,
 }
 
+#[cfg(test)]
 fn handle_doctor_repair_with(
     database_url: &str,
     storage_root: &Path,
@@ -54334,6 +55765,10 @@ fn handle_doctor_repair_with_options(
     )? {
         ftui_runtime::ftui_println!("Repair cancelled.");
         return Ok(());
+    }
+
+    if !dry_run {
+        doctor_quarantine_header_only_wal_sidecars(&reconstruct_db_path)?;
     }
 
     if !dry_run
@@ -54420,6 +55855,7 @@ fn handle_doctor_repair_with_options(
                 next_timestamped_sqlite_backup_path_in_dir(backup_dir, "pre_repair", &timestamp);
             copy_sqlite_backup_consistently(Path::new(&db_path), &bak_path)?;
             ftui_runtime::ftui_println!("  Backup: {}", bak_path.display());
+            doctor_quarantine_header_only_wal_sidecars(Path::new(&db_path))?;
 
             // Also create a .bak sibling next to the primary DB so that the
             // pool's auto-recovery (find_healthy_backup) can discover it.
@@ -54430,6 +55866,7 @@ fn handle_doctor_repair_with_options(
                     sibling_bak.display()
                 );
             }
+            doctor_quarantine_header_only_wal_sidecars(Path::new(&db_path))?;
         }
     }
 
@@ -55953,7 +57390,7 @@ fn handle_doctor_archive_scan(
     // Forensic bundles directory pointer.
     {
         let forensics_dir = storage_root.join("doctor").join("forensics");
-        if forensics_dir.exists() {
+        if path_is_real_directory(&forensics_dir) {
             scan_artifacts.push(ArtifactPointer::referenced(
                 "forensic_bundles_dir",
                 &forensics_dir.display().to_string(),
@@ -55965,7 +57402,7 @@ fn handle_doctor_archive_scan(
     // Doctor reports directory pointer.
     {
         let reports_dir = storage_root.join("doctor").join("reports");
-        if reports_dir.exists() {
+        if path_is_real_directory(&reports_dir) {
             scan_artifacts.push(ArtifactPointer::referenced(
                 "doctor_reports_dir",
                 &reports_dir.display().to_string(),
@@ -56122,7 +57559,7 @@ fn handle_doctor_archive_verify(
         ),
     ];
     let reports_dir = storage_root.join("doctor").join("reports");
-    if reports_dir.exists() {
+    if path_is_real_directory(&reports_dir) {
         artifacts.push(ArtifactPointer::referenced(
             "doctor_reports_dir",
             &reports_dir.display().to_string(),
@@ -60147,6 +61584,28 @@ fn apply_preview_no_cache_headers(resp: &mut asupersync::http::h1::types::Respon
         .push(("Pragma".to_string(), "no-cache".to_string()));
 }
 
+fn preview_allowed_hosts(host: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    push_unique_preview_host(&mut hosts, normalize_preview_allowed_host(host));
+    push_unique_preview_host(&mut hosts, "localhost".to_string());
+    hosts
+}
+
+fn normalize_preview_allowed_host(host: &str) -> String {
+    let trimmed = host.trim().trim_matches(['[', ']']);
+    if trimmed.is_empty() || trimmed == "0.0.0.0" || trimmed == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn push_unique_preview_host(hosts: &mut Vec<String>, host: String) {
+    if !hosts.iter().any(|existing| existing == &host) {
+        hosts.push(host);
+    }
+}
+
 struct PreviewServerHandle {
     addr: std::net::SocketAddr,
     shutdown: asupersync::server::shutdown::ShutdownSignal,
@@ -60160,6 +61619,7 @@ fn start_preview_server(
     log: Option<PreviewLog>,
 ) -> CliResult<PreviewServerHandle> {
     use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
+    use asupersync::http::h1::server::{HostPolicy, Http1Config};
     use asupersync::http::h1::types::Response;
     use asupersync::runtime::RuntimeBuilder;
     use std::sync::mpsc;
@@ -60180,6 +61640,7 @@ fn start_preview_server(
         >,
     >();
 
+    let allowed_hosts = preview_allowed_hosts(&host);
     let join = std::thread::spawn(move || {
         let runtime = match RuntimeBuilder::current_thread().build() {
             Ok(runtime) => runtime,
@@ -60193,6 +61654,9 @@ fn start_preview_server(
         runtime.block_on(async move {
             let dir = base_dir.clone();
             let log = log.clone();
+            let listener_config = Http1ListenerConfig::default().http_config(
+                Http1Config::default().host_policy(HostPolicy::allow_list(allowed_hosts)),
+            );
             let listener = match Http1Listener::bind_with_config(
                 socket_addr,
                 move |req| {
@@ -60281,7 +61745,7 @@ fn start_preview_server(
                         resp
                     }
                 },
-                Http1ListenerConfig::default(),
+                listener_config,
             )
             .await
             {
@@ -63380,4 +64844,299 @@ fn atomic_replace_binary_rollback_on_failure() {
     // Original should still be intact
     let content = std::fs::read(&target).unwrap();
     assert_eq!(content, b"original");
+}
+
+#[cfg(test)]
+fn sample_forensic_current(
+    status: &str,
+    binary_version: &str,
+    schema_version: &str,
+    storage_root: &Path,
+    database_path: &Path,
+    search_state: &str,
+) -> ForensicTimelineCurrent {
+    ForensicTimelineCurrent {
+        generated_at: "2026-05-12T00:00:00Z".to_string(),
+        status: status.to_string(),
+        binary_version: binary_version.to_string(),
+        schema_version: Some(schema_version.to_string()),
+        storage_root: storage_root.display().to_string(),
+        database_path: database_path.display().to_string(),
+        search_index_generation: ForensicSearchIndexGeneration {
+            state: search_state.to_string(),
+            db_identity: Some(database_path.display().to_string()),
+            index_dir: Some(storage_root.join("search").display().to_string()),
+            indexed_messages: Some(10),
+            source_messages: Some(10),
+            skipped_messages: Some(0),
+            last_backfill_at_micros: Some(1_762_819_200_000_000),
+            rebuild_in_progress: false,
+            stale_reason: None,
+        },
+    }
+}
+
+#[cfg(test)]
+fn write_forensic_checkpoint(
+    storage_root: &Path,
+    name: &str,
+    generated_at: &str,
+    current: &ForensicTimelineCurrent,
+) -> PathBuf {
+    let reports = storage_root.join("doctor").join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    let path = reports.join(name);
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "schema": FORENSIC_CHECKPOINT_SCHEMA,
+            "healthy": true,
+            "generated_at": generated_at,
+            "current": current,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn forensic_timeline_reports_no_checkpoint_without_mutating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("storage.sqlite3");
+    let current = sample_forensic_current("ok", "0.2.52", "1", tmp.path(), &db_path, "fresh");
+
+    let report = build_forensic_timeline_report_from_current(tmp.path(), current);
+
+    assert_eq!(report.checkpoint_status, "no_checkpoint");
+    assert_eq!(report.last_healthy_timestamp, None);
+    assert!(report.changes_since_last_healthy.is_empty());
+    assert!(
+        report
+            .next_actions
+            .iter()
+            .any(|action| action == "am doctor check --json")
+    );
+    assert!(
+        !tmp.path().join("doctor").exists(),
+        "read-only timeline builder must not create doctor artifacts"
+    );
+}
+
+#[test]
+fn forensic_timeline_reports_healthy_to_unhealthy_transition() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("storage.sqlite3");
+    let healthy = sample_forensic_current("ok", "0.2.52", "1", tmp.path(), &db_path, "fresh");
+    write_forensic_checkpoint(
+        tmp.path(),
+        "health-checkpoint-ok.json",
+        "2026-05-12T01:00:00Z",
+        &healthy,
+    );
+    let degraded =
+        sample_forensic_current("degraded", "0.2.52", "1", tmp.path(), &db_path, "stale");
+
+    let report = build_forensic_timeline_report_from_current(tmp.path(), degraded);
+
+    assert_eq!(report.checkpoint_status, "changed_since_last_healthy");
+    assert_eq!(
+        report.last_healthy_timestamp.as_deref(),
+        Some("2026-05-12T01:00:00Z")
+    );
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(|change| change.field == "status" && change.after == "degraded")
+    );
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(
+                |change| change.field == "search_index_generation.state" && change.after == "stale"
+            )
+    );
+    assert!(
+        report
+            .next_actions
+            .iter()
+            .any(|action| action == "am doctor support-bundle --json")
+    );
+}
+
+#[test]
+fn forensic_timeline_reports_repair_to_healthy_with_artifact_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("storage.sqlite3");
+    let current = sample_forensic_current("ok", "0.2.52", "1", tmp.path(), &db_path, "fresh");
+    write_forensic_checkpoint(
+        tmp.path(),
+        "health-checkpoint-after-repair.json",
+        "2026-05-12T02:00:00Z",
+        &current,
+    );
+    let repair_dir = tmp
+        .path()
+        .join("doctor/forensics/storage.sqlite3/repair-20260512_020000_000");
+    std::fs::create_dir_all(&repair_dir).unwrap();
+
+    let report = build_forensic_timeline_report_from_current(tmp.path(), current);
+
+    assert_eq!(report.checkpoint_status, "matches_last_healthy");
+    assert_eq!(report.recent_recovery_runs.len(), 1);
+    assert_eq!(report.recent_recovery_runs[0].kind, "repair");
+    assert!(report.artifacts.iter().any(|artifact| {
+        artifact.kind == "latest_recovery_run" && artifact.path == repair_dir.display().to_string()
+    }));
+}
+
+#[test]
+fn forensic_timeline_reports_binary_upgrade_since_last_healthy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("storage.sqlite3");
+    let baseline = sample_forensic_current("ok", "0.2.51", "1", tmp.path(), &db_path, "fresh");
+    write_forensic_checkpoint(
+        tmp.path(),
+        "health-checkpoint-old-binary.json",
+        "2026-05-12T03:00:00Z",
+        &baseline,
+    );
+    let current = sample_forensic_current("ok", "0.2.52", "1", tmp.path(), &db_path, "fresh");
+
+    let report = build_forensic_timeline_report_from_current(tmp.path(), current);
+
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(|change| change.field == "binary_version"
+                && change.before == "0.2.51"
+                && change.after == "0.2.52")
+    );
+}
+
+#[test]
+fn forensic_timeline_reports_config_drift_and_redacts_sensitive_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old_root = tmp.path().join("old-root");
+    let old_db = old_root.join("storage.sqlite3");
+    let new_root = tmp.path().join("new-root");
+    let new_db = new_root.join("storage.sqlite3");
+    let baseline = sample_forensic_current("ok", "0.2.52", "1", &old_root, &old_db, "fresh");
+    write_forensic_checkpoint(
+        tmp.path(),
+        "health-checkpoint-old-config.json",
+        "2026-05-12T04:00:00Z",
+        &baseline,
+    );
+    let current = sample_forensic_current("ok", "0.2.52", "1", &new_root, &new_db, "fresh");
+
+    let report = build_forensic_timeline_report_from_current(tmp.path(), current);
+
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(|change| change.field == "storage_root")
+    );
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(|change| change.field == "database_path")
+    );
+    let redacted = redact_forensic_value(serde_json::json!({
+        "http_bearer_token": "secret-token",
+        "nested": { "password": "hunter2" }
+    }));
+    assert_eq!(redacted["http_bearer_token"], "<redacted>");
+    assert_eq!(redacted["nested"]["password"], "<redacted>");
+    assert_eq!(
+        forensic_safe_value("detail", "Authorization: Bearer secret-token"),
+        "<redacted>"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn forensic_timeline_ignores_symlinked_reports_dir() {
+    let storage = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let db_path = storage.path().join("storage.sqlite3");
+    let healthy = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+    write_forensic_checkpoint(
+        outside.path(),
+        "outside-healthy.json",
+        "2026-05-12T05:00:00Z",
+        &healthy,
+    );
+    std::fs::create_dir_all(storage.path().join("doctor")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("doctor").join("reports"),
+        storage.path().join("doctor").join("reports"),
+    )
+    .unwrap();
+
+    let report = build_forensic_timeline_report_from_current(storage.path(), healthy);
+
+    assert_eq!(report.checkpoint_status, "no_checkpoint");
+    assert!(
+        report
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.kind != "doctor_reports_dir"),
+        "symlinked reports dir must not be advertised as a safe artifact"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn forensic_timeline_ignores_symlinked_checkpoint_file() {
+    let storage = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let db_path = storage.path().join("storage.sqlite3");
+    let healthy = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+    let outside_checkpoint = write_forensic_checkpoint(
+        outside.path(),
+        "outside-healthy.json",
+        "2026-05-12T06:00:00Z",
+        &healthy,
+    );
+    let reports = storage.path().join("doctor").join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::os::unix::fs::symlink(outside_checkpoint, reports.join("linked-healthy.json")).unwrap();
+
+    let report = build_forensic_timeline_report_from_current(storage.path(), healthy);
+
+    assert_eq!(report.checkpoint_status, "no_checkpoint");
+    assert!(report.baseline.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn forensic_timeline_ignores_symlinked_recovery_run_dir() {
+    let storage = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let db_path = storage.path().join("storage.sqlite3");
+    let current = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+    write_forensic_checkpoint(
+        storage.path(),
+        "health-checkpoint-ok.json",
+        "2026-05-12T07:00:00Z",
+        &current,
+    );
+    let outside_run = outside.path().join("repair-20260512_070000_000");
+    std::fs::create_dir_all(&outside_run).unwrap();
+    let family = storage.path().join("doctor/forensics/storage.sqlite3");
+    std::fs::create_dir_all(&family).unwrap();
+    std::os::unix::fs::symlink(&outside_run, family.join("repair-20260512_070000_000")).unwrap();
+
+    let report = build_forensic_timeline_report_from_current(storage.path(), current);
+
+    assert!(
+        report.recent_recovery_runs.is_empty(),
+        "symlinked recovery run directories must not be followed"
+    );
 }
