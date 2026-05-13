@@ -103,6 +103,17 @@ pub fn update_latest_symlink(target: &Path, run_id: &str) -> std::io::Result<()>
     let root = doctor_root(target);
     fs::create_dir_all(&root)?;
     let latest = root.join("latest");
+    if let Ok(meta) = fs::symlink_metadata(&latest)
+        && !meta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace non-symlink .doctor/latest at {}",
+                latest.display()
+            ),
+        ));
+    }
     let target_relative = PathBuf::from("runs").join(run_id);
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -110,7 +121,13 @@ pub fn update_latest_symlink(target: &Path, run_id: &str) -> std::io::Result<()>
         .unwrap_or(0);
     let tmp = root.join(format!(".latest.tmp.{}.{}", std::process::id(), now_ns));
     if fs::symlink_metadata(&tmp).is_ok() {
-        fs::remove_file(&tmp)?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace pre-existing temporary symlink path {}",
+                tmp.display()
+            ),
+        ));
     }
     std::os::unix::fs::symlink(&target_relative, &tmp)?;
     fs::rename(&tmp, &latest)?;
@@ -278,6 +295,24 @@ mod tests {
         let run_id = "2026-05-09T16-30-15Z__abc123";
         let _a = scaffold_run_dir(td.path(), run_id).expect("first");
         let _b = scaffold_run_dir(td.path(), run_id).expect("second — should not error");
+    }
+
+    #[test]
+    fn update_latest_symlink_refuses_regular_file_without_clobbering() {
+        let td = TempDir::new().expect("tempdir");
+        let run_id = "2026-05-09T16-30-15Z__abc123";
+        let root = doctor_root(td.path());
+        scaffold_run_dir(td.path(), run_id).expect("scaffold");
+        fs::write(root.join("latest"), "operator data\n").expect("plant regular latest");
+
+        let err = update_latest_symlink(td.path(), run_id)
+            .expect_err("regular .doctor/latest must be preserved");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(root.join("latest")).unwrap(),
+            "operator data\n"
+        );
     }
 
     #[test]

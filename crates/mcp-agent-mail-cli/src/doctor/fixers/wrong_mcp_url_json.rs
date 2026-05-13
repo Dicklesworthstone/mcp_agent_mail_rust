@@ -172,16 +172,29 @@ pub fn fix(
     let mut v: serde_json::Value =
         serde_json::from_str(&body).map_err(crate::doctor::mutate::MutateError::Serde)?;
 
-    // Walk the JSON pointer (3 segments: container.server.field).
-    let parts: Vec<&str> = finding.json_pointer.split('.').collect();
-    if parts.len() != 3 {
+    // Walk the pseudo JSON pointer: container.server.field. Server keys
+    // may themselves contain dots, so split only at the outer separators.
+    let Some((container, rest)) = finding.json_pointer.split_once('.') else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+    let Some((server, field)) = rest.rsplit_once('.') else {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    };
+    if container.is_empty() || server.is_empty() || field.is_empty() {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
             quarantined_paths: Vec::new(),
         });
     }
-    let (container, server, field) = (parts[0], parts[1], parts[2]);
 
     let Some(obj) = v.as_object_mut() else {
         return Ok(FixOutcome {
@@ -403,6 +416,35 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&p).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn fixer_rewrites_url_for_dotted_server_name() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.json");
+        fs::write(
+            &p,
+            serde_json::json!({
+                "mcpServers": { "mcp.agent.mail": { "url": "http://wrong/" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let findings = detect(CANONICAL, std::slice::from_ref(&p));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].json_pointer, "mcpServers.mcp.agent.mail.url");
+
+        let ctx = ctx_for(&td, "2026-05-12T10-00-00Z__dotted");
+        let outcome = fix(&ctx, &findings[0]).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+
+        let body = fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["mcpServers"]["mcp.agent.mail"]["url"].as_str().unwrap(),
+            CANONICAL
+        );
     }
 
     #[test]

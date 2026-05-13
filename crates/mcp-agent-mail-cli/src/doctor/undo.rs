@@ -18,9 +18,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -33,6 +35,47 @@ const EMPTY_FILE_SHA256: &str =
 fn sha256_hex(bytes: &[u8]) -> String {
     let h = Sha256::digest(bytes);
     format!("sha256:{:x}", h)
+}
+
+fn sha256_path_bytes(path: &Path) -> String {
+    sha256_hex(path.as_os_str().as_bytes())
+}
+
+fn symlink_target_hash(path: &Path) -> std::io::Result<String> {
+    Ok(sha256_path_bytes(&fs::read_link(path)?))
+}
+
+fn path_from_raw_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(OsString::from_vec(bytes))
+}
+
+fn read_regular_file_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    read_regular_file_no_follow_inner(path)
+}
+
+#[cfg(unix)]
+fn read_regular_file_no_follow_inner(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_regular_file_no_follow_inner(path: &Path) -> std::io::Result<Vec<u8>> {
+    fs::read(path)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,16 +111,95 @@ fn per_mutation_backup_dir(backups_dir: &Path, started_at_ns: u128) -> PathBuf {
     backups_dir.join(format!("seq_{:026}", started_at_ns))
 }
 
+fn logged_path_error(logged_path: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("unsafe path in doctor action log: {logged_path:?}"),
+    )
+}
+
+fn checked_logged_components(path: &Path, logged_path: &str) -> std::io::Result<Vec<OsString>> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(logged_path_error(logged_path));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(logged_path_error(logged_path));
+    }
+    Ok(parts)
+}
+
+fn logged_target_path(target: &Path, logged_path: &str) -> std::io::Result<PathBuf> {
+    let path = Path::new(logged_path);
+    checked_logged_components(path, logged_path)?;
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(target.join(path))
+    }
+}
+
+fn artifact_relative_path(logged_path: &str) -> std::io::Result<PathBuf> {
+    let path = Path::new(logged_path);
+    let parts = checked_logged_components(path, logged_path)?;
+    let mut out = if path.is_absolute() {
+        PathBuf::from("__abs__")
+    } else {
+        PathBuf::new()
+    };
+    for part in parts {
+        out.push(part);
+    }
+    Ok(out)
+}
+
+fn action_backup_file(backups_dir: &Path, action: &StoredAction) -> std::io::Result<PathBuf> {
+    let rel = artifact_relative_path(&action.path)?;
+    if action.started_at_ns == 0 {
+        Ok(backups_dir.join(rel))
+    } else {
+        Ok(per_mutation_backup_dir(backups_dir, action.started_at_ns).join(rel))
+    }
+}
+
+fn run_artifact_path(run_dir: &Path, kind: &str, logged_path: &str) -> std::io::Result<PathBuf> {
+    Ok(run_dir
+        .join(kind)
+        .join(artifact_relative_path(logged_path)?))
+}
+
+fn same_action_identity(pending: &StoredAction, completed: &StoredAction) -> bool {
+    pending.started_at_ns == completed.started_at_ns
+        && pending.path == completed.path
+        && pending.op == completed.op
+        && pending.rename_to == completed.rename_to
+}
+
+fn is_safe_run_id(run_id: &str) -> bool {
+    if run_id.is_empty() {
+        return false;
+    }
+    let mut components = Path::new(run_id).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 /// Resolve `<run_id>` argument: literal id OR `latest` (read symlink).
 pub fn resolve_run_id(target: &Path, run_id_arg: &str) -> Option<String> {
     if run_id_arg != "latest" {
-        return Some(run_id_arg.to_string());
+        return is_safe_run_id(run_id_arg).then(|| run_id_arg.to_string());
     }
     let latest = doctor_root(target).join("latest");
     let resolved = fs::read_link(&latest).ok()?;
     resolved
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
+        .filter(|id| is_safe_run_id(id))
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +226,12 @@ pub fn run_undo(
     dry_run: bool,
     strict: bool,
 ) -> std::io::Result<UndoSummary> {
+    if !is_safe_run_id(run_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid doctor run-id {run_id:?}"),
+        ));
+    }
     let run_dir = doctor_root(target).join("runs").join(run_id);
     let actions_path = run_dir.join("actions.jsonl");
     let backups_dir = run_dir.join("backups");
@@ -120,19 +248,24 @@ pub fn run_undo(
     // drops); fs2's exclusive lock dies with the process for crash
     // recovery.
     use fs2::FileExt;
-    let lock_path = run_dir.join("undo.lock");
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    if !dry_run && lock_file.try_lock_exclusive().is_err() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            format!("another undo is in progress on run-id {run_id}"),
-        ));
-    }
+    let _lock_file = if dry_run {
+        None
+    } else {
+        let lock_path = run_dir.join("undo.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        if lock_file.try_lock_exclusive().is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("another undo is in progress on run-id {run_id}"),
+            ));
+        }
+        Some(lock_file)
+    };
 
     let mut summary = UndoSummary {
         run_id: run_id.to_string(),
@@ -142,14 +275,10 @@ pub fn run_undo(
     let f = fs::File::open(&actions_path)?;
     let raw_lines: Vec<String> = BufReader::new(f).lines().map_while(Result::ok).collect();
 
-    // G-Crash-Window fix: dedupe two-phase entries by `started_at_ns`.
-    // For each unique `started_at_ns`, the latest (last-wins) entry is
-    // authoritative. If the latest entry is `phase == "pending"`, the
-    // mutation crashed mid-flight: backup exists, restore from it.
-    // If the latest entry is `"completed"` (or has no phase = legacy),
-    // standard restore.
-    let mut by_started_at: std::collections::BTreeMap<u128, StoredAction> =
-        std::collections::BTreeMap::new();
+    // G-Crash-Window fix: collapse each pending entry only when its matching
+    // completed entry arrives. Preserve raw action order otherwise; elapsed
+    // nanoseconds are useful backup keys, not globally unique log sequence ids.
+    let mut actions = Vec::<StoredAction>::new();
     for line in &raw_lines {
         if line.trim().is_empty() {
             continue;
@@ -158,23 +287,20 @@ pub fn run_undo(
             Ok(a) => a,
             Err(_) => continue, // skip malformed; reported below
         };
-        // started_at_ns == 0 is the legacy fallback (no per-mutation seq);
-        // process those serially in raw order (use line index as key).
-        let key = if action.started_at_ns == 0 {
-            // pack the raw line index into the upper bits to keep ordering;
-            // index 0..N maps to keys 1..N+1 (avoid colliding with real
-            // started_at_ns values which start large).
-            (raw_lines.iter().position(|l| l == line).unwrap_or(0) + 1) as u128
+        if action.phase.as_deref() == Some("completed")
+            && let Some(pos) = actions.iter().rposition(|candidate| {
+                candidate.phase.as_deref() == Some("pending")
+                    && same_action_identity(candidate, &action)
+            })
+        {
+            actions[pos] = action;
         } else {
-            action.started_at_ns
-        };
-        by_started_at.insert(key, action);
+            actions.push(action);
+        }
     }
 
-    // Process in REVERSE order of started_at_ns (most recent mutation undone
-    // first; preserves the per-mutation seq backup correctness verified by
-    // pass-4's property test).
-    let actions: Vec<StoredAction> = by_started_at.values().rev().cloned().collect();
+    // Process in reverse raw mutation order (most recent mutation first).
+    actions.reverse();
 
     for action in actions {
         // Detect crash-window: phase=pending without subsequent completed.
@@ -184,12 +310,8 @@ pub fn run_undo(
             // We do NOT validate after_hash because the mutation may not
             // have completed (or may have completed after the pending log
             // but before the completed log was flushed).
-            let target_file = target.join(&action.path);
-            let backup_file = if action.started_at_ns == 0 {
-                backups_dir.join(&action.path)
-            } else {
-                per_mutation_backup_dir(&backups_dir, action.started_at_ns).join(&action.path)
-            };
+            let target_file = logged_target_path(target, &action.path)?;
+            let backup_file = action_backup_file(&backups_dir, &action)?;
             if dry_run {
                 eprintln!(
                     "[dry-run] crash-window recovery: would restore {} from backup",
@@ -201,7 +323,7 @@ pub fn run_undo(
                 if let Some(parent) = target_file.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let backup_bytes = fs::read(&backup_file)?;
+                let backup_bytes = read_regular_file_no_follow(&backup_file)?;
                 let restore_mode = action.before_mode.unwrap_or(0o644);
                 if super::mutate::atomic_write_file(&target_file, &backup_bytes, restore_mode)
                     .is_ok()
@@ -216,7 +338,8 @@ pub fn run_undo(
                 // File didn't exist before mutation. If it now exists,
                 // mutation probably succeeded — quarantine the post-state.
                 if target_file.exists() {
-                    let quarantine = run_dir.join("quarantine_crash_window").join(&action.path);
+                    let quarantine =
+                        run_artifact_path(&run_dir, "quarantine_crash_window", &action.path)?;
                     if let Some(parent) = quarantine.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -237,16 +360,12 @@ pub fn run_undo(
             continue;
         }
 
-        let target_file = target.join(&action.path);
+        let target_file = logged_target_path(target, &action.path)?;
         // Pass-4 fix: read the per-mutation backup at
         // `backups/seq_<started_at_ns>/<rel>`. If `started_at_ns == 0`
         // (legacy actions.jsonl from pre-pass-4 runs), fall back to the
         // old flat layout `backups/<rel>`.
-        let backup_file = if action.started_at_ns == 0 {
-            backups_dir.join(&action.path)
-        } else {
-            per_mutation_backup_dir(&backups_dir, action.started_at_ns).join(&action.path)
-        };
+        let backup_file = action_backup_file(&backups_dir, &action)?;
 
         match action.op.as_str() {
             "WriteFile" | "AppendFile" | "Chmod" => {
@@ -260,14 +379,31 @@ pub fn run_undo(
                         // another process) modified the file post-mutation —
                         // refuse to clobber their changes (strict) or warn
                         // (non-strict).
-                        if !target_file.exists() {
+                        let target_meta = fs::symlink_metadata(&target_file).ok();
+                        if target_meta.is_none() {
                             // Already gone (user already deleted it, perhaps).
                             // Idempotent — count as no-op replay.
                             summary.actions_skipped += 1;
                             continue;
                         }
                         if !action.after_hash.is_empty() {
-                            match fs::read(&target_file) {
+                            if let Some(m) = target_meta.as_ref()
+                                && m.file_type().is_symlink()
+                            {
+                                let msg = format!(
+                                    "target {} is a symlink; refusing to follow (G2 symlink-attack defense)",
+                                    action.path
+                                );
+                                if strict {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        msg,
+                                    ));
+                                }
+                                summary.failures.push(msg);
+                                continue;
+                            }
+                            match read_regular_file_no_follow(&target_file) {
                                 Ok(bytes) => {
                                     let cur_hash = sha256_hex(&bytes);
                                     if cur_hash != action.after_hash {
@@ -298,7 +434,8 @@ pub fn run_undo(
                                 }
                             }
                         }
-                        let quarantine = run_dir.join("quarantine_undo").join(&action.path);
+                        let quarantine =
+                            run_artifact_path(&run_dir, "quarantine_undo", &action.path)?;
                         if dry_run {
                             eprintln!(
                                 "[dry-run] would quarantine new file {}",
@@ -335,28 +472,50 @@ pub fn run_undo(
                 // Codex-C1 (round 2): verify the live file STILL matches
                 // `after_hash` before restoring. If user modified the file
                 // post-fix, undo refuses to clobber their work.
-                if !action.after_hash.is_empty() && target_file.exists() {
+                if !action.after_hash.is_empty() {
                     // G2 (round 2): refuse to follow a symlink at the target.
                     // `fs::read` follows symlinks, which would let an attacker
                     // redirect undo to overwrite arbitrary files.
-                    let meta = fs::symlink_metadata(&target_file).ok();
-                    if let Some(m) = meta.as_ref()
-                        && m.file_type().is_symlink()
-                    {
-                        let msg = format!(
-                            "target {} is a symlink; refusing to follow (G2 symlink-attack defense)",
-                            action.path
-                        );
-                        if strict {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
-                                msg,
-                            ));
+                    match fs::symlink_metadata(&target_file) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            let msg = format!(
+                                "target {} is a symlink; refusing to follow (G2 symlink-attack defense)",
+                                action.path
+                            );
+                            if strict {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    msg,
+                                ));
+                            }
+                            summary.failures.push(msg);
+                            continue;
                         }
-                        summary.failures.push(msg);
-                        continue;
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            let msg = format!(
+                                "would-restore target {} is missing; refusing to resurrect a user-deleted post-fix file",
+                                action.path
+                            );
+                            if strict {
+                                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+                            }
+                            summary.failures.push(msg);
+                            continue;
+                        }
+                        Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary.failures.push(format!(
+                                "could not stat {} for after_hash check: {}",
+                                target_file.display(),
+                                e
+                            ));
+                            continue;
+                        }
                     }
-                    match fs::read(&target_file) {
+                    match read_regular_file_no_follow(&target_file) {
                         Ok(bytes) => {
                             let cur_hash = sha256_hex(&bytes);
                             if cur_hash != action.after_hash {
@@ -402,7 +561,7 @@ pub fn run_undo(
                 // non-atomic `fs::copy` which could leave a torn file on
                 // disk-full / I/O fault. Now read backup bytes into memory,
                 // then atomic-write through the chokepoint helper.
-                let backup_bytes = match fs::read(&backup_file) {
+                let backup_bytes = match read_regular_file_no_follow(&backup_file) {
                     Ok(b) => b,
                     Err(e) => {
                         if strict {
@@ -421,7 +580,7 @@ pub fn run_undo(
                     Ok(_) => {
                         // C2 fix: verify post-restore hash matches before_hash.
                         // If not, the backup is corrupt or tampered — refuse.
-                        match fs::read(&target_file) {
+                        match read_regular_file_no_follow(&target_file) {
                             Ok(bytes) => {
                                 let restored_hash = sha256_hex(&bytes);
                                 if restored_hash != action.before_hash {
@@ -468,8 +627,8 @@ pub fn run_undo(
                         .push(format!("Rename action missing rename_to: {}", action.path));
                     continue;
                 };
-                let from_after = target.join(rename_to);
-                let restore_to = target.join(&action.path);
+                let from_after = logged_target_path(target, rename_to)?;
+                let restore_to = logged_target_path(target, &action.path)?;
                 if dry_run {
                     eprintln!(
                         "[dry-run] would rename back: {} -> {}",
@@ -509,21 +668,138 @@ pub fn run_undo(
                 }
             }
             "SymlinkAtomic" => {
-                // Symlinks: undo restores the symlink target from the backup
-                // (which itself was a symlink copy if existed, OR records that
-                // no symlink existed before).
+                let current_meta = fs::symlink_metadata(&target_file);
+                let current_exists = current_meta.is_ok();
+                let current_is_symlink = current_meta
+                    .as_ref()
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+
+                if !current_exists && backup_file.exists() && !action.after_hash.is_empty() {
+                    let msg = format!(
+                        "would-restore symlink {} is missing; refusing to resurrect a user-deleted post-fix link",
+                        action.path,
+                    );
+                    if strict {
+                        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+                    }
+                    summary.failures.push(msg);
+                    continue;
+                }
+
+                if current_exists && !current_is_symlink {
+                    let msg = format!(
+                        "target {} is not a symlink; refusing to replace it during SymlinkAtomic undo",
+                        action.path,
+                    );
+                    if strict {
+                        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, msg));
+                    }
+                    summary.failures.push(msg);
+                    continue;
+                }
+
+                if current_is_symlink && !action.after_hash.is_empty() {
+                    let cur_hash = symlink_target_hash(&target_file)?;
+                    if cur_hash != action.after_hash {
+                        let msg = format!(
+                            "would-restore symlink {} no longer matches mutation result (hash {} != recorded after_hash {}); refusing to clobber user-modified link",
+                            action.path, cur_hash, action.after_hash,
+                        );
+                        if strict {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                msg,
+                            ));
+                        }
+                        summary.failures.push(msg);
+                        continue;
+                    }
+                }
+
+                if !backup_file.exists() {
+                    if action.before_hash == EMPTY_FILE_SHA256 {
+                        if !current_exists {
+                            summary.actions_skipped += 1;
+                            continue;
+                        }
+                        let quarantine =
+                            run_artifact_path(&run_dir, "quarantine_undo", &action.path)?;
+                        if dry_run {
+                            eprintln!(
+                                "[dry-run] would quarantine new symlink {}",
+                                target_file.display()
+                            );
+                            summary.actions_replayed += 1;
+                            continue;
+                        }
+                        if let Some(parent) = quarantine.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        match fs::rename(&target_file, &quarantine) {
+                            Ok(_) => summary.actions_replayed += 1,
+                            Err(e) => {
+                                if strict {
+                                    return Err(e);
+                                }
+                                summary.failures.push(format!(
+                                    "could not quarantine symlink {}: {}",
+                                    target_file.display(),
+                                    e
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    let msg = format!("symlink backup missing for {}", action.path);
+                    if strict {
+                        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+                    }
+                    summary.failures.push(msg);
+                    continue;
+                }
+
                 if dry_run {
                     eprintln!(
-                        "[dry-run] would restore symlink at {}",
+                        "[dry-run] would restore symlink {} from backup",
                         target_file.display()
                     );
                     summary.actions_replayed += 1;
                     continue;
                 }
-                // For now, best-effort: remove and recreate from backup.
-                // Backup of a symlink is its target string; without that
-                // captured, we conservatively skip.
-                summary.actions_skipped += 1;
+
+                if let Some(parent) = target_file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let restore_target =
+                    path_from_raw_bytes(read_regular_file_no_follow(&backup_file)?);
+                match super::mutate::atomic_symlink(&target_file, &restore_target) {
+                    Ok(()) => {
+                        let restored_hash = symlink_target_hash(&target_file)?;
+                        if restored_hash != action.before_hash {
+                            let msg = format!(
+                                "post-restore symlink hash mismatch for {}: expected {}, got {}",
+                                action.path, action.before_hash, restored_hash,
+                            );
+                            if strict {
+                                return Err(std::io::Error::other(msg));
+                            }
+                            summary.failures.push(msg);
+                            continue;
+                        }
+                        summary.actions_replayed += 1;
+                    }
+                    Err(e) => {
+                        if strict {
+                            return Err(e);
+                        }
+                        summary.failures.push(format!(
+                            "could not restore symlink {}: {}",
+                            target_file.display(),
+                            e
+                        ));
+                    }
+                }
             }
             "DbExec" | "DbMigrate" => {
                 // DB-row level undo requires the project's DbConn + a saved
@@ -563,6 +839,9 @@ pub fn run_undo(
 
 /// Check if a run-id has already been undone.
 pub fn undo_complete(target: &Path, run_id: &str) -> bool {
+    if !is_safe_run_id(run_id) {
+        return false;
+    }
     let sentinel = doctor_root(target)
         .join("runs")
         .join(run_id)
@@ -671,6 +950,14 @@ mod tests {
             "new\n",
             "dry-run must not restore"
         );
+        assert!(
+            !doctor_root(td.path())
+                .join("runs")
+                .join(run_id)
+                .join("undo.lock")
+                .exists(),
+            "dry-run undo must not create lock artifacts"
+        );
     }
 
     #[test]
@@ -730,6 +1017,173 @@ mod tests {
         super::super::runs::update_latest_symlink(td.path(), run_id).unwrap();
         let resolved = resolve_run_id(td.path(), "latest").unwrap();
         assert_eq!(resolved, run_id);
+    }
+
+    #[test]
+    fn resolve_run_id_rejects_path_components() {
+        let td = TempDir::new().unwrap();
+
+        assert_eq!(resolve_run_id(td.path(), "../escape"), None);
+        assert_eq!(resolve_run_id(td.path(), "nested/run"), None);
+        assert_eq!(resolve_run_id(td.path(), "."), None);
+        assert_eq!(resolve_run_id(td.path(), ""), None);
+    }
+
+    #[test]
+    fn run_undo_rejects_path_component_run_id_before_path_join() {
+        let td = TempDir::new().unwrap();
+        let err = run_undo(td.path(), "../escape", false, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn run_undo_rejects_parent_components_in_action_path() {
+        let td = TempDir::new().unwrap();
+        let run_id = "2026-05-12T14-30-00Z__bad-action-path";
+        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+        fs::write(
+            run_dir.join("actions.jsonl"),
+            serde_json::json!({
+                "path": "../escape.txt",
+                "op": "WriteFile",
+                "before_hash": EMPTY_FILE_SHA256,
+                "after_hash": "",
+                "started_at_ns": 0,
+                "ok": true
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let err = run_undo(td.path(), run_id, false, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn run_undo_rejects_parent_components_in_rename_destination() {
+        let td = TempDir::new().unwrap();
+        let run_id = "2026-05-12T14-31-00Z__bad-rename-path";
+        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+        fs::write(
+            run_dir.join("actions.jsonl"),
+            serde_json::json!({
+                "path": "original.txt",
+                "op": "Rename",
+                "before_hash": EMPTY_FILE_SHA256,
+                "after_hash": "",
+                "started_at_ns": 0,
+                "rename_to": "../escape.txt",
+                "ok": true
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let err = run_undo(td.path(), run_id, false, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn undo_quarantines_symlink_created_by_symlink_atomic() {
+        let td = TempDir::new().unwrap();
+        let latest = td.path().join("latest");
+        let new_target = PathBuf::from("runs/new");
+        let run_id = "2026-05-12T12-30-00Z__symlink-new";
+        let ctx = make_ctx(&td, run_id);
+
+        mutate(
+            &ctx,
+            &latest,
+            Op::SymlinkAtomic {
+                target: new_target.clone(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        assert_eq!(fs::read_link(&latest).unwrap(), new_target);
+
+        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert!(
+            fs::symlink_metadata(&latest).is_err(),
+            "created symlink should be moved to undo quarantine"
+        );
+
+        let quarantined = doctor_root(td.path())
+            .join("runs")
+            .join(run_id)
+            .join("quarantine_undo")
+            .join("latest");
+        assert!(
+            fs::symlink_metadata(&quarantined)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(quarantined).unwrap(),
+            PathBuf::from("runs/new")
+        );
+    }
+
+    #[test]
+    fn undo_restores_previous_symlink_target_for_symlink_atomic() {
+        let td = TempDir::new().unwrap();
+        fs::create_dir_all(td.path().join("runs").join("old")).unwrap();
+        fs::create_dir_all(td.path().join("runs").join("new")).unwrap();
+        let latest = td.path().join("latest");
+        std::os::unix::fs::symlink(Path::new("runs/old"), &latest).unwrap();
+
+        let run_id = "2026-05-12T12-31-00Z__symlink-old";
+        let ctx = make_ctx(&td, run_id);
+        mutate(
+            &ctx,
+            &latest,
+            Op::SymlinkAtomic {
+                target: PathBuf::from("runs/new"),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        assert_eq!(fs::read_link(&latest).unwrap(), PathBuf::from("runs/new"));
+
+        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert_eq!(fs::read_link(&latest).unwrap(), PathBuf::from("runs/old"));
+    }
+
+    #[test]
+    fn undo_refuses_missing_post_fix_symlink_with_backup() {
+        let td = TempDir::new().unwrap();
+        let latest = td.path().join("latest");
+        std::os::unix::fs::symlink(Path::new("runs/old"), &latest).unwrap();
+
+        let run_id = "2026-05-12T13-00-00Z__symlink-missing";
+        let ctx = make_ctx(&td, run_id);
+        mutate(
+            &ctx,
+            &latest,
+            Op::SymlinkAtomic {
+                target: PathBuf::from("runs/new"),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        std::fs::remove_file(&latest).unwrap();
+
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            fs::symlink_metadata(&latest).is_err(),
+            "strict undo must not recreate a user-deleted symlink"
+        );
     }
 
     #[test]
@@ -831,6 +1285,38 @@ mod tests {
     }
 
     #[test]
+    fn undo_codex_c1_refuses_missing_post_fix_writefile() {
+        // A missing target is also a post-fix modification. Strict undo must
+        // not silently resurrect a file the user removed after the doctor run.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.toml");
+        std::fs::write(&target, b"# original\n").unwrap();
+        let run_id = "2026-05-12T13-05-00Z__codex-c1-missing";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"# doctor wrote\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        std::fs::remove_file(&target).unwrap();
+
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "strict undo must not recreate a user-deleted target"
+        );
+    }
+
+    #[test]
     fn undo_codex_h1_no_sentinel_on_failure() {
         // Codex round-2 H1: undo_complete sentinel is only written when
         // there are no failures. Was: always written, stranding the repo
@@ -901,6 +1387,135 @@ mod tests {
     }
 
     #[test]
+    fn undo_refuses_symlink_backup_artifact() {
+        // Backups live under the doctor run directory, but they are still
+        // filesystem inputs. Undo must restore only from regular backup files.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.toml");
+        std::fs::write(&target, b"doctor wrote\n").unwrap();
+        let run_id = "2026-05-12T14-00-00Z__backup-symlink";
+        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+
+        let backup = run_dir.join("backups").join("config.toml");
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        let sensitive = td.path().join("sensitive_backup_source.txt");
+        std::fs::write(&sensitive, b"original\n").unwrap();
+        std::os::unix::fs::symlink(&sensitive, &backup).unwrap();
+
+        let mut actions = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        writeln!(
+            actions,
+            "{}",
+            serde_json::json!({
+                "path": "config.toml",
+                "op": "WriteFile",
+                "before_hash": sha256_hex(b"original\n"),
+                "after_hash": sha256_hex(b"doctor wrote\n"),
+                "before_mode": 0o644,
+                "ok": true,
+            })
+        )
+        .unwrap();
+        drop(actions);
+
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "doctor wrote\n",
+            "target must remain in its post-fix state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sensitive).unwrap(),
+            "original\n",
+            "symlink target must not be consumed as a backup"
+        );
+    }
+
+    #[test]
+    fn undo_g2_refuses_symlink_target_for_created_file_quarantine_branch() {
+        // Same defense as `undo_g2_refuses_symlink_target`, but for files
+        // that did not exist before the doctor mutation. This branch verifies
+        // after_hash before quarantining the created file and must not follow
+        // attacker-controlled symlinks while doing that verification.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("created_by_doctor.txt");
+        let run_id = "2026-05-12T10-05-00Z__g2-created";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"doctor wrote this\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        std::fs::remove_file(&target).unwrap();
+        let sensitive = td.path().join("sensitive_secret.txt");
+        std::fs::write(&sensitive, b"doctor wrote this\n").unwrap();
+        std::os::unix::fs::symlink(&sensitive, &target).unwrap();
+
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink leaf should remain untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sensitive).unwrap(),
+            "doctor wrote this\n"
+        );
+    }
+
+    #[test]
+    fn undo_g2_refuses_dangling_symlink_for_created_file_quarantine_branch() {
+        // `Path::exists()` is false for dangling symlinks. The created-file
+        // branch must use symlink_metadata so it does not skip a hostile link.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("created_by_doctor.txt");
+        let run_id = "2026-05-12T13-10-00Z__g2-dangling";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"doctor wrote this\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(td.path().join("missing-target"), &target).unwrap();
+
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dangling symlink leaf should remain untouched"
+        );
+    }
+
+    #[test]
     fn pass5_g_crash_window_recovery() {
         // Pass-5 G-Crash-Window: simulate a crash mid-mutation by writing
         // ONLY the pending line (no completed line). Run undo: must
@@ -911,7 +1526,7 @@ mod tests {
         let run_id = "2026-05-10T07-00-00Z__crashwindow";
         let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
 
-        // Manually write the backup (as if mutate's step 4 had completed).
+        // Manually write the backup (as if mutate's step 5 had completed).
         let started_at_ns: u128 = 12_345_000_000;
         let backup_dir = run_dir
             .join("backups")
@@ -1045,6 +1660,124 @@ mod tests {
         let summary = run_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0");
+    }
+
+    #[test]
+    fn undo_preserves_distinct_actions_with_same_started_at_ns() {
+        let td = TempDir::new().unwrap();
+        let run_id = "2026-05-10T07-00-00Z__sameclock";
+        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+        let started_at_ns: u128 = 7_777_000_000;
+
+        let alpha = td.path().join("alpha.txt");
+        let beta = td.path().join("beta.txt");
+        std::fs::write(&alpha, b"alpha new\n").unwrap();
+        std::fs::write(&beta, b"beta new\n").unwrap();
+
+        let backup_dir = run_dir
+            .join("backups")
+            .join(format!("seq_{:026}", started_at_ns));
+        fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("alpha.txt"), b"alpha original\n").unwrap();
+        std::fs::write(backup_dir.join("beta.txt"), b"beta original\n").unwrap();
+
+        let action_pair = |path: &str, before: &[u8], after: &[u8]| {
+            let pending = serde_json::json!({
+                "path": path,
+                "op": "WriteFile",
+                "before_hash": sha256_hex(before),
+                "after_hash": "",
+                "started_at_ns": started_at_ns,
+                "finished_at_ns": 0,
+                "run_id": run_id,
+                "fixer_id": "test-fixer",
+                "ok": false,
+                "phase": "pending",
+                "before_mode": 0o644,
+            });
+            let completed = serde_json::json!({
+                "path": path,
+                "op": "WriteFile",
+                "before_hash": sha256_hex(before),
+                "after_hash": sha256_hex(after),
+                "started_at_ns": started_at_ns,
+                "finished_at_ns": started_at_ns + 1,
+                "run_id": run_id,
+                "fixer_id": "test-fixer",
+                "ok": true,
+                "phase": "completed",
+                "before_mode": 0o644,
+            });
+            [pending, completed]
+        };
+
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        for action in action_pair("alpha.txt", b"alpha original\n", b"alpha new\n")
+            .into_iter()
+            .chain(action_pair("beta.txt", b"beta original\n", b"beta new\n"))
+        {
+            f.write_all(serde_json::to_string(&action).unwrap().as_bytes())
+                .unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        drop(f);
+
+        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 2);
+        assert_eq!(std::fs::read_to_string(&alpha).unwrap(), "alpha original\n");
+        assert_eq!(std::fs::read_to_string(&beta).unwrap(), "beta original\n");
+    }
+
+    #[test]
+    fn undo_restores_absolute_path_backups_outside_repo_root() {
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, b"outside original\n").unwrap();
+
+        let run_id = "2026-05-10T07-00-00Z__absolute";
+        let run_dir = scaffold_run_dir(repo.path(), run_id).unwrap();
+        let actions = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        let ctx = MutateContext {
+            run_id: run_id.to_string(),
+            run_dir,
+            capabilities: Capabilities {
+                write_scopes: vec![outside.path().to_path_buf()],
+            },
+            actions_file: Mutex::new(actions),
+            fixer_id: "test-fixer".into(),
+            repo_root: repo.path().to_path_buf(),
+            dry_run: false,
+            start: Instant::now(),
+            extra_locks: Vec::new(),
+        };
+
+        mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"outside new\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside new\n");
+
+        let summary = run_undo(repo.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "outside original\n"
+        );
     }
 
     #[test]

@@ -23,9 +23,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::fs::{self, OpenOptions, Permissions};
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::{Read, Write};
+use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -177,7 +177,7 @@ pub enum MutateError {
     LockHeld(PathBuf),
     #[error("backup verify failed (cmp-strict) for {0}")]
     BackupVerify(PathBuf),
-    /// The live file's hash changed between step 2 (before_hash) and step 4
+    /// The live file's hash changed between step 4 (before_hash) and step 5
     /// (post-backup re-hash). Concurrent writer detected; refusing to
     /// proceed because our backup wouldn't faithfully represent the
     /// pre-mutation state. Maps to exit 5 (`concurrency_lost`).
@@ -189,6 +189,12 @@ pub enum MutateError {
     /// Maps to exit 4 (`refused_unsafe`).
     #[error("rename destination {0} already exists (would clobber per AGENTS.md RULE 1)")]
     RenameDestinationExists(PathBuf),
+    /// File-oriented ops intentionally refuse symlink leaves. Otherwise
+    /// `fs::copy`/hashing may follow the link while atomic writes replace the
+    /// link itself, leaving undo without a faithful backup of the original
+    /// filesystem object.
+    #[error("path {0} is a symlink; use Op::SymlinkAtomic or refuse the fixer")]
+    SymlinkRefused(PathBuf),
     /// The mutation execution failed. The backup was rolled back (or
     /// there was nothing to roll back to). `rolled_back` reflects the
     /// actual result. Maps to exit 3 (`fix_failed_rolled_back`) when
@@ -211,12 +217,38 @@ pub enum MutateError {
 
 /// Stream SHA-256 over the file's bytes without loading the entire file into
 /// memory. Returns the empty-file hash if the path doesn't exist.
-fn sha256_of_path(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    if !path.exists() {
-        return Ok(format!("sha256:{:x}", Sha256::digest(b"")));
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_path_bytes(path: &Path) -> String {
+    sha256_bytes(path.as_os_str().as_bytes())
+}
+
+fn sha256_for_path_before_op(path: &Path, op: &Op) -> std::io::Result<String> {
+    if matches!(op, Op::SymlinkAtomic { .. }) {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Ok(sha256_path_bytes(&fs::read_link(path)?));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(sha256_bytes(b""));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    let mut f = fs::File::open(path)?;
+    sha256_of_path(path)
+}
+
+fn sha256_of_path(path: &Path) -> std::io::Result<String> {
+    let mut f = match open_regular_file_no_follow(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(sha256_bytes(b""));
+        }
+        Err(e) => return Err(e),
+    };
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 65_536];
     loop {
@@ -229,12 +261,32 @@ fn sha256_of_path(path: &Path) -> std::io::Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
-fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
-    match fs::read(path) {
-        Ok(b) => Ok(b),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(e),
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_consts::O_NOFOLLOW)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
     }
+    Ok(f)
+}
+
+fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut f = match open_regular_file_no_follow(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Canonicalize `path` resolving symlinks, or fall back to canonicalizing
@@ -279,22 +331,64 @@ fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), MutateError> 
     Err(MutateError::OutOfScope(path.to_path_buf()))
 }
 
+fn reject_unexpected_symlink(path: &Path, op: &Op) -> Result<(), MutateError> {
+    if matches!(op, Op::SymlinkAtomic { .. }) {
+        return Ok(());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(MutateError::SymlinkRefused(path.to_path_buf()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(MutateError::Io(e)),
+    }
+}
+
 fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(src, dst)?;
-    let meta = fs::metadata(src)?;
-    fs::set_permissions(dst, Permissions::from_mode(meta.permissions().mode()))?;
+    let mut src_file = open_regular_file_no_follow(src)?;
+    let meta = src_file.metadata()?;
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(parent)?;
+    {
+        let mut dst_file = tmp.as_file();
+        std::io::copy(&mut src_file, &mut dst_file)?;
+        dst_file.sync_data()?;
+        dst_file.set_permissions(Permissions::from_mode(meta.permissions().mode()))?;
+    }
+    tmp.persist(dst).map_err(|e| e.error)?;
+    let _ = OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .and_then(|d| d.sync_all());
     Ok(())
+}
+
+fn copy_symlink_target(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let target = fs::read_link(src)?;
+    atomic_write_file(dst, target.as_os_str().as_bytes(), 0o600)
+}
+
+fn cmp_symlink_target(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let target = fs::read_link(src)?;
+    let backup = read_or_empty(dst)?;
+    if target.as_os_str().as_bytes() == backup {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "backup verify failed (symlink target mismatch)",
+        ))
+    }
 }
 
 /// Streaming comparison of two files. Reads 64 KiB at a time and aborts on
 /// the first divergence.
 fn cmp_strict(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::io::Read;
-    let mut fa = fs::File::open(a)?;
-    let mut fb = fs::File::open(b)?;
+    let mut fa = open_regular_file_no_follow(a)?;
+    let mut fb = open_regular_file_no_follow(b)?;
     let len_a = fa.metadata()?.len();
     let len_b = fb.metadata()?.len();
     if len_a != len_b {
@@ -381,9 +475,17 @@ pub(crate) fn backup_path_for(
 }
 
 /// Atomic symlink replacement: write tmp symlink in same dir, rename over.
-fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
+pub(crate) fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && !meta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("refusing to replace non-symlink path {}", path.display()),
+        ));
+    }
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -396,7 +498,13 @@ fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
     );
     let tmp_path = parent.join(&tmp_name);
     if fs::symlink_metadata(&tmp_path).is_ok() {
-        fs::remove_file(&tmp_path)?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace pre-existing temporary symlink path {}",
+                tmp_path.display()
+            ),
+        ));
     }
     std::os::unix::fs::symlink(target, &tmp_path)?;
     fs::rename(&tmp_path, path)?;
@@ -459,17 +567,18 @@ fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
 /// THE chokepoint. Every fixer-driven mutation flows through this.
 ///
 /// Steps in order:
-/// 1. Per-path advisory lock (`fs2::FileExt::try_lock_exclusive`).
-/// 2. Compute `before_hash`.
-/// 3. Validate preconditions (path in scope, rename destination in scope).
-/// 4. Write verbatim backup; verify with `cmp_strict`; verify
+/// 1. Validate preconditions (path in scope, rename destination in scope).
+/// 2. For dry-run, compute `before_hash` and return without write artifacts.
+/// 3. Per-path advisory lock (`fs2::FileExt::try_lock_exclusive`).
+/// 4. Compute `before_hash`.
+/// 5. Write verbatim backup; verify with `cmp_strict`; verify
 ///    `sha256(live) == before_hash` (TOCTOU defense; if mismatch, refuse).
-/// 5. Plan the mutation in memory.
-/// 6. Execute atomically (skipped on dry-run, after preconditions pass).
-/// 7. On exec failure: ATOMIC rollback from backup; record truthful
+/// 6. Plan the mutation in memory.
+/// 7. Execute atomically.
+/// 8. On exec failure: ATOMIC rollback from backup; record truthful
 ///    `rolled_back` value.
-/// 8. Compute `after_hash`.
-/// 9. Append to `actions.jsonl`; fsync; release lock.
+/// 9. Compute `after_hash`.
+/// 10. Append to `actions.jsonl`; fsync; release lock.
 ///
 /// Errors:
 /// - `Err(MutateError::ExecFailed(_))` if the mutation could not be
@@ -481,7 +590,31 @@ fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
 pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, MutateError> {
     let started_at_ns = elapsed_ns(ctx.start);
 
-    // 1. Per-path advisory lock. Lock file lives next to target, distinct name.
+    // 1. Preconditions: path in scope + Rename destination in scope. This
+    // must precede lock scaffolding so refused paths and dry-runs do not
+    // create out-of-scope parent directories or .doctor-lock files.
+    ensure_in_scope(&ctx.capabilities, path)?;
+    if let Op::Rename { to } = &op {
+        ensure_in_scope(&ctx.capabilities, to)?;
+    }
+    reject_unexpected_symlink(path, &op)?;
+
+    if ctx.dry_run {
+        let before_hash = sha256_for_path_before_op(path, &op)?;
+        eprintln!(
+            "[dry-run] would mutate {} via {}",
+            path.display(),
+            op.op_kind()
+        );
+        return Ok(ActionResult {
+            ok: true,
+            before_hash: before_hash.clone(),
+            after_hash: before_hash,
+            error: None,
+        });
+    }
+
+    // 3. Per-path advisory lock. Lock file lives next to target, distinct name.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let basename = path
@@ -509,19 +642,20 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         }
     };
 
-    // 2. before_hash + before_mode. Stream-hash the file rather than
+    // 4. before_hash + before_mode. Stream-hash the file rather than
     // reading entire contents into memory.
-    let before_hash = sha256_of_path(path)?;
-    let before_mode = fs::metadata(path).ok().map(|m| m.permissions().mode());
+    let before_hash = sha256_for_path_before_op(path, &op)?;
+    let before_mode = if matches!(op, Op::SymlinkAtomic { .. })
+        && matches!(
+            fs::symlink_metadata(path),
+            Ok(meta) if meta.file_type().is_symlink()
+        ) {
+        None
+    } else {
+        fs::metadata(path).ok().map(|m| m.permissions().mode())
+    };
 
-    // 3. Preconditions: path in scope + Rename destination in scope. These
-    // run before dry-run returns so dry-run cannot hide exit-4 refusals.
-    ensure_in_scope(&ctx.capabilities, path)?;
-    if let Op::Rename { to } = &op {
-        ensure_in_scope(&ctx.capabilities, to)?;
-    }
-
-    // 4. Verbatim backup (only if file exists). Also re-verifies that the
+    // 5. Verbatim backup (only if file exists). Also re-verifies that the
     // live file still hashes to before_hash after copying. If not, a
     // concurrent writer modified the file in our window and the backup would
     // not represent the true pre-mutation state.
@@ -531,33 +665,28 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // in actions.jsonl preserves the original path semantics for undo.
     let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
-    if !ctx.dry_run && path.exists() {
-        copy_verbatim_with_perms(path, &backup_path)?;
-        cmp_strict(path, &backup_path)
-            .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
-        // Re-hash the live file; if it changed since step 2, someone else
+    if !ctx.dry_run && fs::symlink_metadata(path).is_ok() {
+        if matches!(op, Op::SymlinkAtomic { .. })
+            && matches!(
+                fs::symlink_metadata(path),
+                Ok(meta) if meta.file_type().is_symlink()
+            )
+        {
+            copy_symlink_target(path, &backup_path)?;
+            cmp_symlink_target(path, &backup_path)
+                .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
+        } else {
+            copy_verbatim_with_perms(path, &backup_path)?;
+            cmp_strict(path, &backup_path)
+                .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
+        }
+        // Re-hash the live file; if it changed since step 4, someone else
         // is writing, so refuse to proceed.
-        let post_backup_hash = sha256_of_path(path)?;
+        let post_backup_hash = sha256_for_path_before_op(path, &op)?;
         if post_backup_hash != before_hash {
             let _ = FileExt::unlock(&lock_file);
             return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
         }
-    }
-
-    // Dry-run early return (after all preconditions have been checked).
-    if ctx.dry_run {
-        eprintln!(
-            "[dry-run] would mutate {} via {}",
-            path.display(),
-            op.op_kind()
-        );
-        let _ = FileExt::unlock(&lock_file);
-        return Ok(ActionResult {
-            ok: true,
-            before_hash: before_hash.clone(),
-            after_hash: before_hash,
-            error: None,
-        });
     }
 
     let mut rename_to_record: Option<String> = None;
@@ -571,7 +700,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             path: rel.to_string_lossy().into_owned(),
             op: op.op_kind().to_string(),
             before_hash: before_hash.clone(),
-            after_hash: String::new(), // unknown until step 8
+            after_hash: String::new(), // unknown until step 9
             started_at_ns,
             finished_at_ns: 0, // not yet finished
             run_id: ctx.run_id.clone(),
@@ -596,78 +725,88 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         f.sync_data()?;
     }
 
-    // 5/6. Execute atomically.
+    // 7. Execute atomically.
     let exec_result: Result<(), MutateError> = match op.clone() {
         Op::WriteFile { content, mode } => {
-            atomic_write_file(path, &content, mode)?;
-            after_mode = Some(mode);
-            Ok(())
+            match atomic_write_file(path, &content, mode).map_err(MutateError::Io) {
+                Ok(()) => {
+                    after_mode = Some(mode);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
-        Op::AppendFile { content } => {
-            append_file(path, &content)?;
-            Ok(())
-        }
+        Op::AppendFile { content } => append_file(path, &content).map_err(MutateError::Io),
         Op::Rename { to } => {
-            // Destination scope already checked at step 3.
-            if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            // Also acquire an advisory lock on the destination basename. The
-            // source lock protects `path`; the destination lock prevents two
-            // concurrent renames from racing toward the same target.
-            let to_basename = to
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "_root_".to_string());
-            let to_lock_path = to
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(format!(".{}.doctor-lock", to_basename));
-            let to_lock_file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&to_lock_path)?;
-            if to_lock_file.try_lock_exclusive().is_err() {
-                return Err(MutateError::LockHeld(to.clone()));
-            }
-            // Refuse if the destination already exists. POSIX `fs::rename`
-            // overwrites silently, which would destroy the existing file at
-            // `to`. Check after acquiring the destination lock so concurrent
-            // renames to the same target cannot race past it.
-            if fs::symlink_metadata(&to).is_ok() {
+            let result = (|| -> Result<(), MutateError> {
+                // Destination scope already checked at step 1.
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent).map_err(MutateError::Io)?;
+                }
+                // Also acquire an advisory lock on the destination basename.
+                // The source lock protects `path`; the destination lock
+                // prevents two concurrent renames from racing toward the same
+                // target.
+                let to_basename = to
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "_root_".to_string());
+                let to_lock_path = to
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(format!(".{}.doctor-lock", to_basename));
+                let to_lock_file = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&to_lock_path)
+                    .map_err(MutateError::Io)?;
+                if to_lock_file.try_lock_exclusive().is_err() {
+                    return Err(MutateError::LockHeld(to.clone()));
+                }
+                // Refuse if the destination already exists. POSIX
+                // `fs::rename` overwrites silently, which would destroy the
+                // existing file at `to`. Check after acquiring the destination
+                // lock so concurrent renames to the same target cannot race
+                // past it.
+                if fs::symlink_metadata(&to).is_ok() {
+                    let _ = FileExt::unlock(&to_lock_file);
+                    return Err(MutateError::RenameDestinationExists(to.clone()));
+                }
+                fs::rename(path, &to).map_err(MutateError::Io)?;
                 let _ = FileExt::unlock(&to_lock_file);
-                return Err(MutateError::RenameDestinationExists(to.clone()));
+                Ok(())
+            })();
+            if result.is_ok() {
+                rename_to_record = Some(to.to_string_lossy().into_owned());
             }
-            fs::rename(path, &to)?;
-            rename_to_record = Some(to.to_string_lossy().into_owned());
-            let _ = FileExt::unlock(&to_lock_file);
-            Ok(())
+            result
         }
-        Op::Chmod { mode } => {
-            // Chmod via fd opened with O_NOFOLLOW so a symlink-swap attacker
-            // cannot redirect to an out-of-scope file.
-            chmod_via_fd(path, mode)?;
-            after_mode = Some(mode);
-            Ok(())
-        }
+        // Chmod via fd opened with O_NOFOLLOW so a symlink-swap attacker
+        // cannot redirect to an out-of-scope file.
+        Op::Chmod { mode } => match chmod_via_fd(path, mode).map_err(MutateError::Io) {
+            Ok(()) => {
+                after_mode = Some(mode);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Op::DbExec { sql: _ } => Err(MutateError::Unsupported(
             "DbExec requires a DbConn handle wired by a higher layer",
         )),
         Op::DbMigrate { from: _, to: _ } => Err(MutateError::Unsupported(
             "DbMigrate requires a DbConn handle wired by a higher layer",
         )),
-        Op::SymlinkAtomic { target } => {
-            atomic_symlink(path, &target)?;
-            Ok(())
-        }
+        Op::SymlinkAtomic { target } => atomic_symlink(path, &target).map_err(MutateError::Io),
     };
 
-    // 7. On exec failure: attempt atomic rollback and record the actual
+    // 8. On exec failure: attempt atomic rollback and record the actual
     // `rolled_back` outcome.
     let rolled_back: Option<bool> = if exec_result.is_err() {
-        if backup_path.exists() && path.exists() {
+        if matches!(op, Op::SymlinkAtomic { .. }) {
+            None
+        } else if backup_path.exists() && path.exists() {
             let backup_bytes = read_or_empty(&backup_path)?;
             let restore_mode = before_mode.unwrap_or(0o644);
             match atomic_write_file(path, &backup_bytes, restore_mode) {
@@ -684,14 +823,19 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         None
     };
 
-    // 8. after_hash (read post-state via streaming hash).
-    // For Rename: hash the destination. Else: hash the original path.
+    // 9. after_hash. Prefer op-derived hashes when the successful mutation
+    // deterministically preserves or replaces bytes; fall back to reading the
+    // live path for append/failure cases.
     let after_hash = match &op {
-        Op::Rename { to } if exec_result.is_ok() => sha256_of_path(to)?,
+        Op::WriteFile { content, .. } if exec_result.is_ok() => sha256_bytes(content),
+        Op::Rename { .. } if exec_result.is_ok() => before_hash.clone(),
+        Op::Chmod { .. } if exec_result.is_ok() => before_hash.clone(),
+        Op::SymlinkAtomic { target } if exec_result.is_ok() => sha256_path_bytes(target),
+        Op::SymlinkAtomic { .. } => before_hash.clone(),
         _ => sha256_of_path(path)?,
     };
 
-    // 9. Append to actions.jsonl, fsync. The `rolled_back` field reflects
+    // 10. Append to actions.jsonl, fsync. The `rolled_back` field reflects
     // the actual rollback result, not an assumption.
     let ok = exec_result.is_ok();
     let error = exec_result.as_ref().err().map(|e| e.to_string());
@@ -727,6 +871,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 
     // Return Err on exec failure, not Ok with ok: false.
     if let Err(e) = exec_result {
+        if matches!(&e, MutateError::RenameDestinationExists(_)) {
+            return Err(e);
+        }
         return Err(MutateError::ExecFailed {
             path: path.to_path_buf(),
             op: op.op_kind(),
@@ -805,6 +952,163 @@ mod tests {
             .op_kind(),
             "SymlinkAtomic"
         );
+    }
+
+    #[test]
+    fn atomic_symlink_refuses_regular_destination_without_clobbering() {
+        let td = TempDir::new().unwrap();
+        let latest = td.path().join("latest");
+        fs::write(&latest, "operator data\n").unwrap();
+
+        let err = atomic_symlink(&latest, Path::new("runs/next"))
+            .expect_err("regular destination must be preserved");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&latest).unwrap(), "operator data\n");
+    }
+
+    #[test]
+    fn symlink_atomic_hashes_link_target_without_following_it() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_ctx(&td, "2026-05-12T12-00-00Z__symlink");
+        let latest = td.path().join("latest");
+        let target = PathBuf::from("runs/missing-future-run");
+
+        let result = mutate(
+            &ctx,
+            &latest,
+            Op::SymlinkAtomic {
+                target: target.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(fs::read_link(&latest).unwrap(), target);
+        assert_eq!(result.after_hash, sha256_path_bytes(&target));
+
+        let actions = fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = actions
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "symlink mutation must be completed");
+        assert_eq!(lines[1]["phase"], "completed");
+        assert_eq!(lines[1]["ok"], true);
+        assert_eq!(lines[1]["after_hash"], sha256_path_bytes(&target));
+    }
+
+    #[test]
+    fn write_file_refuses_symlink_leaf_without_clobbering() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_ctx(&td, "2026-05-12T14-00-00Z__write-symlink");
+        let real = td.path().join("real-config.json");
+        let link = td.path().join("config.json");
+        fs::write(&real, "{\"version\":1}\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = mutate(
+            &ctx,
+            &link,
+            Op::WriteFile {
+                content: b"{\"version\":2}\n".to_vec(),
+                mode: 0o600,
+            },
+        )
+        .expect_err("WriteFile must not replace a symlink leaf");
+
+        assert!(matches!(err, MutateError::SymlinkRefused(p) if p == link));
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+        assert_eq!(fs::read_to_string(&link).unwrap(), "{\"version\":1}\n");
+        assert_eq!(
+            fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap(),
+            "",
+            "refusal must happen before pending action logging"
+        );
+    }
+
+    #[test]
+    fn append_file_refuses_symlink_leaf_without_rollback_clobbering() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_ctx(&td, "2026-05-12T14-01-00Z__append-symlink");
+        let real = td.path().join("real.log");
+        let link = td.path().join("log.txt");
+        fs::write(&real, "base\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = mutate(
+            &ctx,
+            &link,
+            Op::AppendFile {
+                content: b"doctor\n".to_vec(),
+            },
+        )
+        .expect_err("AppendFile must not enter rollback on a symlink leaf");
+
+        assert!(matches!(err, MutateError::SymlinkRefused(p) if p == link));
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+        assert_eq!(fs::read_to_string(&real).unwrap(), "base\n");
+        assert_eq!(
+            fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap(),
+            "",
+            "refusal must happen before backup or action logging"
+        );
+    }
+
+    #[test]
+    fn write_file_refuses_dangling_symlink_leaf_without_clobbering() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_ctx(&td, "2026-05-12T14-02-00Z__dangling-symlink");
+        let missing_target = td.path().join("missing-target");
+        let link = td.path().join("config.json");
+        std::os::unix::fs::symlink(&missing_target, &link).unwrap();
+
+        let err = mutate(
+            &ctx,
+            &link,
+            Op::WriteFile {
+                content: b"replacement\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .expect_err("dangling symlink leaves must still be refused");
+
+        assert!(matches!(err, MutateError::SymlinkRefused(p) if p == link));
+        assert_eq!(fs::read_link(&link).unwrap(), missing_target);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn regular_file_helpers_refuse_symlink_leafs_without_following() {
+        let td = TempDir::new().unwrap();
+        let sensitive = td.path().join("sensitive.txt");
+        let link = td.path().join("config.json");
+        let backup = td.path().join("backup.json");
+        fs::write(&sensitive, "secret\n").unwrap();
+        std::os::unix::fs::symlink(&sensitive, &link).unwrap();
+
+        assert!(
+            sha256_of_path(&link).is_err(),
+            "hashing regular-file content must not follow a symlink leaf"
+        );
+        assert!(
+            read_or_empty(&link).is_err(),
+            "backup reads must not follow a symlink leaf"
+        );
+        assert!(
+            copy_verbatim_with_perms(&link, &backup).is_err(),
+            "backup copy must not follow a symlink leaf"
+        );
+        assert!(
+            fs::symlink_metadata(&backup).is_err(),
+            "failed symlink backup must not create an artifact"
+        );
+        assert_eq!(fs::read_to_string(&sensitive).unwrap(), "secret\n");
     }
 
     #[test]
@@ -985,6 +1289,37 @@ mod tests {
         .unwrap();
         assert!(r.ok);
         assert!(!target.exists(), "dry-run must not write");
+        assert!(
+            !td.path().join(".hello.txt.doctor-lock").exists(),
+            "dry-run must not create advisory lock files"
+        );
+    }
+
+    #[test]
+    fn dry_run_does_not_create_missing_parent_or_lock() {
+        let td = TempDir::new().unwrap();
+        let mut ctx = make_ctx(&td, "2026-05-09T16-30-15Z__dry");
+        ctx.dry_run = true;
+        let parent = td.path().join("nested");
+        let target = parent.join("hello.txt");
+        let r = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"x".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        assert!(r.ok);
+        assert!(
+            !parent.exists(),
+            "dry-run must not create missing parent directories"
+        );
+        assert!(
+            !parent.join(".hello.txt.doctor-lock").exists(),
+            "dry-run must not create advisory lock files"
+        );
     }
 
     #[test]
@@ -1002,6 +1337,40 @@ mod tests {
             },
         );
         assert!(matches!(r, Err(MutateError::OutOfScope(_))));
+    }
+
+    #[test]
+    fn out_of_scope_write_refuses_before_lock_artifacts() {
+        let scope = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let ctx = make_ctx(&scope, "2026-05-09T16-30-15Z__scope");
+        let out_of_scope_parent = outside.path().join("nested");
+        let target = out_of_scope_parent.join("target.txt");
+        let lock_path = out_of_scope_parent.join(".target.txt.doctor-lock");
+
+        let r = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"x".to_vec(),
+                mode: 0o644,
+            },
+        );
+
+        assert!(matches!(r, Err(MutateError::OutOfScope(_))));
+        assert!(
+            !out_of_scope_parent.exists(),
+            "out-of-scope refusal must not create parent directories"
+        );
+        assert!(
+            !lock_path.exists(),
+            "out-of-scope refusal must not create advisory lock files"
+        );
+        let actions = fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap();
+        assert!(
+            actions.is_empty(),
+            "refused out-of-scope mutations must not append action records"
+        );
     }
 
     #[test]
@@ -1039,7 +1408,8 @@ mod tests {
     fn db_exec_returns_err_unsupported_in_this_module() {
         // Wired by the dispatch layer; the chokepoint itself doesn't have a DbConn.
         let td = TempDir::new().unwrap();
-        let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__abc");
+        let run_id = "2026-05-09T16-30-15Z__dbexec";
+        let ctx = make_ctx(&td, run_id);
         let target = td.path().join("anything.txt");
         let err = mutate(
             &ctx,
@@ -1055,6 +1425,28 @@ mod tests {
             }
             other => panic!("expected ExecFailed, got: {other:?}"),
         }
+        let actions = fs::read_to_string(
+            td.path()
+                .join(".doctor")
+                .join("runs")
+                .join(run_id)
+                .join("actions.jsonl"),
+        )
+        .unwrap();
+        let lines: Vec<serde_json::Value> = actions
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "failed exec must still be completed");
+        assert_eq!(lines[0]["phase"], "pending");
+        assert_eq!(lines[1]["phase"], "completed");
+        assert_eq!(lines[1]["ok"], false);
+        assert!(
+            lines[1]["error"]
+                .as_str()
+                .expect("error string")
+                .contains("DbConn")
+        );
     }
 
     #[test]
@@ -1106,6 +1498,27 @@ mod tests {
             std::fs::read_to_string(&dst).unwrap(),
             "important destination data",
             "destination file must be preserved per AGENTS.md RULE 1"
+        );
+        let actions = fs::read_to_string(
+            td.path()
+                .join(".doctor")
+                .join("runs")
+                .join("2026-05-09T16-30-15Z__g3")
+                .join("actions.jsonl"),
+        )
+        .unwrap();
+        let lines: Vec<serde_json::Value> = actions
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "refused rename must not leave only pending");
+        assert_eq!(lines[1]["phase"], "completed");
+        assert_eq!(lines[1]["ok"], false);
+        assert!(
+            lines[1]["error"]
+                .as_str()
+                .expect("error string")
+                .contains("already exists")
         );
     }
 
