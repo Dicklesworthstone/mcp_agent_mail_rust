@@ -461,13 +461,8 @@ impl DbMetrics {
     pub fn snapshot(&self) -> DbMetricsSnapshot {
         let pool_total_connections = self.pool_total_connections.load();
         let pool_active_connections = self.pool_active_connections.load();
-        let pool_utilization_pct = if pool_total_connections == 0 {
-            0
-        } else {
-            pool_active_connections
-                .saturating_mul(100)
-                .saturating_div(pool_total_connections)
-        };
+        let pool_utilization_pct =
+            percentage_clamped(pool_active_connections, pool_total_connections);
 
         DbMetricsSnapshot {
             pool_acquires_total: self.pool_acquires_total.load(),
@@ -483,6 +478,16 @@ impl DbMetrics {
             integrity_failures_total: self.integrity_failures_total.load(),
         }
     }
+}
+
+#[inline]
+pub(crate) fn percentage_clamped(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+
+    let pct = (u128::from(value) * 100).saturating_div(u128::from(total));
+    u64::try_from(pct.min(100)).unwrap_or(100)
 }
 
 #[derive(Debug)]
@@ -2158,6 +2163,21 @@ mod tests {
         // total_connections = 0 → no division by zero
         let snap = m.snapshot();
         assert_eq!(snap.pool_utilization_pct, 0);
+    }
+
+    #[test]
+    fn db_metrics_snapshot_utilization_handles_large_values() {
+        let m = DbMetrics::default();
+
+        m.pool_total_connections.set(u64::MAX);
+        m.pool_active_connections.set(u64::MAX);
+        let snap = m.snapshot();
+        assert_eq!(snap.pool_utilization_pct, 100);
+
+        m.pool_total_connections.set(1);
+        m.pool_active_connections.set(u64::MAX);
+        let snap = m.snapshot();
+        assert_eq!(snap.pool_utilization_pct, 100);
     }
 
     // ── SystemMetrics snapshot ────────────────────────────────────────

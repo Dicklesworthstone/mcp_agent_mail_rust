@@ -305,9 +305,18 @@ const fn ratio_score(good: u64, total: u64) -> Option<u8> {
     if total == 0 {
         return None;
     }
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_lossless,
+        clippy::cast_possible_truncation,
+        reason = "const fn cannot use From/TryFrom; the score is clamped before narrowing"
+    )]
     {
-        Some(((good.saturating_mul(100) + total / 2) / total) as u8)
+        let score = (((good as u128) * 100) + ((total / 2) as u128)) / (total as u128);
+        if score > 100 {
+            Some(100)
+        } else {
+            Some(score as u8)
+        }
     }
 }
 
@@ -411,6 +420,14 @@ mod tests {
         assert!(recency_score(10 * DAY_MICROS) < recency_score(7 * DAY_MICROS));
         assert!(recency_score(20 * DAY_MICROS) < recency_score(10 * DAY_MICROS));
         assert!(recency_score(40 * DAY_MICROS) < recency_score(20 * DAY_MICROS));
+    }
+
+    #[test]
+    fn ratio_score_clamps_and_handles_large_values() {
+        assert_eq!(ratio_score(0, 0), None);
+        assert_eq!(ratio_score(1, 3), Some(33));
+        assert_eq!(ratio_score(u64::MAX, u64::MAX), Some(100));
+        assert_eq!(ratio_score(u64::MAX, 1), Some(100));
     }
 
     #[test]

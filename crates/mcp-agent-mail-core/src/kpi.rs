@@ -19,8 +19,8 @@
 //! | `tool_latency_p95_ms` | `snapshot.tool_latency_us.p95 / 1000` | ms |
 //! | `tool_latency_p99_ms` | `snapshot.tool_latency_us.p99 / 1000` | ms |
 //! | `pool_acquire_p95_ms` | `snapshot.db.pool_acquire_latency_us.p95 / 1000` | ms |
-//! | `pool_utilization_pct` | `active_conns × 100 / total_conns` | % |
-//! | `wbq_utilization_pct` | `wbq_depth × 100 / wbq_capacity` | % |
+//! | `pool_utilization_pct` | `min(100, active_conns × 100 / total_conns)` | % |
+//! | `wbq_utilization_pct` | `min(100, wbq_depth × 100 / wbq_capacity)` | % |
 //! | `ack_pending` | last recorded pending ack gauge | count |
 //! | `ack_overdue` | last recorded overdue ack gauge | count |
 //! | `reservation_active` | last recorded active reservation gauge | count |
@@ -36,7 +36,9 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::metrics::{GlobalMetricsSnapshot, HistogramSnapshot, global_metrics};
+use crate::metrics::{
+    GlobalMetricsSnapshot, HistogramSnapshot, global_metrics, percentage_clamped,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -476,15 +478,7 @@ fn compute_kpi(window: KpiWindow, old: &Sample, new: &Sample) -> KpiSnapshot {
 
     // -- Contention --
     let wbq_cap = m_new.storage.wbq_capacity;
-    let wbq_utilization_pct = if wbq_cap == 0 {
-        0
-    } else {
-        m_new
-            .storage
-            .wbq_depth
-            .saturating_mul(100)
-            .saturating_div(wbq_cap)
-    };
+    let wbq_utilization_pct = percentage_clamped(m_new.storage.wbq_depth, wbq_cap);
 
     let reservation_conflicts_in_window = new
         .reservation_conflicts_total
@@ -2057,6 +2051,42 @@ mod tests {
 
         let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
         assert_eq!(kpi.contention.wbq_utilization_pct, 0);
+    }
+
+    #[test]
+    fn wbq_utilization_clamps_and_handles_large_values() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let mut metrics = make_snapshot(0, 0, 0, 0, 0, 0);
+        metrics.storage.wbq_capacity = u64::MAX;
+        metrics.storage.wbq_depth = u64::MAX;
+
+        let old = Sample {
+            taken_at: t0,
+            metrics: make_snapshot(0, 0, 0, 0, 0, 0),
+            ack_pending: 0,
+            ack_overdue: 0,
+            reservation_active: 0,
+            reservation_conflicts_total: 0,
+            messages_sent_total: 0,
+        };
+        let mut new = Sample {
+            taken_at: t1,
+            metrics,
+            ack_pending: 0,
+            ack_overdue: 0,
+            reservation_active: 0,
+            reservation_conflicts_total: 0,
+            messages_sent_total: 0,
+        };
+
+        let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
+        assert_eq!(kpi.contention.wbq_utilization_pct, 100);
+
+        new.metrics.storage.wbq_capacity = 1;
+        new.metrics.storage.wbq_depth = u64::MAX;
+        let kpi = compute_kpi(KpiWindow::OneMin, &old, &new);
+        assert_eq!(kpi.contention.wbq_utilization_pct, 100);
     }
 
     #[test]
