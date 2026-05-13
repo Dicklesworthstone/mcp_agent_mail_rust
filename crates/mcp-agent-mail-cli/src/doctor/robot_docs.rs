@@ -12,9 +12,9 @@
 
 /// The full paste-ready handbook. Includes:
 /// - One-paragraph orientation
-/// - The 10 verb table
+/// - The 14-verb table (legacy + pass-14..26 additions)
 /// - The 11-code exit table
-/// - The 5 most common workflows
+/// - 7 most common workflows (5 original + per-FM verbs + list-all)
 /// - Pointers to capabilities + JSON shapes
 /// - The two AGENTS.md absolutes that affect doctor behavior
 pub fn handbook() -> &'static str {
@@ -37,25 +37,31 @@ mutation is **backed up first**, **hash-witnessed**, and **reversible via
 `am doctor undo <run-id>`**. The doctor never deletes user files; it
 quarantines via rename.
 
-## The 10 Verbs
+## The 14 Verbs
 
 | Verb | Purpose | Mutates? | Default exit |
 |------|---------|----------|--------------|
 | `am doctor` (or `check`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
 | `am doctor --fix` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
 | `am doctor --dry-run --fix` | Print the fix plan; do not execute. | No | 0 |
+| `am doctor fix --only <fm-id>` | Run a single registered FM through the chokepoint. | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
+| `am doctor fix --only <fm-id> --list` | Detect a single FM only — no chokepoint. | No | 0 |
+| `am doctor fix --list` | Detect every registered FM in one round-trip. | No | 0 |
 | `am doctor undo <run-id>` | Restore from `.doctor/runs/<run-id>/backups/`. | Yes (restore-only) | 0 / 3 |
-| `am doctor capabilities --json` | Print machine-readable contract. | No | 0 |
+| `am doctor capabilities --json` | Print machine-readable contract (detectors, fixers, fm_fixers, exit codes, env vars). | No | 0 |
+| `am doctor fixers` | List all per-FM detector+fixer pairs in the registry. | No | 0 |
+| `am doctor explain <id>` | Drill into one finding (latest run) or one registered FM (registry fallback). | No | 0 / 64 |
 | `am doctor robot-docs` | This handbook. | No | 0 |
 | `am doctor health` | One-line liveness summary. For CI. | No | 0 / 1 |
 | `am doctor ls` | List `.doctor/runs/` entries. | No | 0 |
-| `am doctor diff [<ref>]` | Show what `--fix` would change. Read-only. | No | 0 |
-| `am doctor gc --before <date> --yes` | Prune old run dirs. Requires both flags. | Yes (deletion) | 0 |
+| `am doctor triage` | Mega-command: status + findings + plan + capabilities URL in one envelope. | No | 0 |
+| `am doctor selftest` | Exercise mutate() primitives end-to-end in a tempdir. | No | 0 / 1 |
 
-Plus existing verbs preserved for backward compat: `repair`, `backups`,
-`restore`, `reconstruct`, `archive-scan`, `archive-verify`,
-`archive-normalize`, `fix`,
-`fix-orphan-refs`, `pack-archive`.
+Legacy verbs preserved (use the typed forms above for new work):
+`repair`, `backups`, `restore`, `reconstruct`, `archive-scan`,
+`archive-verify`, `archive-normalize`, `fix` (without `--only`,
+runs the legacy multi-detector flow), `fix-orphan-refs`,
+`pack-archive`.
 
 ## Exit codes
 
@@ -116,9 +122,47 @@ Use as a pre-commit gate; fail if exit 1.
 
 ```bash
 am doctor --json | jq -r '.findings[0].id'           # get a finding id
-am doctor --explain <finding-id>                      # see evidence
-am doctor --fix --only <finding-id>                   # apply just that fix
+am doctor explain <finding-id>                        # see evidence
+am doctor fix --only <fm-id> --yes                   # apply just that fix
 ```
+
+`am doctor explain` falls back to the registry when no recent
+run includes the id, so `am doctor explain <fm-id>` works cold —
+useful for understanding what an FM does before invoking it.
+
+### 6. Per-FM surface (recommended for agents)
+
+```bash
+am doctor fixers --format json | jq '.fixers[].id'   # enumerate registered FMs
+am doctor fix --list --json                           # detect across every FM
+am doctor fix --only <fm-id> --list --json            # preview one FM's findings
+am doctor fix --only <fm-id> --dry-run                # rehearse through chokepoint
+am doctor fix --only <fm-id> --yes                    # apply that one FM's fix
+am doctor undo latest                                 # rollback if needed
+```
+
+The per-FM verbs route every mutation through the `mutate()`
+chokepoint: verbatim backups in `<run-dir>/backups/seq_<ns>/`,
+hash-witnessed actions in `actions.jsonl`, reversible via undo.
+The legacy `am doctor fix` (without `--only`) runs the older
+multi-detector flow; prefer the per-FM verbs when targeting
+specific failure modes.
+
+### 7. One-shot system survey
+
+```bash
+am doctor fix --list --json | jq '{
+  total: .total_findings,
+  by_severity: (.per_fm | group_by(.severity) | map({(.[0].severity): map(.findings_count) | add}) | add),
+  per_fm: (.per_fm | map(select(.findings_count > 0)) | map({fm_id, findings_count, actions_planned})),
+  skipped: .skipped
+}'
+```
+
+Single round-trip: every registered FM's detector runs, findings
+aggregate, FMs missing required inputs (e.g., git not on PATH for
+known-bad-git, or `:memory:` DB URL for storage-db chmod) are
+surfaced in `skipped[]` with the missing field name.
 
 ## Per-run artifacts
 
