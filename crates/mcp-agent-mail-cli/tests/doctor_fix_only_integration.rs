@@ -507,6 +507,100 @@ fn list_all_iterates_registry_and_aggregates_findings() {
     );
 }
 
+/// Empty `DispatchInputs` that won't satisfy any FM's optional
+/// required-input checks. Useful for reachability tests that only
+/// care whether the dispatcher recognizes the id, not whether the
+/// underlying detector finds anything.
+fn empty_inputs(td: &tempfile::TempDir) -> DispatchInputs {
+    DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: None,
+        db_file_candidates: Vec::new(),
+        stale_seconds_override: None,
+    }
+}
+
+#[test]
+fn dispatch_only_handles_every_registered_id() {
+    // Pass-26 invariant: for every FM in fixers::registry(),
+    // `dispatch_only` must recognize the id — i.e. return either
+    // Ok(...) or Err(MissingInput {...}). Returning Err(UnknownFm)
+    // means the registry entry was added without a matching
+    // dispatcher arm, which would silently break `am doctor fix
+    // --only <fm-id>` at runtime.
+    //
+    // This is the only test that catches a "registry-only" FM
+    // (registered but not dispatched). Every FM landing in pass-N+1
+    // is required to round-trip through this assertion.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let inputs = empty_inputs(&td);
+    for spec in fixers::registry() {
+        let run_id = format!("2026-05-13T00-00-00Z__reach_{}", spec.id);
+        let ctx = build_ctx(&td, &run_id, spec.id);
+        let result = fixers::dispatch_only(spec.id, &ctx, &inputs);
+        match result {
+            Ok(_) => {}
+            Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+                // MissingInput is fine — it proves the dispatcher
+                // recognized the id and reached the input-gate. The
+                // field name must be non-empty (pinned by the type
+                // signature, but assert here so a future change
+                // that uses an empty &'static str fails loudly).
+                assert!(
+                    !field.is_empty(),
+                    "MissingInput must name its required field for {fm_id}"
+                );
+            }
+            Err(fixers::DispatchError::UnknownFm(id)) => panic!(
+                "dispatch_only returned UnknownFm({id}) for registered FM `{}` — \
+                 registry entry exists but dispatch_only arm is missing",
+                spec.id
+            ),
+            Err(other) => panic!(
+                "unexpected dispatch_only error for registered FM `{}`: {other:?}",
+                spec.id
+            ),
+        }
+    }
+}
+
+#[test]
+fn detect_only_handles_every_registered_id() {
+    // Pass-26 mirror invariant: detect_only must also have an arm
+    // for every registered FM. detect_only doesn't take a
+    // MutateContext (it never invokes the chokepoint), so the
+    // assertion is simpler than dispatch_only.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let inputs = empty_inputs(&td);
+    for spec in fixers::registry() {
+        let result = fixers::detect_only(spec.id, &inputs);
+        match result {
+            Ok(_) => {}
+            Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+                assert!(
+                    !field.is_empty(),
+                    "MissingInput must name its required field for {fm_id}"
+                );
+            }
+            Err(fixers::DispatchError::UnknownFm(id)) => panic!(
+                "detect_only returned UnknownFm({id}) for registered FM `{}` — \
+                 registry entry exists but detect_only arm is missing",
+                spec.id
+            ),
+            Err(other) => panic!(
+                "unexpected detect_only error for registered FM `{}`: {other:?}",
+                spec.id
+            ),
+        }
+    }
+}
+
 #[test]
 fn detect_only_unknown_fm_id_returns_error() {
     let inputs = DispatchInputs {
