@@ -23,6 +23,7 @@ pub mod missing_gitignore_entry;
 pub mod stale_archive_lock;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
+pub mod world_readable_storage_db;
 pub mod world_readable_token_bak;
 pub mod wrong_mcp_url_json;
 
@@ -149,6 +150,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_head_or_ref_lock",
         },
         FixerSpec {
+            id: world_readable_storage_db::FM_ID,
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "Op::Chmod",
+            auto_fixable: true,
+            one_line_description: "storage.sqlite3 has world/group-readable mode (leaks all message bodies)",
+            source_module: "doctor::fixers::world_readable_storage_db",
+        },
+        FixerSpec {
             id: known_bad_git_no_override::FM_ID,
             severity: "P0",
             subsystem: "environment_toolchain",
@@ -217,6 +227,12 @@ pub struct DispatchInputs {
     /// `missing_gitignore_entry` FM. `None` skips the FM. Typically
     /// `<repo_root>/.gitignore`.
     pub gitignore_target: Option<std::path::PathBuf>,
+    /// Candidate SQLite database file paths for the
+    /// `world_readable_storage_db` FM. Typically just
+    /// `<storage_root>/storage.sqlite3` (or whatever
+    /// `DbPoolConfig::database_url` resolves to). Empty slice
+    /// skips the FM.
+    pub db_file_candidates: Vec<std::path::PathBuf>,
     /// Optional override for the per-FM mtime-based staleness threshold.
     ///
     /// `None` (the production default) means each stale-* FM uses its
@@ -341,6 +357,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == world_readable_storage_db::FM_ID {
+        let findings = world_readable_storage_db::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = world_readable_storage_db::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == wrong_mcp_url_json::FM_ID {
         let canonical = inputs
             .canonical_mcp_url
@@ -450,6 +475,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == world_readable_storage_db::FM_ID {
+        world_readable_storage_db::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == wrong_mcp_url_json::FM_ID {
         let canonical = inputs
             .canonical_mcp_url
@@ -487,6 +517,92 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
     Ok(outcome)
 }
 
+/// Successful per-FM entry in the all-fixer detect-only report.
+#[derive(Debug, Serialize)]
+pub struct DetectAllFmOutcome {
+    pub fm_id: String,
+    pub severity: &'static str,
+    pub subsystem: &'static str,
+    pub op_pattern: &'static str,
+    pub findings_count: usize,
+    pub actions_planned: usize,
+    pub findings: Vec<Finding>,
+}
+
+/// Per-FM detector skipped because the caller could not supply an
+/// input required by that detector.
+#[derive(Debug, Serialize)]
+pub struct DetectAllSkipped {
+    pub fm_id: String,
+    pub severity: &'static str,
+    pub subsystem: &'static str,
+    pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_field: Option<&'static str>,
+}
+
+/// Aggregated detect-only report for every registered FM-level fixer.
+#[derive(Debug, Serialize)]
+pub struct DetectAllOutcome {
+    pub fm_count: usize,
+    pub total_findings: usize,
+    pub total_actions_planned: usize,
+    pub per_fm: Vec<DetectAllFmOutcome>,
+    pub skipped: Vec<DetectAllSkipped>,
+}
+
+/// Run every registered FM detector and aggregate the agent-facing
+/// `am doctor fix --list` report without invoking any fixer.
+pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchError> {
+    let specs = registry();
+    let mut outcome = DetectAllOutcome {
+        fm_count: specs.len(),
+        total_findings: 0,
+        total_actions_planned: 0,
+        per_fm: Vec::with_capacity(specs.len()),
+        skipped: Vec::new(),
+    };
+
+    for spec in &specs {
+        match detect_only(spec.id, inputs) {
+            Ok(detected) => {
+                outcome.total_findings += detected.findings_count;
+                outcome.total_actions_planned += detected.actions_planned;
+                outcome.per_fm.push(DetectAllFmOutcome {
+                    fm_id: spec.id.to_string(),
+                    severity: spec.severity,
+                    subsystem: spec.subsystem,
+                    op_pattern: spec.op_pattern,
+                    findings_count: detected.findings_count,
+                    actions_planned: detected.actions_planned,
+                    findings: detected.findings,
+                });
+            }
+            Err(DispatchError::MissingInput { fm_id, field }) => {
+                outcome.skipped.push(DetectAllSkipped {
+                    fm_id: fm_id.to_string(),
+                    severity: spec.severity,
+                    subsystem: spec.subsystem,
+                    reason: "missing_input",
+                    missing_field: Some(field),
+                });
+            }
+            Err(DispatchError::UnknownFm(id)) => {
+                outcome.skipped.push(DetectAllSkipped {
+                    fm_id: id,
+                    severity: spec.severity,
+                    subsystem: spec.subsystem,
+                    reason: "internal_dispatcher_did_not_recognize_registry_id",
+                    missing_field: None,
+                });
+            }
+            Err(DispatchError::Mutate(me)) => return Err(DispatchError::Mutate(me)),
+        }
+    }
+
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,7 +625,7 @@ mod tests {
     fn registry_is_non_empty_and_alphabetically_sorted() {
         // Pass-14: every FM-level fixer must register a FixerSpec.
         let r = registry();
-        assert!(r.len() >= 7, "registry has fewer fixers than expected");
+        assert!(r.len() >= 8, "registry has fewer fixers than expected");
         // Alphabetical sort by id helps `am doctor fixers` produce
         // stable output (operators rely on this for diffing).
         let ids: Vec<&str> = r.iter().map(|s| s.id).collect();

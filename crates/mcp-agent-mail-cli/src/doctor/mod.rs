@@ -412,6 +412,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
+        db_file_candidates: default_db_file_candidates(),
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
     };
@@ -557,6 +558,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
+        db_file_candidates: default_db_file_candidates(),
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
     };
@@ -638,55 +640,27 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         canonical_mcp_url: Some(canonical_mcp_url),
         git_detect: build_git_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
+        db_file_candidates: default_db_file_candidates(),
         stale_seconds_override: None,
     };
 
-    let specs = fixers::registry();
-    let mut per_fm: Vec<serde_json::Value> = Vec::with_capacity(specs.len());
-    let mut total_findings = 0usize;
-    let mut total_actions_planned = 0usize;
-    let mut skipped: Vec<serde_json::Value> = Vec::new();
-
-    for spec in &specs {
-        match fixers::detect_only(spec.id, &inputs) {
-            Ok(outcome) => {
-                total_findings += outcome.findings_count;
-                total_actions_planned += outcome.actions_planned;
-                per_fm.push(serde_json::json!({
-                    "fm_id": spec.id,
-                    "severity": spec.severity,
-                    "subsystem": spec.subsystem,
-                    "op_pattern": spec.op_pattern,
-                    "findings_count": outcome.findings_count,
-                    "actions_planned": outcome.actions_planned,
-                    "findings": outcome.findings,
-                }));
-            }
-            Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
-                skipped.push(serde_json::json!({
-                    "fm_id": fm_id,
-                    "severity": spec.severity,
-                    "subsystem": spec.subsystem,
-                    "reason": "missing_input",
-                    "missing_field": field,
-                }));
-            }
-            Err(fixers::DispatchError::UnknownFm(id)) => {
-                // Impossible — we iterated the registry — but surface
-                // it as a structured warning rather than panic.
-                skipped.push(serde_json::json!({
-                    "fm_id": id,
-                    "reason": "internal_dispatcher_did_not_recognize_registry_id",
-                }));
-            }
-            Err(fixers::DispatchError::Mutate(me)) => {
-                // detect_only doesn't call mutate(). Treat as
-                // internal invariant violation.
-                eprintln!("error: internal — detect_only surfaced a MutateError: {me}");
-                return Err(CliError::ExitCode(1));
-            }
+    let outcome = match fixers::detect_all(&inputs) {
+        Ok(o) => o,
+        Err(fixers::DispatchError::Mutate(me)) => {
+            // detect_all only calls detect_only(), so this is an
+            // internal invariant violation rather than user input.
+            eprintln!("error: internal — detect_all surfaced a MutateError: {me}");
+            return Err(CliError::ExitCode(1));
         }
-    }
+        Err(fixers::DispatchError::UnknownFm(id)) => {
+            eprintln!("error: internal — registry id was not recognized: {id}");
+            return Err(CliError::ExitCode(1));
+        }
+        Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+            eprintln!("error: internal — unaggregated missing input `{field}` for FM `{fm_id}`");
+            return Err(CliError::ExitCode(1));
+        }
+    };
 
     let envelope = serde_json::json!({
         "schema_version": "1.0",
@@ -696,11 +670,11 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         "tool_version": env!("CARGO_PKG_VERSION"),
         "mode": "list_all",
         "duration_ms": started_at.elapsed().as_millis() as u64,
-        "fm_count": specs.len(),
-        "total_findings": total_findings,
-        "total_actions_planned": total_actions_planned,
-        "per_fm": per_fm,
-        "skipped": skipped,
+        "fm_count": outcome.fm_count,
+        "total_findings": outcome.total_findings,
+        "total_actions_planned": outcome.total_actions_planned,
+        "per_fm": outcome.per_fm,
+        "skipped": outcome.skipped,
     });
 
     println!(
@@ -806,6 +780,44 @@ fn token_backup_candidates(storage_root: &Path, home: Option<&Path>) -> Vec<Path
         }
     }
     out
+}
+
+/// Resolve the canonical SQLite DB file path from
+/// `DbPoolConfig::from_env().database_url`. Returns an empty list for
+/// `:memory:` URLs or anything we can't parse as a filesystem path.
+///
+/// Accepts `sqlite:///abs/path/db.sqlite3`,
+/// `sqlite:///./relative/db.sqlite3`,
+/// `sqlite+aiosqlite:///./path` (legacy Python alias),
+/// and bare absolute paths.
+fn default_db_file_candidates() -> Vec<PathBuf> {
+    let url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    if url == ":memory:" || url.ends_with("/:memory:") {
+        return Vec::new();
+    }
+    // Strip the scheme: `sqlite:///`, `sqlite+aiosqlite:///`, etc.
+    let path_str = if let Some(rest) = url.strip_prefix("sqlite+aiosqlite:///") {
+        rest.to_string()
+    } else if let Some(rest) = url.strip_prefix("sqlite:///") {
+        rest.to_string()
+    } else if let Some(rest) = url.strip_prefix("sqlite://") {
+        // Unusual shape but tolerate.
+        rest.to_string()
+    } else {
+        url.clone()
+    };
+    if path_str.is_empty() {
+        return Vec::new();
+    }
+    let path = PathBuf::from(path_str);
+    if path.exists() {
+        vec![path]
+    } else {
+        // Not a real file (may be `:memory:` in disguise, or the DB
+        // hasn't been created yet). Skip rather than emit a spurious
+        // candidate.
+        Vec::new()
+    }
 }
 
 fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {

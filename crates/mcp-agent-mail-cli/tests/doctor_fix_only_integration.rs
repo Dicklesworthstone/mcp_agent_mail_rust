@@ -68,6 +68,7 @@ fn dispatch_only_stale_archive_lock_quarantines_via_mutate() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
 
@@ -120,6 +121,7 @@ fn dispatch_only_unknown_fm_id_returns_error() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
     let result = fixers::dispatch_only("fm-not-a-real-fixer-id-xxx", &ctx, &inputs);
@@ -142,6 +144,7 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
 
@@ -222,6 +225,7 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
 
@@ -241,6 +245,57 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
     assert_eq!(
         archive_outcome.findings_count, 0,
         "no .git/index.lock planted → archive-lock returns 0"
+    );
+}
+
+#[test]
+fn dispatch_only_world_readable_storage_db_chmods_via_chokepoint() {
+    // Pass-25: 8th FM end-to-end. Plant a world-readable
+    // `storage.sqlite3`, route through dispatch_only, assert
+    // chmod-to-0o600 and chokepoint records the action.
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let db = td.path().join("storage.sqlite3");
+    fs::write(&db, b"sqlite header").expect("plant db");
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).expect("0o644");
+
+    let run_id = "2026-05-13T00-00-00Z__storage_db";
+    let fm_id = fixers::world_readable_storage_db::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: None,
+        db_file_candidates: vec![db.clone()],
+        stale_seconds_override: None,
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(outcome.fm_id, fm_id);
+    assert_eq!(outcome.findings_count, 1);
+    assert_eq!(outcome.actions_taken, 1);
+
+    let mode = fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "DB mode must be 0o600 post-fix");
+
+    drop(ctx);
+    let actions_path = td
+        .path()
+        .join(".doctor")
+        .join("runs")
+        .join(run_id)
+        .join("actions.jsonl");
+    let actions = fs::read_to_string(&actions_path).expect("read actions.jsonl");
+    assert!(
+        actions.contains("Chmod"),
+        "actions.jsonl must record a Chmod op"
     );
 }
 
@@ -279,6 +334,7 @@ fn dispatch_only_unrelated_fm_does_not_touch_gitignore() {
         // Even with gitignore_target populated, dispatch for an
         // unrelated FM must NOT invoke the gitignore detector.
         gitignore_target: Some(gi.clone()),
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
 
@@ -318,6 +374,7 @@ fn dispatch_only_missing_gitignore_appends_via_chokepoint() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: Some(gi.clone()),
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
 
@@ -361,6 +418,7 @@ fn dispatch_only_missing_gitignore_requires_target_path() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
     let err = fixers::dispatch_only(fm_id, &ctx, &inputs)
@@ -376,11 +434,11 @@ fn dispatch_only_missing_gitignore_requires_target_path() {
 
 #[test]
 fn list_all_iterates_registry_and_aggregates_findings() {
-    // Pass-24: handle_fix_list_all calls detect_only for every
-    // registered FM and aggregates into one envelope. Here we
-    // exercise the equivalent lower-level loop directly (the
-    // handler is hard to drive in a hermetic test because it
-    // resolves cwd / config / storage_root via env). We assert:
+    // Pass-24: handle_fix_list_all calls fixers::detect_all to run
+    // detect_only for every registered FM and aggregate one envelope.
+    // We exercise that shared aggregation directly (the handler is
+    // hard to drive in a hermetic test because it resolves cwd /
+    // config / storage_root via env). We assert:
     //   - every registered FM is exercised
     //   - findings aggregate without crashing
     //   - MissingInput is structurally surfaceable
@@ -403,39 +461,49 @@ fn list_all_iterates_registry_and_aggregates_findings() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: Some(gi),
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
 
+    let outcome = fixers::detect_all(&inputs).expect("detect_all");
     let mut seen_fm_ids: BTreeSet<String> = BTreeSet::new();
-    let mut total_findings = 0usize;
-    let mut missing_input_count = 0usize;
-    for spec in fixers::registry() {
-        match fixers::detect_only(spec.id, &inputs) {
-            Ok(outcome) => {
-                seen_fm_ids.insert(outcome.fm_id);
-                total_findings += outcome.findings_count;
-            }
-            Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
-                seen_fm_ids.insert(fm_id.to_string());
-                missing_input_count += 1;
-                assert!(!field.is_empty(), "MissingInput must name the field");
-            }
-            Err(other) => panic!("unexpected dispatch error for {}: {:?}", spec.id, other),
+    for entry in &outcome.per_fm {
+        seen_fm_ids.insert(entry.fm_id.clone());
+    }
+    for skipped in &outcome.skipped {
+        seen_fm_ids.insert(skipped.fm_id.clone());
+        if skipped.reason == "missing_input" {
+            assert!(
+                skipped.missing_field.is_some_and(|field| !field.is_empty()),
+                "MissingInput must name the field"
+            );
         }
     }
     // Coverage: every registry id was attempted.
+    assert_eq!(outcome.fm_count, fixers::registry().len());
     assert_eq!(seen_fm_ids.len(), fixers::registry().len());
+    assert_eq!(
+        outcome.per_fm.len() + outcome.skipped.len(),
+        outcome.fm_count
+    );
     // We planted real failures for at least the stale-archive-lock
     // and missing-gitignore-entry FMs, so findings > 0.
     assert!(
-        total_findings >= 2,
-        "expected ≥2 findings (stale lock + gitignore), got {total_findings}"
+        outcome.total_findings >= 2,
+        "expected ≥2 findings (stale lock + gitignore), got {}",
+        outcome.total_findings
     );
     // And we deliberately left git_detect=None + canonical_mcp_url=None,
     // so the known-bad-git and wrong-mcp-url FMs report MissingInput.
     assert!(
-        missing_input_count >= 2,
-        "expected ≥2 MissingInput surfacings, got {missing_input_count}"
+        outcome
+            .skipped
+            .iter()
+            .filter(|entry| entry.reason == "missing_input")
+            .count()
+            >= 2,
+        "expected ≥2 MissingInput surfacings, got {}",
+        outcome.skipped.len()
     );
 }
 
@@ -450,6 +518,7 @@ fn detect_only_unknown_fm_id_returns_error() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
     let err =
@@ -474,6 +543,7 @@ fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
         canonical_mcp_url: None,
         git_detect: None,
         gitignore_target: None,
+        db_file_candidates: Vec::new(),
         stale_seconds_override: None,
     };
     let err = fixers::dispatch_only(fixers::wrong_mcp_url_json::FM_ID, &ctx, &inputs)
