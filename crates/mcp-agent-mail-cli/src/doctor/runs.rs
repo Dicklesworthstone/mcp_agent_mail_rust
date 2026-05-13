@@ -185,7 +185,24 @@ fn run_report_markdown(run_id: &str, report: &serde_json::Value) -> String {
 }
 
 fn run_undo_script(run_id: &str) -> String {
-    format!("#!/bin/sh\nset -eu\nam doctor undo {run_id} \"$@\"\n")
+    format!(
+        "#!/bin/sh\nset -eu\nam doctor undo {} \"$@\"\n",
+        shell_single_quote(run_id)
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Atomically replace `<doctor_root>/latest` -> `runs/<run_id>` symlink.
@@ -407,7 +424,14 @@ mod tests {
         assert_eq!(parsed["run_id"], run_id);
         assert!(run_dir.join("report.md").is_file());
         let undo = fs::read_to_string(run_dir.join("undo.sh")).unwrap();
-        assert!(undo.contains("am doctor undo 2026-05-09T16-30-15Z__abc123"));
+        assert!(undo.contains("am doctor undo '2026-05-09T16-30-15Z__abc123'"));
+    }
+
+    #[test]
+    fn run_undo_script_shell_quotes_run_id() {
+        let script = run_undo_script("bad'id; touch nope");
+
+        assert!(script.contains("am doctor undo 'bad'\\''id; touch nope' \"$@\""));
     }
 
     #[test]
