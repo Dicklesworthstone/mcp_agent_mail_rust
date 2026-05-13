@@ -82,6 +82,7 @@ fn status_envelope() -> RobotEnvelope<StatusData> {
             reservation_forecast: None,
             recovery: None,
             search_index: None,
+            forensic_timeline: None,
         },
     )
     .with_alert(

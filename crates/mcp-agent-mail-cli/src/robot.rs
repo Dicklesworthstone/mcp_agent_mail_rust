@@ -813,6 +813,8 @@ pub struct StatusData {
     pub recovery: Option<RecoveryStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_index: Option<LexicalBackfillHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forensic_timeline: Option<crate::ForensicTimelineReport>,
 }
 
 /// Recovery state surfaced in `robot status` when the mailbox is degraded or recovering.
@@ -1906,6 +1908,206 @@ struct AtcData {
     privacy: Option<AtcPrivacyReportData>,
 }
 
+// ── Stale handoff command data model ────────────────────────────────────────
+
+const ROBOT_HANDOFF_DEFAULT_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct HandoffSummary {
+    total_in_progress: usize,
+    shown: usize,
+    keep: usize,
+    ask_owner: usize,
+    takeover_candidates: usize,
+    reopen_candidates: usize,
+    blocked_by_reservation: usize,
+    needs_human_review: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffData {
+    mode: String,
+    read_only: bool,
+    dry_run: bool,
+    explicit_dry_run: bool,
+    project_root: String,
+    beads_jsonl: String,
+    stale_after_minutes: u32,
+    active_after_minutes: u32,
+    fresh_comment_minutes: u32,
+    summary: HandoffSummary,
+    records: Vec<HandoffRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffRecord {
+    id: String,
+    title: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    updated_age_seconds: Option<i64>,
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inferred_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_state: Option<HandoffOwnerState>,
+    recent_comments: Vec<HandoffCommentView>,
+    active_reservations: Vec<HandoffReservationView>,
+    mail: HandoffMailState,
+    action: String,
+    reason_codes: Vec<String>,
+    rationale: String,
+    safe_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffOwnerState {
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: Option<String>,
+    last_active_age_seconds: Option<i64>,
+    last_active: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffCommentView {
+    author: String,
+    created_at: String,
+    age_seconds: Option<i64>,
+    text_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HandoffReservationView {
+    agent: String,
+    path: String,
+    exclusive: bool,
+    reason: String,
+    created_age_seconds: Option<i64>,
+    remaining_seconds: i64,
+    remaining: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct HandoffMailState {
+    thread_id: String,
+    messages: usize,
+    ack_required_pending: usize,
+    unread: usize,
+    latest_message_at: Option<String>,
+    latest_message_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BeadsIssueJson {
+    id: String,
+    title: String,
+    status: String,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    comments: Vec<BeadsCommentJson>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BeadsCommentJson {
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HandoffAgentInfo {
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct HandoffReservationInfo {
+    id: i64,
+    agent: String,
+    path: String,
+    exclusive: bool,
+    reason: String,
+    created_ts: Option<i64>,
+    expires_ts: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HandoffClassificationInput {
+    stale: bool,
+    owner_present: bool,
+    owner_active: bool,
+    has_active_reservation: bool,
+    has_fresh_comment: bool,
+    has_ack_required_mail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandoffClassification {
+    action: &'static str,
+    reason_codes: Vec<&'static str>,
+}
+
+fn classify_handoff(input: &HandoffClassificationInput) -> HandoffClassification {
+    if !input.stale {
+        return HandoffClassification {
+            action: "keep",
+            reason_codes: vec!["fresh_bead_update"],
+        };
+    }
+    if input.has_active_reservation {
+        return HandoffClassification {
+            action: "blocked_by_reservation",
+            reason_codes: vec!["active_file_reservation"],
+        };
+    }
+    if input.has_ack_required_mail {
+        return HandoffClassification {
+            action: "ask_owner",
+            reason_codes: vec!["ack_required_mail"],
+        };
+    }
+    if input.owner_active {
+        return HandoffClassification {
+            action: "keep",
+            reason_codes: vec!["owner_active"],
+        };
+    }
+    if input.has_fresh_comment {
+        return HandoffClassification {
+            action: "keep",
+            reason_codes: vec!["fresh_comment"],
+        };
+    }
+    if input.owner_present {
+        return HandoffClassification {
+            action: "takeover_candidate",
+            reason_codes: vec!["owner_inactive"],
+        };
+    }
+    HandoffClassification {
+        action: "reopen_candidate",
+        reason_codes: vec!["no_owner"],
+    }
+}
+
 // ── Robot subcommand scaffold ────────────────────────────────────────────────
 
 /// Shared arguments for all `am robot` subcommands.
@@ -2088,6 +2290,28 @@ pub enum RobotSubcommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Stale bead ownership handoff dashboard with dry-run reopen recommendations.
+    Handoff {
+        /// Consider in-progress beads stale after this many minutes without updates.
+        #[arg(long, default_value_t = 12 * 60)]
+        stale_minutes: u32,
+        /// Consider registered agents active when seen within this many minutes.
+        #[arg(long, default_value_t = 30)]
+        active_minutes: u32,
+        /// Treat comments within this many minutes as recent work.
+        #[arg(long, default_value_t = 24 * 60)]
+        fresh_comment_minutes: u32,
+        /// Include non-stale/keep records instead of only actionable handoffs.
+        #[arg(long)]
+        include_fresh: bool,
+        /// Maximum records to return.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Explicitly request dry-run output. The command is always read-only.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 impl RobotSubcommand {
@@ -2124,6 +2348,7 @@ impl RobotSubcommand {
             Self::Projects => "robot projects",
             Self::Attachments => "robot attachments",
             Self::Atc { .. } => "robot atc",
+            Self::Handoff { .. } => "robot handoff",
         }
     }
 }
@@ -4233,6 +4458,14 @@ fn build_status_with_phase(
         "degraded".to_string()
     };
 
+    let config = mcp_agent_mail_core::Config::get();
+    let forensic_timeline = crate::build_forensic_timeline_report(
+        &config.database_url,
+        &config.storage_root,
+        &health,
+        &[],
+    );
+
     let data = StatusData {
         health,
         unread,
@@ -4250,6 +4483,7 @@ fn build_status_with_phase(
         reservation_forecast,
         recovery,
         search_index: None,
+        forensic_timeline: Some(forensic_timeline),
     };
 
     Ok((data, actions))
@@ -4394,6 +4628,14 @@ fn build_recovery_only_status(
         playbooks: vec![],
     }];
     let health = status_health_from_recovery(Some(&recovery), &anomalies);
+    let config = mcp_agent_mail_core::Config::get();
+    let forensic_timeline = crate::build_forensic_timeline_report(
+        &config.database_url,
+        &config.storage_root,
+        &health,
+        &[],
+    );
+
     let data = StatusData {
         health,
         unread: 0,
@@ -4411,6 +4653,7 @@ fn build_recovery_only_status(
         reservation_forecast: None,
         recovery: Some(recovery),
         search_index: None,
+        forensic_timeline: Some(forensic_timeline),
     };
 
     Some((data, actions, project_slug, agent_name))
@@ -6778,6 +7021,643 @@ fn build_reservations_with_snapshot_cache(
 /// Check whether two reservation path patterns can overlap.
 fn glob_matches(pattern: &str, path: &str) -> bool {
     mcp_agent_mail_core::pattern_overlap::patterns_overlap(pattern, path)
+}
+
+fn clean_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::borrow::ToOwned::to_owned)
+}
+
+fn parse_handoff_timestamp_micros(value: Option<&str>) -> Option<i64> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(mcp_agent_mail_db::iso_to_micros)
+}
+
+fn find_beads_issues_jsonl(start: &Path) -> Option<PathBuf> {
+    let base = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    for candidate in base.ancestors() {
+        let issues = candidate.join(".beads").join("issues.jsonl");
+        if issues.is_file() {
+            return Some(issues);
+        }
+    }
+    None
+}
+
+fn resolve_handoff_project_root(project_human_key: Option<String>) -> Result<PathBuf, CliError> {
+    let Some(project_human_key) = project_human_key else {
+        return Err(CliError::Other(
+            "handoff requires a persisted project human_key; run `am robot handoff --project /abs/path` for the target beads workspace".to_string(),
+        ));
+    };
+    let project_root = PathBuf::from(&project_human_key);
+    if !project_root.is_absolute() {
+        return Err(CliError::InvalidArgument(format!(
+            "handoff project human_key must be absolute: {project_human_key}"
+        )));
+    }
+    if project_root.is_dir() {
+        Ok(project_root)
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "handoff project human_key is not an existing directory: {project_human_key}"
+        )))
+    }
+}
+
+fn decode_beads_issue_line(line: &str) -> Result<Option<BeadsIssueJson>, CliError> {
+    let raw: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| CliError::Other(format!("parse .beads/issues.jsonl failed: {error}")))?;
+    let Some(id) = clean_optional_string(raw.get("id").and_then(serde_json::Value::as_str)) else {
+        return Ok(None);
+    };
+    let title = clean_optional_string(raw.get("title").and_then(serde_json::Value::as_str))
+        .unwrap_or_else(|| id.clone());
+    let status = clean_optional_string(raw.get("status").and_then(serde_json::Value::as_str))
+        .unwrap_or_default();
+    let updated_at =
+        clean_optional_string(raw.get("updated_at").and_then(serde_json::Value::as_str));
+    let assignee = clean_optional_string(raw.get("assignee").and_then(serde_json::Value::as_str));
+    let owner = clean_optional_string(raw.get("owner").and_then(serde_json::Value::as_str));
+    let comments = raw
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .map(|comments| {
+            comments
+                .iter()
+                .map(|comment| BeadsCommentJson {
+                    author: clean_optional_string(
+                        comment.get("author").and_then(serde_json::Value::as_str),
+                    ),
+                    text: clean_optional_string(
+                        comment.get("text").and_then(serde_json::Value::as_str),
+                    ),
+                    created_at: clean_optional_string(
+                        comment
+                            .get("created_at")
+                            .and_then(serde_json::Value::as_str),
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(BeadsIssueJson {
+        id,
+        title,
+        status,
+        updated_at,
+        assignee,
+        owner,
+        comments,
+    }))
+}
+
+fn read_in_progress_beads(path: &Path) -> Result<Vec<BeadsIssueJson>, CliError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| CliError::Other(format!("read {} failed: {error}", path.display())))?;
+    let mut issues = Vec::new();
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(issue) = decode_beads_issue_line(line)?
+            && issue.status == "in_progress"
+        {
+            issues.push(issue);
+        }
+    }
+    issues.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(issues)
+}
+
+fn latest_handoff_comment(comments: &[BeadsCommentJson]) -> Option<&BeadsCommentJson> {
+    comments
+        .iter()
+        .filter(|comment| comment.author.is_some() || comment.created_at.is_some())
+        .max_by(|left, right| {
+            let left_ts = parse_handoff_timestamp_micros(left.created_at.as_deref()).unwrap_or(0);
+            let right_ts = parse_handoff_timestamp_micros(right.created_at.as_deref()).unwrap_or(0);
+            left_ts
+                .cmp(&right_ts)
+                .then_with(|| left.author.cmp(&right.author))
+        })
+}
+
+fn recent_handoff_comments(comments: &[BeadsCommentJson], now_us: i64) -> Vec<HandoffCommentView> {
+    let mut comments = comments.to_vec();
+    comments.sort_by(|left, right| {
+        let left_ts = parse_handoff_timestamp_micros(left.created_at.as_deref()).unwrap_or(0);
+        let right_ts = parse_handoff_timestamp_micros(right.created_at.as_deref()).unwrap_or(0);
+        right_ts
+            .cmp(&left_ts)
+            .then_with(|| right.author.cmp(&left.author))
+    });
+    comments
+        .into_iter()
+        .take(3)
+        .map(|comment| {
+            let created_at = comment.created_at.unwrap_or_else(|| "unknown".to_string());
+            let age_seconds = parse_handoff_timestamp_micros(Some(&created_at))
+                .map(|created_ts| age_seconds_from_micros(now_us, created_ts));
+            let text_preview = truncate_str(
+                &comment.text.unwrap_or_default().replace(['\r', '\n'], " "),
+                160,
+            );
+            HandoffCommentView {
+                author: comment.author.unwrap_or_else(|| "unknown".to_string()),
+                created_at,
+                age_seconds,
+                text_preview,
+            }
+        })
+        .collect()
+}
+
+fn fetch_handoff_agents(
+    conn: &DbConn,
+    project_id: i64,
+) -> Result<HashMap<String, HandoffAgentInfo>, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT name, program, model, last_active_ts
+             FROM agents
+             WHERE project_id = ?
+             ORDER BY last_active_ts DESC, id DESC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|error| CliError::Other(format!("handoff agents query failed: {error}")))?;
+    let mut agents = HashMap::new();
+    for row in &rows {
+        let name: String = row.get_as(0).unwrap_or_default();
+        if name.trim().is_empty() {
+            continue;
+        }
+        let key = name.to_ascii_lowercase();
+        agents.entry(key).or_insert_with(|| {
+            let last_active_ts = row
+                .get_as::<sqlmodel_core::Value>(3)
+                .ok()
+                .and_then(|value| value_to_micros(&value));
+            HandoffAgentInfo {
+                name,
+                program: row.get_as(1).unwrap_or_default(),
+                model: row.get_as(2).unwrap_or_default(),
+                last_active_ts,
+            }
+        });
+    }
+    Ok(agents)
+}
+
+fn fetch_handoff_active_reservations(
+    conn: &DbConn,
+    project_id: i64,
+    now_us: i64,
+) -> Result<Vec<HandoffReservationInfo>, CliError> {
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT fr.id,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.path_pattern, fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts
+                 FROM file_reservations fr{active_reservation_join}
+                 LEFT JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                 ORDER BY fr.expires_ts ASC, fr.id ASC"
+            ),
+            &[Value::BigInt(project_id), Value::BigInt(now_us)],
+        )
+        .map_err(|error| {
+            CliError::Other(format!("handoff reservations query failed: {error}"))
+        })?;
+
+    let mut reservations = Vec::new();
+    for row in &rows {
+        let agent: String = row.get_as(1).unwrap_or_default();
+        if agent.trim().is_empty() {
+            continue;
+        }
+        let created_ts = row
+            .get_as::<sqlmodel_core::Value>(5)
+            .ok()
+            .and_then(|value| value_to_micros(&value));
+        let expires_ts = row
+            .get_as::<sqlmodel_core::Value>(6)
+            .ok()
+            .and_then(|value| value_to_micros(&value))
+            .unwrap_or(0);
+        reservations.push(HandoffReservationInfo {
+            id: row.get_as(0).unwrap_or_default(),
+            agent,
+            path: row.get_as(2).unwrap_or_default(),
+            exclusive: row.get_as::<i64>(3).unwrap_or(1) != 0,
+            reason: row.get_as(4).unwrap_or_default(),
+            created_ts,
+            expires_ts,
+        });
+    }
+    Ok(reservations)
+}
+
+fn reservation_reason_mentions_issue(reason: &str, issue_id: &str) -> bool {
+    let issue_id = issue_id.trim();
+    if issue_id.is_empty() {
+        return false;
+    }
+    reason
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        .any(|token| token.eq_ignore_ascii_case(issue_id))
+}
+
+fn handoff_reservations_for_issue(
+    reservations: &[HandoffReservationInfo],
+    owner_key: Option<&str>,
+    issue_id: &str,
+) -> Vec<HandoffReservationInfo> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut matched = Vec::new();
+    for reservation in reservations {
+        let matches_owner =
+            owner_key.is_some_and(|key| reservation.agent.eq_ignore_ascii_case(key));
+        let matches_reason = reservation_reason_mentions_issue(&reservation.reason, issue_id);
+        if (matches_owner || matches_reason) && seen.insert(reservation.id) {
+            matched.push(reservation.clone());
+        }
+    }
+    matched
+}
+
+fn fetch_handoff_mail_state(
+    conn: &DbConn,
+    project_id: i64,
+    thread_id: &str,
+    now_us: i64,
+) -> Result<HandoffMailState, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(DISTINCT m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 1 ELSE 0 END), 0) AS ack_pending,
+                    COALESCE(SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread_count,
+                    COALESCE(MAX(m.created_ts), 0) AS latest_ts
+             FROM messages m
+             LEFT JOIN message_recipients mr ON mr.message_id = m.id
+             WHERE m.project_id = ? AND m.thread_id = ?",
+            &[Value::BigInt(project_id), Value::Text(thread_id.to_string())],
+        )
+        .map_err(|error| CliError::Other(format!("handoff mail query failed: {error}")))?;
+    let Some(row) = rows.first() else {
+        return Ok(HandoffMailState {
+            thread_id: thread_id.to_string(),
+            ..HandoffMailState::default()
+        });
+    };
+    let latest_ts = row.get_named::<i64>("latest_ts").unwrap_or(0);
+    Ok(HandoffMailState {
+        thread_id: thread_id.to_string(),
+        messages: row.get_named::<i64>("message_count").unwrap_or(0).max(0) as usize,
+        ack_required_pending: row.get_named::<i64>("ack_pending").unwrap_or(0).max(0) as usize,
+        unread: row.get_named::<i64>("unread_count").unwrap_or(0).max(0) as usize,
+        latest_message_at: (latest_ts > 0).then(|| mcp_agent_mail_db::micros_to_iso(latest_ts)),
+        latest_message_age_seconds: (latest_ts > 0)
+            .then(|| age_seconds_from_micros(now_us, latest_ts)),
+    })
+}
+
+fn handoff_owner_state(
+    agent: Option<&HandoffAgentInfo>,
+    now_us: i64,
+    active_cutoff_us: i64,
+) -> Option<HandoffOwnerState> {
+    let agent = agent?;
+    let status = match agent.last_active_ts {
+        Some(ts) if ts >= active_cutoff_us => "active",
+        Some(_) => "inactive",
+        None => "unknown",
+    }
+    .to_string();
+    Some(HandoffOwnerState {
+        name: agent.name.clone(),
+        program: agent.program.clone(),
+        model: agent.model.clone(),
+        last_active_ts: agent.last_active_ts.map(mcp_agent_mail_db::micros_to_iso),
+        last_active_age_seconds: agent
+            .last_active_ts
+            .map(|ts| age_seconds_from_micros(now_us, ts)),
+        last_active: agent
+            .last_active_ts
+            .map(|ts| format_age(age_seconds_from_micros(now_us, ts)))
+            .unwrap_or_else(|| "unknown".to_string()),
+        status,
+    })
+}
+
+fn handoff_reservation_views(
+    reservations: &[HandoffReservationInfo],
+    now_us: i64,
+) -> Vec<HandoffReservationView> {
+    reservations
+        .iter()
+        .map(|reservation| {
+            let remaining_seconds = remaining_seconds_from_micros(now_us, reservation.expires_ts);
+            HandoffReservationView {
+                agent: reservation.agent.clone(),
+                path: reservation.path.clone(),
+                exclusive: reservation.exclusive,
+                reason: reservation.reason.clone(),
+                created_age_seconds: reservation
+                    .created_ts
+                    .map(|ts| age_seconds_from_micros(now_us, ts)),
+                remaining_seconds,
+                remaining: format_remaining(remaining_seconds),
+            }
+        })
+        .collect()
+}
+
+fn handoff_action_rank(action: &str) -> u8 {
+    match action {
+        "blocked_by_reservation" => 0,
+        "ask_owner" => 1,
+        "takeover_candidate" => 2,
+        "reopen_candidate" => 3,
+        "needs_human_review" => 4,
+        "keep" => 5,
+        _ => 6,
+    }
+}
+
+fn handoff_safe_command(
+    action: &str,
+    project_slug: &str,
+    bead_root: &Path,
+    issue_id: &str,
+    owner: Option<&str>,
+) -> String {
+    let issue_arg = robot_shell_arg(issue_id);
+    let project_arg = robot_shell_arg(project_slug);
+    let bead_root_arg = robot_shell_arg(&bead_root.display().to_string());
+    let br_command = |command: String| format!("cd {bead_root_arg} && {command}");
+    match action {
+        "blocked_by_reservation" => owner.map_or_else(
+            || format!("am robot reservations --project {project_arg} --all --format json"),
+            |owner| {
+                format!(
+                    "am robot reservations --project {project_arg} --agent {} --all --format json",
+                    robot_shell_arg(owner)
+                )
+            },
+        ),
+        "ask_owner" => {
+            format!("am robot thread {issue_arg} --project {project_arg} --format json")
+        }
+        "takeover_candidate" | "reopen_candidate" => {
+            let command = if action == "takeover_candidate" {
+                format!("br update {issue_arg} --claim --json")
+            } else {
+                format!("br update {issue_arg} --status open --json")
+            };
+            br_command(command)
+        }
+        "keep" => br_command(format!("br show {issue_arg} --json")),
+        _ => format!("am robot handoff --project {project_arg} --include-fresh --format json"),
+    }
+}
+
+fn handoff_rationale(
+    action: &str,
+    owner: Option<&str>,
+    updated_age_seconds: Option<i64>,
+    reservation_count: usize,
+    mail: &HandoffMailState,
+) -> String {
+    let age = updated_age_seconds
+        .map(format_age)
+        .unwrap_or_else(|| "unknown age".to_string());
+    match action {
+        "blocked_by_reservation" => format!(
+            "Bead is stale ({age}), but {reservation_count} active reservation(s) still exist; coordinate before reopening."
+        ),
+        "ask_owner" => format!(
+            "Bead is stale ({age}) and has {} pending ack-required recipient row(s) in its mail thread; inspect or ask the owner first.",
+            mail.ack_required_pending
+        ),
+        "takeover_candidate" => format!(
+            "Bead is stale ({age}) and owner `{}` is not active by the configured threshold; inspect peer work before claiming it.",
+            owner.unwrap_or("unknown")
+        ),
+        "reopen_candidate" => {
+            format!(
+                "Bead is stale ({age}) and no owner could be inferred from assignee, owner, or comments."
+            )
+        }
+        "keep" => {
+            format!("Bead is not a safe handoff candidate under the configured thresholds ({age}).")
+        }
+        _ => "Bead needs manual review before any ownership change.".to_string(),
+    }
+}
+
+fn summarize_handoff_records(
+    total_in_progress: usize,
+    records: &[HandoffRecord],
+) -> HandoffSummary {
+    let mut summary = HandoffSummary {
+        total_in_progress,
+        shown: records.len(),
+        ..HandoffSummary::default()
+    };
+    for record in records {
+        match record.action.as_str() {
+            "keep" => summary.keep += 1,
+            "ask_owner" => summary.ask_owner += 1,
+            "takeover_candidate" => summary.takeover_candidates += 1,
+            "reopen_candidate" => summary.reopen_candidates += 1,
+            "blocked_by_reservation" => summary.blocked_by_reservation += 1,
+            "needs_human_review" => summary.needs_human_review += 1,
+            _ => summary.needs_human_review += 1,
+        }
+    }
+    summary
+}
+
+fn build_handoff(
+    scope: &ResolvedRobotProjectScope,
+    stale_minutes: u32,
+    active_minutes: u32,
+    fresh_comment_minutes: u32,
+    include_fresh: bool,
+    limit: Option<usize>,
+    explicit_dry_run: bool,
+) -> Result<(HandoffData, Vec<String>), CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let stale_cutoff_us = micros_ago(now_us, i64::from(stale_minutes) * MICROS_PER_MINUTE);
+    let active_cutoff_us = micros_ago(now_us, i64::from(active_minutes) * MICROS_PER_MINUTE);
+    let fresh_comment_cutoff_us =
+        micros_ago(now_us, i64::from(fresh_comment_minutes) * MICROS_PER_MINUTE);
+
+    let project_root =
+        resolve_handoff_project_root(project_human_key_sync(scope.conn(), scope.project_id)?)?;
+    let beads_jsonl = find_beads_issues_jsonl(&project_root).ok_or_else(|| {
+        CliError::InvalidArgument(format!(
+            "no .beads/issues.jsonl found at or above {}",
+            project_root.display()
+        ))
+    })?;
+    let bead_root = beads_jsonl
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(project_root.as_path())
+        .to_path_buf();
+    let issues = read_in_progress_beads(&beads_jsonl)?;
+    let total_in_progress = issues.len();
+    let agents = fetch_handoff_agents(scope.conn(), scope.project_id)?;
+    let active_reservations_all =
+        fetch_handoff_active_reservations(scope.conn(), scope.project_id, now_us)?;
+
+    let mut records = Vec::new();
+    for issue in issues {
+        let updated_ts = parse_handoff_timestamp_micros(issue.updated_at.as_deref());
+        let updated_age_seconds = updated_ts.map(|ts| age_seconds_from_micros(now_us, ts));
+        let stale = updated_ts.is_none_or(|ts| ts <= stale_cutoff_us);
+        let latest_comment = latest_handoff_comment(&issue.comments);
+        let latest_comment_ts = latest_comment
+            .and_then(|comment| parse_handoff_timestamp_micros(comment.created_at.as_deref()));
+        let has_fresh_comment = latest_comment_ts.is_some_and(|ts| ts >= fresh_comment_cutoff_us);
+        let inferred_owner = issue
+            .assignee
+            .clone()
+            .or_else(|| issue.owner.clone())
+            .or_else(|| latest_comment.and_then(|comment| comment.author.clone()));
+        let owner_key = inferred_owner
+            .as_ref()
+            .map(|owner| owner.to_ascii_lowercase());
+        let owner_agent = owner_key.as_ref().and_then(|key| agents.get(key));
+        let owner_state = handoff_owner_state(owner_agent, now_us, active_cutoff_us);
+        let owner_active = owner_state
+            .as_ref()
+            .is_some_and(|state| state.status == "active");
+        let owner_reservations = handoff_reservations_for_issue(
+            &active_reservations_all,
+            owner_key.as_deref(),
+            &issue.id,
+        );
+        let active_reservations = handoff_reservation_views(&owner_reservations, now_us);
+        let mail = fetch_handoff_mail_state(scope.conn(), scope.project_id, &issue.id, now_us)?;
+        let classification = classify_handoff(&HandoffClassificationInput {
+            stale,
+            owner_present: inferred_owner.is_some(),
+            owner_active,
+            has_active_reservation: !active_reservations.is_empty(),
+            has_fresh_comment,
+            has_ack_required_mail: mail.ack_required_pending > 0,
+        });
+        let action = classification.action.to_string();
+        let mut reason_codes: Vec<String> = classification
+            .reason_codes
+            .iter()
+            .map(|reason| (*reason).to_string())
+            .collect();
+        if updated_ts.is_none() {
+            reason_codes.push("missing_bead_updated_at".to_string());
+        }
+        let safe_command = handoff_safe_command(
+            &action,
+            &scope.project_slug,
+            &bead_root,
+            &issue.id,
+            inferred_owner.as_deref(),
+        );
+        let rationale = handoff_rationale(
+            &action,
+            inferred_owner.as_deref(),
+            updated_age_seconds,
+            active_reservations.len(),
+            &mail,
+        );
+        records.push(HandoffRecord {
+            id: issue.id,
+            title: issue.title,
+            status: issue.status,
+            updated_at: issue.updated_at,
+            updated_age_seconds,
+            stale,
+            assignee: issue.assignee,
+            owner: issue.owner,
+            inferred_owner,
+            owner_state,
+            recent_comments: recent_handoff_comments(&issue.comments, now_us),
+            active_reservations,
+            mail,
+            action,
+            reason_codes,
+            rationale,
+            safe_command,
+        });
+    }
+
+    if !include_fresh {
+        records.retain(|record| record.action != "keep");
+    }
+    records.sort_by(|left, right| {
+        handoff_action_rank(&left.action)
+            .cmp(&handoff_action_rank(&right.action))
+            .then_with(|| {
+                right
+                    .updated_age_seconds
+                    .unwrap_or(i64::MAX)
+                    .cmp(&left.updated_age_seconds.unwrap_or(i64::MAX))
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
+
+    let summary = summarize_handoff_records(total_in_progress, &records);
+    let mut actions: Vec<String> = records
+        .iter()
+        .filter(|record| record.action != "keep")
+        .map(|record| record.safe_command.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if actions.is_empty() && !include_fresh && total_in_progress > 0 {
+        actions.push(format!(
+            "am robot handoff --project {} --include-fresh --format json",
+            robot_shell_arg(&scope.project_slug)
+        ));
+    }
+
+    Ok((
+        HandoffData {
+            mode: "stale_handoff_dashboard".to_string(),
+            read_only: true,
+            dry_run: true,
+            explicit_dry_run,
+            project_root: bead_root.display().to_string(),
+            beads_jsonl: beads_jsonl.display().to_string(),
+            stale_after_minutes: stale_minutes,
+            active_after_minutes: active_minutes,
+            fresh_comment_minutes,
+            summary,
+            records,
+        },
+        actions,
+    ))
 }
 
 // ── Timeline command implementation ─────────────────────────────────────────
@@ -12323,6 +13203,48 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env._meta.project = resolved_project;
             format_output(&env, format)?
         }
+        RobotSubcommand::Handoff {
+            stale_minutes,
+            active_minutes,
+            fresh_comment_minutes,
+            include_fresh,
+            limit,
+            dry_run,
+        } => {
+            let scope = resolve_robot_project_scope(args.project.as_deref())?;
+            let (data, actions) = build_handoff(
+                &scope,
+                stale_minutes,
+                active_minutes,
+                fresh_comment_minutes,
+                include_fresh,
+                limit,
+                dry_run,
+            )?;
+            let mut env = RobotEnvelope::new(cmd_name, format, data);
+            env._meta.project = Some(scope.project_slug);
+            env = env.with_action(
+                "Read-only dashboard: inspect commands before running any ownership change",
+            );
+            for action in actions {
+                env = env.with_action(action);
+            }
+            if env.data.summary.blocked_by_reservation > 0 {
+                env = env.with_alert(
+                    "warn",
+                    "Some stale beads still have active file reservations",
+                    Some("Coordinate with the holder before reopening or editing".to_string()),
+                );
+            }
+            if env.data.summary.reopen_candidates > 0 || env.data.summary.takeover_candidates > 0 {
+                env = env.with_alert(
+                    "warn",
+                    "Handoff candidates are proposals only; no bead was reopened",
+                    Some("Run the proposed br update command only after checking reservations and peer work".to_string()),
+                );
+            }
+            format_output(&env, format)?
+        }
         RobotSubcommand::Atc {
             since,
             stratum,
@@ -12676,6 +13598,355 @@ mod tests {
     struct TestData {
         items: Vec<String>,
         count: usize,
+    }
+
+    fn handoff_classification(input: HandoffClassificationInput) -> HandoffClassification {
+        classify_handoff(&input)
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_requires_persisted_human_key() {
+        let err = resolve_handoff_project_root(None).expect_err("missing human_key must fail");
+        assert!(
+            err.to_string()
+                .contains("requires a persisted project human_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_rejects_missing_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let missing = td.path().join("missing-project");
+        let err = resolve_handoff_project_root(Some(missing.display().to_string()))
+            .expect_err("missing project path must fail closed");
+        assert!(
+            err.to_string().contains("not an existing directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_rejects_relative_human_key() {
+        let err = resolve_handoff_project_root(Some("relative/project".to_string()))
+            .expect_err("relative project path must fail closed");
+        assert!(
+            err.to_string().contains("must be absolute"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_handoff_project_root_accepts_existing_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let root = resolve_handoff_project_root(Some(td.path().display().to_string())).unwrap();
+        assert_eq!(root, td.path());
+    }
+
+    #[test]
+    fn classify_handoff_keeps_active_owner() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            owner_active: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "keep");
+        assert_eq!(result.reason_codes, vec!["owner_active"]);
+    }
+
+    #[test]
+    fn classify_handoff_marks_inactive_owner_takeover_candidate() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "takeover_candidate");
+        assert_eq!(result.reason_codes, vec!["owner_inactive"]);
+    }
+
+    #[test]
+    fn classify_handoff_blocks_on_active_reservation() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            has_active_reservation: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "blocked_by_reservation");
+        assert_eq!(result.reason_codes, vec!["active_file_reservation"]);
+    }
+
+    #[test]
+    fn classify_handoff_keeps_fresh_comment() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            has_fresh_comment: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "keep");
+        assert_eq!(result.reason_codes, vec!["fresh_comment"]);
+    }
+
+    #[test]
+    fn classify_handoff_asks_owner_for_ack_required_mail() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            owner_present: true,
+            has_ack_required_mail: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "ask_owner");
+        assert_eq!(result.reason_codes, vec!["ack_required_mail"]);
+    }
+
+    #[test]
+    fn classify_handoff_reopens_no_owner_stale_bead() {
+        let result = handoff_classification(HandoffClassificationInput {
+            stale: true,
+            ..HandoffClassificationInput::default()
+        });
+        assert_eq!(result.action, "reopen_candidate");
+        assert_eq!(result.reason_codes, vec!["no_owner"]);
+    }
+
+    #[test]
+    fn reservation_reason_mentions_bracketed_issue_id() {
+        assert!(reservation_reason_mentions_issue(
+            "[br-lmcob.15] forensic timeline",
+            "br-lmcob.15"
+        ));
+        assert!(reservation_reason_mentions_issue(
+            "handoff for br-idea-wizard-swarm-reliability-2ac6x.6",
+            "br-idea-wizard-swarm-reliability-2ac6x.6"
+        ));
+        assert!(!reservation_reason_mentions_issue(
+            "handoff for br-lmcob.150",
+            "br-lmcob.15"
+        ));
+    }
+
+    #[test]
+    fn handoff_reservations_include_bead_reason_without_owner() {
+        let reservations = vec![
+            HandoffReservationInfo {
+                id: 1,
+                agent: "OtherAgent".to_string(),
+                path: "crates/mcp-agent-mail-cli/src/robot.rs".to_string(),
+                exclusive: true,
+                reason: "working [br-lmcob.15]".to_string(),
+                created_ts: None,
+                expires_ts: 0,
+            },
+            HandoffReservationInfo {
+                id: 2,
+                agent: "OtherAgent".to_string(),
+                path: "README.md".to_string(),
+                exclusive: true,
+                reason: "unrelated".to_string(),
+                created_ts: None,
+                expires_ts: 0,
+            },
+        ];
+
+        let matched = handoff_reservations_for_issue(&reservations, None, "br-lmcob.15");
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, 1);
+        assert_eq!(matched[0].agent, "OtherAgent");
+    }
+
+    #[test]
+    fn fetch_handoff_active_reservations_ignores_expired_stale_claims() {
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let db_path = db_dir.path().join("handoff_expired_reservations.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open handoff db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+             (1, 1, 1, 'stale/**', 1, 'working br-stale', ?, ?, NULL),
+             (2, 1, 1, 'active/**', 1, 'working br-active', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 2 * MICROS_PER_HOUR),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_HOUR),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + MICROS_PER_HOUR),
+            ],
+        )
+        .expect("insert reservations");
+
+        let reservations =
+            fetch_handoff_active_reservations(&conn, 1, now_us).expect("fetch reservations");
+
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].id, 2);
+        assert_eq!(reservations[0].reason, "working br-active");
+    }
+
+    #[test]
+    fn build_handoff_blocks_no_owner_bead_with_reason_reservation() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let beads_dir = project_dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let now_us = mcp_agent_mail_db::now_micros();
+        let stale_updated_at = mcp_agent_mail_db::micros_to_iso(now_us - 2 * MICROS_PER_HOUR);
+        let issue = serde_json::json!({
+            "id": "br-stale",
+            "title": "Stale handoff candidate",
+            "status": "in_progress",
+            "updated_at": stale_updated_at,
+            "comments": []
+        });
+        std::fs::write(beads_dir.join("issues.jsonl"), format!("{issue}\n"))
+            .expect("write issues jsonl");
+
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let db_path = db_dir.path().join("handoff.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open handoff db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                thread_id TEXT,
+                subject TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL DEFAULT 0,
+                importance TEXT NOT NULL DEFAULT 'normal'
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'demo', ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                    project_dir.path().display().to_string(),
+                ),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+            ],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (1, 1, 'OtherAgent', 'codex-cli', 'gpt-5.5', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 1, 'crates/**', 1, 'working br-stale', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - MICROS_PER_MINUTE),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + MICROS_PER_HOUR),
+            ],
+        )
+        .expect("insert reservation");
+
+        let scope = ResolvedRobotProjectScope {
+            db: RobotDbHandle::from_conn(conn),
+            project_id: 1,
+            project_slug: "demo".to_string(),
+        };
+        let (data, _actions) =
+            build_handoff(&scope, 30, 30, 30, false, None, false).expect("build handoff");
+
+        assert_eq!(data.records.len(), 1);
+        assert_eq!(data.records[0].action, "blocked_by_reservation");
+        assert_eq!(data.records[0].active_reservations.len(), 1);
+        assert_eq!(data.records[0].active_reservations[0].agent, "OtherAgent");
+        assert_eq!(data.summary.blocked_by_reservation, 1);
     }
 
     fn sample_atc_snapshot() -> AtcRobotSnapshot {
@@ -14811,6 +16082,7 @@ mod tests {
             reservation_forecast: None,
             recovery: None,
             search_index: None,
+            forensic_timeline: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"health\":\"ok\""));
@@ -14845,6 +16117,7 @@ mod tests {
             reservation_forecast: None,
             recovery: None,
             search_index: None,
+            forensic_timeline: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, data).with_alert(
             "warn",
@@ -15727,6 +17000,7 @@ mod tests {
             reservation_forecast: None,
             recovery: None,
             search_index: None,
+            forensic_timeline: None,
         };
         let env = RobotEnvelope::new("robot status", OutputFormat::Json, status).with_alert(
             "info",
@@ -21464,6 +22738,7 @@ mod tests {
                 admission: None,
             }),
             search_index: None,
+            forensic_timeline: None,
         };
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["health"], "recovering");

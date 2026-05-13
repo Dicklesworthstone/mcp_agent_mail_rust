@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn am_bin() -> PathBuf {
     // Cargo sets this for integration tests.
@@ -155,7 +158,17 @@ fn run_am(
     args: &[&str],
     stdin: Option<&[u8]>,
 ) -> Output {
-    let mut cmd = Command::new(am_bin());
+    run_am_binary(&am_bin(), env, cwd, args, stdin)
+}
+
+fn run_am_binary(
+    binary: &Path,
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Output {
+    let mut cmd = Command::new(binary);
     cmd.args(args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
@@ -174,9 +187,80 @@ fn run_am(
             let mut handle = child.stdin.take().expect("child stdin");
             handle.write_all(stdin_bytes).expect("write stdin to am");
         }
-        child.wait_with_output().expect("wait for am output")
+        child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("wait for {} output: {error}", binary.display()))
     } else {
-        cmd.output().expect("spawn am")
+        cmd.output()
+            .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display()))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct TimedProcessOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+}
+
+#[allow(dead_code)]
+fn run_am_with_timeout(
+    env: &[(String, String)],
+    cwd: Option<&Path>,
+    args: &[&str],
+    timeout: Duration,
+) -> TimedProcessOutput {
+    let mut cmd = Command::new(am_bin());
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd.spawn().expect("spawn timed am");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut stderr = child.stderr.take().expect("child stderr");
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).expect("read child stdout");
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        stderr.read_to_string(&mut buf).expect("read child stderr");
+        buf
+    });
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("timed am wait failed: {error}"),
+        }
+    }
+
+    let exit_code = child.wait().expect("wait timed am").code();
+    TimedProcessOutput {
+        stdout: stdout_thread.join().expect("join stdout thread"),
+        stderr: stderr_thread.join().expect("join stderr thread"),
+        exit_code,
+        timed_out,
     }
 }
 
@@ -191,6 +275,116 @@ fn run_am_hermetic(env: &[(String, String)], cwd: Option<&Path>, args: &[&str]) 
         cmd.env(k, v);
     }
     cmd.output().expect("spawn hermetic am")
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct StdioSessionRun {
+    responses: Vec<Value>,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+}
+
+#[allow(dead_code)]
+fn initialize_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "startup-recovery-crash-replay",
+                "version": "1.0"
+            }
+        }
+    })
+}
+
+#[allow(dead_code)]
+fn tool_call(id: i64, name: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": name,
+            "arguments": arguments
+        }
+    })
+}
+
+#[allow(dead_code)]
+fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessionRun {
+    let mut cmd = Command::new(am_bin());
+    cmd.arg("serve-stdio")
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd.spawn().expect("spawn `am serve-stdio`");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut stderr = child.stderr.take().expect("child stderr");
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).expect("read child stdout");
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        stderr.read_to_string(&mut buf).expect("read child stderr");
+        buf
+    });
+    {
+        let mut stdin = child.stdin.take().expect("child stdin");
+        serde_json::to_writer(&mut stdin, &initialize_request()).expect("serialize initialize");
+        stdin.write_all(b"\n").expect("write initialize delimiter");
+        for request in requests {
+            serde_json::to_writer(&mut stdin, request).expect("serialize stdio request");
+            stdin.write_all(b"\n").expect("write request delimiter");
+        }
+        stdin.flush().expect("flush stdio requests");
+    }
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(15);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("stdio wait failed: {error}"),
+        }
+    }
+
+    let exit_code = child.wait().expect("wait stdio child").code();
+    let stdout = stdout_thread.join().expect("join stdout thread");
+    let stderr = stderr_thread.join().expect("join stderr thread");
+    let responses = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .collect();
+    StdioSessionRun {
+        responses,
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+    }
 }
 
 fn unused_loopback_port() -> u16 {
@@ -265,6 +459,82 @@ fn insert_recipient(conn: &mcp_agent_mail_db::DbConn, message_id: i64, agent_id:
         ],
     )
     .expect("insert recipient");
+}
+
+fn seed_startup_recovery_orphan_recipient(env: &TestEnv) {
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    conn.execute_raw("PRAGMA foreign_keys = OFF")
+        .expect("disable foreign keys for crash replay fixture");
+    insert_project(
+        &conn,
+        1,
+        "startup-recovery",
+        &env.tmp.path().join("project").display().to_string(),
+    );
+    insert_agent(&conn, 1, 1, "Sender", "codex-cli", "gpt-5");
+    insert_agent(&conn, 2, 1, "Recipient", "codex-cli", "gpt-5");
+    insert_message(&conn, 1, 1, 1, "startup repair replay", "body");
+    insert_recipient(&conn, 1, 2);
+    insert_recipient(&conn, 999, 2);
+    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("checkpoint crash replay fixture");
+}
+
+fn seed_startup_recovery_archive_only(env: &TestEnv) {
+    let project_path = env.tmp.path().join("reconstructed-project");
+    std::fs::create_dir_all(&project_path).expect("create reconstruct project path");
+    let project_human_key = project_path.display().to_string();
+    let project_slug = mcp_agent_mail_db::queries::generate_slug(&project_human_key);
+    let project_dir = env.storage_root.join("projects").join(&project_slug);
+    let sender_dir = project_dir.join("agents").join("Sender");
+    let recipient_dir = project_dir.join("agents").join("Recipient");
+    let message_dir = project_dir.join("messages").join("2026").join("05");
+    std::fs::create_dir_all(&sender_dir).expect("create sender archive dir");
+    std::fs::create_dir_all(&recipient_dir).expect("create recipient archive dir");
+    std::fs::create_dir_all(&message_dir).expect("create message archive dir");
+    std::fs::write(
+        project_dir.join("project.json"),
+        format!(
+            r#"{{"slug":"{}","human_key":"{}"}}"#,
+            project_slug, project_human_key
+        ),
+    )
+    .expect("write reconstruct project metadata");
+    std::fs::write(
+        sender_dir.join("profile.json"),
+        r#"{"name":"Sender","agent_name":"Sender","program":"codex-cli","model":"gpt-5","task_description":"startup reconstruct sender","inception_ts":"2026-05-12T00:00:00Z","last_active_ts":"2026-05-12T00:00:01Z"}"#,
+    )
+    .expect("write sender profile");
+    std::fs::write(
+        recipient_dir.join("profile.json"),
+        r#"{"name":"Recipient","agent_name":"Recipient","program":"codex-cli","model":"gpt-5","task_description":"startup reconstruct recipient","inception_ts":"2026-05-12T00:00:02Z","last_active_ts":"2026-05-12T00:00:03Z"}"#,
+    )
+    .expect("write recipient profile");
+    std::fs::write(
+        message_dir.join("2026-05-12T00-00-04Z__startup-reconstruct__1.md"),
+        r#"---json
+{
+  "id": 1,
+  "from": "Sender",
+  "from_agent": "Sender",
+  "to": ["Recipient"],
+  "cc": [],
+  "bcc": [],
+  "subject": "startup reconstruct replay",
+  "importance": "normal",
+  "ack_required": false,
+  "thread_id": "startup-reconstruct",
+  "created_ts": "2026-05-12T00:00:04Z",
+  "attachments": []
+}
+---
+
+reconstruct body
+"#,
+    )
+    .expect("write reconstruct message archive");
 }
 
 fn insert_file_reservation(
@@ -392,6 +662,318 @@ fn assert_success(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn startup_recovery_artifacts_dir() -> PathBuf {
+    repo_root().join("tests/artifacts/startup_recovery_crash_replay")
+}
+
+fn installed_binary_parity_artifacts_dir() -> PathBuf {
+    repo_root().join("tests/artifacts/installed_binary_parity")
+}
+
+fn support_bundle_redaction_artifacts_dir() -> PathBuf {
+    repo_root().join("tests/artifacts/support_bundle_redaction_adversarial")
+}
+
+fn stale_handoff_artifacts_dir() -> PathBuf {
+    repo_root().join("tests/artifacts/stale_handoff_dashboard")
+}
+
+fn write_text_artifact(run_root: &Path, name: &str, content: &str) {
+    std::fs::write(run_root.join(name), content).expect("write text artifact");
+}
+
+fn write_json_artifact(run_root: &Path, name: &str, value: &Value) {
+    let content = serde_json::to_string_pretty(value).expect("serialize JSON artifact");
+    write_text_artifact(run_root, name, &format!("{content}\n"));
+}
+
+fn robot_search_index_state<'a>(value: &'a Value, context: &str) -> &'a str {
+    value
+        .get("data")
+        .and_then(|data| data.get("search_index"))
+        .and_then(|search_index| search_index.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing robot search_index.state in {context}: {value}"))
+}
+
+fn response_by_id(responses: &[Value], id: i64) -> Option<&Value> {
+    responses
+        .iter()
+        .find(|response| response.get("id").and_then(Value::as_i64) == Some(id))
+}
+
+fn response_is_error(response: &Value) -> bool {
+    response.get("error").is_some()
+        || response
+            .get("result")
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+#[derive(Debug)]
+struct InstalledParitySurface {
+    id: &'static str,
+    args: &'static [&'static str],
+    required_paths: &'static [&'static str],
+}
+
+const INSTALLED_PARITY_SURFACES: &[InstalledParitySurface] = &[
+    InstalledParitySurface {
+        id: "doctor_check",
+        args: &["doctor", "check", "--json"],
+        required_paths: &[
+            "forensic_timeline.schema",
+            "forensic_timeline.current.binary_version",
+            "forensic_timeline.current.schema_version",
+            "forensic_timeline.current.storage_root",
+            "forensic_timeline.current.database_path",
+            "forensic_timeline.current.search_index_generation.state",
+            "forensic_timeline.recent_recovery_runs",
+            "forensic_timeline.artifacts",
+            "forensic_timeline.next_actions",
+        ],
+    },
+    InstalledParitySurface {
+        id: "robot_status",
+        args: &[
+            "robot",
+            "status",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        required_paths: &[
+            "forensic_timeline.schema",
+            "forensic_timeline.current.binary_version",
+            "forensic_timeline.current.search_index_generation.state",
+        ],
+    },
+    InstalledParitySurface {
+        id: "robot_search",
+        args: &["robot", "search", "parity-probe", "--format", "json"],
+        required_paths: &["search_index.state"],
+    },
+];
+
+fn parity_json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    (!current.is_null()).then_some(current)
+}
+
+fn redacted_parity_text(text: &str, storage_root: &Path, database_url: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("bearer")
+        || lower.contains("password")
+        || lower.contains("secret")
+        || lower.contains("token")
+    {
+        return "<redacted>".to_string();
+    }
+
+    let mut redacted = text.replace(&repo_root().display().to_string(), "<repo_root>");
+    redacted = redacted.replace(&storage_root.display().to_string(), "<storage_root>");
+    redacted.replace(database_url, "<database_url>")
+}
+
+fn redacted_parity_value(value: Option<&Value>, storage_root: &Path, database_url: &str) -> Value {
+    match value {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(text)) => {
+            Value::String(redacted_parity_text(text, storage_root, database_url))
+        }
+        Some(Value::Array(items)) => Value::Array(
+            items
+                .iter()
+                .map(|item| redacted_parity_value(Some(item), storage_root, database_url))
+                .collect(),
+        ),
+        Some(Value::Object(map)) => Value::Object(
+            map.iter()
+                .map(|(key, item)| {
+                    (
+                        key.clone(),
+                        redacted_parity_value(Some(item), storage_root, database_url),
+                    )
+                })
+                .collect(),
+        ),
+        Some(other) => other.clone(),
+    }
+}
+
+fn parity_version(outputs: &Value) -> Value {
+    parity_json_path(
+        outputs,
+        "doctor_check.forensic_timeline.current.binary_version",
+    )
+    .cloned()
+    .unwrap_or(Value::Null)
+}
+
+fn source_git_commit() -> Value {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(repo_root())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if commit.is_empty() {
+                Value::Null
+            } else {
+                Value::String(commit)
+            }
+        }
+        _ => Value::Null,
+    }
+}
+
+fn installed_binary_parity_report(
+    source_binary: &Path,
+    installed_binary: &Path,
+    storage_root: &Path,
+    database_url: &str,
+    source_outputs: &Value,
+    installed_outputs: &Value,
+) -> Value {
+    let mut checks = Vec::new();
+    for surface in INSTALLED_PARITY_SURFACES {
+        let source_surface = source_outputs.get(surface.id).unwrap_or(&Value::Null);
+        let installed_surface = installed_outputs.get(surface.id).unwrap_or(&Value::Null);
+        for path in surface.required_paths {
+            let source_value = parity_json_path(source_surface, path);
+            let installed_value = parity_json_path(installed_surface, path);
+            let status = match (source_value, installed_value) {
+                (Some(source), Some(installed)) if source == installed => "pass",
+                (Some(_), Some(_)) => "value_mismatch",
+                (Some(_), None) => "installed_missing",
+                (None, Some(_)) => "source_missing",
+                (None, None) => "missing_both",
+            };
+            checks.push(json!({
+                "surface": surface.id,
+                "json_path": path,
+                "status": status,
+                "source_value": redacted_parity_value(source_value, storage_root, database_url),
+                "installed_value": redacted_parity_value(installed_value, storage_root, database_url),
+            }));
+        }
+    }
+
+    let passed = checks
+        .iter()
+        .all(|check| check.get("status").and_then(Value::as_str) == Some("pass"));
+    let commands: Vec<Value> = INSTALLED_PARITY_SURFACES
+        .iter()
+        .map(|surface| {
+            json!({
+                "surface": surface.id,
+                "source_command": std::iter::once(redacted_parity_text(
+                    &source_binary.display().to_string(),
+                    storage_root,
+                    database_url,
+                ))
+                .chain(surface.args.iter().map(|arg| (*arg).to_string()))
+                .collect::<Vec<_>>(),
+                "installed_command": std::iter::once(redacted_parity_text(
+                    &installed_binary.display().to_string(),
+                    storage_root,
+                    database_url,
+                ))
+                .chain(surface.args.iter().map(|arg| (*arg).to_string()))
+                .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    json!({
+        "schema": "installed-binary-parity.v1",
+        "bead": "br-idea-wizard-swarm-reliability-2ac6x.4",
+        "passed": passed,
+        "metadata": {
+            "source_binary": redacted_parity_text(
+                &source_binary.display().to_string(),
+                storage_root,
+                database_url,
+            ),
+            "source_version": parity_version(source_outputs),
+            "source_git_commit": source_git_commit(),
+            "installed_binary": redacted_parity_text(
+                &installed_binary.display().to_string(),
+                storage_root,
+                database_url,
+            ),
+            "installed_version": parity_version(installed_outputs),
+            "installed_git_commit": Value::Null,
+            "storage_root": "<storage_root>",
+            "database_url": "<database_url>",
+            "database_path": "<database_path>",
+        },
+        "commands": commands,
+        "checks": checks,
+    })
+}
+
+fn collect_installed_parity_outputs(binary: &Path, env: &TestEnv) -> Value {
+    let mut outputs = serde_json::Map::new();
+    for surface in INSTALLED_PARITY_SURFACES {
+        let out = run_am_binary(
+            binary,
+            &env.base_env(),
+            Some(env.tmp.path()),
+            surface.args,
+            None,
+        );
+        assert!(
+            out.status.success(),
+            "{} parity command failed for {}\nstdout:\n{}\nstderr:\n{}",
+            surface.id,
+            binary.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let parsed: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{} parity command emitted invalid JSON for {}: {error}\nstdout:\n{}",
+                surface.id,
+                binary.display(),
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        outputs.insert(surface.id.to_string(), parsed);
+    }
+    Value::Object(outputs)
+}
+
+fn run_startup_server_once(env: &TestEnv) -> TimedProcessOutput {
+    run_startup_server_once_at(env, env.tmp.path())
+}
+
+fn run_startup_server_once_at(env: &TestEnv, cwd: &Path) -> TimedProcessOutput {
+    let startup_port = unused_loopback_port().to_string();
+    let startup_args = [
+        "serve-http",
+        "--no-tui",
+        "--no-auth",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        startup_port.as_str(),
+    ];
+    run_am_with_timeout(
+        &env.base_env(),
+        Some(cwd),
+        &startup_args,
+        Duration::from_secs(10),
+    )
 }
 
 #[test]
@@ -1997,6 +2579,837 @@ fn config_set_port_updates_existing_env_file() {
 // ---- Doctor commands ----
 
 #[test]
+fn installed_binary_parity_report_flags_missing_forensic_timeline_fields() {
+    let env = TestEnv::new();
+    let source_outputs = json!({
+        "doctor_check": {
+            "healthy": true,
+            "forensic_timeline": {
+                "schema": "forensic-timeline.v1",
+                "current": {
+                    "binary_version": "0.2.52",
+                    "schema_version": "12",
+                    "storage_root": env.storage_root.display().to_string(),
+                    "database_path": env.db_path.display().to_string(),
+                    "search_index_generation": {
+                        "state": "fresh"
+                    }
+                },
+                "recent_recovery_runs": [],
+                "artifacts": [],
+                "next_actions": ["am doctor support-bundle --bearer-token super-secret"]
+            }
+        },
+        "robot_status": {
+            "forensic_timeline": {
+                "schema": "forensic-timeline.v1",
+                "current": {
+                    "binary_version": "0.2.52",
+                    "search_index_generation": {
+                        "state": "fresh"
+                    }
+                }
+            }
+        },
+        "robot_search": {
+            "search_index": {
+                "state": "fresh"
+            }
+        }
+    });
+    let installed_outputs = json!({
+        "doctor_check": {
+            "healthy": true,
+            "forensic_timeline": null
+        },
+        "robot_status": {},
+        "robot_search": {
+            "search_index": {
+                "state": "fresh"
+            }
+        }
+    });
+
+    let report = installed_binary_parity_report(
+        &repo_root().join("target/debug/am"),
+        Path::new("/usr/local/bin/am"),
+        &env.storage_root,
+        &env.database_url(),
+        &source_outputs,
+        &installed_outputs,
+    );
+    let run_root = installed_binary_parity_artifacts_dir().join(format!(
+        "{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S%.3fZ"),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&run_root).expect("create installed parity artifact root");
+    write_json_artifact(&run_root, "missing_forensic_timeline_report.json", &report);
+
+    assert_eq!(report["passed"], false);
+    let checks = report["checks"].as_array().expect("checks array");
+    assert!(
+        checks.iter().any(|check| {
+            check["surface"] == "doctor_check"
+                && check["json_path"] == "forensic_timeline.schema"
+                && check["status"] == "installed_missing"
+        }),
+        "report should flag missing installed doctor forensic timeline: {report}"
+    );
+    assert!(
+        checks.iter().any(|check| {
+            check["surface"] == "robot_status"
+                && check["json_path"] == "forensic_timeline.schema"
+                && check["status"] == "installed_missing"
+        }),
+        "report should flag missing installed robot forensic timeline: {report}"
+    );
+    let report_text = serde_json::to_string(&report).expect("serialize parity report");
+    assert!(
+        !report_text.contains("super-secret")
+            && !report_text.contains(&env.storage_root.display().to_string())
+            && !report_text.contains(&env.database_url()),
+        "parity report must redact secrets and local paths: {report_text}"
+    );
+}
+
+#[test]
+fn doctor_support_bundle_adversarial_redaction_writes_report() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let forensics = env
+        .storage_root
+        .join("doctor")
+        .join("forensics")
+        .join("mailbox.sqlite3")
+        .join("repair-20260512_225800_001");
+    std::fs::create_dir_all(&forensics).expect("create forensic fixture");
+    std::fs::write(
+        forensics.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "command": "repair --bearer-token=manifest-command-secret",
+            "safe_command": "am doctor support-bundle --bearer-token=manifest-safe-secret --database-url sqlite://user:pass@example.invalid/mail?token=query-secret",
+            "env": {
+                "HTTP_BEARER_TOKEN": "manifest-token",
+                "OpenAi_Api_Key": "sk-manifest-key"
+            },
+            "subject": "Sensitive forensic subject",
+            "body_md": "Private forensic body",
+            "attachments": ["private-forensic-screenshot.png"],
+            "artifact_path_kind": "raw_forensic_manifest",
+            "reason_code": "foreign_key_integrity"
+        }))
+        .expect("serialize manifest fixture"),
+    )
+    .expect("write manifest fixture");
+    std::fs::write(
+        forensics.join("summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "command": "repair --token=summary-command-secret",
+            "nested": {
+                "authorization": "Bearer summary-token",
+                "content": "Private summary body"
+            },
+            "artifact_path_kind": "raw_forensic_summary",
+            "reason_code": "repair_completed"
+        }))
+        .expect("serialize summary fixture"),
+    )
+    .expect("write summary fixture");
+
+    let stdout_log = env.tmp.path().join("operator_stdout.log");
+    let stderr_log = env.tmp.path().join("operator_stderr.log");
+    std::fs::write(
+        &stdout_log,
+        format!(
+            "Authorization: Bearer stdout-token\nTOKEN\u{ff1a}stdout-unicode-secret\nDATABASE_URL: sqlite://user:pass@example.invalid/mail\nsubject=Sensitive stdout subject\nbody_md=Private stdout body\nattachments=stdout-secret.png\npath={}\nsource_path_class=operator_supplied_log\ncommand_shape=am doctor support-bundle --json\n",
+            env.db_path.display()
+        ),
+    )
+    .expect("write stdout fixture");
+    std::fs::write(
+        &stderr_log,
+        "safe_command=am doctor support-bundle --bearer-token=stderr-secret --json\nreason_code=operator_log\n",
+    )
+    .expect("write stderr fixture");
+
+    let output_dir = env.tmp.path().join("support-output");
+    let output_dir_text = output_dir.display().to_string();
+    let stdout_log_text = stdout_log.display().to_string();
+    let stderr_log_text = stderr_log.display().to_string();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "doctor",
+            "support-bundle",
+            "--output-dir",
+            &output_dir_text,
+            "--stdout-log",
+            &stdout_log_text,
+            "--stderr-log",
+            &stderr_log_text,
+            "--redact-subjects",
+            "--json",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "support-bundle should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result: Value =
+        serde_json::from_slice(&out.stdout).expect("support-bundle JSON should parse");
+    let bundle_path = PathBuf::from(result["bundle_path"].as_str().expect("bundle_path string"));
+    let mut bundle_text = String::new();
+    let mut bundle_files = Vec::new();
+    for entry in walkdir::WalkDir::new(&bundle_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&bundle_path)
+            .expect("bundle file under bundle root")
+            .display()
+            .to_string();
+        bundle_files.push(rel);
+        bundle_text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        bundle_text.push('\n');
+    }
+    bundle_files.sort();
+    let stdout_text = String::from_utf8_lossy(&out.stdout);
+    let searchable = format!("{stdout_text}\n{bundle_text}");
+    let forbidden = [
+        (
+            "manifest_command_secret",
+            "manifest-command-secret".to_string(),
+        ),
+        ("manifest_safe_secret", "manifest-safe-secret".to_string()),
+        ("query_secret", "query-secret".to_string()),
+        ("manifest_token", "manifest-token".to_string()),
+        ("manifest_api_key", "sk-manifest-key".to_string()),
+        ("forensic_subject", "Sensitive forensic subject".to_string()),
+        ("forensic_body", "Private forensic body".to_string()),
+        (
+            "forensic_attachment",
+            "private-forensic-screenshot.png".to_string(),
+        ),
+        (
+            "summary_command_secret",
+            "summary-command-secret".to_string(),
+        ),
+        ("summary_token", "summary-token".to_string()),
+        ("summary_body", "Private summary body".to_string()),
+        ("stdout_token", "stdout-token".to_string()),
+        ("stdout_unicode_secret", "stdout-unicode-secret".to_string()),
+        ("stdout_subject", "Sensitive stdout subject".to_string()),
+        ("stdout_body", "Private stdout body".to_string()),
+        ("stdout_attachment", "stdout-secret.png".to_string()),
+        ("stderr_secret", "stderr-secret".to_string()),
+        ("database_credentials", "user:pass".to_string()),
+        ("storage_root", env.storage_root.display().to_string()),
+        ("database_path", env.db_path.display().to_string()),
+    ];
+    let leaked: Vec<&str> = forbidden
+        .iter()
+        .filter_map(|(label, value)| searchable.contains(value).then_some(*label))
+        .collect();
+    let retained = [
+        ("raw_manifest_kind", "raw_forensic_manifest"),
+        ("summary_kind", "raw_forensic_summary"),
+        ("foreign_key_reason", "foreign_key_integrity"),
+        ("operator_log_class", "operator_supplied_log"),
+        ("command_shape", "am doctor support-bundle --json"),
+        ("redacted_secret_marker", "<redacted-secret>"),
+        ("redacted_body_marker", "<redacted-message-body>"),
+        ("redacted_path_marker", "<redacted-path>"),
+    ];
+    let missing_retained: Vec<&str> = retained
+        .iter()
+        .filter_map(|(label, value)| (!searchable.contains(value)).then_some(*label))
+        .collect();
+    let forbidden_absent = leaked.is_empty();
+    let retained_present = missing_retained.is_empty();
+
+    let run_root = support_bundle_redaction_artifacts_dir().join(format!(
+        "{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S%.3fZ"),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&run_root).expect("create support bundle redaction artifact root");
+    let report = json!({
+        "schema": "support-bundle-redaction-adversarial.v1",
+        "bead": "br-idea-wizard-swarm-reliability-2ac6x.8",
+        "bundle_files": bundle_files,
+        "forbidden_absent": forbidden_absent,
+        "leaked_forbidden_labels": leaked.clone(),
+        "retained_present": retained_present,
+        "missing_retained_labels": missing_retained.clone(),
+        "repro": "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs doctor_support_bundle_adversarial_redaction_writes_report -- --nocapture"
+    });
+    write_json_artifact(&run_root, "redaction_report.json", &report);
+    write_text_artifact(
+        &run_root,
+        "support_bundle_stdout.json",
+        stdout_text.as_ref(),
+    );
+    write_text_artifact(
+        &run_root,
+        "support_bundle_stderr.txt",
+        &String::from_utf8_lossy(&out.stderr),
+    );
+    eprintln!(
+        "support bundle redaction artifact root: {}",
+        run_root.display()
+    );
+
+    assert!(
+        leaked.is_empty(),
+        "support bundle leaked labels: {leaked:?}"
+    );
+    assert!(
+        missing_retained.is_empty(),
+        "support bundle dropped retained labels: {missing_retained:?}"
+    );
+}
+
+#[test]
+#[ignore = "release gate; set AM_INSTALLED_BINARY_PARITY_BIN to the installed am binary path"]
+fn installed_binary_parity_probe_compares_source_and_installed_am() {
+    let installed_binary = PathBuf::from(
+        std::env::var("AM_INSTALLED_BINARY_PARITY_BIN")
+            .expect("set AM_INSTALLED_BINARY_PARITY_BIN to the installed am binary path"),
+    );
+    assert!(
+        installed_binary.is_file(),
+        "installed am binary does not exist on this worker: {}",
+        installed_binary.display()
+    );
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    insert_project(
+        &conn,
+        1,
+        "installed-parity",
+        &env.tmp.path().display().to_string(),
+    );
+    insert_agent(&conn, 1, 1, "Recipient", "codex-cli", "gpt-5");
+
+    let source_outputs = collect_installed_parity_outputs(&am_bin(), &env);
+    let installed_outputs = collect_installed_parity_outputs(&installed_binary, &env);
+    let report = installed_binary_parity_report(
+        &am_bin(),
+        &installed_binary,
+        &env.storage_root,
+        &env.database_url(),
+        &source_outputs,
+        &installed_outputs,
+    );
+
+    let run_root = installed_binary_parity_artifacts_dir().join(format!(
+        "{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S%.3fZ"),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&run_root).expect("create installed parity artifact root");
+    write_json_artifact(&run_root, "source_outputs.json", &source_outputs);
+    write_json_artifact(&run_root, "installed_outputs.json", &installed_outputs);
+    write_json_artifact(&run_root, "parity_report.json", &report);
+
+    assert_eq!(
+        report["passed"],
+        true,
+        "installed binary parity report failed; see {}: {}",
+        run_root.display(),
+        report
+    );
+}
+
+#[test]
+fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct() {
+    let env = TestEnv::new();
+    seed_startup_recovery_orphan_recipient(&env);
+
+    let run_root = startup_recovery_artifacts_dir().join(format!(
+        "{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S%.3fZ"),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&run_root).expect("create startup recovery artifact root");
+    eprintln!(
+        "startup recovery crash replay artifact root: {}",
+        run_root.display()
+    );
+    write_text_artifact(
+        &run_root,
+        "storage_root.txt",
+        &format!(
+            "storage_root={}\ndatabase_url={}\n",
+            env.storage_root.display(),
+            env.database_url()
+        ),
+    );
+    write_text_artifact(
+        &run_root,
+        "repro.txt",
+        "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
+         startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct -- --nocapture\n",
+    );
+    write_text_artifact(
+        &run_root,
+        "repro.env",
+        "DATABASE_URL=<isolated temp sqlite fixture>\nSTORAGE_ROOT=<isolated temp storage root>\n",
+    );
+
+    let before = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["doctor", "check", "--json"],
+        None,
+    );
+    write_text_artifact(
+        &run_root,
+        "before_doctor.json",
+        &String::from_utf8_lossy(&before.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "before_doctor.stderr.txt",
+        &String::from_utf8_lossy(&before.stderr),
+    );
+    let before_json: Value =
+        serde_json::from_slice(&before.stdout).expect("before doctor JSON should parse");
+    let before_text = serde_json::to_string(&before_json).expect("serialize before doctor JSON");
+    assert!(
+        before_text.contains("orphaned message_recipients")
+            || before_text.contains("orphaned-recipient"),
+        "before doctor output should identify the orphaned-recipient fixture:\n{before_text}"
+    );
+
+    let startup = run_startup_server_once(&env);
+    write_text_artifact(&run_root, "startup_stdout.txt", &startup.stdout);
+    write_text_artifact(&run_root, "startup_stderr.txt", &startup.stderr);
+    let startup_combined = format!("{}\n{}", startup.stdout, startup.stderr);
+    assert!(
+        startup_combined.contains("Automatic mailbox repair completed"),
+        "startup output should show automatic repair completion:\n{startup_combined}"
+    );
+    assert!(
+        startup_combined.contains("Forensics:") || startup_combined.contains("forensic bundle:"),
+        "startup output should preserve forensic artifact context:\n{startup_combined}"
+    );
+    assert!(
+        !startup_combined.contains("RefCell already borrowed")
+            && !startup_combined.contains("panicked at"),
+        "startup replay must not panic after repair:\n{startup_combined}"
+    );
+
+    let after = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["doctor", "check", "--json"],
+        None,
+    );
+    assert!(
+        after.status.success(),
+        "after doctor check should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&after.stdout),
+        String::from_utf8_lossy(&after.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "after_doctor.json",
+        &String::from_utf8_lossy(&after.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "after_doctor.stderr.txt",
+        &String::from_utf8_lossy(&after.stderr),
+    );
+    let after_json: Value =
+        serde_json::from_slice(&after.stdout).expect("after doctor JSON should parse");
+    assert_eq!(
+        after_json.get("healthy").and_then(Value::as_bool),
+        Some(true),
+        "after doctor check should be healthy"
+    );
+
+    let doctor_health = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["doctor", "health"],
+        None,
+    );
+    assert!(
+        doctor_health.status.success(),
+        "doctor health should succeed after startup repair\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor_health.stdout),
+        String::from_utf8_lossy(&doctor_health.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "doctor_health.txt",
+        &String::from_utf8_lossy(&doctor_health.stdout),
+    );
+
+    let robot_status = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "robot",
+            "status",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        robot_status.status.success(),
+        "robot status should succeed after startup repair\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&robot_status.stdout),
+        String::from_utf8_lossy(&robot_status.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "robot_status.json",
+        &String::from_utf8_lossy(&robot_status.stdout),
+    );
+    let _: Value =
+        serde_json::from_slice(&robot_status.stdout).expect("robot status JSON should parse");
+
+    let stdio = run_stdio_session(&env.base_env(), &[tool_call(20, "health_check", json!({}))]);
+    let stdio_artifact = json!({
+        "stdout": stdio.stdout,
+        "stderr": stdio.stderr,
+        "exit_code": stdio.exit_code,
+        "timed_out": stdio.timed_out,
+        "responses": stdio.responses,
+    });
+    write_json_artifact(&run_root, "stdio_smoke.json", &stdio_artifact);
+    let stdio_responses = stdio_artifact["responses"]
+        .as_array()
+        .expect("stdio responses array");
+    let health_response = response_by_id(stdio_responses, 20).expect("stdio health_check response");
+    assert!(
+        !response_is_error(health_response),
+        "stdio health_check should succeed: {health_response}"
+    );
+
+    let reconstruct_env = TestEnv::new();
+    seed_startup_recovery_archive_only(&reconstruct_env);
+    let reconstruct_project_path = reconstruct_env.tmp.path().join("reconstructed-project");
+    write_text_artifact(
+        &run_root,
+        "reconstruct_storage_root.txt",
+        &format!(
+            "storage_root={}\ndatabase_url={}\n",
+            reconstruct_env.storage_root.display(),
+            reconstruct_env.database_url()
+        ),
+    );
+
+    let reconstruct_before = run_am(
+        &reconstruct_env.base_env(),
+        Some(&reconstruct_project_path),
+        &["doctor", "check", "--json"],
+        None,
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_before_doctor.json",
+        &String::from_utf8_lossy(&reconstruct_before.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_before_doctor.stderr.txt",
+        &String::from_utf8_lossy(&reconstruct_before.stderr),
+    );
+    let reconstruct_before_json: Value = serde_json::from_slice(&reconstruct_before.stdout)
+        .expect("reconstruct before doctor JSON should parse");
+    let reconstruct_before_text =
+        serde_json::to_string(&reconstruct_before_json).expect("serialize reconstruct before JSON");
+    assert!(
+        reconstruct_before_text.contains("Database file does not exist")
+            && reconstruct_before_text.contains("doctor reconstruct --dry-run"),
+        "before doctor output should identify the archive-backed reconstruct fixture:\n{reconstruct_before_text}"
+    );
+
+    let reconstruct_startup =
+        run_startup_server_once_at(&reconstruct_env, &reconstruct_project_path);
+    write_text_artifact(
+        &run_root,
+        "reconstruct_startup_stdout.txt",
+        &reconstruct_startup.stdout,
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_startup_stderr.txt",
+        &reconstruct_startup.stderr,
+    );
+    let reconstruct_startup_combined = format!(
+        "{}\n{}",
+        reconstruct_startup.stdout, reconstruct_startup.stderr
+    );
+    assert!(
+        reconstruct_startup_combined.contains("Automatic mailbox reconstruction completed"),
+        "startup output should show automatic reconstruction completion:\n{reconstruct_startup_combined}"
+    );
+    assert!(
+        !reconstruct_startup_combined.contains("RefCell already borrowed")
+            && !reconstruct_startup_combined.contains("panicked at"),
+        "startup reconstruct replay must not panic:\n{reconstruct_startup_combined}"
+    );
+
+    let reconstruct_after = run_am(
+        &reconstruct_env.base_env(),
+        Some(&reconstruct_project_path),
+        &["doctor", "check", "--json"],
+        None,
+    );
+    assert!(
+        reconstruct_after.status.success(),
+        "after reconstruct doctor check should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reconstruct_after.stdout),
+        String::from_utf8_lossy(&reconstruct_after.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_after_doctor.json",
+        &String::from_utf8_lossy(&reconstruct_after.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_after_doctor.stderr.txt",
+        &String::from_utf8_lossy(&reconstruct_after.stderr),
+    );
+    let reconstruct_after_json: Value = serde_json::from_slice(&reconstruct_after.stdout)
+        .expect("reconstruct after doctor JSON should parse");
+    assert_eq!(
+        reconstruct_after_json
+            .get("healthy")
+            .and_then(Value::as_bool),
+        Some(true),
+        "after reconstruct doctor check should be healthy"
+    );
+
+    let reconstruct_doctor_health = run_am(
+        &reconstruct_env.base_env(),
+        Some(&reconstruct_project_path),
+        &["doctor", "health"],
+        None,
+    );
+    assert!(
+        reconstruct_doctor_health.status.success(),
+        "doctor health should succeed after startup reconstruct\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reconstruct_doctor_health.stdout),
+        String::from_utf8_lossy(&reconstruct_doctor_health.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_doctor_health.txt",
+        &String::from_utf8_lossy(&reconstruct_doctor_health.stdout),
+    );
+
+    let reconstruct_robot_status = run_am(
+        &reconstruct_env.base_env(),
+        Some(&reconstruct_project_path),
+        &[
+            "robot",
+            "status",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        reconstruct_robot_status.status.success(),
+        "robot status should succeed after startup reconstruct\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reconstruct_robot_status.stdout),
+        String::from_utf8_lossy(&reconstruct_robot_status.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_robot_status.json",
+        &String::from_utf8_lossy(&reconstruct_robot_status.stdout),
+    );
+    let reconstruct_robot_status_json: Value =
+        serde_json::from_slice(&reconstruct_robot_status.stdout)
+            .expect("reconstruct robot status JSON should parse");
+    let reconstruct_search_state_before = robot_search_index_state(
+        &reconstruct_robot_status_json,
+        "reconstruct robot status before search backfill",
+    );
+    assert_ne!(
+        reconstruct_search_state_before, "fresh",
+        "archive-only reconstruct should not claim a fresh Search V3 index before a real backfill"
+    );
+
+    let reconstruct_robot_search = run_am(
+        &reconstruct_env.base_env(),
+        Some(&reconstruct_project_path),
+        &[
+            "robot",
+            "search",
+            "reconstruct",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        reconstruct_robot_search.status.success(),
+        "robot search should refresh Search V3 after startup reconstruct\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reconstruct_robot_search.stdout),
+        String::from_utf8_lossy(&reconstruct_robot_search.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_robot_search.json",
+        &String::from_utf8_lossy(&reconstruct_robot_search.stdout),
+    );
+    let reconstruct_robot_search_json: Value =
+        serde_json::from_slice(&reconstruct_robot_search.stdout)
+            .expect("reconstruct robot search JSON should parse");
+    assert_eq!(
+        robot_search_index_state(
+            &reconstruct_robot_search_json,
+            "reconstruct robot search after backfill"
+        ),
+        "fresh",
+        "robot search should perform the real Search V3 lexical backfill"
+    );
+    assert!(
+        reconstruct_robot_search_json["data"]["total_results"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "reconstruct robot search should find the archive-reconstructed message: {reconstruct_robot_search_json}"
+    );
+
+    let reconstruct_robot_status_after_search = run_am(
+        &reconstruct_env.base_env(),
+        Some(&reconstruct_project_path),
+        &[
+            "robot",
+            "status",
+            "--agent",
+            "Recipient",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        reconstruct_robot_status_after_search.status.success(),
+        "robot status should succeed after reconstruct search backfill\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reconstruct_robot_status_after_search.stdout),
+        String::from_utf8_lossy(&reconstruct_robot_status_after_search.stderr)
+    );
+    write_text_artifact(
+        &run_root,
+        "reconstruct_robot_status_after_search.json",
+        &String::from_utf8_lossy(&reconstruct_robot_status_after_search.stdout),
+    );
+    let reconstruct_robot_status_after_search_json: Value =
+        serde_json::from_slice(&reconstruct_robot_status_after_search.stdout)
+            .expect("reconstruct robot status after search JSON should parse");
+    assert_eq!(
+        robot_search_index_state(
+            &reconstruct_robot_status_after_search_json,
+            "reconstruct robot status after search backfill"
+        ),
+        "fresh",
+        "robot status should report fresh Search V3 health after the real backfill"
+    );
+
+    let reconstruct_stdio = run_stdio_session(
+        &reconstruct_env.base_env(),
+        &[tool_call(20, "health_check", json!({}))],
+    );
+    let reconstruct_stdio_artifact = json!({
+        "stdout": reconstruct_stdio.stdout,
+        "stderr": reconstruct_stdio.stderr,
+        "exit_code": reconstruct_stdio.exit_code,
+        "timed_out": reconstruct_stdio.timed_out,
+        "responses": reconstruct_stdio.responses,
+    });
+    write_json_artifact(
+        &run_root,
+        "reconstruct_stdio_smoke.json",
+        &reconstruct_stdio_artifact,
+    );
+    let reconstruct_stdio_responses = reconstruct_stdio_artifact["responses"]
+        .as_array()
+        .expect("reconstruct stdio responses array");
+    let reconstruct_health_response = response_by_id(reconstruct_stdio_responses, 20)
+        .expect("reconstruct stdio health_check response");
+    assert!(
+        !response_is_error(reconstruct_health_response),
+        "reconstruct stdio health_check should succeed: {reconstruct_health_response}"
+    );
+
+    write_json_artifact(
+        &run_root,
+        "summary.json",
+        &json!({
+            "schema": "startup-recovery-crash-replay.v1",
+            "bead": "br-idea-wizard-swarm-reliability-2ac6x.3",
+            "startup": {
+                "exit_code": startup.exit_code,
+                "timed_out": startup.timed_out,
+                "repair_completed": startup_combined.contains("Automatic mailbox repair completed"),
+                "refcell_panic_seen": startup_combined.contains("RefCell already borrowed"),
+            },
+            "reconstruct_startup": {
+                "exit_code": reconstruct_startup.exit_code,
+                "timed_out": reconstruct_startup.timed_out,
+                "reconstruct_completed": reconstruct_startup_combined.contains("Automatic mailbox reconstruction completed"),
+                "refcell_panic_seen": reconstruct_startup_combined.contains("RefCell already borrowed"),
+            },
+            "doctor": {
+                "before_healthy": before_json.get("healthy").and_then(Value::as_bool),
+                "after_healthy": after_json.get("healthy").and_then(Value::as_bool),
+                "doctor_health_exit_code": doctor_health.status.code(),
+                "reconstruct_before_healthy": reconstruct_before_json.get("healthy").and_then(Value::as_bool),
+                "reconstruct_after_healthy": reconstruct_after_json.get("healthy").and_then(Value::as_bool),
+                "reconstruct_doctor_health_exit_code": reconstruct_doctor_health.status.code(),
+            },
+            "robot_status_exit_code": robot_status.status.code(),
+            "reconstruct_robot_status_exit_code": reconstruct_robot_status.status.code(),
+            "reconstruct_search_state_before": reconstruct_search_state_before,
+            "reconstruct_robot_search_exit_code": reconstruct_robot_search.status.code(),
+            "reconstruct_robot_status_after_search_exit_code": reconstruct_robot_status_after_search.status.code(),
+            "reconstruct_search_state_after_search": robot_search_index_state(
+                &reconstruct_robot_status_after_search_json,
+                "summary reconstruct robot status after search backfill"
+            ),
+            "stdio_health_check_exit_code": stdio_artifact.get("exit_code"),
+            "reconstruct_stdio_health_check_exit_code": reconstruct_stdio_artifact.get("exit_code"),
+            "frankensqlite_dependency_note": {
+                "local_source_path": "/data/projects/frankensqlite/crates/fsqlite-core/src/connection.rs",
+                "borrow_boundary": "old schema fingerprint is scoped before self.schema.borrow_mut during reload",
+                "binary_under_test": "cargo-built CARGO_BIN_EXE_am, not the installed release binary"
+            }
+        }),
+    );
+}
+
+#[test]
 fn doctor_check_on_migrated_db_passes() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
@@ -2400,6 +3813,231 @@ fn list_acks_with_seeded_project() {
         "expected success\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let project_path = env.tmp.path().join("handoff_project");
+    let beads_dir = project_path.join(".beads");
+    std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+    let project_path_str = project_path.to_string_lossy().to_string();
+    insert_project(&conn, 1, "handoff-proj", &project_path_str);
+    insert_agent(&conn, 1, 1, "ActiveAgent", "codex-cli", "gpt-5");
+    insert_agent(&conn, 2, 1, "ReservedAgent", "codex-cli", "gpt-5");
+    insert_agent(&conn, 3, 1, "AckAgent", "codex-cli", "gpt-5");
+    insert_agent(&conn, 4, 1, "InactiveAgent", "codex-cli", "gpt-5");
+    insert_agent(&conn, 5, 1, "FreshAgent", "codex-cli", "gpt-5");
+
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+    conn.execute_sync(
+        "UPDATE agents SET last_active_ts = ? WHERE name = ?",
+        &[
+            SqlValue::BigInt(now_us),
+            SqlValue::Text("ActiveAgent".to_string()),
+        ],
+    )
+    .expect("mark active agent fresh");
+    insert_file_reservation(
+        &conn,
+        1,
+        1,
+        2,
+        "crates/mcp-agent-mail-cli/src/robot.rs",
+        true,
+        now_us + 2 * 60 * 60 * 1_000_000,
+    );
+    conn.execute_sync(
+        "INSERT INTO messages (\
+            id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts\
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            SqlValue::BigInt(900),
+            SqlValue::BigInt(1),
+            SqlValue::BigInt(1),
+            SqlValue::Text("br-handoff-ack".to_string()),
+            SqlValue::Text("Ack needed".to_string()),
+            SqlValue::Text("Please confirm handoff state.".to_string()),
+            SqlValue::Text("normal".to_string()),
+            SqlValue::Bool(true),
+            SqlValue::BigInt(now_us - 2 * 60 * 60 * 1_000_000),
+        ],
+    )
+    .expect("insert ack message");
+    conn.execute_sync(
+        "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, ?, ?)",
+        &[
+            SqlValue::BigInt(900),
+            SqlValue::BigInt(3),
+            SqlValue::Text("to".to_string()),
+            SqlValue::Null,
+            SqlValue::Null,
+        ],
+    )
+    .expect("insert ack recipient");
+
+    let stale_at = mcp_agent_mail_db::micros_to_iso(now_us - 48 * 60 * 60 * 1_000_000);
+    let fresh_at = mcp_agent_mail_db::micros_to_iso(now_us - 5 * 60 * 1_000_000);
+    let issues_jsonl = [
+        json!({
+            "id": "br-handoff-active",
+            "title": "Active owner should keep",
+            "status": "in_progress",
+            "updated_at": stale_at,
+            "comments": [{"author": "ActiveAgent", "text": "still on it", "created_at": stale_at}]
+        }),
+        json!({
+            "id": "br-handoff-reserved",
+            "title": "Reservation should block",
+            "status": "in_progress",
+            "updated_at": stale_at,
+            "comments": [{"author": "ReservedAgent", "text": "holding files", "created_at": stale_at}]
+        }),
+        json!({
+            "id": "br-handoff-ack",
+            "title": "Ack-required mail should ask owner",
+            "status": "in_progress",
+            "updated_at": stale_at,
+            "comments": [{"author": "AckAgent", "text": "waiting", "created_at": stale_at}]
+        }),
+        json!({
+            "id": "br-handoff-inactive",
+            "title": "Inactive owner can be taken over",
+            "status": "in_progress",
+            "updated_at": stale_at,
+            "comments": [{"author": "InactiveAgent", "text": "started", "created_at": stale_at}]
+        }),
+        json!({
+            "id": "br-handoff-no-owner",
+            "title": "No owner can be reopened",
+            "status": "in_progress",
+            "updated_at": stale_at,
+            "comments": []
+        }),
+        json!({
+            "id": "br-handoff-fresh-comment",
+            "title": "Fresh comment should keep",
+            "status": "in_progress",
+            "updated_at": stale_at,
+            "comments": [{"author": "FreshAgent", "text": "fresh handoff note", "created_at": fresh_at}]
+        }),
+    ]
+    .into_iter()
+    .map(|value| serde_json::to_string(&value).expect("serialize issue"))
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let issues_path = beads_dir.join("issues.jsonl");
+    std::fs::write(&issues_path, &issues_jsonl).expect("write handoff issues");
+    let before = std::fs::read_to_string(&issues_path).expect("read before issues");
+
+    let out = run_am(
+        &env.base_env(),
+        Some(&project_path),
+        &[
+            "robot",
+            "handoff",
+            "--project",
+            &project_path_str,
+            "--include-fresh",
+            "--dry-run",
+            "--stale-minutes",
+            "60",
+            "--active-minutes",
+            "30",
+            "--fresh-comment-minutes",
+            "30",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "robot handoff should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).expect("valid handoff JSON");
+    let records = report["records"].as_array().expect("records array");
+    let action_for = |id: &str| {
+        records
+            .iter()
+            .find(|record| record["id"].as_str() == Some(id))
+            .and_then(|record| record["action"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let safe_command_for = |id: &str| {
+        records
+            .iter()
+            .find(|record| record["id"].as_str() == Some(id))
+            .and_then(|record| record["safe_command"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    assert_eq!(action_for("br-handoff-active"), "keep");
+    assert_eq!(action_for("br-handoff-reserved"), "blocked_by_reservation");
+    assert_eq!(action_for("br-handoff-ack"), "ask_owner");
+    assert_eq!(action_for("br-handoff-inactive"), "takeover_candidate");
+    assert_eq!(action_for("br-handoff-no-owner"), "reopen_candidate");
+    assert_eq!(action_for("br-handoff-fresh-comment"), "keep");
+    assert_eq!(
+        report["dry_run"].as_bool(),
+        Some(true),
+        "handoff command must report dry-run/read-only mode"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record["safe_command"].as_str().is_some_and(|command| {
+                command.starts_with("cd ")
+                    && command.contains(&project_path_str)
+                    && command.contains("br update br-handoff-no-owner --status open --json")
+            })
+        }),
+        "expected cwd-anchored proposed reopen command in report:\n{}",
+        serde_json::to_string_pretty(&report).unwrap()
+    );
+    let takeover_command = safe_command_for("br-handoff-inactive");
+    assert!(
+        takeover_command.starts_with("cd ")
+            && takeover_command.contains(&project_path_str)
+            && takeover_command.contains("br update br-handoff-inactive --claim --json"),
+        "expected cwd-anchored proposed claim command, got: {takeover_command}"
+    );
+    let after = std::fs::read_to_string(&issues_path).expect("read after issues");
+    assert_eq!(after, before, "robot handoff must not mutate beads JSONL");
+
+    let run_root = stale_handoff_artifacts_dir().join(format!(
+        "{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S%.3fZ"),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&run_root).expect("create handoff artifact root");
+    write_json_artifact(&run_root, "handoff_report.json", &report);
+    write_text_artifact(
+        &run_root,
+        "stdout.json",
+        &String::from_utf8_lossy(&out.stdout),
+    );
+    write_text_artifact(
+        &run_root,
+        "stderr.txt",
+        &String::from_utf8_lossy(&out.stderr),
+    );
+    write_text_artifact(&run_root, "issues_before.jsonl", &before);
+    write_text_artifact(
+        &run_root,
+        "repro.txt",
+        "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only -- --nocapture\n",
+    );
+    eprintln!(
+        "stale handoff dashboard artifact root: {}",
+        run_root.display()
     );
 }
 
