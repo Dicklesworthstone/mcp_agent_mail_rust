@@ -89,7 +89,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **37 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
 | **16-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, archive browsing, and ATC |
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
-| **Robot Mode** | 17 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
+| **Robot Mode** | 18 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
 | **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing are controlled by the hybrid feature flag (`feature = "hybrid"`). |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
@@ -648,7 +648,7 @@ Archive Browser note: use `Enter` to expand/preview, `Tab` to switch tree vs pre
 
 Non-interactive, agent-first CLI surface for TUI-equivalent situational awareness. Use it when you need structured snapshots quickly, especially in automated loops and when tokens matter.
 
-### 17 Subcommands
+### 18 Subcommands
 
 | Command | Purpose | Key flags |
 |---------|---------|-----------|
@@ -669,6 +669,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
 | `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
 | `am robot atc` | Live ATC snapshot with local DB fallback when the server is unavailable | `--since`, `--stratum`, `--summary-only`, `--limit` |
+| `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
 
 ### Output Formats
 
@@ -677,6 +678,8 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
 
 `am robot atc` reads the live ATC snapshot over `/mail/ws-state` when the local server is running and falls back to a local SQLite rollup/liveness view when that snapshot is unavailable. Use `--since` to trim recent decisions/executions, `--stratum` to focus open-stratum counts, and `--summary-only` for the compact health view.
+
+`am robot handoff` correlates in-progress beads with Agent Mail activity, active file reservations, thread mail, and recent comments. It is always read-only: reopen/takeover rows contain proposed `br update ... --status open --json` commands, but agents must inspect reservations, peer dirty work, and the related thread before running them.
 
 ### Agent Workflow Recipes
 
@@ -1228,6 +1231,18 @@ am verify bench-quick --path . --agent AgentName --block-on-conflicts
 ```
 
 `am verify` is a thin `am-run` lane mapper. It always shows the exact command, uses a `verify-*` build slot even when `WORKTREES_ENABLED` is not set in the shell, routes cargo-heavy work through `rch exec -- ...`, and writes `command.json`, `stdout.log`, `stderr.log`, `exit_code.txt`, and `result.json` under `STORAGE_ROOT/artifacts/verify/<timestamp>-<lane>/` unless `--artifact-dir` is supplied.
+
+`result.json` includes `rch_proof.status`, `child_exit_code`, and the final proof `exit_code`. For `rch exec` lanes, a zero-exit child is only green when the captured output includes a positive remote-execution marker. Local fallback or missing remote proof fails closed, writes `rch_proof_failure.txt`, and best-effort captures `rch_status_workers.json` plus `rch_queue.json` so operators can distinguish a remote test failure from transport/sync/fleet degradation.
+
+Release evidence for robot/doctor fields must prove the installed `am` binary, not only the source-built test binary. For parity-sensitive fields such as `forensic_timeline`, search-index health, recovery status, artifact links, next actions, and redaction, run the installed-binary parity gate against the release candidate installed on the same host or remote worker:
+
+```bash
+AM_INSTALLED_BINARY_PARITY_BIN=/path/to/installed/am \
+  rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
+  installed_binary_parity_probe_compares_source_and_installed_am -- --ignored --nocapture
+```
+
+The gate writes `tests/artifacts/installed_binary_parity/<run>/parity_report.json` with one pass/fail row per required JSON path, redacted source/installed values, value-mismatch status, and redacted command metadata. If the candidate lacks fields that source tests rely on, or returns different required values, the report is red and the release is not closed. A local direct `am doctor check --json` or `am robot ... --format json` probe is useful for quick inspection, but it is not sufficient release evidence unless paired with this parity report and an `rch exec -- ...` cargo proof.
 
 Use `--dry-run` to inspect the lane without running it. Use `--no-block-on-conflicts` only when the slot conflict is understood and you intentionally want advisory behavior.
 
