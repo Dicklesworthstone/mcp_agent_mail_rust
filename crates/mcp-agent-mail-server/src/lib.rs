@@ -4148,16 +4148,17 @@ static READINESS_SEMANTIC_CACHE: std::sync::LazyLock<Mutex<ReadinessSemanticCach
     std::sync::LazyLock::new(|| Mutex::new((Instant::now(), None)));
 
 // ---------------------------------------------------------------------------
-// Dispatch admission control (Fix: bound concurrent spawn_blocking threads)
+// Dispatch admission control (Fix: bound concurrent blocking dispatch threads)
 // ---------------------------------------------------------------------------
 
-/// Maximum concurrent `tools/call` dispatches allowed through `spawn_blocking`.
+/// Maximum concurrent `tools/call` dispatches allowed through the blocking
+/// dispatch worker handoff.
 /// Threads that exceed this limit receive an immediate "overloaded" error
 /// instead of queueing, preventing unbounded thread accumulation when the
-/// blocking pool backs up behind a timeout.
+/// blocking worker handoff backs up behind a timeout.
 const MAX_CONCURRENT_DISPATCHES: u32 = 128;
 
-/// Atomic counter tracking in-flight `spawn_blocking` dispatches.
+/// Atomic counter tracking in-flight blocking dispatches.
 static DISPATCH_INFLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// RAII guard that decrements `DISPATCH_INFLIGHT` on drop, ensuring the
@@ -4267,6 +4268,87 @@ impl Drop for SharedPermitGuard {
     }
 }
 
+struct DispatchThreadState<T> {
+    result: Option<Result<T, McpError>>,
+    waker: Option<std::task::Waker>,
+}
+
+struct DispatchThreadReceiver<T> {
+    state: Arc<Mutex<DispatchThreadState<T>>>,
+}
+
+impl<T> Future for DispatchThreadReceiver<T> {
+    type Output = Result<T, McpError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.result.take().map_or_else(
+            || {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            },
+            Poll::Ready,
+        )
+    }
+}
+
+fn spawn_dispatch_thread<T, F>(
+    method: String,
+    cancel: DispatchCancel,
+    shared_permit: SharedPermit,
+    work: F,
+) -> Result<DispatchThreadReceiver<T>, McpError>
+where
+    T: Send + 'static,
+    F: FnOnce(DispatchCancel) -> Result<T, McpError> + Send + 'static,
+{
+    // Do not use asupersync::runtime::spawn_blocking here: under a current Cx
+    // with no blocking-pool handle it deliberately runs inline, which prevents
+    // the timeout wrapper from being polled.
+    let state = Arc::new(Mutex::new(DispatchThreadState {
+        result: None,
+        waker: None,
+    }));
+    let worker_state = Arc::clone(&state);
+    let worker_permit = Arc::clone(&shared_permit);
+    let worker_method = method.clone();
+
+    let spawn_result = std::thread::Builder::new()
+        .name("dispatch-blocking".into())
+        .spawn(move || {
+            let _permit_guard = SharedPermitGuard(worker_permit);
+            let result =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(cancel))) {
+                    Ok(result) => result,
+                    Err(payload) => Err(dispatch_panic_error(&worker_method, payload.as_ref())),
+                };
+            let waker = {
+                let mut state = worker_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.result = Some(result);
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+
+    match spawn_result {
+        Ok(_) => Ok(DispatchThreadReceiver { state }),
+        Err(err) => {
+            drop(
+                shared_permit
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
+            Err(McpError::new(
+                McpErrorCode::InternalError,
+                format!("Failed to spawn blocking dispatch thread for {method}: {err}"),
+            ))
+        }
+    }
+}
+
 async fn run_cancellable_blocking_dispatch<T, F>(
     method: String,
     dispatch_timeout_secs: u64,
@@ -4279,16 +4361,12 @@ where
     T: Send + 'static,
     F: FnOnce(DispatchCancel) -> Result<T, McpError> + Send + 'static,
 {
-    let worker_cancel = cancel.clone();
-    let worker_method = method.clone();
-    let closure_permit = Arc::clone(&shared_permit);
-    let spawn_future = asupersync::runtime::spawn_blocking(move || {
-        let _permit_guard = SharedPermitGuard(closure_permit);
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(worker_cancel))) {
-            Ok(result) => result,
-            Err(payload) => Err(dispatch_panic_error(&worker_method, payload.as_ref())),
-        }
-    });
+    let spawn_future = spawn_dispatch_thread(
+        method.clone(),
+        cancel.clone(),
+        Arc::clone(&shared_permit),
+        work,
+    )?;
 
     if dispatch_timeout_secs == 0 {
         return spawn_future.await;
@@ -4333,7 +4411,7 @@ where
                 method = %method,
                 dispatch_timeout_secs,
                 grace_secs,
-                "dispatch spawn_blocking timed out; cancellation requested, \
+                "blocking dispatch timed out; cancellation requested, \
                  permit will be force-released after {grace_secs}s grace"
             );
             Err(dispatch_timeout_error(&method, dispatch_timeout_secs))
@@ -6153,6 +6231,7 @@ fn ensure_atc_executor_identity(
                 "atc-executor".to_string(),
                 Some(atc::ATC_AGENT_NAME.to_string()),
                 Some("ATC automated control plane".to_string()),
+                None,
                 None,
                 None,
             )
@@ -9129,7 +9208,7 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
-    /// Weak self-reference for `spawn_blocking` in async dispatch.
+    /// Weak self-reference for async blocking dispatch.
     /// Set immediately after `Arc::new(HttpState::new(...))`.
     self_ref: std::sync::OnceLock<std::sync::Weak<HttpState>>,
 }
@@ -9338,6 +9417,7 @@ impl HttpState {
             return resp;
         }
 
+        let json_rpc = inject_tmux_pane_header(json_rpc, &req);
         let response = self.dispatch(json_rpc).await.map_or_else(
             || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
             |resp| HttpResponse::ok().with_json(&resp),
@@ -10298,7 +10378,7 @@ to skip auth for local requests.</p>
     }
 
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        // Upgrade self_ref to Arc so we can move into the 'static spawn_blocking closure.
+        // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             // self_ref not set or HttpState already dropped — fall back to inline sync.
@@ -10314,7 +10394,7 @@ to skip auth for local requests.</p>
         let id = request.id.clone();
         let method = request.method.clone();
 
-        // Admission control: reject early when the blocking pool is saturated
+        // Admission control: reject early when blocking dispatch is saturated
         // so timed-out threads don't accumulate unboundedly.
         let Some(permit) = DispatchPermit::try_acquire() else {
             tracing::warn!(
@@ -14037,6 +14117,78 @@ fn readiness_check_with_integrity(
     Ok(())
 }
 
+const MAX_TMUX_PANE_HEADER_LEN: usize = 64;
+
+fn is_trusted_tmux_pane_header(value: &str) -> bool {
+    let Some(digits) = value.strip_prefix('%') else {
+        return false;
+    };
+    !digits.is_empty()
+        && value.len() <= MAX_TMUX_PANE_HEADER_LEN
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn tmux_pane_header(req: &Http1Request) -> Option<String> {
+    req.headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-tmux-pane"))
+        .find_map(|(_, value)| {
+            let value = value.trim();
+            (!value.is_empty() && is_trusted_tmux_pane_header(value)).then(|| value.to_string())
+        })
+}
+
+fn accepts_pane_id_header(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "register_agent"
+            | "create_agent_identity"
+            | "macro_start_session"
+            | "resolve_pane_identity"
+    )
+}
+
+fn inject_tmux_pane_header(mut request: JsonRpcRequest, req: &Http1Request) -> JsonRpcRequest {
+    if request.method != "tools/call" {
+        return request;
+    }
+    let Some(pane_id) = tmux_pane_header(req) else {
+        return request;
+    };
+    let Some(params) = request
+        .params
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return request;
+    };
+    let Some(tool_name) = params.get("name").and_then(serde_json::Value::as_str) else {
+        return request;
+    };
+    if !accepts_pane_id_header(tool_name) {
+        return request;
+    }
+
+    let arguments = params
+        .entry("arguments")
+        .or_insert_with(|| serde_json::json!({}));
+    if arguments.is_null() {
+        *arguments = serde_json::json!({});
+    }
+    let Some(args) = arguments.as_object_mut() else {
+        return request;
+    };
+
+    let caller_supplied_pane = args
+        .get("pane_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if !caller_supplied_pane {
+        args.insert("pane_id".to_string(), serde_json::Value::String(pane_id));
+    }
+    request
+}
+
 fn parse_params<T: serde::de::DeserializeOwned>(
     params: Option<serde_json::Value>,
 ) -> Result<T, McpError> {
@@ -14860,6 +15012,7 @@ mod tests {
     static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     struct NoopTool;
@@ -15049,139 +15202,145 @@ mod tests {
 
     #[test]
     fn dispatch_timeout_keeps_permit_until_blocking_work_stops() {
-        let permit = DispatchPermit::try_acquire().expect("permit available");
-        let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
-        assert!(before >= 1);
-        let cancel_observed = Arc::new(AtomicBool::new(false));
-        let release_worker = Arc::new(AtomicBool::new(false));
-        let cancel_observed_worker = Arc::clone(&cancel_observed);
-        let release_worker_clone = Arc::clone(&release_worker);
+        with_serialized_dispatch_permits(|| {
+            let permit = DispatchPermit::try_acquire().expect("permit available");
+            let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+            assert!(before >= 1);
+            let cancel_observed = Arc::new(AtomicBool::new(false));
+            let release_worker = Arc::new(AtomicBool::new(false));
+            let cancel_observed_worker = Arc::clone(&cancel_observed);
+            let release_worker_clone = Arc::clone(&release_worker);
 
-        let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
-            "test/permit-lifetime".to_string(),
-            1,
-            Cx::for_request_with_budget(Budget::INFINITE),
-            DispatchCancel::new(),
-            Arc::new(Mutex::new(Some(permit))),
-            move |cancel| {
-                loop {
-                    if cancel.is_requested() {
-                        cancel_observed_worker.store(true, Ordering::Release);
-                        while !release_worker_clone.load(Ordering::Acquire) {
-                            std::thread::sleep(Duration::from_millis(10));
+            let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+                "test/permit-lifetime".to_string(),
+                1,
+                Cx::for_request_with_budget(Budget::INFINITE),
+                DispatchCancel::new(),
+                Arc::new(Mutex::new(Some(permit))),
+                move |cancel| {
+                    loop {
+                        if cancel.is_requested() {
+                            cancel_observed_worker.store(true, Ordering::Release);
+                            while !release_worker_clone.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            return Err(dispatch_cancelled_error());
                         }
-                        return Err(dispatch_cancelled_error());
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            },
-        ));
+                },
+            ));
 
-        assert!(result.is_err(), "dispatch timeout must return an error");
-        let wait_started = Instant::now();
-        while !cancel_observed.load(Ordering::Acquire)
-            && wait_started.elapsed() < Duration::from_secs(5)
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            cancel_observed.load(Ordering::Acquire),
-            "blocking work must observe cancellation before permit release"
-        );
-        assert_eq!(
-            DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-            before,
-            "permit must remain held while blocking work is still running"
-        );
+            assert!(result.is_err(), "dispatch timeout must return an error");
+            let wait_started = Instant::now();
+            while !cancel_observed.load(Ordering::Acquire)
+                && wait_started.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                cancel_observed.load(Ordering::Acquire),
+                "blocking work must observe cancellation before permit release"
+            );
+            assert_eq!(
+                DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                before,
+                "permit must remain held while blocking work is still running"
+            );
 
-        release_worker.store(true, Ordering::Release);
-        let release_started = Instant::now();
-        while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
-            && release_started.elapsed() < Duration::from_secs(5)
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-            before - 1,
-            "permit must release after the cancelled blocking work exits"
-        );
+            release_worker.store(true, Ordering::Release);
+            let release_started = Instant::now();
+            while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
+                && release_started.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                before - 1,
+                "permit must release after the cancelled blocking work exits"
+            );
+        });
     }
 
     #[test]
     fn dispatch_hard_grace_force_releases_permit_when_closure_ignores_cancel() {
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("AM_DISPATCH_HARD_GRACE_SECS", "5")],
-            || {
-                let permit = DispatchPermit::try_acquire().expect("permit available");
-                let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
-                assert!(before >= 1);
+        with_serialized_dispatch_permits(|| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_DISPATCH_HARD_GRACE_SECS", "5")],
+                || {
+                    let permit = DispatchPermit::try_acquire().expect("permit available");
+                    let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+                    assert!(before >= 1);
 
-                let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
-                    "test/zombie-closure".to_string(),
-                    1,
-                    Cx::for_request_with_budget(Budget::INFINITE),
-                    DispatchCancel::new(),
-                    Arc::new(Mutex::new(Some(permit))),
-                    move |_cancel| {
-                        // Deliberately ignore cancellation — simulate a stuck closure.
-                        std::thread::sleep(Duration::from_secs(10));
-                        Ok(())
-                    },
-                ));
+                    let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+                        "test/zombie-closure".to_string(),
+                        1,
+                        Cx::for_request_with_budget(Budget::INFINITE),
+                        DispatchCancel::new(),
+                        Arc::new(Mutex::new(Some(permit))),
+                        move |_cancel| {
+                            // Deliberately ignore cancellation; simulate a stuck closure.
+                            std::thread::sleep(Duration::from_secs(10));
+                            Ok(())
+                        },
+                    ));
 
-                assert!(result.is_err(), "dispatch timeout must return an error");
+                    assert!(result.is_err(), "dispatch timeout must return an error");
 
-                // Permit should still be held immediately after timeout (grace not expired).
-                assert_eq!(
-                    DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-                    before,
-                    "permit must remain held during grace window"
-                );
+                    // Permit should still be held immediately after timeout (grace not expired).
+                    assert_eq!(
+                        DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                        before,
+                        "permit must remain held during grace window"
+                    );
 
-                // Wait for the hard grace timeout (5s) + epsilon.
-                let wait_started = Instant::now();
-                while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
-                    && wait_started.elapsed() < Duration::from_secs(7)
-                {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                assert_eq!(
-                    DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-                    before - 1,
-                    "hard grace timeout must force-release the permit"
-                );
-            },
-        );
+                    // Wait for the hard grace timeout (5s) + epsilon.
+                    let wait_started = Instant::now();
+                    while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
+                        && wait_started.elapsed() < Duration::from_secs(7)
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    assert_eq!(
+                        DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                        before - 1,
+                        "hard grace timeout must force-release the permit"
+                    );
+                },
+            );
+        });
     }
 
     #[test]
     fn dispatch_worker_panic_returns_error_and_releases_permit() {
-        let permit = DispatchPermit::try_acquire().expect("permit available");
-        let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
-        assert!(before >= 1);
+        with_serialized_dispatch_permits(|| {
+            let permit = DispatchPermit::try_acquire().expect("permit available");
+            let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+            assert!(before >= 1);
 
-        let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
-            "test/panic".to_string(),
-            0,
-            Cx::for_request_with_budget(Budget::INFINITE),
-            DispatchCancel::new(),
-            Arc::new(Mutex::new(Some(permit))),
-            move |_cancel| -> Result<(), McpError> {
-                std::panic::panic_any("synthetic blocking panic");
-            },
-        ));
+            let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+                "test/panic".to_string(),
+                0,
+                Cx::for_request_with_budget(Budget::INFINITE),
+                DispatchCancel::new(),
+                Arc::new(Mutex::new(Some(permit))),
+                move |_cancel| -> Result<(), McpError> {
+                    std::panic::panic_any("synthetic blocking panic");
+                },
+            ));
 
-        let error = result.expect_err("blocking worker panic should become an MCP error");
-        let error_text = format!("{error:?}");
-        assert!(error_text.contains("Blocking dispatch panicked"));
-        assert!(error_text.contains("test/panic"));
-        assert!(error_text.contains("synthetic blocking panic"));
-        assert_eq!(
-            DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-            before - 1,
-            "panic path must release the dispatch permit"
-        );
+            let error = result.expect_err("blocking worker panic should become an MCP error");
+            let error_text = format!("{error:?}");
+            assert!(error_text.contains("Blocking dispatch panicked"));
+            assert!(error_text.contains("test/panic"));
+            assert!(error_text.contains("synthetic blocking panic"));
+            assert_eq!(
+                DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                before - 1,
+                "panic path must release the dispatch permit"
+            );
+        });
     }
 
     #[test]
@@ -16716,6 +16875,16 @@ first body
         )
     }
 
+    fn with_serialized_dispatch_permits<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _lock = DISPATCH_PERMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f()
+    }
+
     fn with_serialized_health_count_cache<F, T>(f: F) -> T
     where
         F: FnOnce() -> T,
@@ -16761,6 +16930,140 @@ first body
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    fn injected_pane_id(request: &JsonRpcRequest) -> Option<&str> {
+        request
+            .params
+            .as_ref()?
+            .get("arguments")?
+            .get("pane_id")?
+            .as_str()
+    }
+
+    #[test]
+    fn x_tmux_pane_header_injects_pane_id_for_identity_tools() {
+        let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", "%23")]);
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "register_agent",
+                "arguments": {
+                    "project_key": "/tmp/project",
+                    "program": "claude-code",
+                    "model": "opus"
+                }
+            })),
+            1,
+        );
+
+        let injected = inject_tmux_pane_header(json_rpc, &req);
+        assert_eq!(injected_pane_id(&injected), Some("%23"));
+    }
+
+    #[test]
+    fn explicit_pane_id_wins_over_x_tmux_pane_header() {
+        let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", "%23")]);
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "macro_start_session",
+                "arguments": {
+                    "human_key": "/tmp/project",
+                    "program": "claude-code",
+                    "model": "opus",
+                    "pane_id": "%99"
+                }
+            })),
+            1,
+        );
+
+        let injected = inject_tmux_pane_header(json_rpc, &req);
+        assert_eq!(injected_pane_id(&injected), Some("%99"));
+    }
+
+    #[test]
+    fn x_tmux_pane_header_ignores_unrelated_tools() {
+        let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", "%23")]);
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "health_check",
+                "arguments": {}
+            })),
+            1,
+        );
+
+        let injected = inject_tmux_pane_header(json_rpc, &req);
+        assert_eq!(injected_pane_id(&injected), None);
+    }
+
+    #[test]
+    fn x_tmux_pane_header_injects_for_resolve_pane_identity() {
+        let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", "%23")]);
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "resolve_pane_identity",
+                "arguments": {
+                    "project_key": "/tmp/project"
+                }
+            })),
+            1,
+        );
+
+        let injected = inject_tmux_pane_header(json_rpc, &req);
+        assert_eq!(injected_pane_id(&injected), Some("%23"));
+    }
+
+    #[test]
+    fn x_tmux_pane_header_uses_first_trusted_duplicate() {
+        let req = make_request(
+            Http1Method::Post,
+            "/mcp/",
+            &[("X-Tmux-Pane", "main:0:2"), ("X-Tmux-Pane", "%23")],
+        );
+        let json_rpc = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "register_agent",
+                "arguments": {
+                    "project_key": "/tmp/project",
+                    "program": "claude-code",
+                    "model": "opus"
+                }
+            })),
+            1,
+        );
+
+        let injected = inject_tmux_pane_header(json_rpc, &req);
+        assert_eq!(injected_pane_id(&injected), Some("%23"));
+    }
+
+    #[test]
+    fn x_tmux_pane_header_rejects_untrusted_values() {
+        for value in ["main:0:2", "%", "%23\nX-Bad: yes", "%not-digits"] {
+            let req = make_request(Http1Method::Post, "/mcp/", &[("X-Tmux-Pane", value)]);
+            let json_rpc = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "register_agent",
+                    "arguments": {
+                        "project_key": "/tmp/project",
+                        "program": "claude-code",
+                        "model": "opus"
+                    }
+                })),
+                1,
+            );
+
+            let injected = inject_tmux_pane_header(json_rpc, &req);
+            assert_eq!(
+                injected_pane_id(&injected),
+                None,
+                "untrusted X-Tmux-Pane value was injected: {value:?}"
+            );
+        }
     }
 
     #[test]
