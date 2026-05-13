@@ -1661,7 +1661,7 @@ fn respond_contact_updates_status_and_expires() {
     assert_eq!(link.status, "approved");
     assert!(
         link.expires_ts.is_some(),
-        "accepted contact should have expiry"
+        "approved contact should have expiry"
     );
     assert!(link.updated_ts > 0, "updated_ts should be set");
 

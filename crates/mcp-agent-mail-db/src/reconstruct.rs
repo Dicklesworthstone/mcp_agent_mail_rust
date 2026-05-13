@@ -6541,7 +6541,7 @@ archive body
         salvage_conn
             .query_sync(
                 "INSERT INTO agent_links (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)
-                 VALUES (100, 10, 100, 11, 'accepted', 'carry contact state', 7, 8, 9)",
+                 VALUES (100, 10, 100, 11, 'approved', 'carry contact state', 7, 8, 9)",
                 &[],
             )
             .expect("insert agent link");
@@ -6573,7 +6573,7 @@ archive body
             contact_rows[0]
                 .get_named::<String>("status")
                 .expect("status"),
-            "accepted"
+            "approved"
         );
         assert_eq!(
             contact_rows[0]

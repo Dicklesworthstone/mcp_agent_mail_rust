@@ -9660,12 +9660,12 @@ fn fetch_robot_agent_contact_stats(
         "WITH approved_links AS ( \
             SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
             FROM agent_links \
-            WHERE status IN ('approved', 'accepted') \
+            WHERE status = 'approved' \
               AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
             UNION \
             SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
             FROM agent_links \
-            WHERE status IN ('approved', 'accepted') \
+            WHERE status = 'approved' \
               AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
          ) \
          SELECT \
@@ -13556,6 +13556,94 @@ mod tests {
         .expect("seed recipient");
 
         (temp_dir, conn)
+    }
+
+    #[test]
+    fn robot_contact_stats_only_treats_approved_links_as_respected() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_contact_stats.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                contact_policy TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_agent_id INTEGER NOT NULL,
+                b_agent_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                expires_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create links");
+
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, contact_policy) VALUES
+                (1, 1, 'open'),
+                (2, 1, 'contacts_only')",
+            &empty,
+        )
+        .expect("seed agents");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, created_ts)
+             VALUES (1, 1, 1, 100)",
+            &empty,
+        )
+        .expect("seed message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id)
+             VALUES (1, 1, 2)",
+            &empty,
+        )
+        .expect("seed recipient");
+        conn.query_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts)
+             VALUES (1, 1, 2, 'accepted', NULL)",
+            &empty,
+        )
+        .expect("seed stale link");
+
+        let stale_stats = fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000);
+        let stale = stale_stats.get(&2).expect("stale contact stats");
+        assert_eq!(stale.respected_count, 0);
+        assert_eq!(stale.violation_count, 1);
+
+        conn.query_sync("UPDATE agent_links SET status = 'approved'", &empty)
+            .expect("approve link");
+
+        let approved_stats = fetch_robot_agent_contact_stats(&conn, 1, "2", 0, 1_000);
+        let approved = approved_stats.get(&2).expect("approved contact stats");
+        assert_eq!(approved.respected_count, 1);
+        assert_eq!(approved.violation_count, 0);
     }
 
     fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
