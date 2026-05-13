@@ -413,6 +413,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         git_detect: build_git_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
+        doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
     };
@@ -559,6 +560,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         git_detect: build_git_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
+        doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
     };
@@ -641,6 +643,7 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         git_detect: build_git_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
+        doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
         stale_seconds_override: None,
     };
 

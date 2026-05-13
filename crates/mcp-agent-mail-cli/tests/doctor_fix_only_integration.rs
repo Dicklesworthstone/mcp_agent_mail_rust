@@ -69,6 +69,7 @@ fn dispatch_only_stale_archive_lock_quarantines_via_mutate() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -122,6 +123,7 @@ fn dispatch_only_unknown_fm_id_returns_error() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
     let result = fixers::dispatch_only("fm-not-a-real-fixer-id-xxx", &ctx, &inputs);
@@ -145,6 +147,7 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -226,6 +229,7 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -274,6 +278,7 @@ fn dispatch_only_world_readable_storage_db_chmods_via_chokepoint() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: vec![db.clone()],
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -297,6 +302,107 @@ fn dispatch_only_world_readable_storage_db_chmods_via_chokepoint() {
         actions.contains("Chmod"),
         "actions.jsonl must record a Chmod op"
     );
+}
+
+#[test]
+fn dispatch_only_dangling_doctor_latest_re_aims_via_chokepoint() {
+    // Pass-28: 9th FM, Op::SymlinkAtomic at FM level. Plant a
+    // dangling `.doctor/latest` plus one surviving runs/<id>
+    // directory. Route through dispatch_only and assert the
+    // symlink is re-aimed at the surviving target AND the
+    // chokepoint records a SymlinkAtomic op in actions.jsonl.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let doctor_root = td.path().join(".doctor");
+    let runs = doctor_root.join("runs");
+    let surviving = "2026-05-13T01-00-00Z__alive";
+    fs::create_dir_all(runs.join(surviving)).expect("mkdir surviving run");
+
+    let latest = doctor_root.join("latest");
+    let dangling = PathBuf::from("runs").join("2026-05-13T00-00-00Z__gone");
+    std::os::unix::fs::symlink(&dangling, &latest).expect("plant dangling symlink");
+
+    let run_id = "2026-05-13T02-00-00Z__symlink_fm";
+    let fm_id = fixers::dangling_doctor_latest::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: None,
+        db_file_candidates: Vec::new(),
+        doctor_latest_target: Some(latest.clone()),
+        stale_seconds_override: None,
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(outcome.fm_id, fm_id);
+    assert_eq!(outcome.findings_count, 1);
+    assert_eq!(outcome.actions_taken, 1);
+
+    // The chokepoint also scaffolded its own run-dir
+    // (`<td>/.doctor/runs/<run_id>/`) via build_ctx. The fixer
+    // picks whichever runs/<id> is newest by mtime, which may
+    // be either the planted `surviving` dir or the build_ctx
+    // scaffold. The behavioral guarantee we care about is that
+    // the symlink no longer dangles.
+    let new_target = fs::read_link(&latest).expect("read .doctor/latest");
+    let resolved = doctor_root.join(&new_target);
+    assert!(
+        resolved.exists(),
+        "re-aimed target {resolved:?} must exist (no longer dangling); planted surviving={surviving}"
+    );
+    assert_ne!(
+        new_target.to_string_lossy(),
+        dangling.to_string_lossy(),
+        "symlink must have been updated (not still pointing at the original dangling target)"
+    );
+
+    drop(ctx);
+    let actions_path = td
+        .path()
+        .join(".doctor")
+        .join("runs")
+        .join(run_id)
+        .join("actions.jsonl");
+    let actions = fs::read_to_string(&actions_path).expect("read actions.jsonl");
+    assert!(
+        actions.contains("SymlinkAtomic"),
+        "actions.jsonl must record a SymlinkAtomic op (got: {actions})"
+    );
+}
+
+#[test]
+fn dispatch_only_dangling_doctor_latest_requires_target_path() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let fm_id = fixers::dangling_doctor_latest::FM_ID;
+    let ctx = build_ctx(&td, "2026-05-13T00-00-00Z__no_input", fm_id);
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: Vec::new(),
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: None,
+        db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
+        stale_seconds_override: None,
+    };
+    let err = fixers::dispatch_only(fm_id, &ctx, &inputs)
+        .expect_err("missing input must surface as DispatchError");
+    assert!(matches!(
+        err,
+        fixers::DispatchError::MissingInput {
+            field: "doctor_latest_target",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -335,6 +441,7 @@ fn dispatch_only_unrelated_fm_does_not_touch_gitignore() {
         // unrelated FM must NOT invoke the gitignore detector.
         gitignore_target: Some(gi.clone()),
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -375,6 +482,7 @@ fn dispatch_only_missing_gitignore_appends_via_chokepoint() {
         git_detect: None,
         gitignore_target: Some(gi.clone()),
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -419,6 +527,7 @@ fn dispatch_only_missing_gitignore_requires_target_path() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
     let err = fixers::dispatch_only(fm_id, &ctx, &inputs)
@@ -462,6 +571,7 @@ fn list_all_iterates_registry_and_aggregates_findings() {
         git_detect: None,
         gitignore_target: Some(gi),
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
 
@@ -522,6 +632,7 @@ fn empty_inputs(td: &tempfile::TempDir) -> DispatchInputs {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     }
 }
@@ -613,6 +724,7 @@ fn detect_only_unknown_fm_id_returns_error() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
     let err =
@@ -638,6 +750,7 @@ fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
+        doctor_latest_target: None,
         stale_seconds_override: None,
     };
     let err = fixers::dispatch_only(fixers::wrong_mcp_url_json::FM_ID, &ctx, &inputs)

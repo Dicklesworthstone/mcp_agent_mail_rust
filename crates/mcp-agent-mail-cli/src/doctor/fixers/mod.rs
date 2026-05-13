@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dangling_doctor_latest;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
 pub mod stale_archive_lock;
@@ -159,6 +160,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::world_readable_storage_db",
         },
         FixerSpec {
+            id: dangling_doctor_latest::FM_ID,
+            severity: "P2",
+            subsystem: "doctor_state_files",
+            op_pattern: "Op::SymlinkAtomic",
+            auto_fixable: true,
+            one_line_description: ".doctor/latest symlink points at a non-existent runs/<id> directory",
+            source_module: "doctor::fixers::dangling_doctor_latest",
+        },
+        FixerSpec {
             id: known_bad_git_no_override::FM_ID,
             severity: "P0",
             subsystem: "environment_toolchain",
@@ -233,6 +243,9 @@ pub struct DispatchInputs {
     /// `DbPoolConfig::database_url` resolves to). Empty slice
     /// skips the FM.
     pub db_file_candidates: Vec<std::path::PathBuf>,
+    /// Path to the `<repo>/.doctor/latest` symlink for the
+    /// `dangling_doctor_latest` FM. `None` skips the FM.
+    pub doctor_latest_target: Option<std::path::PathBuf>,
     /// Optional override for the per-FM mtime-based staleness threshold.
     ///
     /// `None` (the production default) means each stale-* FM uses its
@@ -366,6 +379,22 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == dangling_doctor_latest::FM_ID {
+        let latest = inputs
+            .doctor_latest_target
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: dangling_doctor_latest::FM_ID,
+                field: "doctor_latest_target",
+            })?;
+        let findings = dangling_doctor_latest::detect(latest);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = dangling_doctor_latest::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == wrong_mcp_url_json::FM_ID {
         let canonical = inputs
             .canonical_mcp_url
@@ -477,6 +506,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == world_readable_storage_db::FM_ID {
         world_readable_storage_db::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == dangling_doctor_latest::FM_ID {
+        let latest = inputs
+            .doctor_latest_target
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: dangling_doctor_latest::FM_ID,
+                field: "doctor_latest_target",
+            })?;
+        dangling_doctor_latest::detect(latest)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -625,7 +666,7 @@ mod tests {
     fn registry_is_non_empty_and_alphabetically_sorted() {
         // Pass-14: every FM-level fixer must register a FixerSpec.
         let r = registry();
-        assert!(r.len() >= 8, "registry has fewer fixers than expected");
+        assert!(r.len() >= 9, "registry has fewer fixers than expected");
         // Alphabetical sort by id helps `am doctor fixers` produce
         // stable output (operators rely on this for diffing).
         let ids: Vec<&str> = r.iter().map(|s| s.id).collect();
