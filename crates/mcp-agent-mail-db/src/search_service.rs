@@ -971,6 +971,16 @@ struct LexicalBackfillDbFingerprint {
     len_bytes: u64,
     #[serde(default)]
     modified_micros: i64,
+    #[serde(default)]
+    device_id: Option<u64>,
+    #[serde(default)]
+    inode: Option<u64>,
+}
+
+impl LexicalBackfillDbFingerprint {
+    fn stable_file_id(&self) -> Option<(u64, u64)> {
+        Some((self.device_id?, self.inode?))
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1006,6 +1016,13 @@ fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBack
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
+    #[cfg(unix)]
+    let (device_id, inode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device_id, inode) = (None, None);
     let modified_micros = metadata
         .modified()
         .ok()
@@ -1015,6 +1032,8 @@ fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBack
     Some(LexicalBackfillDbFingerprint {
         len_bytes: metadata.len(),
         modified_micros,
+        device_id,
+        inode,
     })
 }
 
@@ -1121,13 +1140,25 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let skipped_messages = source_messages.saturating_sub(indexed_messages);
     let fingerprint_stale_reason = state.db_fingerprint.as_ref().and_then(|recorded| {
         match sqlite_file_lexical_backfill_fingerprint(pool.sqlite_path()) {
-            Some(current) if recorded != &current => Some(format!(
-                "backfill marker database fingerprint changed for {}",
-                pool.sqlite_path()
-            )),
-            Some(_) => None,
+            Some(current) => match (recorded.stable_file_id(), current.stable_file_id()) {
+                (Some(recorded_id), Some(current_id)) if recorded_id != current_id => {
+                    Some(format!(
+                        "backfill marker database identity changed for {}",
+                        pool.sqlite_path()
+                    ))
+                }
+                (None, Some(_)) => Some(format!(
+                    "backfill marker database identity is missing for {}",
+                    pool.sqlite_path()
+                )),
+                (Some(_), None) => Some(format!(
+                    "backfill marker database identity is unavailable for {}",
+                    pool.sqlite_path()
+                )),
+                _ => None,
+            },
             None => Some(format!(
-                "backfill marker database fingerprint is unavailable for {}",
+                "backfill marker database identity is unavailable for {}",
                 pool.sqlite_path()
             )),
         }
@@ -1163,7 +1194,7 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let health_state = match stale_reason.as_deref() {
         None => "fresh",
         Some(reason) if reason.starts_with("backfill marker belongs") => "stale",
-        Some(reason) if reason.starts_with("backfill marker database fingerprint") => "stale",
+        Some(reason) if reason.starts_with("backfill marker database identity") => "stale",
         Some(reason) if reason.starts_with("process-global lexical bridge") => "stale",
         Some(_) => "partial",
     };
@@ -4630,6 +4661,8 @@ mod tests {
             LexicalBackfillDbFingerprint {
                 len_bytes: 1,
                 modified_micros: 2,
+                device_id: None,
+                inode: None,
             },
         );
         let payload = serde_json::json!({
@@ -4637,7 +4670,9 @@ mod tests {
             "db_path": db_path,
             "db_fingerprint": {
                 "len_bytes": db_fingerprint.len_bytes,
-                "modified_micros": db_fingerprint.modified_micros
+                "modified_micros": db_fingerprint.modified_micros,
+                "device_id": db_fingerprint.device_id,
+                "inode": db_fingerprint.inode
             },
             "db_stats": {
                 "count": db_count,
@@ -4752,7 +4787,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_backfill_health_reports_stale_after_same_path_database_fingerprint_change() {
+    fn lexical_backfill_health_ignores_same_file_timestamp_churn() {
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4766,11 +4801,42 @@ mod tests {
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(pool.sqlite_path())
-                .expect("open db file for fingerprint change");
-            file.write_all(b"fingerprint-change")
-                .expect("change db fingerprint");
-            file.sync_all().expect("sync db fingerprint change");
+                .expect("open db file for timestamp churn");
+            file.write_all(b"same-file-churn")
+                .expect("change same file metadata");
+            file.sync_all().expect("sync same file metadata change");
         }
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "fresh");
+        assert!(health.stale_reason.is_none());
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lexical_backfill_health_reports_stale_when_state_lacks_database_identity() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        let state_path = root.path().join("search_index").join("backfill_state.json");
+        let mut state_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("read backfill state"),
+        )
+        .expect("parse backfill state");
+        state_json["db_fingerprint"]["device_id"] = serde_json::Value::Null;
+        state_json["db_fingerprint"]["inode"] = serde_json::Value::Null;
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state_json).expect("serialize adjusted state"),
+        )
+        .expect("write adjusted backfill state");
 
         let health = lexical_backfill_health(&pool);
 
@@ -4779,7 +4845,55 @@ mod tests {
             health
                 .stale_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("database fingerprint changed"))
+                .is_some_and(|reason| reason.contains("database identity is missing"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_stale_after_same_path_database_identity_change() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        let replacement_identity_path = root.path().join("replacement-mail.sqlite3");
+        std::fs::write(
+            &replacement_identity_path,
+            b"same path, different database identity fixture",
+        )
+        .expect("replacement identity fixture");
+        let replacement_fingerprint = sqlite_file_lexical_backfill_fingerprint(
+            replacement_identity_path
+                .to_str()
+                .expect("replacement fixture path"),
+        )
+        .expect("replacement fingerprint");
+        let state_path = root.path().join("search_index").join("backfill_state.json");
+        let mut state_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_path).expect("read backfill state"),
+        )
+        .expect("parse backfill state");
+        state_json["db_fingerprint"]["device_id"] =
+            serde_json::json!(replacement_fingerprint.device_id);
+        state_json["db_fingerprint"]["inode"] = serde_json::json!(replacement_fingerprint.inode);
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state_json).expect("serialize adjusted state"),
+        )
+        .expect("write adjusted backfill state");
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("database identity changed"))
         );
         reset_lexical_bootstrap_tracking();
     }

@@ -611,6 +611,10 @@ const BACKFILL_STATE_SCHEMA_VERSION: u32 = 1;
 struct BackfillDbFingerprint {
     len_bytes: u64,
     modified_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inode: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -650,6 +654,13 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
+    #[cfg(unix)]
+    let (device_id, inode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (Some(metadata.dev()), Some(metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let (device_id, inode) = (None, None);
     let modified_micros = metadata
         .modified()
         .ok()
@@ -659,6 +670,8 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
     Some(BackfillDbFingerprint {
         len_bytes: metadata.len(),
         modified_micros,
+        device_id,
+        inode,
     })
 }
 
@@ -1065,6 +1078,19 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
+        if let Some(fingerprint) = db_fingerprint
+            && state.db_fingerprint != fingerprint
+        {
+            write_backfill_state(
+                &bridge,
+                db_path,
+                fingerprint,
+                state.db_stats,
+                state.message_watermark,
+                current_index_fingerprint,
+                state.index_stats,
+            );
+        }
         tracing::info!(
             message_seq = message_watermark.sequence,
             message_max_id = message_watermark.max_id,
