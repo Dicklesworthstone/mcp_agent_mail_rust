@@ -539,7 +539,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     });
 
     if !dry_run && actions_taken > 0 {
-        runs::write_run_artifacts(&run_dir, envelope["run_id"].as_str().unwrap_or("unknown"), &envelope)
+        runs::write_run_artifacts(&run_dir, &run_id, &envelope)
             .map_err(|e| CliError::Other(format!("writing doctor run artifacts: {e}")))?;
     }
 
@@ -1758,6 +1758,13 @@ fn resolve_latest_doctor_run_dir(doctor_root: &Path) -> Option<PathBuf> {
     Some(run_dir)
 }
 
+fn path_absent_without_following_symlink(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 fn latest_named_file(root: &Path, file_name: &str) -> Option<PathBuf> {
     if !root.exists() {
         return None;
@@ -1980,7 +1987,9 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     let latest = root.join("latest");
     let runs_dir = root.join("runs");
 
-    if !latest.exists() && !runs_dir.exists() {
+    if path_absent_without_following_symlink(&latest)
+        && path_absent_without_following_symlink(&runs_dir)
+    {
         // No prior run; doctor itself is healthy (no findings to report).
         println!("ok: no prior runs");
         return Ok(());
@@ -2237,6 +2246,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(latest_doctor_report_path_for_root(&doctor_root), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_absent_without_following_symlink_treats_dangling_symlink_as_present() {
+        let root = tempfile::tempdir().unwrap();
+        let dangling = root.path().join("dangling");
+        let missing = root.path().join("missing");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+
+        assert!(path_absent_without_following_symlink(&missing));
+        assert!(
+            !path_absent_without_following_symlink(&dangling),
+            "dangling symlink should count as present doctor state"
+        );
     }
 
     #[test]

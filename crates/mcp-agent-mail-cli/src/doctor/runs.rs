@@ -95,6 +95,99 @@ pub fn scaffold_run_dir(target: &Path, run_id: &str) -> std::io::Result<PathBuf>
     Ok(run_dir)
 }
 
+/// Persist the user-facing run artifacts for a completed mutating doctor run.
+pub fn write_run_artifacts(
+    run_dir: &Path,
+    run_id: &str,
+    report: &serde_json::Value,
+) -> std::io::Result<()> {
+    let pretty = serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?;
+    let mut json = pretty;
+    json.push(b'\n');
+
+    atomic_write_bytes(&run_dir.join("report.json"), &json, 0o644)?;
+    atomic_write_bytes(&run_dir.join("stdout.json"), &json, 0o644)?;
+    atomic_write_bytes(
+        &run_dir.join("report.md"),
+        run_report_markdown(run_id, report).as_bytes(),
+        0o644,
+    )?;
+    atomic_write_bytes(
+        &run_dir.join("undo.sh"),
+        run_undo_script(run_id).as_bytes(),
+        0o755,
+    )?;
+    Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent: {}", path.display()),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        now_ns
+    ));
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    file.write_all(content)?;
+    file.sync_data()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn run_report_markdown(run_id: &str, report: &serde_json::Value) -> String {
+    let mode = report
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let fm_id = report
+        .get("fm_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let ok = report
+        .get("ok")
+        .and_then(|value| value.as_bool())
+        .map_or("unknown".to_string(), |value| value.to_string());
+    let actions_taken = report
+        .get("actions_taken")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let remaining_findings = report
+        .get("summary")
+        .and_then(|summary| summary.get("total_findings"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+
+    format!(
+        "# am doctor run {run_id}\n\n- mode: {mode}\n- finding: {fm_id}\n- ok: {ok}\n- actions taken: {actions_taken}\n- remaining findings: {remaining_findings}\n"
+    )
+}
+
+fn run_undo_script(run_id: &str) -> String {
+    format!("#!/bin/sh\nset -eu\nam doctor undo {run_id} \"$@\"\n")
+}
+
 /// Atomically replace `<doctor_root>/latest` -> `runs/<run_id>` symlink.
 ///
 /// Uses a unique pid+ns-suffixed tmp symlink that we created ourselves,
@@ -287,6 +380,34 @@ mod tests {
         let run_dir = scaffold_run_dir(td.path(), run_id).expect("scaffold");
         assert!(run_dir.join("backups").is_dir());
         assert!(run_dir.join("actions.jsonl").exists());
+    }
+
+    #[test]
+    fn write_run_artifacts_persists_report_stdout_markdown_and_undo() {
+        let td = TempDir::new().expect("tempdir");
+        let run_id = "2026-05-09T16-30-15Z__abc123";
+        let run_dir = scaffold_run_dir(td.path(), run_id).expect("scaffold");
+        let report = serde_json::json!({
+            "run_id": run_id,
+            "mode": "fix",
+            "fm_id": "fm-test",
+            "ok": true,
+            "actions_taken": 1,
+            "summary": {
+                "total_findings": 0
+            }
+        });
+
+        write_run_artifacts(&run_dir, run_id, &report).expect("write artifacts");
+
+        let report_json = fs::read_to_string(run_dir.join("report.json")).unwrap();
+        let stdout_json = fs::read_to_string(run_dir.join("stdout.json")).unwrap();
+        assert_eq!(report_json, stdout_json);
+        let parsed: serde_json::Value = serde_json::from_str(&report_json).unwrap();
+        assert_eq!(parsed["run_id"], run_id);
+        assert!(run_dir.join("report.md").is_file());
+        let undo = fs::read_to_string(run_dir.join("undo.sh")).unwrap();
+        assert!(undo.contains("am doctor undo 2026-05-09T16-30-15Z__abc123"));
     }
 
     #[test]
