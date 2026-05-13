@@ -2888,16 +2888,176 @@ wait_for_remote_http_endpoint() {
   return 1
 }
 
+plist_xml_escape() {
+  local value="${1:-}"
+  value="${value//&/\&amp;}"
+  value="${value//</\&lt;}"
+  value="${value//>/\&gt;}"
+  value="${value//\"/\&quot;}"
+  value="${value//\'/\&apos;}"
+  printf '%s' "$value"
+}
+
+plist_string_entry() {
+  local value="${1:-}"
+  printf '        <string>%s</string>\n' "$(plist_xml_escape "$value")"
+}
+
+plist_env_entry() {
+  local key="${1:-}"
+  local value="${2:-}"
+  [ -n "$key" ] || return 0
+  [ -n "$value" ] || return 0
+  printf '        <key>%s</key>\n' "$(plist_xml_escape "$key")"
+  printf '        <string>%s</string>\n' "$(plist_xml_escape "$value")"
+}
+
+ensure_real_directory_tree() {
+  local path="$1"
+  local label="$2"
+  local current="" part
+
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*) current="/" ;;
+  esac
+
+  local parts=()
+  IFS='/' read -r -a parts <<< "$path"
+
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || continue
+    [ "$part" = "." ] && continue
+    if [ "$part" = ".." ]; then
+      warn "Refusing to create $label with parent traversal: $path"
+      return 1
+    fi
+    if [ "$current" = "/" ]; then
+      current="/$part"
+    elif [ -n "$current" ]; then
+      current="$current/$part"
+    else
+      current="$part"
+    fi
+
+    if [ -L "$current" ]; then
+      warn "$label component is a symlink; refusing to write through it: $current"
+      return 1
+    fi
+    if [ -e "$current" ] && [ ! -d "$current" ]; then
+      warn "$label component exists but is not a directory: $current"
+      return 1
+    fi
+    [ -d "$current" ] || mkdir "$current" || return 1
+  done
+}
+
+ensure_real_file_target_path() {
+  local path="$1"
+  local label="$2"
+  local parent
+
+  parent="$(dirname "$path")"
+  ensure_real_directory_tree "$parent" "$label parent" || return 1
+  if [ -L "$path" ]; then
+    warn "$label is a symlink; refusing to write through it: $path"
+    return 1
+  fi
+  if [ -e "$path" ] && [ ! -f "$path" ]; then
+    warn "$label exists but is not a regular file: $path"
+    return 1
+  fi
+}
+
+write_launchd_service_plist() {
+  local plist_path="$1"
+  local am_bin="$2"
+  local home="$3"
+  local storage_root="$4"
+  local database_url="$5"
+  local bearer_token="$6"
+  local host="$7"
+  local port="$8"
+  local http_path="$9"
+
+  local log_dir="$home/Library/Logs/agent-mail"
+  local args_xml env_xml tmp_plist
+  ensure_real_file_target_path "$plist_path" "LaunchAgent plist" || return 1
+  ensure_real_directory_tree "$log_dir" "LaunchAgent log directory" || return 1
+  ensure_real_directory_tree "$storage_root" "Agent Mail storage root" || return 1
+
+  args_xml="$(
+    plist_string_entry "$am_bin"
+    plist_string_entry "serve-http"
+    plist_string_entry "--host"
+    plist_string_entry "$host"
+    plist_string_entry "--port"
+    plist_string_entry "$port"
+    plist_string_entry "--no-tui"
+  )"
+
+  env_xml="$(
+    plist_env_entry "RUST_LOG" "info"
+    plist_env_entry "HOME" "$home"
+    plist_env_entry "DATABASE_URL" "$database_url"
+    plist_env_entry "STORAGE_ROOT" "$storage_root"
+    plist_env_entry "HTTP_BEARER_TOKEN" "$bearer_token"
+    plist_env_entry "HTTP_HOST" "$host"
+    plist_env_entry "HTTP_PORT" "$port"
+    plist_env_entry "HTTP_PATH" "$http_path"
+  )"
+
+  tmp_plist="$(mktemp "${plist_path}.tmp.XXXXXX")" || return 1
+  if ! cat > "$tmp_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agent-mail</string>
+    <key>ProgramArguments</key>
+    <array>
+${args_xml}
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$(plist_xml_escape "$storage_root")</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>$(plist_xml_escape "$log_dir")/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$(plist_xml_escape "$log_dir")/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+${env_xml}
+    </dict>
+</dict>
+</plist>
+EOF
+  then
+    return 1
+  fi
+  chmod 644 "$tmp_plist" || return 1
+  mv -f "$tmp_plist" "$plist_path" || return 1
+}
+
 repair_launchd_service_env_from_rust_config() {
   [ "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" = "darwin" ] || return 0
 
   local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
-  [ -f "$plist_path" ] || return 0
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not found; cannot patch LaunchAgent environment for config.env compatibility."
+  if [ -L "$plist_path" ]; then
+    warn "LaunchAgent plist is a symlink; refusing to rewrite it automatically: $plist_path"
     return 0
   fi
+  [ -f "$plist_path" ] || return 0
 
   local rust_env="$HOME/.config/mcp-agent-mail/config.env"
   local storage_root database_url bearer_token host port http_path
@@ -2916,40 +3076,9 @@ repair_launchd_service_env_from_rust_config() {
   http_path=$(read_env_assignment_value "$rust_env" "HTTP_PATH")
   [ -z "$http_path" ] && http_path="${HTTP_PATH:-/mcp/}"
 
-  if ! python3 - "$plist_path" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path" <<'PY'
-import plistlib
-import sys
-
-plist_path, home, storage_root, database_url, bearer_token, host, port, http_path = sys.argv[1:]
-
-with open(plist_path, "rb") as fh:
-    data = plistlib.load(fh)
-
-env = dict(data.get("EnvironmentVariables") or {})
-env["RUST_LOG"] = env.get("RUST_LOG", "info")
-env["HOME"] = home
-
-for key, value in (
-    ("STORAGE_ROOT", storage_root),
-    ("DATABASE_URL", database_url),
-    ("HTTP_BEARER_TOKEN", bearer_token),
-    ("HTTP_HOST", host),
-    ("HTTP_PORT", port),
-    ("HTTP_PATH", http_path),
-):
-    if value:
-        env[key] = value
-    else:
-        env.pop(key, None)
-
-data["EnvironmentVariables"] = env
-data["WorkingDirectory"] = storage_root or home
-
-with open(plist_path, "wb") as fh:
-    plistlib.dump(data, fh)
-PY
+  if ! write_launchd_service_plist "$plist_path" "$DEST/$BIN_CLI" "$HOME" "$storage_root" "$database_url" "$bearer_token" "$host" "$port" "$http_path"
   then
-    warn "Failed to inject Rust config environment into LaunchAgent plist."
+    warn "Failed to rewrite LaunchAgent plist with Rust config environment."
     return 0
   fi
 
