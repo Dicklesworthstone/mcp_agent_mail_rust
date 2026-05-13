@@ -16702,14 +16702,30 @@ pub(crate) fn build_forensic_timeline_report(
         database_path: forensic_database_path(database_url),
         search_index_generation: forensic_search_index_generation(database_url, storage_root),
     };
-    build_forensic_timeline_report_from_current(storage_root, current)
+    let doctor_root = std::env::current_dir()
+        .ok()
+        .map(|cwd| doctor::runs::doctor_root(&cwd));
+    build_forensic_timeline_report_from_current_with_doctor_root(
+        storage_root,
+        doctor_root.as_deref(),
+        current,
+    )
 }
 
+#[cfg(test)]
 fn build_forensic_timeline_report_from_current(
     storage_root: &Path,
     current: ForensicTimelineCurrent,
 ) -> ForensicTimelineReport {
-    let baseline = latest_healthy_forensic_checkpoint(storage_root);
+    build_forensic_timeline_report_from_current_with_doctor_root(storage_root, None, current)
+}
+
+fn build_forensic_timeline_report_from_current_with_doctor_root(
+    storage_root: &Path,
+    doctor_root: Option<&Path>,
+    current: ForensicTimelineCurrent,
+) -> ForensicTimelineReport {
+    let baseline = latest_healthy_forensic_checkpoint(storage_root, doctor_root);
     let changes_since_last_healthy = baseline
         .as_ref()
         .map(|checkpoint| forensic_timeline_changes(&checkpoint.current, &current))
@@ -16725,7 +16741,8 @@ fn build_forensic_timeline_report_from_current(
         .map(|checkpoint| checkpoint.timestamp.clone());
     let recent_recovery_runs = forensic_recent_recovery_runs(storage_root);
     let archive_commits = forensic_archive_commit_summary(storage_root);
-    let artifacts = forensic_timeline_artifacts(storage_root, &baseline, &recent_recovery_runs);
+    let artifacts =
+        forensic_timeline_artifacts(storage_root, doctor_root, &baseline, &recent_recovery_runs);
     let next_actions = forensic_timeline_next_actions(
         &checkpoint_status,
         &current,
@@ -16837,13 +16854,29 @@ fn forensic_search_index_generation(
     }
 }
 
-fn latest_healthy_forensic_checkpoint(storage_root: &Path) -> Option<ForensicTimelineCheckpoint> {
+fn latest_healthy_forensic_checkpoint(
+    storage_root: &Path,
+    doctor_root: Option<&Path>,
+) -> Option<ForensicTimelineCheckpoint> {
+    let mut latest: Option<(std::time::SystemTime, ForensicTimelineCheckpoint)> = None;
+    collect_legacy_forensic_report_checkpoints(storage_root, &mut latest);
+    if let Some(doctor_root) = doctor_root {
+        collect_doctor_run_report_checkpoints(doctor_root, &mut latest);
+    }
+    latest.map(|(_, checkpoint)| checkpoint)
+}
+
+fn collect_legacy_forensic_report_checkpoints(
+    storage_root: &Path,
+    latest: &mut Option<(std::time::SystemTime, ForensicTimelineCheckpoint)>,
+) {
     let reports_dir = storage_root.join("doctor").join("reports");
     if !path_is_real_directory(&reports_dir) {
-        return None;
+        return;
     }
-    let entries = std::fs::read_dir(&reports_dir).ok()?;
-    let mut latest: Option<(std::time::SystemTime, ForensicTimelineCheckpoint)> = None;
+    let Ok(entries) = std::fs::read_dir(&reports_dir) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -16853,20 +16886,66 @@ fn latest_healthy_forensic_checkpoint(storage_root: &Path) -> Option<ForensicTim
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let Some(checkpoint) = read_forensic_checkpoint(&path) else {
-            continue;
-        };
         let modified = entry
             .metadata()
             .ok()
             .and_then(|meta| meta.modified().ok())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if latest.as_ref().is_none_or(|(seen, _)| modified > *seen) {
-            latest = Some((modified, checkpoint));
-        }
+        consider_forensic_checkpoint(latest, &path, modified);
     }
+}
 
-    latest.map(|(_, checkpoint)| checkpoint)
+fn collect_doctor_run_report_checkpoints(
+    doctor_root: &Path,
+    latest: &mut Option<(std::time::SystemTime, ForensicTimelineCheckpoint)>,
+) {
+    if !path_is_real_directory(doctor_root) {
+        return;
+    }
+    let runs_dir = doctor_root.join("runs");
+    if !path_is_real_directory(&runs_dir) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&runs_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+        let report_path = entry.path().join("report.json");
+        if !path_is_real_file(&report_path) {
+            continue;
+        }
+        let modified = std::fs::symlink_metadata(&report_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        consider_forensic_checkpoint(latest, &report_path, modified);
+    }
+}
+
+fn consider_forensic_checkpoint(
+    latest: &mut Option<(std::time::SystemTime, ForensicTimelineCheckpoint)>,
+    path: &Path,
+    modified: std::time::SystemTime,
+) {
+    let Some(checkpoint) = read_forensic_checkpoint(path) else {
+        return;
+    };
+    let sort_time = forensic_checkpoint_sort_time(&checkpoint).unwrap_or(modified);
+    if latest.as_ref().is_none_or(|(seen, _)| sort_time > *seen) {
+        *latest = Some((sort_time, checkpoint));
+    }
+}
+
+fn forensic_checkpoint_sort_time(
+    checkpoint: &ForensicTimelineCheckpoint,
+) -> Option<std::time::SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(&checkpoint.timestamp)
+        .ok()
+        .map(|timestamp| std::time::SystemTime::from(timestamp.with_timezone(&Utc)))
 }
 
 fn read_forensic_checkpoint(path: &Path) -> Option<ForensicTimelineCheckpoint> {
@@ -16887,6 +16966,12 @@ fn read_forensic_checkpoint(path: &Path) -> Option<ForensicTimelineCheckpoint> {
     let timestamp = value
         .get("generated_at")
         .or_else(|| value.get("timestamp"))
+        .or_else(|| {
+            value
+                .get("forensic_timeline")
+                .and_then(|timeline| timeline.get("current"))
+                .and_then(|current| current.get("generated_at"))
+        })
         .and_then(|ts| ts.as_str())
         .map(str::to_string)
         .or_else(|| {
@@ -16902,24 +16987,34 @@ fn read_forensic_checkpoint(path: &Path) -> Option<ForensicTimelineCheckpoint> {
 }
 
 fn forensic_checkpoint_is_healthy(value: &serde_json::Value) -> bool {
-    value
+    let top_level_schema_ok = value
         .get("schema")
         .and_then(|schema| schema.as_str())
         .is_some_and(|schema| {
             schema == FORENSIC_CHECKPOINT_SCHEMA || schema == FORENSIC_TIMELINE_SCHEMA
-        })
-        && (value.get("healthy").and_then(|healthy| healthy.as_bool()) == Some(true)
-            || value
-                .get("current")
-                .and_then(|current| current.get("status"))
-                .and_then(|status| status.as_str())
-                == Some("ok")
-            || value
-                .get("forensic_timeline")
-                .and_then(|timeline| timeline.get("current"))
-                .and_then(|current| current.get("status"))
-                .and_then(|status| status.as_str())
-                == Some("ok"))
+        });
+    let embedded_timeline_schema_ok = value
+        .get("forensic_timeline")
+        .and_then(|timeline| timeline.get("schema"))
+        .and_then(|schema| schema.as_str())
+        == Some(FORENSIC_TIMELINE_SCHEMA);
+    if !(top_level_schema_ok || embedded_timeline_schema_ok) {
+        return false;
+    }
+
+    value.get("healthy").and_then(|healthy| healthy.as_bool()) == Some(true)
+        || value.get("ok").and_then(|ok| ok.as_bool()) == Some(true)
+        || value
+            .get("current")
+            .and_then(|current| current.get("status"))
+            .and_then(|status| status.as_str())
+            == Some("ok")
+        || value
+            .get("forensic_timeline")
+            .and_then(|timeline| timeline.get("current"))
+            .and_then(|current| current.get("status"))
+            .and_then(|status| status.as_str())
+            == Some("ok")
 }
 
 fn forensic_timeline_changes(
@@ -17070,6 +17165,7 @@ fn parse_forensic_archive_commit(line: &str) -> Option<ForensicArchiveCommit> {
 
 fn forensic_timeline_artifacts(
     storage_root: &Path,
+    doctor_root: Option<&Path>,
     baseline: &Option<ForensicTimelineCheckpoint>,
     recovery_runs: &[ForensicRecoveryRun],
 ) -> Vec<ForensicArtifactLink> {
@@ -17080,6 +17176,15 @@ fn forensic_timeline_artifacts(
             kind: "doctor_reports_dir".to_string(),
             path: reports_dir.display().to_string(),
         });
+    }
+    if let Some(doctor_root) = doctor_root {
+        let runs_dir = doctor_root.join("runs");
+        if path_is_real_directory(&runs_dir) {
+            artifacts.push(ForensicArtifactLink {
+                kind: "doctor_runs_dir".to_string(),
+                path: runs_dir.display().to_string(),
+            });
+        }
     }
     if let Some(checkpoint) = baseline {
         artifacts.push(ForensicArtifactLink {
@@ -64984,6 +65089,34 @@ fn write_forensic_checkpoint(
     path
 }
 
+#[cfg(test)]
+fn write_forensic_doctor_run_report(
+    doctor_root: &Path,
+    run_id: &str,
+    healthy: bool,
+    current: &ForensicTimelineCurrent,
+) -> PathBuf {
+    let run_dir = doctor_root.join("runs").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let path = run_dir.join("report.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "healthy": healthy,
+            "summary": {
+                "overall_status": if healthy { "ok" } else { "fail" },
+            },
+            "forensic_timeline": {
+                "schema": FORENSIC_TIMELINE_SCHEMA,
+                "current": current,
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
 #[test]
 fn forensic_timeline_reports_no_checkpoint_without_mutating() {
     let tmp = tempfile::tempdir().unwrap();
@@ -65004,6 +65137,155 @@ fn forensic_timeline_reports_no_checkpoint_without_mutating() {
     assert!(
         !tmp.path().join("doctor").exists(),
         "read-only timeline builder must not create doctor artifacts"
+    );
+}
+
+#[test]
+fn forensic_timeline_reads_world_class_doctor_run_reports() {
+    let storage = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let doctor_root = repo.path().join(".doctor");
+    let db_path = storage.path().join("storage.sqlite3");
+    let baseline = sample_forensic_current("ok", "0.2.51", "1", storage.path(), &db_path, "fresh");
+    let report_path = write_forensic_doctor_run_report(
+        &doctor_root,
+        "2026-05-12T00-00-00Z__healthy",
+        true,
+        &baseline,
+    );
+    let current =
+        sample_forensic_current("degraded", "0.2.52", "1", storage.path(), &db_path, "stale");
+
+    let report = build_forensic_timeline_report_from_current_with_doctor_root(
+        storage.path(),
+        Some(&doctor_root),
+        current,
+    );
+
+    assert_eq!(report.checkpoint_status, "changed_since_last_healthy");
+    assert_eq!(
+        report.last_healthy_timestamp.as_deref(),
+        Some("2026-05-12T00:00:00Z")
+    );
+    assert_eq!(
+        report
+            .baseline
+            .as_ref()
+            .map(|checkpoint| checkpoint.source_path.as_str()),
+        Some(report_path.to_string_lossy().as_ref())
+    );
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(|change| change.field == "binary_version"
+                && change.before == "0.2.51"
+                && change.after == "0.2.52")
+    );
+    assert!(report.artifacts.iter().any(|artifact| {
+        artifact.kind == "doctor_runs_dir"
+            && artifact.path == doctor_root.join("runs").display().to_string()
+    }));
+    assert!(report.artifacts.iter().any(|artifact| {
+        artifact.kind == "last_healthy_checkpoint"
+            && artifact.path == report_path.display().to_string()
+    }));
+}
+
+#[test]
+fn forensic_timeline_ignores_newer_unhealthy_doctor_run_report() {
+    let storage = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let doctor_root = repo.path().join(".doctor");
+    let db_path = storage.path().join("storage.sqlite3");
+    let healthy = sample_forensic_current("ok", "0.2.51", "1", storage.path(), &db_path, "fresh");
+    let unhealthy =
+        sample_forensic_current("fail", "0.2.52", "1", storage.path(), &db_path, "stale");
+    let healthy_report = write_forensic_doctor_run_report(
+        &doctor_root,
+        "2026-05-12T00-00-00Z__healthy",
+        true,
+        &healthy,
+    );
+    write_forensic_doctor_run_report(
+        &doctor_root,
+        "2026-05-12T01-00-00Z__unhealthy",
+        false,
+        &unhealthy,
+    );
+    let current = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+
+    let report = build_forensic_timeline_report_from_current_with_doctor_root(
+        storage.path(),
+        Some(&doctor_root),
+        current,
+    );
+
+    assert_eq!(
+        report
+            .baseline
+            .as_ref()
+            .map(|checkpoint| checkpoint.source_path.as_str()),
+        Some(healthy_report.to_string_lossy().as_ref())
+    );
+    assert!(
+        report
+            .changes_since_last_healthy
+            .iter()
+            .any(|change| change.field == "binary_version"
+                && change.before == "0.2.51"
+                && change.after == "0.2.52")
+    );
+}
+
+#[test]
+fn forensic_timeline_orders_doctor_runs_by_report_timestamp_before_mtime() {
+    let storage = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let doctor_root = repo.path().join(".doctor");
+    let db_path = storage.path().join("storage.sqlite3");
+    let mut older = sample_forensic_current("ok", "0.2.51", "1", storage.path(), &db_path, "fresh");
+    older.generated_at = "2026-05-12T00:00:00Z".to_string();
+    let mut newer = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+    newer.generated_at = "2026-05-12T01:00:00Z".to_string();
+    let older_report = write_forensic_doctor_run_report(
+        &doctor_root,
+        "2026-05-12T00-00-00Z__healthy",
+        true,
+        &older,
+    );
+    let newer_report = write_forensic_doctor_run_report(
+        &doctor_root,
+        "2026-05-12T01-00-00Z__healthy",
+        true,
+        &newer,
+    );
+
+    // Simulate a support workflow or manual copy that touches an older report
+    // after a newer healthy run has already been created.
+    std::fs::write(
+        &older_report,
+        std::fs::read_to_string(&older_report).expect("read older report"),
+    )
+    .expect("touch older report");
+
+    let current = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+    let report = build_forensic_timeline_report_from_current_with_doctor_root(
+        storage.path(),
+        Some(&doctor_root),
+        current,
+    );
+
+    assert_eq!(
+        report
+            .baseline
+            .as_ref()
+            .map(|checkpoint| checkpoint.source_path.as_str()),
+        Some(newer_report.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        report.last_healthy_timestamp.as_deref(),
+        Some("2026-05-12T01:00:00Z")
     );
 }
 
@@ -65196,6 +65478,41 @@ fn forensic_timeline_ignores_symlinked_checkpoint_file() {
 
     assert_eq!(report.checkpoint_status, "no_checkpoint");
     assert!(report.baseline.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn forensic_timeline_ignores_symlinked_doctor_runs_dir() {
+    let storage = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let doctor_root = repo.path().join(".doctor");
+    let outside_doctor_root = outside.path().join(".doctor");
+    let db_path = storage.path().join("storage.sqlite3");
+    let healthy = sample_forensic_current("ok", "0.2.52", "1", storage.path(), &db_path, "fresh");
+    write_forensic_doctor_run_report(
+        &outside_doctor_root,
+        "2026-05-12T00-00-00Z__healthy",
+        true,
+        &healthy,
+    );
+    std::fs::create_dir_all(&doctor_root).unwrap();
+    std::os::unix::fs::symlink(outside_doctor_root.join("runs"), doctor_root.join("runs")).unwrap();
+
+    let report = build_forensic_timeline_report_from_current_with_doctor_root(
+        storage.path(),
+        Some(&doctor_root),
+        healthy,
+    );
+
+    assert_eq!(report.checkpoint_status, "no_checkpoint");
+    assert!(
+        report
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.kind != "doctor_runs_dir"),
+        "symlinked doctor runs dir must not be advertised as a safe artifact"
+    );
 }
 
 #[cfg(unix)]
