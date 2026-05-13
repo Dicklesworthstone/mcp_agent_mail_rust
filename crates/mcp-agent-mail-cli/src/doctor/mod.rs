@@ -70,18 +70,10 @@ pub fn handle_robot_docs() -> CliResult<()> {
 /// `quick_mode_eligible` attribute lives on the capabilities side.
 pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
     let root = runs::doctor_root(target);
-    let latest = root.join("latest");
-    let resolved = std::fs::read_link(&latest).ok().map(|p| root.join(p));
-    let report_path = resolved.and_then(|p| {
-        let r = p.join("report.json");
-        if r.exists() { Some(r) } else { None }
-    });
+    let report_path = latest_doctor_report_path_for_root(&root);
 
     let report_value: serde_json::Value = if let Some(rp) = report_path.as_ref() {
-        let s = std::fs::read_to_string(rp)
-            .map_err(|e| CliError::Other(format!("reading {}: {}", rp.display(), e)))?;
-        serde_json::from_str(&s)
-            .map_err(|e| CliError::Other(format!("parsing report.json: {e}")))?
+        read_json_file(rp)?
     } else {
         serde_json::json!({
             "ok": null,
@@ -191,31 +183,26 @@ pub fn handle_explain(
     // than aborting — silently better UX for `explain` on a registered
     // FM that simply hasn't fired in any run yet.
     let root = runs::doctor_root(target);
-    let latest = root.join("latest");
-    let latest_envelope = std::fs::read_link(&latest)
-        .ok()
-        .map(|p| root.join(p))
-        .and_then(|resolved| {
-            let report_path = resolved.join("report.json");
-            let body = std::fs::read_to_string(&report_path).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-            let findings = v.get("findings")?.as_array()?;
-            let matched = findings.iter().find(|f| {
-                f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
-                    || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
-            })?;
-            Some(serde_json::json!({
-                "schema_version": "1.0",
-                "mode": "latest_run",
-                "finding_id": finding_id,
-                "finding": matched,
-                "report_path": report_path.to_string_lossy(),
-                "next_actions": [
-                    format!("am doctor --fix --only {finding_id} --yes"),
-                    "am doctor capabilities --json".to_string(),
-                ],
-            }))
-        });
+    let latest_envelope = latest_doctor_report_path_for_root(&root).and_then(|report_path| {
+        let body = std::fs::read_to_string(&report_path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let findings = v.get("findings")?.as_array()?;
+        let matched = findings.iter().find(|f| {
+            f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
+                || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
+        })?;
+        Some(serde_json::json!({
+            "schema_version": "1.0",
+            "mode": "latest_run",
+            "finding_id": finding_id,
+            "finding": matched,
+            "report_path": report_path.to_string_lossy(),
+            "next_actions": [
+                format!("am doctor --fix --only {finding_id} --yes"),
+                "am doctor capabilities --json".to_string(),
+            ],
+        }))
+    });
 
     if let Some(envelope) = latest_envelope {
         emit_explain_envelope(&envelope, format)?;
@@ -423,8 +410,12 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         runs::now_iso_seconds(),
         short_run_suffix(fm_id),
     );
-    let run_dir = runs::scaffold_run_dir(&repo_root, &run_id)
-        .map_err(|e| CliError::Other(format!("scaffolding run dir: {e}")))?;
+    let run_dir = if dry_run {
+        runs::doctor_root(&repo_root).join("dry-run").join(&run_id)
+    } else {
+        runs::scaffold_run_dir(&repo_root, &run_id)
+            .map_err(|e| CliError::Other(format!("scaffolding run dir: {e}")))?
+    };
     // Pass-22: the bypassing call to `runs::ensure_gitignore_entry` that
     // used to live here is gone. The pass-21 FM
     // `fm-archive-state-files-missing-doctor-gitignore-entry` now owns
@@ -434,11 +425,16 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     // via `am doctor undo`). Doing it here would silently mutate
     // `.gitignore` on every unrelated --only run and the change
     // wouldn't be undone by `am doctor undo` of that run-id.
-    let actions_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(run_dir.join("actions.jsonl"))
-        .map_err(|e| CliError::Other(format!("opening actions.jsonl: {e}")))?;
+    let actions_file = if dry_run {
+        tempfile::tempfile()
+            .map_err(|e| CliError::Other(format!("creating dry-run actions sink: {e}")))?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .map_err(|e| CliError::Other(format!("opening actions.jsonl: {e}")))?
+    };
 
     let mut write_scopes = default_write_scopes();
     write_scopes.push(repo_root.clone());
@@ -490,12 +486,37 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         (outcome.actions_taken, outcome.actions_taken)
     };
 
+    let post_detect = if !dry_run && outcome.actions_taken > 0 {
+        match fixers::detect_only(fm_id, &inputs) {
+            Ok(detected) => Some(detected),
+            Err(err) => {
+                eprintln!("warning: post-fix detection failed for `{fm_id}`: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let remaining_findings = post_detect
+        .as_ref()
+        .map(|detected| detected.findings_count)
+        .unwrap_or(outcome.findings_count);
+    let ok = !dry_run && remaining_findings == 0 && outcome.actions_skipped == 0;
+
+    let run_dir_json = if dry_run {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(run_dir.to_string_lossy().into_owned())
+    };
+
     let envelope = serde_json::json!({
         "schema_version": "1.0",
         "doctor_version": runs::DOCTOR_VERSION,
         "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
         "tool": "am",
         "tool_version": env!("CARGO_PKG_VERSION"),
+        "ok": ok,
+        "exit_code": if ok { 0 } else { 1 },
         "fm_id": fm_id,
         "severity": spec.severity,
         "subsystem": spec.subsystem,
@@ -503,12 +524,24 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         "mode": if dry_run { "dry-run" } else { "fix" },
         "dry_run": dry_run,
         "run_id": run_id,
-        "run_dir": run_dir.to_string_lossy(),
+        "run_dir": run_dir_json,
         "duration_ms": started_at.elapsed().as_millis() as u64,
         "actions_taken": actions_taken,
         "actions_planned": actions_planned,
+        "summary": {
+            "total_findings": remaining_findings,
+            "initial_findings": outcome.findings_count,
+            "actions_taken": actions_taken,
+            "actions_skipped": outcome.actions_skipped,
+        },
+        "post_fix": post_detect,
         "outcome": outcome,
     });
+
+    if !dry_run && actions_taken > 0 {
+        runs::write_run_artifacts(&run_dir, envelope["run_id"].as_str().unwrap_or("unknown"), &envelope)
+            .map_err(|e| CliError::Other(format!("writing doctor run artifacts: {e}")))?;
+    }
 
     println!(
         "{}",
@@ -1690,9 +1723,39 @@ fn latest_forensic_manifest(storage_root: &Path) -> Option<PathBuf> {
 fn latest_doctor_report_path() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let doctor_root = runs::doctor_root(&cwd);
+    latest_doctor_report_path_for_root(&doctor_root)
+}
+
+fn latest_doctor_report_path_for_root(doctor_root: &Path) -> Option<PathBuf> {
+    let run_dir = resolve_latest_doctor_run_dir(doctor_root)?;
+    let report_path = run_dir.join("report.json");
+    fs::symlink_metadata(&report_path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())?;
+    Some(report_path)
+}
+
+fn resolve_latest_doctor_run_dir(doctor_root: &Path) -> Option<PathBuf> {
     let latest = doctor_root.join("latest");
     let target = fs::read_link(&latest).ok()?;
-    Some(doctor_root.join(target).join("report.json"))
+    let mut components = target.components();
+    match components.next()? {
+        std::path::Component::Normal(segment) if segment == "runs" => {}
+        _ => return None,
+    }
+    let run_id = match components.next()? {
+        std::path::Component::Normal(segment) => segment,
+        _ => return None,
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    let run_dir = doctor_root.join("runs").join(run_id);
+    reject_symlink_ancestor(&run_dir, "doctor latest target").ok()?;
+    fs::symlink_metadata(&run_dir)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_dir())?;
+    Some(run_dir)
 }
 
 fn latest_named_file(root: &Path, file_name: &str) -> Option<PathBuf> {
@@ -1923,11 +1986,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         return Ok(());
     }
 
-    let resolved = std::fs::read_link(&latest).ok().map(|p| root.join(p));
-    let report_path = resolved.and_then(|p| {
-        let r = p.join("report.json");
-        if r.exists() { Some(r) } else { None }
-    });
+    let report_path = latest_doctor_report_path_for_root(&root);
 
     let Some(report_path) = report_path else {
         println!("warn: no report.json in latest run");
@@ -2127,6 +2186,57 @@ mod tests {
         assert!(s.contains(".doctor"));
         // Storage root is conditional; XDG paths are conditional. Just assert
         // the per-repo scopes are always present.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_doctor_report_path_accepts_canonical_relative_latest_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let doctor_root = root.path().join(".doctor");
+        let run_dir = doctor_root.join("runs/2026-05-13T00-00-00Z__abc123");
+        fs::create_dir_all(&run_dir).unwrap();
+        let report_path = run_dir.join("report.json");
+        fs::write(&report_path, "{}").unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("runs/2026-05-13T00-00-00Z__abc123"),
+            doctor_root.join("latest"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_doctor_report_path_for_root(&doctor_root).as_deref(),
+            Some(report_path.as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_doctor_report_path_rejects_absolute_latest_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let doctor_root = root.path().join(".doctor");
+        let outside_run = outside.path().join("runs/2026-05-13T00-00-00Z__abc123");
+        fs::create_dir_all(&doctor_root).unwrap();
+        fs::create_dir_all(&outside_run).unwrap();
+        fs::write(outside_run.join("report.json"), r#"{"ok":true}"#).unwrap();
+        std::os::unix::fs::symlink(&outside_run, doctor_root.join("latest")).unwrap();
+
+        assert_eq!(latest_doctor_report_path_for_root(&doctor_root), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_doctor_report_path_rejects_parent_traversal_latest_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let doctor_root = root.path().join(".doctor");
+        let outside_run = root.path().join("outside-run");
+        fs::create_dir_all(&doctor_root).unwrap();
+        fs::create_dir_all(&outside_run).unwrap();
+        fs::write(outside_run.join("report.json"), r#"{"ok":true}"#).unwrap();
+        std::os::unix::fs::symlink(Path::new("../outside-run"), doctor_root.join("latest"))
+            .unwrap();
+
+        assert_eq!(latest_doctor_report_path_for_root(&doctor_root), None);
     }
 
     #[test]
