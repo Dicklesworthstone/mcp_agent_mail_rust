@@ -375,6 +375,71 @@ fn dispatch_only_missing_gitignore_requires_target_path() {
 }
 
 #[test]
+fn list_all_iterates_registry_and_aggregates_findings() {
+    // Pass-24: handle_fix_list_all calls detect_only for every
+    // registered FM and aggregates into one envelope. Here we
+    // exercise the equivalent lower-level loop directly (the
+    // handler is hard to drive in a hermetic test because it
+    // resolves cwd / config / storage_root via env). We assert:
+    //   - every registered FM is exercised
+    //   - findings aggregate without crashing
+    //   - MissingInput is structurally surfaceable
+    use std::collections::BTreeSet;
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = plant_stale_lock_archive(&td, "alpha");
+    let gi = td.path().join(".gitignore");
+    fs::write(&gi, "target/\n").expect("plant .gitignore");
+
+    // Build an inputs struct that has SOME findings (stale archive
+    // lock + missing .doctor/ entry) and SOME missing inputs
+    // (no git_detect, no canonical_mcp_url).
+    let inputs = DispatchInputs {
+        repo_root: td.path().to_path_buf(),
+        archive_roots: vec![archive],
+        pid_hint_candidates: Vec::new(),
+        token_backup_candidates: Vec::new(),
+        mcp_config_candidates: Vec::new(),
+        canonical_mcp_url: None,
+        git_detect: None,
+        gitignore_target: Some(gi),
+        stale_seconds_override: None,
+    };
+
+    let mut seen_fm_ids: BTreeSet<String> = BTreeSet::new();
+    let mut total_findings = 0usize;
+    let mut missing_input_count = 0usize;
+    for spec in fixers::registry() {
+        match fixers::detect_only(spec.id, &inputs) {
+            Ok(outcome) => {
+                seen_fm_ids.insert(outcome.fm_id);
+                total_findings += outcome.findings_count;
+            }
+            Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+                seen_fm_ids.insert(fm_id.to_string());
+                missing_input_count += 1;
+                assert!(!field.is_empty(), "MissingInput must name the field");
+            }
+            Err(other) => panic!("unexpected dispatch error for {}: {:?}", spec.id, other),
+        }
+    }
+    // Coverage: every registry id was attempted.
+    assert_eq!(seen_fm_ids.len(), fixers::registry().len());
+    // We planted real failures for at least the stale-archive-lock
+    // and missing-gitignore-entry FMs, so findings > 0.
+    assert!(
+        total_findings >= 2,
+        "expected ≥2 findings (stale lock + gitignore), got {total_findings}"
+    );
+    // And we deliberately left git_detect=None + canonical_mcp_url=None,
+    // so the known-bad-git and wrong-mcp-url FMs report MissingInput.
+    assert!(
+        missing_input_count >= 2,
+        "expected ≥2 MissingInput surfacings, got {missing_input_count}"
+    );
+}
+
+#[test]
 fn detect_only_unknown_fm_id_returns_error() {
     let inputs = DispatchInputs {
         repo_root: PathBuf::from("/tmp"),

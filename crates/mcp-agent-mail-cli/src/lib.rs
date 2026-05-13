@@ -38,6 +38,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::McpContext;
 
+use mcp_agent_mail_core::disk::{sqlite_file_path_from_database_url, sqlite_url_from_path};
 use mcp_agent_mail_core::{
     AgentDetectError, AgentDetectOptions, ArchiveScanDedupeRule, ArchiveScanDiagnostic,
     ArchiveScanScope, ArchiveScanSeverityBucket, ArchiveScanSummary, ArtifactPointer, Config,
@@ -2157,16 +2158,18 @@ pub enum DoctorCommand {
         /// valid ids. Unknown ids exit 64 with a hint.
         #[arg(long)]
         only: Option<String>,
-        /// With `--only <fm-id>`: detect-only, no `fix()` call (pass-16).
+        /// Detect-only, no `fix()` call. Two operating modes:
         ///
-        /// Faster than `--dry-run` because the `mutate()` chokepoint is
-        /// not exercised at all (no run-dir scaffolding, no actions
-        /// recorded). Emits the same `findings[]` array a real fix
-        /// would, plus an `actions_planned` count. Useful before
-        /// committing to a real run.
+        /// - **With `--only <fm-id>`** (pass-16): runs that single FM's
+        ///   detector. Faster than `--dry-run` because the `mutate()`
+        ///   chokepoint isn't exercised at all (no run-dir scaffolding,
+        ///   no actions recorded). Emits the same `findings[]` array a
+        ///   real fix would, plus an `actions_planned` count.
         ///
-        /// Without `--only`, this flag is rejected (exit 2) — listing
-        /// every FM's findings simultaneously isn't supported yet.
+        /// - **Without `--only`** (pass-24): enumerates every
+        ///   registered FM and emits a combined envelope in one
+        ///   round-trip. The single agent-visible "what's broken on
+        ///   this system per the FM surface" call.
         #[arg(long)]
         list: bool,
     },
@@ -5849,10 +5852,10 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
                     doctor::handle_fix_only(&fm_id, dry_run, yes, json)
                 }
             } else if list {
-                eprintln!(
-                    "error: `--list` requires `--only <fm-id>` (use `am doctor fixers` to enumerate registered FMs, or `am doctor --json` for a full check)"
-                );
-                Err(CliError::ExitCode(2))
+                // Pass-24: `--list` without `--only` enumerates every
+                // registered FM in one round-trip. Replaces the
+                // pass-16 exit-2 reject path with a real verb.
+                doctor::handle_fix_list_all(json)
             } else {
                 handle_doctor_fix(dry_run, yes, json)
             }
@@ -27456,26 +27459,39 @@ fn build_launchd_args_xml(
 
 /// Resolve the absolute database path from a database_url string.
 ///
-/// Handles the `sqlite+aiosqlite:///./path` and `sqlite:///path` prefixes.
-/// The Python `aiosqlite` convention uses `sqlite+aiosqlite:///./path` for
-/// relative paths and `sqlite+aiosqlite:////absolute/path` for absolute paths
-/// (four slashes). We normalize both to `sqlite:///absolute/path`.
+/// Uses the same SQLite URL parser as the DB layer so managed services do not
+/// rewrite a valid absolute URL like `sqlite:///Users/me/storage.sqlite3` into a
+/// relative path under the LaunchAgent/SystemD working directory.
 fn resolve_absolute_database_url(database_url: &str, cwd: &Path) -> String {
-    // Strip scheme prefix including the conventional third slash.
-    let path_part = database_url
-        .strip_prefix("sqlite+aiosqlite:///")
-        .or_else(|| database_url.strip_prefix("sqlite:///"))
-        .unwrap_or(database_url);
-
-    let db_path = Path::new(path_part);
-    let abs_path = if db_path.is_absolute() {
-        db_path.to_path_buf()
-    } else {
-        cwd.join(db_path)
+    let Some(db_path) = sqlite_file_path_from_database_url(database_url) else {
+        return database_url.to_string();
     };
+    let abs_path = if db_path.is_absolute() {
+        db_path
+    } else {
+        cwd.join(&db_path)
+    };
+    sqlite_url_from_path(&abs_path)
+}
 
-    // Reconstruct: sqlite:// + absolute_path (which starts with `/`, giving `sqlite:///...`)
-    format!("sqlite://{}", abs_path.display())
+fn sqlite_parent_dir_from_database_url(database_url: &str) -> Option<PathBuf> {
+    let db_path = sqlite_file_path_from_database_url(database_url)?;
+    db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+fn ensure_sqlite_parent_dir_for_database_url(database_url: &str) -> CliResult<()> {
+    let Some(parent) = sqlite_parent_dir_from_database_url(database_url) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&parent).map_err(|err| {
+        CliError::Other(format!(
+            "failed to create database parent directory {}: {err}",
+            parent.display()
+        ))
+    })
 }
 
 fn build_systemd_unit_content(
@@ -27572,12 +27588,7 @@ fn service_install_systemd(
     // If DATABASE_URL points outside the storage root (custom layout), make
     // sure the SQLite parent directory exists too so `am migrate` on first
     // launch can open the DB file without surprise.
-    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://")
-        && let Some(parent) = Path::new(db_path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    ensure_sqlite_parent_dir_for_database_url(&abs_db_url)?;
 
     let unit_content = build_systemd_unit_content(
         &exec_args,
@@ -27726,12 +27737,7 @@ fn service_install_launchd(
             abs_storage_root.display()
         ))
     })?;
-    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://")
-        && let Some(parent) = Path::new(db_path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    ensure_sqlite_parent_dir_for_database_url(&abs_db_url)?;
 
     let plist_content = build_launchd_plist_content(
         &args_xml,
@@ -28700,11 +28706,12 @@ mod tests {
 
     #[test]
     fn build_systemd_unit_content_quotes_environment_values() {
+        let database_url = sqlite_url_from_path(Path::new("/tmp/storage root/storage.sqlite3"));
         let unit = build_systemd_unit_content(
             "/tmp/am serve-http",
             Path::new("/tmp/storage root"),
             "/home/user name",
-            "sqlite:///tmp/storage root/storage.sqlite3",
+            &database_url,
             Path::new("/tmp/storage root"),
             "127.0.0.1",
             8765,
@@ -28717,7 +28724,7 @@ mod tests {
         );
         assert!(
             unit.contains(
-                "Environment=\"DATABASE_URL=sqlite:///tmp/storage root/storage.sqlite3\""
+                "Environment=\"DATABASE_URL=sqlite:////tmp/storage root/storage.sqlite3\""
             ),
             "unit must quote DATABASE_URL with spaces: {unit}"
         );
@@ -28731,38 +28738,67 @@ mod tests {
     fn resolve_absolute_database_url_makes_relative_path_absolute() {
         let cwd = Path::new("/home/user/projects/myapp");
         let result = resolve_absolute_database_url("sqlite+aiosqlite:///./storage.sqlite3", cwd);
-        // sqlite:// + /home/user/projects/myapp/./storage.sqlite3
         assert_eq!(
             result,
-            "sqlite:///home/user/projects/myapp/./storage.sqlite3"
+            "sqlite:////home/user/projects/myapp/./storage.sqlite3"
         );
-        // After `sqlite://`, the path portion must be absolute
-        let path_part = result.strip_prefix("sqlite://").unwrap();
+        let path_part =
+            sqlite_file_path_from_database_url(&result).expect("resolved URL should parse");
         assert!(
-            Path::new(path_part).is_absolute(),
-            "database path must be absolute: {path_part}"
+            path_part.is_absolute(),
+            "database path must be absolute: {path_part:?}"
         );
     }
 
     #[test]
-    fn resolve_absolute_database_url_preserves_already_absolute() {
-        // Four slashes in the URI convention: sqlite:// + /data/agent_mail.db
-        // After stripping sqlite:///, path_part is "data/agent_mail.db" which is
-        // relative, so it gets joined against cwd. To provide a truly absolute path
-        // use the four-slash form: sqlite:////data/agent_mail.db
+    fn resolve_absolute_database_url_preserves_four_slash_absolute() {
         let cwd = Path::new("/tmp");
         let result = resolve_absolute_database_url("sqlite:////data/agent_mail.db", cwd);
-        assert_eq!(result, "sqlite:///data/agent_mail.db");
+        assert_eq!(result, "sqlite:////data/agent_mail.db");
+    }
+
+    #[test]
+    fn resolve_absolute_database_url_preserves_three_slash_absolute() {
+        let cwd = Path::new("/tmp");
+        let result = resolve_absolute_database_url("sqlite:///Users/dev/storage.sqlite3", cwd);
+        assert_eq!(result, "sqlite:////Users/dev/storage.sqlite3");
+    }
+
+    #[test]
+    fn resolve_absolute_database_url_leaves_memory_urls_unchanged() {
+        let cwd = Path::new("/tmp");
+        let result = resolve_absolute_database_url("sqlite:///:memory:", cwd);
+        assert_eq!(result, "sqlite:///:memory:");
+    }
+
+    #[test]
+    fn sqlite_parent_dir_from_database_url_uses_core_sqlite_url_semantics() {
+        assert_eq!(
+            sqlite_parent_dir_from_database_url("sqlite:////Users/dev/storage.sqlite3").as_deref(),
+            Some(Path::new("/Users/dev"))
+        );
+        assert_eq!(
+            sqlite_parent_dir_from_database_url("sqlite:///Users/dev/storage.sqlite3").as_deref(),
+            Some(Path::new("/Users/dev"))
+        );
+        assert_eq!(
+            sqlite_parent_dir_from_database_url("sqlite:///:memory:"),
+            None
+        );
     }
 
     #[test]
     fn build_launchd_plist_includes_absolute_paths() {
+        let database_url = resolve_absolute_database_url(
+            "sqlite:///Users/dev/projects/myapp/storage.sqlite3",
+            Path::new("/tmp"),
+        );
         let plist = build_launchd_plist_content(
             "        <string>/usr/local/bin/am</string>",
             Path::new("/Users/dev/Library/Logs/agent-mail"),
             Path::new("/Users/dev/projects/myapp"),
             "/Users/dev",
-            "sqlite:///Users/dev/projects/myapp/storage.sqlite3",
+            &database_url,
             Path::new("/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo"),
             "127.0.0.1",
             8765,
@@ -28782,7 +28818,7 @@ mod tests {
             "plist must contain DATABASE_URL key"
         );
         assert!(
-            plist.contains("<string>sqlite:///Users/dev/projects/myapp/storage.sqlite3</string>"),
+            plist.contains("<string>sqlite:////Users/dev/projects/myapp/storage.sqlite3</string>"),
             "plist must contain absolute DATABASE_URL value"
         );
         assert!(

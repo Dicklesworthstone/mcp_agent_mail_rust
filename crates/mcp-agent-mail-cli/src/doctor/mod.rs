@@ -604,6 +604,113 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
     Ok(())
 }
 
+/// Pass-24 verb: `am doctor fix --list` (without `--only`).
+///
+/// Single agent-visible "what's broken across the entire FM surface"
+/// call. Iterates `fixers::registry()`, runs each FM's detector via
+/// `fixers::detect_only`, and emits a combined JSON envelope without
+/// touching the `mutate()` chokepoint at all (no run-dir, no
+/// actions.jsonl, no advisory locks).
+///
+/// FMs whose detector hits a `MissingInput` (e.g., `git_detect` for
+/// the known-bad-git FM when `git` isn't on PATH) are recorded in
+/// the envelope's `skipped[]` array with the missing field name —
+/// agents can decide whether the missing input is recoverable.
+///
+/// Exit 0 on success regardless of finding count (findings ≠
+/// failure). Exit 1 only on internal serialization error.
+pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
+    use std::time::Instant;
+
+    let started_at = Instant::now();
+    let repo_root =
+        std::env::current_dir().map_err(|e| CliError::Other(format!("getting cwd: {e}")))?;
+    let config = Config::from_env();
+    let storage_root = config.storage_root.clone();
+    let canonical_mcp_url = canonical_mcp_url_for_config(&config);
+
+    let inputs = fixers::DispatchInputs {
+        repo_root: repo_root.clone(),
+        archive_roots: enumerate_archive_roots(&storage_root),
+        pid_hint_candidates: default_listener_pid_candidates(&storage_root),
+        token_backup_candidates: default_token_backup_candidates(&storage_root),
+        mcp_config_candidates: default_mcp_config_candidates(),
+        canonical_mcp_url: Some(canonical_mcp_url),
+        git_detect: build_git_detect_inputs(),
+        gitignore_target: Some(repo_root.join(".gitignore")),
+        stale_seconds_override: None,
+    };
+
+    let specs = fixers::registry();
+    let mut per_fm: Vec<serde_json::Value> = Vec::with_capacity(specs.len());
+    let mut total_findings = 0usize;
+    let mut total_actions_planned = 0usize;
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+
+    for spec in &specs {
+        match fixers::detect_only(spec.id, &inputs) {
+            Ok(outcome) => {
+                total_findings += outcome.findings_count;
+                total_actions_planned += outcome.actions_planned;
+                per_fm.push(serde_json::json!({
+                    "fm_id": spec.id,
+                    "severity": spec.severity,
+                    "subsystem": spec.subsystem,
+                    "op_pattern": spec.op_pattern,
+                    "findings_count": outcome.findings_count,
+                    "actions_planned": outcome.actions_planned,
+                    "findings": outcome.findings,
+                }));
+            }
+            Err(fixers::DispatchError::MissingInput { fm_id, field }) => {
+                skipped.push(serde_json::json!({
+                    "fm_id": fm_id,
+                    "severity": spec.severity,
+                    "subsystem": spec.subsystem,
+                    "reason": "missing_input",
+                    "missing_field": field,
+                }));
+            }
+            Err(fixers::DispatchError::UnknownFm(id)) => {
+                // Impossible — we iterated the registry — but surface
+                // it as a structured warning rather than panic.
+                skipped.push(serde_json::json!({
+                    "fm_id": id,
+                    "reason": "internal_dispatcher_did_not_recognize_registry_id",
+                }));
+            }
+            Err(fixers::DispatchError::Mutate(me)) => {
+                // detect_only doesn't call mutate(). Treat as
+                // internal invariant violation.
+                eprintln!("error: internal — detect_only surfaced a MutateError: {me}");
+                return Err(CliError::ExitCode(1));
+            }
+        }
+    }
+
+    let envelope = serde_json::json!({
+        "schema_version": "1.0",
+        "doctor_version": runs::DOCTOR_VERSION,
+        "doctor_contract_version": runs::DOCTOR_CONTRACT_VERSION,
+        "tool": "am",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "mode": "list_all",
+        "duration_ms": started_at.elapsed().as_millis() as u64,
+        "fm_count": specs.len(),
+        "total_findings": total_findings,
+        "total_actions_planned": total_actions_planned,
+        "per_fm": per_fm,
+        "skipped": skipped,
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&envelope)
+            .map_err(|e| CliError::Other(format!("serializing list_all envelope: {e}")))?
+    );
+    Ok(())
+}
+
 /// Prompt-or-bypass helper for `handle_fix_only`. Lifted from
 /// `confirm_mutating_doctor_action` in lib.rs so we don't have to
 /// expose its internals; matches the same semantics.
