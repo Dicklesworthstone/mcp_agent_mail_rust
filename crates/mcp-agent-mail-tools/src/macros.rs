@@ -132,6 +132,7 @@ pub async fn macro_start_session(
     file_reservation_ttl_seconds: Option<i64>,
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
 ) -> McpResult<String> {
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
@@ -160,8 +161,11 @@ pub async fn macro_start_session(
     // the pane identity first and reuse the pre-registered name when one is
     // available, so the macro is idempotent against the boot path.
     let resolved_name = agent_name.or_else(|| {
-        mcp_agent_mail_core::pane_identity::resolve_identity_current_pane(&project.human_key)
-            .and_then(|name| normalize_resolved_pane_agent_name(&name))
+        mcp_agent_mail_core::pane_identity::resolve_identity_with_optional_pane(
+            &project.human_key,
+            pane_id.as_deref(),
+        )
+        .and_then(|name| normalize_resolved_pane_agent_name(&name))
     });
 
     let agent_json = crate::identity::register_agent(
@@ -173,6 +177,7 @@ pub async fn macro_start_session(
         task_description,
         None,
         reaper_exempt,
+        pane_id,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;
@@ -315,6 +320,7 @@ pub async fn macro_prepare_thread(
             model,
             agent_name,
             task_description,
+            None,
             None,
             None,
         )

@@ -956,11 +956,21 @@ struct LexicalBackfillStateFile {
     #[serde(default)]
     db_path: String,
     #[serde(default)]
+    db_fingerprint: Option<LexicalBackfillDbFingerprint>,
+    #[serde(default)]
     db_stats: LexicalBackfillStateStats,
     #[serde(default)]
     index_stats: LexicalBackfillStateStats,
     #[serde(default)]
     updated_at_micros: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+struct LexicalBackfillDbFingerprint {
+    #[serde(default)]
+    len_bytes: u64,
+    #[serde(default)]
+    modified_micros: i64,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -989,6 +999,23 @@ fn read_lexical_backfill_state_file(
         ));
     }
     Ok(Some(state))
+}
+
+fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBackfillDbFingerprint> {
+    if db_path == ":memory:" {
+        return None;
+    }
+    let metadata = std::fs::metadata(db_path).ok()?;
+    let modified_micros = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|dur| i64::try_from(dur.as_micros()).ok())
+        .unwrap_or(0);
+    Some(LexicalBackfillDbFingerprint {
+        len_bytes: metadata.len(),
+        modified_micros,
+    })
 }
 
 /// Inspect the Search V3 lexical index state without initializing or backfilling the bridge.
@@ -1092,12 +1119,27 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let source_messages = state.db_stats.count;
     let indexed_messages = state.index_stats.count;
     let skipped_messages = source_messages.saturating_sub(indexed_messages);
+    let fingerprint_stale_reason = state.db_fingerprint.as_ref().and_then(|recorded| {
+        match sqlite_file_lexical_backfill_fingerprint(pool.sqlite_path()) {
+            Some(current) if recorded != &current => Some(format!(
+                "backfill marker database fingerprint changed for {}",
+                pool.sqlite_path()
+            )),
+            Some(_) => None,
+            None => Some(format!(
+                "backfill marker database fingerprint is unavailable for {}",
+                pool.sqlite_path()
+            )),
+        }
+    });
     let stale_reason = if state.db_path != pool.sqlite_path() {
         Some(format!(
             "backfill marker belongs to {}, current database is {}",
             state.db_path,
             pool.sqlite_path()
         ))
+    } else if let Some(reason) = fingerprint_stale_reason {
+        Some(reason)
     } else if active_key
         .as_deref()
         .is_some_and(|active| active != sqlite_key.as_str())
@@ -1121,6 +1163,7 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
     let health_state = match stale_reason.as_deref() {
         None => "fresh",
         Some(reason) if reason.starts_with("backfill marker belongs") => "stale",
+        Some(reason) if reason.starts_with("backfill marker database fingerprint") => "stale",
         Some(reason) if reason.starts_with("process-global lexical bridge") => "stale",
         Some(_) => "partial",
     };
@@ -4576,12 +4619,25 @@ mod tests {
     ) {
         let index_dir = root.join("search_index");
         std::fs::create_dir_all(&index_dir).expect("search index dir");
+        if db_path != ":memory:" && !std::path::Path::new(db_path).exists() {
+            if let Some(parent) = std::path::Path::new(db_path).parent() {
+                std::fs::create_dir_all(parent).expect("db parent dir");
+            }
+            std::fs::write(db_path, b"lexical backfill health fixture")
+                .expect("db fingerprint fixture");
+        }
+        let db_fingerprint = sqlite_file_lexical_backfill_fingerprint(db_path).unwrap_or(
+            LexicalBackfillDbFingerprint {
+                len_bytes: 1,
+                modified_micros: 2,
+            },
+        );
         let payload = serde_json::json!({
             "schema_version": 1,
             "db_path": db_path,
             "db_fingerprint": {
-                "len_bytes": 1,
-                "modified_micros": 2
+                "len_bytes": db_fingerprint.len_bytes,
+                "modified_micros": db_fingerprint.modified_micros
             },
             "db_stats": {
                 "count": db_count,
@@ -4691,6 +4747,39 @@ mod tests {
                 .stale_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("backfill marker belongs"))
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn lexical_backfill_health_reports_stale_after_same_path_database_fingerprint_change() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), pool.sqlite_path(), 3, 9, 3, 9);
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(pool.sqlite_path())
+                .expect("open db file for fingerprint change");
+            file.write_all(b"fingerprint-change")
+                .expect("change db fingerprint");
+            file.sync_all().expect("sync db fingerprint change");
+        }
+
+        let health = lexical_backfill_health(&pool);
+
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("database fingerprint changed"))
         );
         reset_lexical_bootstrap_tracking();
     }

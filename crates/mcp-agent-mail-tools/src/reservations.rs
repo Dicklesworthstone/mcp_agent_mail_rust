@@ -1414,6 +1414,19 @@ pub async fn force_release_file_reservation(
                     &message.subject,
                     &message.body_md,
                 );
+                crate::messaging::enqueue_message_lexical_index(
+                    &mcp_agent_mail_db::search_v3::IndexableMessage {
+                        id: message_id,
+                        project_id,
+                        project_slug: project.slug.clone(),
+                        sender_name: agent_name.clone(),
+                        subject: message.subject.clone(),
+                        body_md: message.body_md.clone(),
+                        thread_id: message.thread_id.clone(),
+                        importance: message.importance.clone(),
+                        created_ts: message.created_ts,
+                    },
+                );
                 let all_recipient_names = vec![holder_agent_name.clone()];
                 let msg_json = serde_json::json!({
                     "id": message_id,

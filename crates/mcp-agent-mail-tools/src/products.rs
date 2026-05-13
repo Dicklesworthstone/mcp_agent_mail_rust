@@ -249,11 +249,7 @@ fn merge_product_partial_failure_diagnostics(
     let mut diagnostics = diagnostics.unwrap_or_else(|| crate::search::SearchDiagnostics {
         degraded: true,
         fallback_mode: Some("product_partial_failure".to_string()),
-        timeout_stage: None,
-        budget_tier: None,
-        budget_remaining_ms: None,
-        budget_exhausted: None,
-        remediation_hints: Vec::new(),
+        ..Default::default()
     });
     diagnostics.degraded = true;
     if diagnostics.fallback_mode.is_none() {
@@ -270,6 +266,16 @@ fn merge_product_partial_failure_diagnostics(
         diagnostics.remediation_hints.push(hint);
     }
     Some(diagnostics)
+}
+
+fn merge_product_search_diagnostics(
+    diagnostics: Option<crate::search::SearchDiagnostics>,
+    partial_failures: &[ProductPartialFailure],
+    index_health: &mcp_agent_mail_db::search_service::LexicalBackfillHealth,
+) -> Option<crate::search::SearchDiagnostics> {
+    let diagnostics =
+        merge_product_partial_failure_diagnostics(diagnostics, partial_failures, "product search");
+    crate::search::merge_search_index_diagnostics(diagnostics, index_health)
 }
 
 async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
@@ -690,10 +696,10 @@ pub async fn search_messages_product(
         "row_materialization"
     });
 
-    let diagnostics = merge_product_partial_failure_diagnostics(
+    let diagnostics = merge_product_search_diagnostics(
         crate::search::derive_search_diagnostics(planner_response.explain.as_ref()),
         &partial_failures,
-        "product search",
+        &mcp_agent_mail_db::search_service::lexical_backfill_health(&pool),
     );
     phase.mark("diagnostics_derivation");
     let response = ProductSearchResponse {
@@ -1387,7 +1393,6 @@ mod tests {
             diagnostics: Some(crate::search::SearchDiagnostics {
                 degraded: true,
                 fallback_mode: Some("product_sql_budget_governor".to_string()),
-                timeout_stage: None,
                 budget_tier: Some("critical".to_string()),
                 budget_remaining_ms: Some(0),
                 budget_exhausted: Some(true),
@@ -1395,6 +1400,7 @@ mod tests {
                     "Continue with `next_cursor` or narrow product filters to stay within budget."
                         .to_string(),
                 ],
+                ..Default::default()
             }),
             partial_failures: Vec::new(),
         };
@@ -1411,6 +1417,91 @@ mod tests {
                 .as_ref()
                 .and_then(|diag| diag.budget_tier.as_deref()),
             Some("critical")
+        );
+    }
+
+    #[test]
+    fn product_search_diagnostics_include_search_index_health() {
+        let health = mcp_agent_mail_db::search_service::LexicalBackfillHealth {
+            state: "partial".to_string(),
+            db_identity: "/tmp/mail.sqlite3".to_string(),
+            index_dir: "/tmp/search_index".to_string(),
+            indexed_messages: 2,
+            source_messages: Some(5),
+            skipped_messages: 3,
+            last_backfill_at_micros: Some(123_456),
+            rebuild_in_progress: false,
+            active_db_identity: None,
+            stale_reason: Some("indexed message count 2 differs from source count 5".to_string()),
+            safe_remediation: Some(
+                "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
+            ),
+        };
+
+        let diagnostics = merge_product_search_diagnostics(None, &[], &health)
+            .expect("partial search index should produce product search diagnostics");
+
+        assert!(diagnostics.degraded);
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("search_index_partial")
+        );
+        assert_eq!(diagnostics.search_index_state.as_deref(), Some("partial"));
+        assert_eq!(
+            diagnostics.search_index_reason.as_deref(),
+            Some("indexed message count 2 differs from source count 5")
+        );
+    }
+
+    #[test]
+    fn product_search_diagnostics_merge_partial_failures_and_index_health() {
+        let partial_failures = vec![ProductPartialFailure {
+            project_id: 999,
+            reason_code: "linked_project_missing".to_string(),
+            reason: "product_project_links references a project id with no projects row"
+                .to_string(),
+            remediation_command: "am doctor reconstruct".to_string(),
+        }];
+        let health = mcp_agent_mail_db::search_service::LexicalBackfillHealth {
+            state: "stale".to_string(),
+            db_identity: "/tmp/current.sqlite3".to_string(),
+            index_dir: "/tmp/search_index".to_string(),
+            indexed_messages: 10,
+            source_messages: Some(10),
+            skipped_messages: 0,
+            last_backfill_at_micros: Some(123_456),
+            rebuild_in_progress: false,
+            active_db_identity: Some("/tmp/other.sqlite3".to_string()),
+            stale_reason: Some(
+                "process-global lexical bridge is active for a different database".to_string(),
+            ),
+            safe_remediation: Some(
+                "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
+            ),
+        };
+
+        let diagnostics = merge_product_search_diagnostics(None, &partial_failures, &health)
+            .expect("partial failure plus stale index should produce diagnostics");
+
+        assert!(diagnostics.degraded);
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("product_partial_failure")
+        );
+        assert_eq!(diagnostics.search_index_state.as_deref(), Some("stale"));
+        assert!(
+            diagnostics
+                .remediation_hints
+                .iter()
+                .any(|hint| hint.contains("product search")),
+            "product-specific remediation should be preserved: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .remediation_hints
+                .iter()
+                .any(|hint| hint.contains("am robot search <query>")),
+            "index remediation should be preserved: {diagnostics:?}"
         );
     }
 

@@ -276,6 +276,15 @@ const fn us_to_ms_ceil(us: u64) -> u64 {
     us.saturating_add(999).saturating_div(1000)
 }
 
+fn percentage_clamped(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+
+    let pct = (u128::from(value) * 100).saturating_div(u128::from(total));
+    u64::try_from(pct.min(100)).unwrap_or(100)
+}
+
 const HEALTH_CHECK_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
 const HEALTH_CHECK_REQUIRED_TABLES: &[&str] =
     &["projects", "agents", "messages", "message_recipients"];
@@ -895,15 +904,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.wbq_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let wbq_utilization_pct = if metrics.storage.wbq_capacity == 0 {
-                0
-            } else {
-                metrics
-                    .storage
-                    .wbq_depth
-                    .saturating_mul(100)
-                    .saturating_div(metrics.storage.wbq_capacity)
-            };
+            let wbq_utilization_pct =
+                percentage_clamped(metrics.storage.wbq_depth, metrics.storage.wbq_capacity);
 
             let commit_over_80_for_s = if metrics.storage.commit_over_80_since_us == 0 {
                 0
@@ -912,15 +914,10 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.commit_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let commit_utilization_pct = if metrics.storage.commit_soft_cap == 0 {
-                0
-            } else {
-                metrics
-                    .storage
-                    .commit_pending_requests
-                    .saturating_mul(100)
-                    .saturating_div(metrics.storage.commit_soft_cap)
-            };
+            let commit_utilization_pct = percentage_clamped(
+                metrics.storage.commit_pending_requests,
+                metrics.storage.commit_soft_cap,
+            );
 
             QueuesHealthResponse {
                 wbq: WbqQueueHealthResponse {
@@ -1090,6 +1087,8 @@ Check that all parameters have valid values."
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `reaper_exempt`: Optional bool to exempt agent from the inactivity reaper (default: false)
+/// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
+///   caller pane explicitly; stdio callers may omit it.
 ///
 /// # Returns
 /// Agent profile with all fields
@@ -1113,6 +1112,7 @@ pub async fn register_agent(
     task_description: Option<String>,
     attachments_policy: Option<String>,
     reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -1315,9 +1315,11 @@ Check that all parameters have valid values."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) =
-        mcp_agent_mail_core::write_identity_current_pane(&project.human_key, &row.name)
-    {
+    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane(
+        &project.human_key,
+        pane_id.as_deref(),
+        &row.name,
+    ) {
         match result {
             Ok(path) => {
                 tracing::debug!("wrote pane identity file: {}", path.display());
@@ -1361,6 +1363,8 @@ Check that all parameters have valid values."
 /// - `name_hint`: Optional name hint (must be valid adjective+noun if provided)
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
+/// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
+///   caller pane explicitly; stdio callers may omit it.
 ///
 /// # Returns
 /// New agent profile
@@ -1368,6 +1372,10 @@ Check that all parameters have valid values."
 /// # Conformance
 /// Python-parity.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MCP tool signatures mirror the public JSON-RPC schema"
+)]
 #[tool(
     description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```"
 )]
@@ -1379,6 +1387,7 @@ pub async fn create_agent_identity(
     name_hint: Option<String>,
     task_description: Option<String>,
     attachments_policy: Option<String>,
+    pane_id: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -1570,9 +1579,11 @@ Choose a different name (or omit the name to auto-generate one)."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) =
-        mcp_agent_mail_core::write_identity_current_pane(&project.human_key, &row.name)
-    {
+    if let Some(result) = mcp_agent_mail_core::write_identity_with_optional_pane(
+        &project.human_key,
+        pane_id.as_deref(),
+        &row.name,
+    ) {
         match result {
             Ok(path) => {
                 tracing::debug!("wrote pane identity file: {}", path.display());
@@ -2459,6 +2470,14 @@ mod tests {
         let result = us_to_ms_ceil(u64::MAX);
         // u64::MAX.saturating_add(999) → u64::MAX; u64::MAX / 1000 = 18446744073709551
         assert!(result > 0);
+    }
+
+    #[test]
+    fn percentage_clamped_handles_large_values() {
+        assert_eq!(percentage_clamped(0, 0), 0);
+        assert_eq!(percentage_clamped(50, 100), 50);
+        assert_eq!(percentage_clamped(u64::MAX, u64::MAX), 100);
+        assert_eq!(percentage_clamped(u64::MAX, 1), 100);
     }
 
     // ── Response serialization — optional fields omitted ──

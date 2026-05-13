@@ -76,7 +76,7 @@ pub struct SearchResponse {
 }
 
 /// Deterministic degraded-mode diagnostics extracted from explain metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchDiagnostics {
     pub degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +89,10 @@ pub struct SearchDiagnostics {
     pub budget_remaining_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_exhausted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remediation_hints: Vec<String>,
 }
@@ -264,15 +268,7 @@ pub(crate) fn derive_search_diagnostics(
     explain: Option<&mcp_agent_mail_db::search_planner::QueryExplain>,
 ) -> Option<SearchDiagnostics> {
     let explain = explain?;
-    let mut diagnostics = SearchDiagnostics {
-        degraded: false,
-        fallback_mode: None,
-        timeout_stage: None,
-        budget_tier: None,
-        budget_remaining_ms: None,
-        budget_exhausted: None,
-        remediation_hints: Vec::new(),
-    };
+    let mut diagnostics = SearchDiagnostics::default();
 
     if let Some(outcome) = explain_facet_value(explain, "rerank_outcome") {
         if let Some(tier) = parse_budget_tier_from_rerank_outcome(outcome) {
@@ -355,6 +351,34 @@ pub(crate) fn derive_search_diagnostics(
     } else {
         None
     }
+}
+
+pub(crate) fn merge_search_index_diagnostics(
+    diagnostics: Option<SearchDiagnostics>,
+    health: &mcp_agent_mail_db::search_service::LexicalBackfillHealth,
+) -> Option<SearchDiagnostics> {
+    if !health.is_degraded() {
+        return diagnostics;
+    }
+
+    let mut diagnostics = diagnostics.unwrap_or_default();
+    diagnostics.degraded = true;
+    diagnostics.search_index_state = Some(health.state.clone());
+    diagnostics
+        .search_index_reason
+        .clone_from(&health.stale_reason);
+    diagnostics
+        .fallback_mode
+        .get_or_insert_with(|| format!("search_index_{}", health.state));
+    if let Some(remediation) = &health.safe_remediation
+        && !diagnostics
+            .remediation_hints
+            .iter()
+            .any(|hint| hint == remediation)
+    {
+        diagnostics.remediation_hints.push(remediation.clone());
+    }
+    Some(diagnostics)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -919,7 +943,10 @@ pub async fn search_messages(
         results.len()
     );
 
-    let diagnostics = derive_search_diagnostics(planner_response.explain.as_ref());
+    let diagnostics = merge_search_index_diagnostics(
+        derive_search_diagnostics(planner_response.explain.as_ref()),
+        &mcp_agent_mail_db::search_service::lexical_backfill_health(&pool),
+    );
     phase.mark("diagnostics_derivation");
     let response = SearchResponse {
         result: results,
@@ -1527,6 +1554,84 @@ mod tests {
         assert_eq!(diagnostics.budget_tier.as_deref(), Some("tight"));
         assert_eq!(diagnostics.budget_remaining_ms, Some(180));
         assert_eq!(diagnostics.budget_exhausted, Some(false));
+    }
+
+    #[test]
+    fn merge_search_index_diagnostics_reports_partial_index_state() {
+        let health = mcp_agent_mail_db::search_service::LexicalBackfillHealth {
+            state: "partial".to_string(),
+            db_identity: "/tmp/mail.sqlite3".to_string(),
+            index_dir: "/tmp/search_index".to_string(),
+            indexed_messages: 2,
+            source_messages: Some(5),
+            skipped_messages: 3,
+            last_backfill_at_micros: Some(123_456),
+            rebuild_in_progress: false,
+            active_db_identity: None,
+            stale_reason: Some("indexed message count 2 differs from source count 5".to_string()),
+            safe_remediation: Some(
+                "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
+            ),
+        };
+
+        let diagnostics =
+            merge_search_index_diagnostics(None, &health).expect("partial index diagnostics");
+
+        assert!(diagnostics.degraded);
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("search_index_partial")
+        );
+        assert_eq!(diagnostics.search_index_state.as_deref(), Some("partial"));
+        assert_eq!(
+            diagnostics.search_index_reason.as_deref(),
+            Some("indexed message count 2 differs from source count 5")
+        );
+        assert!(
+            diagnostics
+                .remediation_hints
+                .iter()
+                .any(|hint| hint.contains("am robot search <query>"))
+        );
+    }
+
+    #[test]
+    fn merge_search_index_diagnostics_preserves_existing_budget_signal() {
+        let health = mcp_agent_mail_db::search_service::LexicalBackfillHealth {
+            state: "stale".to_string(),
+            db_identity: "/tmp/current.sqlite3".to_string(),
+            index_dir: "/tmp/search_index".to_string(),
+            indexed_messages: 10,
+            source_messages: Some(10),
+            skipped_messages: 0,
+            last_backfill_at_micros: Some(123_456),
+            rebuild_in_progress: false,
+            active_db_identity: Some("/tmp/other.sqlite3".to_string()),
+            stale_reason: Some(
+                "process-global lexical bridge is serving another database".to_string(),
+            ),
+            safe_remediation: Some(
+                "Run `am robot search <query>` to refresh Search V3 lexical backfill".to_string(),
+            ),
+        };
+        let existing = SearchDiagnostics {
+            degraded: true,
+            fallback_mode: Some("hybrid_budget_governor".to_string()),
+            budget_tier: Some("critical".to_string()),
+            remediation_hints: vec!["Reduce `limit` or narrow filters.".to_string()],
+            ..Default::default()
+        };
+
+        let diagnostics =
+            merge_search_index_diagnostics(Some(existing), &health).expect("merged diagnostics");
+
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("hybrid_budget_governor")
+        );
+        assert_eq!(diagnostics.budget_tier.as_deref(), Some("critical"));
+        assert_eq!(diagnostics.search_index_state.as_deref(), Some("stale"));
+        assert_eq!(diagnostics.remediation_hints.len(), 2);
     }
 
     #[test]

@@ -298,6 +298,8 @@ pub async fn request_contact(
         &target_project_row.human_key,
     )
     .await?;
+    let from_agent_name = from_row.name.clone();
+    let target_agent_name = to_row.name.clone();
 
     // Clamp caller-supplied TTL to [60s, 1 year], matching file_reservation_paths,
     // acquire_build_slot, macro_file_reservation_cycle, and macro_contact_handshake.
@@ -328,7 +330,7 @@ pub async fn request_contact(
     .await;
     if let Outcome::Err(ref err) = link_out {
         tracing::error!(
-            from_agent = %from_agent,
+            from_agent = %from_agent_name,
             from_project_id = project_id,
             to_agent = %target_agent_name,
             to_project_id = target_project_id,
@@ -343,8 +345,9 @@ pub async fn request_contact(
     let should_send_intro = to_row.contact_policy != "block_all" && link_row.status != "blocked";
 
     if should_send_intro {
-        let subject = format!("Contact request from {from_agent}");
-        let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
+        let subject = format!("Contact request from {from_agent_name}");
+        let body_md =
+            format!("{from_agent_name} requests permission to contact {target_agent_name}.");
 
         let to_id = to_row.id.unwrap_or(0);
         let recipients: &[(i64, &str)] = &[(to_id, "to")];
@@ -364,7 +367,7 @@ pub async fn request_contact(
         .await;
         if let Outcome::Err(ref err) = message_out {
             tracing::error!(
-                from_agent = %from_agent,
+                from_agent = %from_agent_name,
                 from_project_id = project_id,
                 to_agent = %target_agent_name,
                 to_project_id = target_project_id,
@@ -381,6 +384,19 @@ pub async fn request_contact(
             &message.subject,
             &message.body_md,
         );
+        crate::messaging::enqueue_message_lexical_index(
+            &mcp_agent_mail_db::search_v3::IndexableMessage {
+                id: message.id.unwrap_or(0),
+                project_id: target_project_id,
+                project_slug: target_project_row.slug.clone(),
+                sender_name: from_agent_name.clone(),
+                subject: message.subject.clone(),
+                body_md: message.body_md.clone(),
+                thread_id: message.thread_id.clone(),
+                importance: message.importance.clone(),
+                created_ts: message.created_ts,
+            },
+        );
 
         // Write message to archive
         let config = mcp_agent_mail_core::Config::get();
@@ -389,7 +405,7 @@ pub async fn request_contact(
 
         let msg_json = serde_json::json!({
             "id": message_id,
-            "from": &from_agent,
+            "from": &from_agent_name,
             "to": &all_recipient_names,
             "cc": [],
             "bcc": [],
@@ -408,14 +424,14 @@ pub async fn request_contact(
             &target_project_row.slug,
             &msg_json,
             &message.body_md,
-            &from_agent,
+            &from_agent_name,
             &all_recipient_names,
             &[],
         );
     }
 
     let response = ContactLinkState {
-        from: from_agent,
+        from: from_agent_name,
         from_project: project.human_key,
         to: target_agent_name,
         to_project: target_project_row.human_key,

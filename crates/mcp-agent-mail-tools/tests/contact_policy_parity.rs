@@ -3,7 +3,7 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    ensure_project, fetch_inbox, register_agent, send_message, set_contact_policy,
+    ensure_project, fetch_inbox, register_agent, request_contact, send_message, set_contact_policy,
 };
 use serde_json::Value;
 use std::fs;
@@ -106,6 +106,7 @@ async fn setup_project_and_agents(ctx: &McpContext, project_key: &str, agents: &
             Some("contact policy parity test".to_string()),
             None,
             None,
+            None,
         )
         .await
         .expect("register_agent");
@@ -139,6 +140,70 @@ async fn send_basic_message(
         None,
     )
     .await
+}
+
+#[test]
+fn test_request_contact_uses_canonical_agent_names_in_intro() {
+    run_serial_async(|cx| async move {
+        let scenario = "request_contact_uses_canonical_agent_names_in_intro";
+        let project_key = format!("/tmp/{scenario}-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["BlueLake", "GreenCastle"]).await;
+
+        let response_json = request_contact(
+            &ctx,
+            project_key.clone(),
+            "bluelake".to_string(),
+            "greencastle".to_string(),
+            None,
+            Some("case mismatch regression".to_string()),
+            Some(60),
+            Some(false),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("request_contact");
+        let response: Value = serde_json::from_str(&response_json).expect("parse response");
+        assert_eq!(
+            response.get("from").and_then(Value::as_str),
+            Some("BlueLake")
+        );
+        assert_eq!(
+            response.get("to").and_then(Value::as_str),
+            Some("GreenCastle")
+        );
+
+        let inbox_json = fetch_inbox(
+            &ctx,
+            project_key,
+            "GreenCastle".to_string(),
+            None,
+            None,
+            Some(20),
+            Some(true),
+            None,
+        )
+        .await
+        .expect("fetch GreenCastle inbox");
+        let inbox: Vec<Value> = serde_json::from_str(&inbox_json).expect("parse inbox");
+        let intro = inbox
+            .iter()
+            .find(|message| {
+                message
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    .is_some_and(|subject| subject == "Contact request from BlueLake")
+            })
+            .expect("canonical contact request intro");
+        assert_eq!(intro.get("from").and_then(Value::as_str), Some("BlueLake"));
+        assert_eq!(
+            intro.get("body_md").and_then(Value::as_str),
+            Some("BlueLake requests permission to contact GreenCastle.")
+        );
+    });
 }
 
 #[test]
