@@ -7,6 +7,7 @@ use crate::config::ProjectIdentityMode;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 // `use std::process::Command;` removed under br-8ujfs.3.4 (C4); all
 // git invocations now go through `crate::git_cmd::GitCmd`.
@@ -40,8 +41,16 @@ pub struct ProjectIdentity {
 fn sha1_hex(text: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    format!("{digest:x}")
+    bytes_to_lower_hex(hasher.finalize())
+}
+
+pub(crate) fn bytes_to_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn short_sha1(text: &str, n: usize) -> String {

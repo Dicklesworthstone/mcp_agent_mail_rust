@@ -751,13 +751,13 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
         let remote_body_hash: Option<String> = root_probe
             .as_ref()
             .ok()
-            .map(|resp| format!("{:x}", Sha256::digest(&resp.body)));
+            .map(|resp| hex::encode(Sha256::digest(&resp.body)));
         // Get local index.html hash
         let local_hash: Option<String> = opts.bundle_path.as_ref().and_then(|bp| {
             let index_path = bp.join("index.html");
             std::fs::read(&index_path)
                 .ok()
-                .map(|data| format!("{:x}", Sha256::digest(&data)))
+                .map(|data| hex::encode(Sha256::digest(&data)))
         });
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = match_start.elapsed().as_millis() as u64;

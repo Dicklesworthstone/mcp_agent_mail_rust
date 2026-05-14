@@ -16806,7 +16806,7 @@ Test body.
         let hash = {
             let mut hasher = sha1::Sha1::new();
             hasher.update(path_pattern.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let artifact = serde_json::json!({

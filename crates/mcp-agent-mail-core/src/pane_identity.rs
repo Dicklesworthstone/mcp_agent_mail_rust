@@ -460,7 +460,7 @@ fn project_hash(project_key: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(project_key.as_bytes());
     let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = crate::identity::bytes_to_lower_hex(digest);
     hex.chars().take(PROJECT_HASH_LEN).collect()
 }
 
