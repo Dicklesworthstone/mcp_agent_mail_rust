@@ -16562,14 +16562,59 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
         }
     }
 
+    if doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).is_some()
+        && let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path)
+    {
+        candidate_path = absolute_candidate;
+        used_absolute_fallback = true;
+    }
+
+    if let Some(detail) = doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)) {
+        return Err(CliError::Other(format!(
+            "{detail}; refusing non-mutating doctor probe; run `am doctor repair` to quarantine it before opening the database"
+        )));
+    }
+
     match mcp_agent_mail_db::DbConn::open_file(&candidate_path) {
-        Ok(conn) => Ok(DoctorOpenContext {
-            conn,
-            configured_path: path,
-            opened_path: candidate_path,
-            used_absolute_fallback,
-            fallback_due_to_missing_configured_path,
-        }),
+        Ok(conn) => match conn.query_sync("SELECT 1 AS one", &[]) {
+            Ok(_) => Ok(DoctorOpenContext {
+                conn,
+                configured_path: path,
+                opened_path: candidate_path,
+                used_absolute_fallback,
+                fallback_due_to_missing_configured_path,
+            }),
+            Err(probe_err) => {
+                let probe_err_text = probe_err.to_string();
+                if let Some(fallback_path) =
+                    sqlite_absolute_fallback_path(&candidate_path, &probe_err_text)
+                {
+                    let fallback_conn =
+                        mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
+                            CliError::Other(format!(
+                                "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
+                            ))
+                        })?;
+                    fallback_conn
+                        .query_sync("SELECT 1 AS one", &[])
+                        .map_err(|e| {
+                            CliError::Other(format!(
+                                "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} probe failed: {e}"
+                            ))
+                        })?;
+                    return Ok(DoctorOpenContext {
+                        conn: fallback_conn,
+                        configured_path: path,
+                        opened_path: fallback_path,
+                        used_absolute_fallback: true,
+                        fallback_due_to_missing_configured_path,
+                    });
+                }
+                Err(CliError::Other(format!(
+                    "database probe failed at {candidate_path}: {probe_err}"
+                )))
+            }
+        },
         Err(primary_err) => {
             let primary_err_text = primary_err.to_string();
             if let Some(fallback_path) =
@@ -16579,6 +16624,13 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
                     mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
                         CliError::Other(format!(
                             "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
+                        ))
+                    })?;
+                fallback_conn
+                    .query_sync("SELECT 1 AS one", &[])
+                    .map_err(|e| {
+                        CliError::Other(format!(
+                            "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} probe failed: {e}"
                         ))
                     })?;
                 return Ok(DoctorOpenContext {
@@ -16692,15 +16744,26 @@ pub(crate) fn build_forensic_timeline_report(
     storage_root: &Path,
     status: &str,
     checks: &[serde_json::Value],
+    allow_database_probes: bool,
 ) -> ForensicTimelineReport {
     let current = ForensicTimelineCurrent {
         generated_at: Utc::now().to_rfc3339(),
         status: status.to_string(),
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
-        schema_version: forensic_schema_version(database_url, checks),
+        schema_version: if allow_database_probes {
+            forensic_schema_version(database_url, checks)
+        } else {
+            doctor_check_detail(checks, "schema_version").map(parse_schema_version_detail)
+        },
         storage_root: storage_root.display().to_string(),
         database_path: forensic_database_path(database_url),
-        search_index_generation: forensic_search_index_generation(database_url, storage_root),
+        search_index_generation: if allow_database_probes {
+            forensic_search_index_generation(database_url, storage_root)
+        } else {
+            forensic_search_index_generation_skipped(
+                "database repair/reconstruct preflight blocked read-only probes",
+            )
+        },
     };
     let doctor_root = std::env::current_dir()
         .ok()
@@ -16851,6 +16914,20 @@ fn forensic_search_index_generation(
                 &error.to_string(),
             )),
         },
+    }
+}
+
+fn forensic_search_index_generation_skipped(reason: &str) -> ForensicSearchIndexGeneration {
+    ForensicSearchIndexGeneration {
+        state: "unavailable".to_string(),
+        db_identity: None,
+        index_dir: None,
+        indexed_messages: None,
+        source_messages: None,
+        skipped_messages: None,
+        last_backfill_at_micros: None,
+        rebuild_in_progress: false,
+        stale_reason: Some(forensic_safe_value("search_index_error", reason)),
     }
 }
 
@@ -19292,6 +19369,47 @@ fn doctor_database_next_action(strategy: &DoctorDatabaseFixStrategy) -> String {
     }
 }
 
+fn doctor_database_strategy_summary(strategy: &DoctorDatabaseFixStrategy) -> serde_json::Value {
+    let (strategy_name, detail) = match strategy {
+        DoctorDatabaseFixStrategy::Reconstruct(detail) => ("reconstruct", detail),
+        DoctorDatabaseFixStrategy::Repair(detail) => ("repair", detail),
+        DoctorDatabaseFixStrategy::None(detail) => ("none", detail),
+    };
+    serde_json::json!({
+        "strategy": strategy_name,
+        "detail": detail,
+        "next_action": doctor_database_next_action(strategy),
+    })
+}
+
+fn doctor_database_probe_blocker_read_only(
+    database_url: &str,
+) -> Option<DoctorDatabaseFixStrategy> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let configured_path = cfg.sqlite_path().ok()?;
+    if configured_path == ":memory:" {
+        return None;
+    }
+
+    let mut candidate_path = configured_path.clone();
+    if !Path::new(&candidate_path).exists() {
+        candidate_path = sqlite_absolute_candidate_path(&candidate_path)?;
+    } else if doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).is_some()
+        && let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path)
+    {
+        candidate_path = absolute_candidate;
+    }
+
+    doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).map(|detail| {
+        DoctorDatabaseFixStrategy::Repair(format!(
+            "{detail}; run `am doctor repair` to quarantine it before opening the database"
+        ))
+    })
+}
+
 fn doctor_server_next_action(diagnostics: &DoctorServerFixDiagnostics) -> Option<String> {
     if diagnostics.restart_recommended {
         Some(
@@ -19429,6 +19547,9 @@ fn build_doctor_check_summary(
         },
         "primary_issue": primary_issue,
         "archive_hygiene": archive_hygiene,
+        "database_fix_strategy": database_strategy
+            .map(doctor_database_strategy_summary)
+            .unwrap_or(serde_json::Value::Null),
         "secondary_fail_count": fail_count.saturating_sub(primary_fail_count),
         "secondary_warning_count": warn_count
             .saturating_sub(primary_warn_count)
@@ -21720,10 +21841,27 @@ fn handle_doctor_check_with(
     let mut checks: Vec<serde_json::Value> = Vec::new();
     let mut db_file_sanity_failed = false;
     let env_config = Config::from_env();
+    let database_probe_blocker_strategy = doctor_database_probe_blocker_read_only(database_url);
+    let database_probe_blocker = database_probe_blocker_strategy
+        .as_ref()
+        .and_then(|strategy| {
+            let detail = match strategy {
+                DoctorDatabaseFixStrategy::Repair(detail)
+                | DoctorDatabaseFixStrategy::Reconstruct(detail) => detail,
+                DoctorDatabaseFixStrategy::None(_) => return None,
+            };
+            Some(format!(
+                "{} {}",
+                detail,
+                doctor_database_next_action(strategy)
+            ))
+        });
 
     // Check 1: Database accessible (non-mutating; avoid auto-recovery side effects).
-    let (db_status, db_detail) = match open_db_for_doctor_check_with_context(database_url)
-        .and_then(|opened| {
+    let (db_status, db_detail) = if let Some(detail) = database_probe_blocker.as_ref() {
+        ("fail".to_string(), detail.clone())
+    } else {
+        match open_db_for_doctor_check_with_context(database_url).and_then(|opened| {
             opened
                 .conn
                 .query_sync("SELECT 1 AS one", &[])
@@ -21753,8 +21891,9 @@ fn handle_doctor_check_with(
             };
             Ok((status, detail))
         }) {
-        Ok((status, detail)) => (status.to_string(), detail),
-        Err(e) => ("fail".to_string(), format!("Cannot open database: {e}")),
+            Ok((status, detail)) => (status.to_string(), detail),
+            Err(e) => ("fail".to_string(), format!("Cannot open database: {e}")),
+        }
     };
     checks.push(serde_json::json!({
         "check": "database",
@@ -21764,52 +21903,61 @@ fn handle_doctor_check_with(
 
     // Check 1b: DB file sanity (non-zero size + sidecar-aware health probes)
     {
-        let cfg = mcp_agent_mail_db::DbPoolConfig {
-            database_url: database_url.to_string(),
-            ..Default::default()
-        };
-        match cfg.sqlite_path() {
-            Ok(db_path) => {
-                if db_path != ":memory:" {
-                    match sqlite_doctor_file_sanity(&db_path) {
-                        Ok((
-                            qc_ok,
-                            detail,
-                            used_absolute_fallback,
-                            _fallback_due_to_missing_configured_path,
-                        )) => {
-                            if !qc_ok {
-                                db_file_sanity_failed = true;
+        if let Some(detail) = database_probe_blocker.as_ref() {
+            db_file_sanity_failed = true;
+            checks.push(serde_json::json!({
+                "check": "db_file_sanity",
+                "status": "fail",
+                "detail": format!("Skipped live SQLite file probe: {detail}"),
+            }));
+        } else {
+            let cfg = mcp_agent_mail_db::DbPoolConfig {
+                database_url: database_url.to_string(),
+                ..Default::default()
+            };
+            match cfg.sqlite_path() {
+                Ok(db_path) => {
+                    if db_path != ":memory:" {
+                        match sqlite_doctor_file_sanity(&db_path) {
+                            Ok((
+                                qc_ok,
+                                detail,
+                                used_absolute_fallback,
+                                _fallback_due_to_missing_configured_path,
+                            )) => {
+                                if !qc_ok {
+                                    db_file_sanity_failed = true;
+                                }
+                                let status = if qc_ok {
+                                    if used_absolute_fallback { "warn" } else { "ok" }
+                                } else {
+                                    "fail"
+                                };
+                                checks.push(serde_json::json!({
+                                    "check": "db_file_sanity",
+                                    "status": status,
+                                    "detail": detail,
+                                }));
                             }
-                            let status = if qc_ok {
-                                if used_absolute_fallback { "warn" } else { "ok" }
-                            } else {
-                                "fail"
-                            };
-                            checks.push(serde_json::json!({
-                                "check": "db_file_sanity",
-                                "status": status,
-                                "detail": detail,
-                            }));
-                        }
-                        Err(e) => {
-                            db_file_sanity_failed = true;
-                            checks.push(serde_json::json!({
-                                "check": "db_file_sanity",
-                                "status": "fail",
-                                "detail": format!("Database health probe error: {e}"),
-                            }));
+                            Err(e) => {
+                                db_file_sanity_failed = true;
+                                checks.push(serde_json::json!({
+                                    "check": "db_file_sanity",
+                                    "status": "fail",
+                                    "detail": format!("Database health probe error: {e}"),
+                                }));
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                db_file_sanity_failed = true;
-                checks.push(serde_json::json!({
-                    "check": "db_file_sanity",
-                    "status": "fail",
-                    "detail": format!("Cannot resolve sqlite path for sanity check: {e}"),
-                }));
+                Err(e) => {
+                    db_file_sanity_failed = true;
+                    checks.push(serde_json::json!({
+                        "check": "db_file_sanity",
+                        "status": "fail",
+                        "detail": format!("Cannot resolve sqlite path for sanity check: {e}"),
+                    }));
+                }
             }
         }
     }
@@ -21851,7 +21999,13 @@ fn handle_doctor_check_with(
 
     // Check 1d: Non-mutating reopen probe (do not run migrations in doctor check).
     {
-        if db_file_sanity_failed {
+        if let Some(detail) = database_probe_blocker.as_ref() {
+            checks.push(serde_json::json!({
+                "check": "pool_init",
+                "status": "fail",
+                "detail": format!("Skipped database reopen probe: {detail}"),
+            }));
+        } else if db_file_sanity_failed {
             checks.push(serde_json::json!({
                 "check": "pool_init",
                 "status": "fail",
@@ -21879,7 +22033,13 @@ fn handle_doctor_check_with(
 
     // Check 1e: Foreign-key integrity, including orphaned message recipients.
     {
-        if db_file_sanity_failed {
+        if let Some(detail) = database_probe_blocker.as_ref() {
+            checks.push(serde_json::json!({
+                "check": "foreign_key_integrity",
+                "status": "fail",
+                "detail": format!("Skipped relational integrity probe: {detail}"),
+            }));
+        } else if db_file_sanity_failed {
             checks.push(serde_json::json!({
                 "check": "foreign_key_integrity",
                 "status": "fail",
@@ -22013,7 +22173,13 @@ fn handle_doctor_check_with(
     }
 
     // Check 1e: Hot query-plan drift diagnostics.
-    if db_file_sanity_failed {
+    if let Some(detail) = database_probe_blocker.as_ref() {
+        checks.push(serde_json::json!({
+            "check": "query_plan_hot_paths",
+            "status": "warn",
+            "detail": format!("Skipped hot query-plan diagnostics: {detail}"),
+        }));
+    } else if db_file_sanity_failed {
         checks.push(serde_json::json!({
             "check": "query_plan_hot_paths",
             "status": "warn",
@@ -22101,6 +22267,12 @@ fn handle_doctor_check_with(
                 "Skipped: no archive projects directory found under {}",
                 projects_root.display()
             ),
+        }));
+    } else if let Some(detail) = database_probe_blocker.as_ref() {
+        checks.push(serde_json::json!({
+            "check": "archive_db_parity",
+            "status": "fail",
+            "detail": format!("Skipped Archive/DB inventory probe: {detail}"),
         }));
     } else if db_file_sanity_failed {
         checks.push(serde_json::json!({
@@ -22952,12 +23124,16 @@ fn handle_doctor_check_with(
     // Check 4h: Database format and health (br-28mgh.7.4)
     {
         use mcp_agent_mail_db::migrate;
-        let conn_result = open_db_for_doctor_check(database_url);
+        let conn_result = if database_probe_blocker.is_some() {
+            None
+        } else {
+            Some(open_db_for_doctor_check(database_url))
+        };
 
         // 4d-i: Timestamp format
         let ts_check = conn_result
             .as_ref()
-            .ok()
+            .and_then(|result| result.as_ref().ok())
             .and_then(|conn| migrate::detect_timestamp_format(conn).ok());
         match ts_check {
             Some(fmt) if fmt.needs_migration() => {
@@ -22978,13 +23154,16 @@ fn handle_doctor_check_with(
                 checks.push(serde_json::json!({
                     "check": "timestamp_format",
                     "status": "warn",
-                    "detail": "Could not detect timestamp format",
+                    "detail": database_probe_blocker
+                        .as_ref()
+                        .map(|detail| format!("Skipped timestamp format probe: {detail}"))
+                        .unwrap_or_else(|| "Could not detect timestamp format".to_string()),
                 }));
             }
         }
 
         // 4d-ii: WAL mode
-        if let Ok(ref conn) = conn_result {
+        if let Some(Ok(ref conn)) = conn_result {
             let wal_ok = conn
                 .query_sync("PRAGMA journal_mode", &[])
                 .ok()
@@ -23006,7 +23185,7 @@ fn handle_doctor_check_with(
         }
 
         // 4d-iii: Schema version (user_version PRAGMA)
-        if let Ok(ref conn) = conn_result {
+        if let Some(Ok(ref conn)) = conn_result {
             let version = conn
                 .query_sync("PRAGMA user_version", &[])
                 .ok()
@@ -23023,7 +23202,7 @@ fn handle_doctor_check_with(
         }
 
         // 4d-iv: FTS5 virtual tables
-        if let Ok(ref conn) = conn_result {
+        if let Some(Ok(ref conn)) = conn_result {
             let legacy_fts_tables = doctor_legacy_fts_tables(conn);
             let (fts_status, fts_detail) = if legacy_fts_tables.is_empty() {
                 (
@@ -23048,7 +23227,7 @@ fn handle_doctor_check_with(
         }
 
         // 4d-v: Row counts (sanity check)
-        if verbose && let Ok(ref conn) = conn_result {
+        if verbose && let Some(Ok(ref conn)) = conn_result {
             let tables = ["projects", "agents", "messages", "file_reservations"];
             let mut counts: Vec<String> = Vec::new();
             for table in &tables {
@@ -23087,6 +23266,7 @@ fn handle_doctor_check_with(
 
     // Check 5: Project-specific checks
     if let Some(ref slug) = project
+        && database_probe_blocker.is_none()
         && let Ok(conn) = open_db_for_doctor_check(database_url)
     {
         let resolved_project = crate::context::resolve_project(&conn, slug);
@@ -23138,8 +23318,8 @@ fn handle_doctor_check_with(
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
     let fail_count = checks.iter().filter(|c| c["status"] == "fail").count();
     let warn_count = checks.iter().filter(|c| c["status"] == "warn").count();
-    let database_fix_strategy =
-        doctor_database_fix_strategy_read_only(database_url, storage_root).ok();
+    let database_fix_strategy = database_probe_blocker_strategy
+        .or_else(|| doctor_database_fix_strategy_read_only(database_url, storage_root).ok());
     let summary = build_doctor_check_summary(
         &checks,
         database_fix_strategy.as_ref(),
@@ -23261,8 +23441,13 @@ fn handle_doctor_check_with(
         warn_count,
         diagnostic_artifacts,
     );
-    let forensic_timeline =
-        build_forensic_timeline_report(database_url, storage_root, overall_status, &checks);
+    let forensic_timeline = build_forensic_timeline_report(
+        database_url,
+        storage_root,
+        overall_status,
+        &checks,
+        database_probe_blocker.is_none(),
+    );
     let payload = serde_json::json!({
         "healthy": all_ok,
         "summary": summary,
@@ -48526,6 +48711,57 @@ startup_timeout_sec = 42
             }
         }
         panic!("doctor check produced no matching JSON output after 2 attempts");
+    }
+
+    #[test]
+    fn doctor_check_reports_header_only_wal_without_quarantining_sidecars() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root_s = dir.path().display().to_string();
+
+        let parsed = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_s)],
+            || {
+                let db_path = dir.path().join("doctor-check-header-only-wal.sqlite3");
+                seed_project_only_db(&db_path, "doctor-check-header-only-wal", "/doctor-check");
+                mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+                    .expect("checkpoint seeded db before adding header-only wal");
+
+                let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+                let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+                std::fs::write(
+                    &wal_path,
+                    vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+                )
+                .expect("write header-only wal");
+                std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+                let db_url = format!("sqlite:///{}", db_path.display());
+                let parsed = run_doctor_check_json(&db_url, dir.path());
+
+                assert!(wal_path.exists(), "doctor check must not quarantine WAL");
+                assert!(shm_path.exists(), "doctor check must not quarantine SHM");
+                parsed
+            },
+        );
+
+        assert_eq!(
+            parsed["healthy"],
+            serde_json::Value::Bool(false),
+            "header-only WAL should make doctor check unhealthy"
+        );
+        let summary = parsed["summary"].as_object().expect("summary object");
+        let strategy = summary
+            .get("database_fix_strategy")
+            .expect("database fix strategy summary");
+        assert_eq!(strategy["strategy"].as_str(), Some("repair"));
+        let detail = strategy["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("header-only/truncated") && detail.contains("am doctor repair"),
+            "doctor check should expose specific WAL repair detail, got: {detail}"
+        );
     }
 
     #[test]

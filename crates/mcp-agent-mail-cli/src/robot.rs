@@ -4464,6 +4464,7 @@ fn build_status_with_phase(
         &config.storage_root,
         &health,
         &[],
+        true,
     );
 
     let data = StatusData {
@@ -4634,6 +4635,7 @@ fn build_recovery_only_status(
         &config.storage_root,
         &health,
         &[],
+        false,
     );
 
     let data = StatusData {
