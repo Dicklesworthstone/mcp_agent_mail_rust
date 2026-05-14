@@ -66,6 +66,10 @@ fn null_auto_increment_ids(value: &mut Value) {
 /// For tooling/directory-like resources with "clusters" → "tools" arrays,
 /// filter the actual response to only include tools whose names appear in
 /// the expected output. This handles tools added after fixture generation.
+///
+/// Tool entries may also grow Rust-only examples after the Python fixture was
+/// generated. Keep fixture parity focused on the examples Python knows about by
+/// matching `usage_examples` on their stable `hint` labels.
 fn align_cluster_tools(actual: &mut Value, expected: &Value) {
     let Some(expected_clusters) = expected.get("clusters").and_then(|c| c.as_array()) else {
         return;
@@ -91,7 +95,8 @@ fn align_cluster_tools(actual: &mut Value, expected: &Value) {
         return;
     }
 
-    // Filter actual clusters: remove tools not in expected, remove empty clusters
+    // Filter actual clusters: remove tools not in expected, remove extra usage
+    // examples inside known tools, then remove empty clusters.
     for cluster in actual_clusters.iter_mut() {
         if let Some(tools) = cluster.get_mut("tools").and_then(|t| t.as_array_mut()) {
             tools.retain(|tool| {
@@ -99,6 +104,52 @@ fn align_cluster_tools(actual: &mut Value, expected: &Value) {
                     .and_then(|n| n.as_str())
                     .is_some_and(|name| expected_tool_names.contains(name))
             });
+
+            for tool in tools {
+                let Some(tool_name) = tool.get("name").and_then(|name| name.as_str()) else {
+                    continue;
+                };
+                let expected_hints: std::collections::HashSet<String> = expected_clusters
+                    .iter()
+                    .filter_map(|cluster| cluster.get("tools").and_then(|tools| tools.as_array()))
+                    .flatten()
+                    .find(|expected_tool| {
+                        expected_tool.get("name").and_then(|name| name.as_str()) == Some(tool_name)
+                    })
+                    .and_then(|expected_tool| {
+                        expected_tool
+                            .get("usage_examples")
+                            .and_then(|examples| examples.as_array())
+                    })
+                    .map(|examples| {
+                        examples
+                            .iter()
+                            .filter_map(|example| {
+                                example
+                                    .get("hint")
+                                    .and_then(|hint| hint.as_str())
+                                    .map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if expected_hints.is_empty() {
+                    continue;
+                }
+
+                if let Some(actual_examples) = tool
+                    .get_mut("usage_examples")
+                    .and_then(|examples| examples.as_array_mut())
+                {
+                    actual_examples.retain(|example| {
+                        example
+                            .get("hint")
+                            .and_then(|hint| hint.as_str())
+                            .is_some_and(|hint| expected_hints.contains(hint))
+                    });
+                }
+            }
         }
     }
     actual_clusters.retain(|c| {
@@ -1215,6 +1266,7 @@ fn setup_fixture_env() -> FixtureEnv {
         ("TOOLS_FILTER_ENABLED", "0"),
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
+        ("LLM_DEFAULT_MODEL", "conformance-stub"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),

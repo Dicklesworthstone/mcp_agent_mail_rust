@@ -2922,7 +2922,6 @@ fn merge_salvaged_database(
         let mut project_id_map: HashMap<i64, i64> = HashMap::new();
         let mut agent_id_map: HashMap<i64, i64> = HashMap::new();
         let mut product_id_map: HashMap<i64, i64> = HashMap::new();
-
         if has_projects {
             let project_columns = table_columns(&salvage_conn, "projects")?;
             let Some(project_select) = build_salvage_select(

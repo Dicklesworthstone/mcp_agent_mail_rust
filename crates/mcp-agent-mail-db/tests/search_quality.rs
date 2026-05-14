@@ -790,7 +790,7 @@ fn ensure_v3_tantivy_index(corpus: &SeededCorpus) {
         std::process::id()
     ));
     std::fs::create_dir_all(&index_dir).expect("create Tantivy index directory");
-    search_v3::init_bridge(Path::new(&index_dir)).expect("init Tantivy bridge");
+    search_v3::init_or_switch_bridge(Path::new(&index_dir)).expect("init Tantivy bridge");
 
     let bridge = search_v3::get_bridge().expect("Tantivy bridge initialized");
     let handles = bridge.handles();

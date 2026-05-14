@@ -1144,6 +1144,13 @@ mod tests {
             &[Value::BigInt(recipient_id), Value::BigInt(pid)],
         )
         .unwrap();
+        conn.execute_sync(
+            "INSERT OR IGNORE INTO message_recipients \
+             (message_id, agent_id, kind, read_ts, ack_ts) \
+             VALUES (?, ?, 'to', NULL, NULL)",
+            &[Value::BigInt(msg_id), Value::BigInt(recipient_id)],
+        )
+        .unwrap();
 
         sync_message_recipients_json(&conn, msg_id).expect("sync recipients_json");
 

@@ -51,7 +51,7 @@ ftui-widgets = { version = "0.4.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.4.0"
 ftui-harness = "0.4.0"
 ftui-render = "0.4.0"
-beads_rust = "0.2.8"
+beads_rust = "0.2.10"
 toon = { version = "0.2.3", package = "tru" }
 
 # Internal workspace crates

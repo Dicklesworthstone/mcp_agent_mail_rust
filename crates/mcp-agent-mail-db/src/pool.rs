@@ -424,6 +424,9 @@ pub struct RecoveryAdmissionController {
 }
 /// Interior state protected by the controller's `Mutex`.
 struct RecoveryAdmissionState {
+    /// Path whose failures currently own the backoff/suppression window.
+    failure_path: Option<PathBuf>,
+
     /// Number of consecutive failures (reset to 0 on success).
     consecutive_failures: u32,
 
@@ -460,6 +463,7 @@ impl RecoveryAdmissionController {
         Self {
             in_progress: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(RecoveryAdmissionState {
+                failure_path: None,
                 consecutive_failures: 0,
                 last_attempt: None,
                 window_attempts: std::collections::VecDeque::new(),
@@ -480,12 +484,17 @@ impl RecoveryAdmissionController {
     /// [`report_success`](Self::report_success) or
     /// [`report_failure`](Self::report_failure) before the guard drops so
     /// the backoff/window state is updated correctly.
-    pub fn try_acquire(&self) -> Option<RecoveryGuard<'_>> {
+    pub fn try_acquire(&self, primary_path: &Path) -> Option<RecoveryGuard<'_>> {
         {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let now = Instant::now();
+            let same_failure_path = state
+                .failure_path
+                .as_deref()
+                .is_some_and(|path| path == primary_path);
 
-            if let Some(until) = state.suppressed_until
+            if same_failure_path
+                && let Some(until) = state.suppressed_until
                 && now < until
             {
                 tracing::warn!(
@@ -498,7 +507,8 @@ impl RecoveryAdmissionController {
                 return None;
             }
 
-            if state.consecutive_failures > 0
+            if same_failure_path
+                && state.consecutive_failures > 0
                 && let Some(last) = state.last_attempt
             {
                 let required_delay = Self::backoff_delay(state.consecutive_failures);
@@ -531,6 +541,21 @@ impl RecoveryAdmissionController {
             return None;
         }
 
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state
+                .failure_path
+                .as_deref()
+                .is_some_and(|path| path != primary_path)
+            {
+                state.failure_path = None;
+                state.consecutive_failures = 0;
+                state.last_attempt = None;
+                state.window_attempts.clear();
+                state.suppressed_until = None;
+            }
+        }
+
         Some(RecoveryGuard { controller: self })
     }
 
@@ -539,6 +564,7 @@ impl RecoveryAdmissionController {
     pub fn report_success(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
+        state.failure_path = None;
         state.consecutive_failures = 0;
         state.last_attempt = Some(now);
         state.suppressed_until = None;
@@ -548,9 +574,20 @@ impl RecoveryAdmissionController {
     /// Record a failed recovery. Increments consecutive-failure count,
     /// records the attempt in the sliding window, and may activate
     /// loop suppression if the window threshold is exceeded.
-    pub fn report_failure(&self) {
+    pub fn report_failure(&self, primary_path: &Path) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
+        if state
+            .failure_path
+            .as_deref()
+            .is_none_or(|path| path != primary_path)
+        {
+            state.failure_path = Some(primary_path.to_path_buf());
+            state.consecutive_failures = 0;
+            state.last_attempt = None;
+            state.window_attempts.clear();
+            state.suppressed_until = None;
+        }
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         state.last_attempt = Some(now);
         Self::prune_window(&mut state.window_attempts, now);
@@ -617,6 +654,7 @@ impl RecoveryAdmissionController {
         self.in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.failure_path = None;
         state.consecutive_failures = 0;
         state.last_attempt = None;
         state.window_attempts.clear();
@@ -740,14 +778,14 @@ where
         return operation();
     }
 
-    let Some(_guard) = recovery_admission().try_acquire() else {
+    let Some(_guard) = recovery_admission().try_acquire(primary_path) else {
         return Err(recovery_admission_blocked_error(primary_path, action));
     };
     let _depth_guard = RecoveryAdmissionDepthGuard::enter();
     let result = operation();
     match &result {
         Ok(_) => recovery_admission().report_success(),
-        Err(_) => recovery_admission().report_failure(),
+        Err(_) => recovery_admission().report_failure(primary_path),
     }
     result
 }
@@ -1120,21 +1158,21 @@ impl DeferredWriteQueue {
         let entry_bytes = estimate_deferred_write_bytes(&sql, &params);
         let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
 
-        if !inner.active {
-            return DeferralOutcome::NotRecovering;
-        }
         if inner.sealed {
             return DeferralOutcome::Sealed;
+        }
+        if !inner.active {
+            return DeferralOutcome::NotRecovering;
         }
 
         // Hard-stop: oldest entry exceeded max age → recovery is stalled.
         if let Some(oldest) = inner.entries.first() {
             let age_us = now_us.saturating_sub(oldest.deferred_at_us).max(0);
-            let age_secs = u64::try_from(age_us / 1_000_000).unwrap_or(0);
-            if age_secs > inner.policy.max_age_secs {
+            let max_age_us = inner.policy.max_age_secs.saturating_mul(1_000_000);
+            if u64::try_from(age_us).unwrap_or(u64::MAX) > max_age_us {
                 inner.shed_count = inner.shed_count.saturating_add(1);
                 return DeferralOutcome::HardStopAge {
-                    oldest_age_secs: age_secs,
+                    oldest_age_secs: u64::try_from(age_us / 1_000_000).unwrap_or(0),
                     max_age_secs: inner.policy.max_age_secs,
                 };
             }
@@ -1150,19 +1188,21 @@ impl DeferredWriteQueue {
         }
 
         // Fairness: per-operation limit.
-        let fairness_limit = inner.policy.fairness_limit();
-        let op_count = inner
-            .per_operation_counts
-            .get(operation)
-            .copied()
-            .unwrap_or(0);
-        if op_count >= fairness_limit {
-            inner.shed_count = inner.shed_count.saturating_add(1);
-            return DeferralOutcome::FairnessLimitReached {
-                operation,
-                count: op_count,
-                limit: fairness_limit,
-            };
+        if inner.policy.fairness_limit_pct != 0 && inner.policy.fairness_limit_pct <= 100 {
+            let fairness_limit = inner.policy.fairness_limit();
+            let op_count = inner
+                .per_operation_counts
+                .get(operation)
+                .copied()
+                .unwrap_or(0);
+            if op_count >= fairness_limit {
+                inner.shed_count = inner.shed_count.saturating_add(1);
+                return DeferralOutcome::FairnessLimitReached {
+                    operation,
+                    count: op_count,
+                    limit: fairness_limit,
+                };
+            }
         }
 
         // Backpressure: capacity limit.
@@ -2347,8 +2387,11 @@ impl DbPool {
                         error = %e,
                         "startup integrity check failed to open sqlite file; attempting auto-recovery"
                     );
-                    recover_sqlite_file(Path::new(&self.sqlite_path))
-                        .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
+                    recover_sqlite_file_with_storage_root(
+                        Path::new(&self.sqlite_path),
+                        &self.storage_root,
+                    )
+                    .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                         DbError::Sqlite(format!(
                             "startup integrity check: open failed after recovery: {reopen}"
@@ -2380,7 +2423,10 @@ impl DbPool {
                 // Close connection before attempting restore (Windows/locking safety)
                 drop(conn);
 
-                if let Err(e) = recover_sqlite_file(Path::new(&self.sqlite_path)) {
+                if let Err(e) = recover_sqlite_file_with_storage_root(
+                    Path::new(&self.sqlite_path),
+                    &self.storage_root,
+                ) {
                     return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                 }
 
@@ -2395,6 +2441,37 @@ impl DbPool {
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
                         DbError::Sqlite(format!(
                             "startup integrity check (post-recovery): open failed: {e}"
+                        ))
+                    })?,
+                    "startup integrity check post-recovery connection",
+                );
+                self.quick_check_with_canonical_fallback(&conn, "post-recovery")
+            }
+            Err(e)
+                if is_sqlite_recovery_error_message(&e.to_string())
+                    || is_corruption_error_message(&e.to_string()) =>
+            {
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    error = %e,
+                    "startup integrity probe hit sqlite recovery error; attempting auto-recovery"
+                );
+
+                drop(conn);
+
+                if let Err(recovery_error) = recover_sqlite_file_with_storage_root(
+                    Path::new(&self.sqlite_path),
+                    &self.storage_root,
+                ) {
+                    return Err(DbError::Sqlite(format!(
+                        "startup recovery failed: {recovery_error}"
+                    )));
+                }
+
+                let conn = crate::guard_db_conn(
+                    open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
+                        DbError::Sqlite(format!(
+                            "startup integrity check (post-recovery): open failed: {reopen}"
                         ))
                     })?,
                     "startup integrity check post-recovery connection",
@@ -2921,7 +2998,7 @@ impl DbPool {
             }
         };
 
-        match recover_sqlite_file(primary_path) {
+        match recover_sqlite_file_with_storage_root(primary_path, &self.storage_root) {
             Ok(()) => {
                 self.retire_runtime_state_after_recovery(trigger_error);
                 tracing::warn!(
@@ -3669,7 +3746,7 @@ fn reconcile_archive_state_before_init(
         return Ok(false);
     }
 
-    let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
+    let stats = reconstruct_sqlite_file_from_archive_without_salvage(primary_path, storage_root)?;
     tracing::warn!(
         path = %primary_path.display(),
         storage_root = %storage_root.display(),
@@ -3849,17 +3926,19 @@ fn execute_sql_with_lock_retry(
 #[allow(clippy::result_large_err)]
 pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlError> {
     if sqlite_path == ":memory:" {
-        return DbConn::open_memory();
+        let conn = DbConn::open_memory()?;
+        conn.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL)?;
+        return Ok(conn);
     }
     ensure_sqlite_parent_dir_exists(sqlite_path)?;
 
-    match open_sqlite_file_with_lock_retry(sqlite_path) {
+    match open_sqlite_file_with_configured_pragmas(sqlite_path) {
         Ok(conn) => Ok(conn),
         Err(primary_err) => {
             let primary_msg = primary_err.to_string();
 
             if let Some(fallback_path) = sqlite_absolute_fallback_path(sqlite_path, &primary_msg) {
-                match open_sqlite_file_with_lock_retry(&fallback_path) {
+                match open_sqlite_file_with_configured_pragmas(&fallback_path) {
                     Ok(conn) => return Ok(conn),
                     Err(fallback_err) => {
                         return Err(SqlError::Custom(format!(
@@ -3874,13 +3953,25 @@ pub fn open_sqlite_file_with_recovery(sqlite_path: &str) -> Result<DbConn, SqlEr
             }
 
             recover_sqlite_file(Path::new(sqlite_path))?;
-            open_sqlite_file_with_lock_retry(sqlite_path).map_err(|reopen_err| {
+            open_sqlite_file_with_configured_pragmas(sqlite_path).map_err(|reopen_err| {
                 SqlError::Custom(format!(
                     "cannot open sqlite at {sqlite_path}: {primary_err}; reopen after recovery failed: {reopen_err}"
                 ))
             })
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_configured_pragmas(sqlite_path: &str) -> Result<DbConn, SqlError> {
+    let conn = open_sqlite_file_with_lock_retry(sqlite_path)?;
+    execute_sql_with_lock_retry(
+        &conn,
+        sqlite_path,
+        schema::PRAGMA_CONN_SETTINGS_SQL,
+        "sqlite connection pragmas",
+    )?;
+    Ok(conn)
 }
 
 #[allow(clippy::result_large_err)]
@@ -4713,12 +4804,18 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
 #[allow(clippy::result_large_err)]
 fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
     let config = mcp_agent_mail_core::Config::from_env();
-    let storage_root_path = config.storage_root.as_path();
+    recover_sqlite_file_with_storage_root(primary_path, config.storage_root.as_path())
+}
 
+#[allow(clippy::result_large_err)]
+fn recover_sqlite_file_with_storage_root(
+    primary_path: &Path,
+    storage_root_path: &Path,
+) -> Result<(), SqlError> {
     // Capture pre-recovery snapshot before any mutation.
     let snapshot =
         crate::forensics::capture_pre_recovery_snapshot(primary_path, "automatic-recovery")
-            .with_environment(storage_root_path, &config.database_url);
+            .with_environment(storage_root_path, &sqlite_url_from_path(primary_path));
     tracing::info!(
         trigger = snapshot.trigger,
         db_bytes = ?snapshot.db_bytes,
@@ -4873,11 +4970,11 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
             }
             let name = entry.file_name();
             let priority = if os_str_starts_with(&name, &backup_bak_prefix) {
-                1
+                0
             } else if os_str_starts_with(&name, &backup_prefix) {
-                2
+                1
             } else if os_str_starts_with(&name, &recovery_prefix) {
-                3
+                2
             } else {
                 continue;
             };
@@ -4896,9 +4993,9 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     }
 
     candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
+        a.2.cmp(&b.2)
+            .then_with(|| b.0.cmp(&a.0))
+            .then_with(|| b.1.cmp(&a.1))
             .then_with(|| b.3.cmp(&a.3))
     });
     candidates.into_iter().map(|(_, _, _, p)| p).collect()
@@ -6098,6 +6195,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     primary_path: &Path,
     storage_root: &Path,
     capture_forensics: bool,
+    salvage_existing: bool,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
     if capture_forensics {
@@ -6144,10 +6242,11 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
         "archive reconciliation",
     )?;
 
+    let salvage_db_path = salvage_existing.then_some(quarantined.as_path());
     match reconstruct_archive_into_candidate(
         primary_path,
         storage_root,
-        Some(&quarantined),
+        salvage_db_path,
         &timestamp,
     ) {
         Ok(stats) => Ok(stats),
@@ -6267,7 +6366,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_uncached(
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     let result = with_recovery_admission(primary_path, "archive salvage reconstruction", || {
-        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
+        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true, true)
     });
     if let Ok(stats) = &result {
         let completed_archive_inventory =
@@ -6284,6 +6383,17 @@ fn reconstruct_sqlite_file_with_archive_salvage_uncached(
         );
     }
     result
+}
+
+#[allow(clippy::result_large_err)]
+fn reconstruct_sqlite_file_from_archive_without_salvage(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    validate_archive_salvage_storage_root(primary_path, storage_root)?;
+    with_recovery_admission(primary_path, "archive reconstruction", || {
+        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true, false)
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -6560,6 +6670,12 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     storage_root: &Path,
 ) -> Result<(), SqlError> {
     validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
+    if !path_is_occupied(primary_path) && has_quarantined_primary_artifact(primary_path) {
+        return Err(SqlError::Custom(format!(
+            "database file {} is missing but quarantined recovery artifact(s) exist; refusing blank reinitialization without operator action",
+            primary_path.display()
+        )));
+    }
     if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
         if !primary_path.exists() {
             return Ok(());
@@ -6592,6 +6708,12 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     storage_root: &Path,
 ) -> Result<(), SqlError> {
     validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
+    if !path_is_occupied(primary_path) && has_quarantined_primary_artifact(primary_path) {
+        return Err(SqlError::Custom(format!(
+            "database file {} is missing but quarantined recovery artifact(s) exist; refusing blank reinitialization without operator action",
+            primary_path.display()
+        )));
+    }
     if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
         if !primary_path.exists() {
             return Ok(());
@@ -6661,14 +6783,35 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
             capture_automatic_recovery_bundle(primary_path, storage_root, "reconstruct")?;
     }
 
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+
+    if had_primary && !archive_has_real_projects(storage_root) {
+        if let Some(quarantined) =
+            quarantine_reconstructed_candidate(primary_path, &timestamp, "corrupt")?
+        {
+            tracing::warn!(
+                primary = %primary_path.display(),
+                quarantined = %quarantined.display(),
+                "quarantined corrupt database after archive-aware recovery found no durable archive state"
+            );
+        }
+        return Err(SqlError::Custom(format!(
+            "database file {} was quarantined for archive-aware recovery, but archive reconstruction found no durable mail state; refusing blank reinitialization to avoid data loss",
+            primary_path.display()
+        )));
+    }
+
     tracing::warn!(
         storage_root = %storage_root.display(),
         "no healthy backup found; attempting database reconstruction from Git archive"
     );
 
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-
-    match reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, false) {
+    match reconstruct_sqlite_file_with_archive_salvage_inner(
+        primary_path,
+        storage_root,
+        false,
+        true,
+    ) {
         Ok(stats) => {
             if had_primary && stats.projects == 0 && stats.agents == 0 && stats.messages == 0 {
                 if let Some(quarantined) = quarantine_reconstructed_candidate(
@@ -7811,8 +7954,13 @@ mod tests {
                 .await
                 .into_result()
                 .expect("acquire initialized pool connection");
-            conn.execute_raw("PRAGMA fsqlite.concurrent_mode = OFF")
-                .expect("force retained-autocommit candidate mode");
+            if let Err(error) = conn.execute_raw("PRAGMA fsqlite.concurrent_mode = OFF") {
+                let message = error.to_string();
+                assert!(
+                    message.contains("unknown database fsqlite"),
+                    "force retained-autocommit candidate mode: {error}"
+                );
+            }
             conn.execute_raw(
                 "INSERT INTO projects (slug, human_key, created_at) \
                  VALUES ('retain-disabled', '/tmp/am-retain-disabled', 0)",
@@ -8255,7 +8403,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stage_backup_restore_candidate_rejects_symlinked_candidate() {
+    fn stage_backup_restore_candidate_avoids_symlinked_candidate() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -8268,13 +8416,11 @@ mod tests {
         std::fs::write(&backup, b"backup bytes").unwrap();
         symlink(&redirected_target, &candidate).unwrap();
 
-        let err = stage_backup_restore_candidate(&backup, &primary, timestamp)
-            .expect_err("symlinked restore candidate must be rejected");
-        let err_text = err.to_string();
-        assert!(
-            err_text.contains("failed to stage sqlite backup")
-                && err_text.contains(candidate.to_string_lossy().as_ref()),
-            "unexpected error: {err_text}"
+        let staged = stage_backup_restore_candidate(&backup, &primary, timestamp)
+            .expect("staging should choose a non-symlinked candidate path");
+        assert_ne!(
+            staged, candidate,
+            "staging must not reuse a symlinked candidate path"
         );
         assert!(
             std::fs::symlink_metadata(&candidate)
@@ -12788,6 +12934,31 @@ mod tests {
             let parsed: RecoveryApproval = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(*approval, parsed, "serde roundtrip failed for {approval:?}");
         }
+    }
+
+    #[test]
+    fn recovery_admission_rejected_different_path_preserves_existing_backoff() {
+        let controller = RecoveryAdmissionController::new();
+        let failed_path = Path::new("/tmp/failed-mailbox.sqlite3");
+        let other_path = Path::new("/tmp/other-mailbox.sqlite3");
+
+        controller.report_failure(failed_path);
+        controller
+            .in_progress
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            controller.try_acquire(other_path).is_none(),
+            "different-path caller should be refused while another recovery is active"
+        );
+
+        controller
+            .in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            controller.try_acquire(failed_path).is_none(),
+            "refused different-path caller must not clear the failed path's backoff"
+        );
     }
 
     // ── DeferredWriteQueue tests ──────────────────────────────────────

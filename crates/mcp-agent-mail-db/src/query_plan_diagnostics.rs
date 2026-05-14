@@ -170,7 +170,7 @@ fn explain_query_plan(
     }
 
     let missing_expected_indexes = missing_expected_indexes(&steps, &spec.expected_indexes);
-    let warnings = scan_warnings(&steps, spec.scan_sensitive_sources);
+    let warnings = scan_warnings(&steps, spec.scan_sensitive_sources, &spec.expected_indexes);
     let status = if missing_expected_indexes.is_empty() && warnings.is_empty() {
         "ok"
     } else {
@@ -225,24 +225,53 @@ fn missing_expected_indexes(steps: &[QueryPlanStep], expected: &[IndexExpectatio
         .collect()
 }
 
-fn scan_warnings(steps: &[QueryPlanStep], sensitive_sources: &[&str]) -> Vec<String> {
+fn scan_warnings(
+    steps: &[QueryPlanStep],
+    sensitive_sources: &[&str],
+    expected_indexes: &[IndexExpectation],
+) -> Vec<String> {
     let sensitive_sources = sensitive_sources
         .iter()
         .map(|source| source.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let expected_index_fragments = expected_indexes
+        .iter()
+        .flat_map(|expectation| expectation.alternatives.iter())
+        .map(|fragment| fragment.to_ascii_lowercase())
         .collect::<Vec<_>>();
     normalized_details(steps)
         .into_iter()
         .filter_map(|detail| {
             let scanned = sensitive_sources
                 .iter()
-                .any(|source| detail.starts_with(&format!("scan {source}")));
-            if scanned && !detail.contains("using ") {
+                .any(|source| detail_scans_source(&detail, source));
+            let uses_expected_index = expected_index_fragments
+                .iter()
+                .any(|fragment| detail.contains(fragment));
+            let scan_uses_unexpected_index = !detail.contains("using ") || !uses_expected_index;
+            if scanned && scan_uses_unexpected_index {
                 Some(detail)
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn detail_scans_source(detail: &str, source: &str) -> bool {
+    let mut previous = "";
+    let mut before_previous = "";
+    for token in detail.split_whitespace() {
+        if previous == "scan" && token == source {
+            return true;
+        }
+        if before_previous == "scan" && previous == "table" && token == source {
+            return true;
+        }
+        before_previous = previous;
+        previous = token;
+    }
+    false
 }
 
 fn normalized_details(steps: &[QueryPlanStep]) -> Vec<String> {
@@ -499,6 +528,69 @@ mod tests {
                 .any(|warning| warning.contains("scan m") || warning.contains("scan messages")),
             "expected full scan warning, got {:?}",
             diagnostic.warnings
+        );
+    }
+
+    #[test]
+    fn scan_warning_is_not_suppressed_by_unrelated_expected_index() {
+        let steps = vec![
+            QueryPlanStep {
+                id: 1,
+                parent: 0,
+                notused: 0,
+                detail: "SCAN m USING INDEX idx_unexpected".to_string(),
+            },
+            QueryPlanStep {
+                id: 2,
+                parent: 0,
+                notused: 0,
+                detail: "SEARCH r USING INDEX idx_message_recipients_agent (agent_id=?)"
+                    .to_string(),
+            },
+        ];
+        let expected_indexes = vec![IndexExpectation {
+            label: "message_recipients(agent_id)",
+            alternatives: &["idx_message_recipients_agent"],
+        }];
+
+        let warnings = scan_warnings(&steps, &["m", "messages"], &expected_indexes);
+        assert_eq!(warnings, vec!["scan m using index idx_unexpected"]);
+    }
+
+    #[test]
+    fn scan_warning_accepts_expected_index_on_same_detail() {
+        let steps = vec![QueryPlanStep {
+            id: 1,
+            parent: 0,
+            notused: 0,
+            detail: "SCAN m USING INDEX idx_messages_created_ts".to_string(),
+        }];
+        let expected_indexes = vec![IndexExpectation {
+            label: "messages(created_ts)",
+            alternatives: &["idx_messages_created_ts"],
+        }];
+
+        let warnings = scan_warnings(&steps, &["m", "messages"], &expected_indexes);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn scan_warning_does_not_match_alias_prefix() {
+        let steps = vec![QueryPlanStep {
+            id: 1,
+            parent: 0,
+            notused: 0,
+            detail: "SCAN message_recipients USING INDEX idx_unexpected".to_string(),
+        }];
+        let expected_indexes = vec![IndexExpectation {
+            label: "messages(created_ts)",
+            alternatives: &["idx_messages_created_ts"],
+        }];
+
+        let warnings = scan_warnings(&steps, &["m", "messages"], &expected_indexes);
+        assert!(
+            warnings.is_empty(),
+            "alias source 'm' should not match message_recipients: {warnings:?}"
         );
     }
 

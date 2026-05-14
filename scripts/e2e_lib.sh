@@ -1444,6 +1444,11 @@ e2e_write_bundle_manifest() {
         git_dirty="true"
     fi
 
+    local bundle_files=()
+    while IFS= read -r f; do
+        bundle_files+=("$f")
+    done < <(find "$artifact_dir" -type f ! -path "$manifest" ! -name ".case_artifacts.tsv" | sort)
+
     {
         echo "{"
         echo "  \"schema\": {\"name\": \"mcp-agent-mail-artifacts\", \"major\": 1, \"minor\": 0},"
@@ -1481,7 +1486,7 @@ e2e_write_bundle_manifest() {
         echo "  \"files\": ["
 
         local first=1
-        while IFS= read -r f; do
+        for f in "${bundle_files[@]}"; do
             local rel="${f#"$artifact_dir"/}"
             local sha
             sha="$(e2e_sha256 "$f")"
@@ -1569,7 +1574,7 @@ e2e_write_bundle_manifest() {
                 echo "    ,"
             fi
             echo "    {\"path\": \"$( _e2e_json_escape "$rel" )\", \"sha256\": \"$( _e2e_json_escape "$sha" )\", \"bytes\": ${bytes}, \"kind\": \"$( _e2e_json_escape "$kind" )\", \"schema\": ${schema_json}}"
-        done < <(find "$artifact_dir" -type f ! -name "bundle.json" ! -name ".case_artifacts.tsv" | sort)
+        done
 
         echo "  ]"
         echo "}"

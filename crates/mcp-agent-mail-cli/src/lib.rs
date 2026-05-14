@@ -6979,17 +6979,15 @@ fn mailbox_activity_storage_root_is_explicit(
     storage_root: &Path,
     storage_root_override: Option<&Path>,
 ) -> bool {
-    storage_root_override.is_some() || storage_root_is_effectively_explicit(storage_root)
+    let explicit_override = storage_root_override.is_some()
+        && !mcp_agent_mail_core::config::is_default_storage_root(storage_root);
+    explicit_override || storage_root_is_effectively_explicit(storage_root)
 }
 
 fn storage_root_is_effectively_explicit(storage_root: &Path) -> bool {
-    if mcp_agent_mail_core::config::infra_env_value("STORAGE_ROOT").is_some()
+    mcp_agent_mail_core::config::process_env_value("STORAGE_ROOT").is_some()
         && Config::from_env().storage_root == storage_root
-    {
-        return true;
-    }
-
-    !mcp_agent_mail_core::config::is_default_storage_root(storage_root)
+        && !mcp_agent_mail_core::config::is_default_storage_root(storage_root)
 }
 
 fn should_lock_mailbox_storage_root(
@@ -8101,7 +8099,7 @@ fn maybe_reconcile_sync_opened_sqlite_archive_drift(
     let _mailbox_mutation_locks = if acquire_mutation_locks {
         Some(acquire_cli_mailbox_mutation_locks(
             database_url,
-            Some(&storage_root),
+            storage_root_override,
         )?)
     } else {
         None
@@ -8233,6 +8231,25 @@ impl CanonicalSnapshotSource {
         })
     }
 
+    fn live_full_sqlite_snapshot(
+        reported_path: PathBuf,
+        source_path: &Path,
+        context: &str,
+    ) -> CliResult<Self> {
+        let snapshot_dir = tempfile::Builder::new()
+            .prefix("canonical-mailbox-full-snapshot-")
+            .tempdir()
+            .map_err(|e| CliError::Other(format!("{context} full snapshot tempdir failed: {e}")))?;
+        let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
+        vacuum_into_sqlite_snapshot(source_path, &actual_path, context)?;
+        Ok(Self {
+            actual_path,
+            reported_path,
+            kind: CanonicalSnapshotSourceKind::LiveSnapshot,
+            _snapshot_dir: Some(snapshot_dir),
+        })
+    }
+
     fn actual_path(&self) -> &Path {
         &self.actual_path
     }
@@ -8257,6 +8274,46 @@ impl CanonicalSnapshotSource {
         let actual_path = self.actual_path;
         Self::live_snapshot(reported_path, &actual_path, context)
     }
+}
+
+fn sqlite_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn vacuum_into_sqlite_snapshot(source: &Path, destination: &Path, context: &str) -> CliResult<()> {
+    if destination.exists() {
+        return Err(CliError::Other(format!(
+            "{context} full snapshot destination already exists: {}",
+            destination.display()
+        )));
+    }
+    if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            CliError::Other(format!(
+                "{context} full snapshot parent creation failed for {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let source_str = source.display().to_string();
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&source_str).map_err(|error| {
+        CliError::Other(format!(
+            "{context} full snapshot source open failed for {}: {error}",
+            source.display()
+        ))
+    })?;
+    let destination_literal = sqlite_string_literal(&destination.display().to_string());
+    conn.execute_raw(&format!("VACUUM INTO {destination_literal}"))
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context} full snapshot failed from {} to {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })?;
+    Ok(())
 }
 
 fn resolve_canonical_snapshot_source_path(
@@ -8435,7 +8492,7 @@ fn open_canonical_async_read_source_with_database_url(
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
     let storage_root_is_explicit =
         mailbox_activity_storage_root_is_explicit(&storage_root, storage_root_override);
-    let mailbox_read_locks = acquire_cli_mailbox_read_locks(database_url, Some(&storage_root))?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks(database_url, storage_root_override)?;
     let source = resolve_canonical_snapshot_source_with_database_url(
         database_url,
         &storage_root,
@@ -8454,7 +8511,7 @@ fn open_db_sync_canonical_read_with_database_url(
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
     let storage_root_is_explicit =
         mailbox_activity_storage_root_is_explicit(&storage_root, storage_root_override);
-    let mailbox_read_locks = acquire_cli_mailbox_read_locks(database_url, Some(&storage_root))?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks(database_url, storage_root_override)?;
     let source = resolve_canonical_snapshot_source_with_database_url(
         database_url,
         &storage_root,
@@ -8534,6 +8591,40 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
         &storage_root,
         storage_root_is_explicit,
         context,
+    )?;
+    let source_path = source.actual_path().display().to_string();
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.storage_root = Some(storage_root);
+    pool_cfg.run_migrations = false;
+    pool_cfg.warmup_connections = 0;
+    let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+    Ok(CanonicalReadDbPool {
+        conn,
+        pool,
+        _source: source,
+        _mailbox_read_locks: CliMailboxReadLocks {
+            _storage_root_lock: None,
+            _sqlite_lock: None,
+        },
+    })
+}
+
+fn open_atc_simulate_read_pool_with_database_url(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<CanonicalReadDbPool> {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    let source_candidate = resolve_read_only_sqlite_source_path_with_database_url(database_url)?;
+    let (probe_conn, opened_path) =
+        open_sqlite_read_only_with_fallback(&source_candidate.display().to_string())?;
+    drop(probe_conn);
+    let source = CanonicalSnapshotSource::live_full_sqlite_snapshot(
+        PathBuf::from(&opened_path),
+        Path::new(&opened_path),
+        "ATC simulate",
     )?;
     let source_path = source.actual_path().display().to_string();
     let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
@@ -11208,10 +11299,9 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
             let bundle = read_atc_simulate_policy_bundle(&policy)?;
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let config = Config::from_env();
-            let read_db = open_db_sync_async_canonical_read_best_effort_with_database_url(
+            let read_db = open_atc_simulate_read_pool_with_database_url(
                 &cfg.database_url,
                 Some(config.storage_root.as_path()),
-                "ATC simulate",
             )?;
             let range = query_atc_simulation_sequence_range(
                 read_db.conn(),
@@ -51433,7 +51523,16 @@ startup_timeout_sec = 42
                 ("HOME", fake_home_text.as_str()),
                 ("XDG_DATA_HOME", fake_data_home_text.as_str()),
             ],
-            || open_db_sync_with_database_url(&db_url),
+            || {
+                let resolved_storage_root = resolve_mailbox_activity_storage_root(None);
+                assert!(
+                    !should_lock_mailbox_storage_root(&db_path, &resolved_storage_root, None),
+                    "external custom DB should not lock unrelated implicit storage root {}; db={}",
+                    resolved_storage_root.display(),
+                    db_path.display()
+                );
+                open_db_sync_with_database_url(&db_url)
+            },
         )
         .expect("open local db without unrelated archive reconciliation");
         let rows = reopened

@@ -21,7 +21,7 @@ use mcp_agent_mail_db::{
         release_reservations_by_ids_returning_ids,
     },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -885,6 +885,15 @@ fn write_cleanup_artifacts(
     else {
         return Err("failed to list reservations for artifact generation".into());
     };
+    let found_ids = target_reservations
+        .iter()
+        .filter_map(|row| row.id)
+        .collect::<HashSet<_>>();
+    if let Some(missing_id) = released_ids.iter().find(|id| !found_ids.contains(id)) {
+        return Err(format!(
+            "cleanup artifact reservation lookup failed for released reservation {missing_id}"
+        ));
+    }
 
     let mut res_jsons = Vec::new();
     for row in target_reservations {
@@ -1123,6 +1132,13 @@ mod tests {
         create_pool(&pool_config).expect("create pool")
     }
 
+    fn allow_ephemeral_project_roots_for_test<R>(f: impl FnOnce() -> R) -> R {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            f,
+        )
+    }
+
     fn seed_active_reservation(
         tmp: &tempfile::TempDir,
     ) -> (DbPool, Cx, i64, i64, i64, String, String) {
@@ -1133,12 +1149,14 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project = match fastmcp_core::block_on(async {
-            queries::ensure_project(&cx, &pool, &human_key).await
-        }) {
-            Outcome::Ok(p) => p,
-            other => panic!("ensure_project failed: {other:?}"),
-        };
+        let project = allow_ephemeral_project_roots_for_test(|| {
+            match fastmcp_core::block_on(async {
+                queries::ensure_project(&cx, &pool, &human_key).await
+            }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
+            }
+        });
         let project_id = project.id.expect("project id");
 
         let agent = match fastmcp_core::block_on(async {
@@ -1200,12 +1218,14 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project = match fastmcp_core::block_on(async {
-            queries::ensure_project(&cx, &pool, &human_key).await
-        }) {
-            Outcome::Ok(p) => p,
-            other => panic!("ensure_project failed: {other:?}"),
-        };
+        let project = allow_ephemeral_project_roots_for_test(|| {
+            match fastmcp_core::block_on(async {
+                queries::ensure_project(&cx, &pool, &human_key).await
+            }) {
+                Outcome::Ok(p) => p,
+                other => panic!("ensure_project failed: {other:?}"),
+            }
+        });
         let project_id = project.id.expect("project id");
 
         let agent = match fastmcp_core::block_on(async {
@@ -1698,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn write_cleanup_artifacts_errors_when_agent_lookup_fails() {
+    fn write_cleanup_artifacts_errors_when_released_reservation_lookup_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
@@ -1727,8 +1747,8 @@ mod tests {
         let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
         assert!(
             result
-                .expect_err("missing agent lookup should fail cleanup artifact generation")
-                .contains("agent lookup failed")
+                .expect_err("missing reservation lookup should fail cleanup artifact generation")
+                .contains("reservation lookup failed")
         );
     }
 

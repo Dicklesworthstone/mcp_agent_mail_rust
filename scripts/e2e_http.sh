@@ -420,6 +420,40 @@ wait_for_server_start_or_fail() {
     startup_finalize_artifacts "${label}" "ready" "port opened at http://127.0.0.1:${port}"
 }
 
+wait_for_readiness_or_fail() {
+    local label="$1"
+    local pid="$2"
+    local port="$3"
+    local url="$4"
+    local timeout_s="${E2E_SERVER_READINESS_TIMEOUT_SECONDS:-20}"
+    local attempts=$(( timeout_s * 4 ))
+    local case_id="${label}_readiness_wait"
+    local body_file="${E2E_ARTIFACT_DIR}/${case_id}_body.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+    local curl_stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_curl_stderr.txt"
+    local status=""
+    local body=""
+
+    mkdir -p "${E2E_ARTIFACT_DIR}/${case_id}"
+    for _ in $(seq 1 "${attempts}"); do
+        set +e
+        status="$(curl -sS -o "${body_file}" -w "%{http_code}" "${url}" 2>"${curl_stderr_file}")"
+        local rc=$?
+        set -e
+        echo "${status}" > "${status_file}"
+        body="$(cat "${body_file}" 2>/dev/null || true)"
+        if [ "${rc}" -eq 0 ] && [ "${status}" = "200" ] && [[ "${body}" == *"ready"* ]]; then
+            e2e_log "Readiness OK (${label}) after polling ${url}"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    startup_write_failure_diagnostics "${label}" "${pid}" "${port}" "${timeout_s}"
+    stop_server "${pid}"
+    e2e_fatal "server ${label} did not report readiness within ${timeout_s}s (last status=${status}, body=${body})"
+}
+
 start_server() {
     local label="$1"
     local port="$2"
@@ -568,6 +602,7 @@ PID1="$(start_server "run1" "${PORT1}" "${DB1}" "${STORAGE1}" "${BIN}" \
 trap 'stop_server "${PID1}" || true' EXIT
 
 wait_for_server_start_or_fail "run1" "${PID1}" "${PORT1}" "server run1 failed to start (port not open)"
+wait_for_readiness_or_fail "run1" "${PID1}" "${PORT1}" "${URL_BASE}/health/readiness"
 
 AUTHZ="Authorization: Bearer ${TOKEN}"
 

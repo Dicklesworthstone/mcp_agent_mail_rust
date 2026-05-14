@@ -4519,13 +4519,13 @@ fn build_status_with_snapshot_cache(
         agent_id: agent.as_ref().map(|(id, _)| *id),
         agent_name: agent.as_ref().map(|(_, name)| name.clone()),
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_status_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok((entry.data.clone(), entry.actions.clone()));
@@ -4540,7 +4540,7 @@ fn build_status_with_snapshot_cache(
         key,
         RobotStatusSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             data: data.clone(),
             actions: actions.clone(),
         },
@@ -4994,13 +4994,13 @@ fn build_inbox_with_snapshot_cache(
         show_all,
         limit,
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_inbox_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.result.clone());
@@ -5028,7 +5028,7 @@ fn build_inbox_with_snapshot_cache(
         key,
         RobotInboxSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             result: result.clone(),
         },
     );
@@ -6985,13 +6985,13 @@ fn build_reservations_with_snapshot_cache(
         conflicts_only,
         expiring_minutes,
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_reservations_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         return Ok((entry.data.clone(), entry.actions.clone()));
     }
@@ -7012,7 +7012,7 @@ fn build_reservations_with_snapshot_cache(
         key,
         RobotReservationsSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             data: data.clone(),
             actions: actions.clone(),
         },
@@ -7994,13 +7994,13 @@ fn build_overview_with_snapshot_cache(
         }
     };
     let key = RobotOverviewSnapshotKey { db_identity };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_overview_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.projects.clone());
@@ -8015,7 +8015,7 @@ fn build_overview_with_snapshot_cache(
         key,
         RobotOverviewSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             projects: projects.clone(),
         },
     );
@@ -8961,13 +8961,13 @@ fn build_agents_with_snapshot_cache(
         active_only,
         sort_field: sort_field.map(str::to_string),
     };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_agents_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         return Ok(entry.agents.clone());
     }
@@ -8987,7 +8987,7 @@ fn build_agents_with_snapshot_cache(
         key,
         RobotAgentsSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             agents: agents.clone(),
         },
     );
@@ -9924,13 +9924,13 @@ fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, 
         }
     };
     let key = RobotProjectsSnapshotKey { db_identity };
-    let now = Instant::now();
+    let cache_lookup_at = Instant::now();
     let mut cache = robot_projects_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
     {
         return Ok(entry.projects.clone());
     }
@@ -9943,7 +9943,7 @@ fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, 
         key,
         RobotProjectsSnapshotEntry {
             generation,
-            cached_at: now,
+            cached_at: Instant::now(),
             projects: projects.clone(),
         },
     );
@@ -16654,7 +16654,10 @@ mod tests {
             .into_iter()
             .map(|phase| phase.name)
             .collect();
-        assert!(phase_names.iter().any(|name| name == "snapshot_cache_hit"));
+        assert!(
+            phase_names.iter().any(|name| name == "snapshot_cache_hit"),
+            "expected cache hit phase, got {phase_names:?}"
+        );
         assert!(
             !phase_names.iter().any(|name| name == "sqlite_inbox_counts"),
             "fresh cache hits should skip the expensive status query pipeline"

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -151,25 +152,38 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
 
     let start = Instant::now();
     let mut child = cmd.spawn().expect("spawn command");
+    let mut stdout = child.stdout.take().expect("capture adapter stdout");
+    let mut stderr = child.stderr.take().expect("capture adapter stderr");
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).expect("read adapter stdout");
+        buf
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).expect("read adapter stderr");
+        buf
+    });
     let mut timed_out = false;
 
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     timed_out = true;
                     let _ = child.kill();
-                    break;
+                    break child.wait().expect("wait after adapter timeout");
                 }
                 thread::sleep(Duration::from_millis(25));
             }
             Err(error) => panic!("try_wait failed: {error}"),
         }
-    }
+    };
 
-    let output = child.wait_with_output().expect("wait_with_output");
-    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = stdout_reader.join().expect("join adapter stdout reader");
+    let stderr = stderr_reader.join().expect("join adapter stderr reader");
+    let mut stderr = String::from_utf8_lossy(&stderr).to_string();
     if timed_out {
         if !stderr.is_empty() {
             stderr.push('\n');
@@ -181,8 +195,8 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> CommandOutcome {
     }
 
     CommandOutcome {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        exit_code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
         stderr,
         duration_ms: start.elapsed().as_millis() as u64,
         timed_out,

@@ -2092,6 +2092,13 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    migrations.push(Migration::new(
+        "v24_drop_agents_cascade_message_recipients".to_string(),
+        "preserve message recipient history when agent metadata is removed".to_string(),
+        "DROP TRIGGER IF EXISTS trg_agents_cascade_message_recipients".to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 
@@ -2379,6 +2386,14 @@ pub fn schema_migrations_runtime_canonical_followup() -> Vec<Migration> {
         .collect();
     migrations.sort_by_key(|migration| runtime_canonical_followup_order(migration.id.as_str()));
     migrations
+}
+
+#[must_use]
+pub fn schema_migrations_atc_runtime_canonical_followup() -> Vec<Migration> {
+    schema_migrations_runtime_canonical_followup()
+        .into_iter()
+        .filter(|migration| is_atc_runtime_canonical_migration(migration.id.as_str()))
+        .collect()
 }
 
 #[must_use]
@@ -2719,8 +2734,8 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
         "DROP TABLE IF EXISTS messages_v15_rebuild",
         "CREATE TABLE messages_v15_rebuild (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
-            project_id INTEGER NOT NULL REFERENCES projects(id),\
-            sender_id INTEGER NOT NULL REFERENCES agents(id),\
+            project_id INTEGER NOT NULL,\
+            sender_id INTEGER NOT NULL,\
             thread_id TEXT,\
             subject TEXT NOT NULL,\
             body_md TEXT NOT NULL,\
@@ -3147,6 +3162,29 @@ pub async fn migrate_runtime_canonical_followup<C: Connection>(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
     let expected = schema_migrations_runtime_canonical_followup();
+    let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
+        Outcome::Ok(value) => value,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    if already_complete {
+        return Outcome::Ok(Vec::new());
+    }
+    run_specific_migrations(cx, conn, expected).await
+}
+
+pub async fn migrate_atc_runtime_canonical_followup<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<Vec<String>, SqlError> {
+    match init_migrations_table(cx, conn).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+    let expected = schema_migrations_atc_runtime_canonical_followup();
     let already_complete = match migration_set_is_complete(cx, conn, &expected).await {
         Outcome::Ok(value) => value,
         Outcome::Err(e) => return Outcome::Err(e),

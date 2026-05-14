@@ -2,7 +2,7 @@
 //!
 //! Converts a [`SearchQuery`] into SQL + params, supporting:
 //! - Faceted filtering (importance, direction, time range, project, agent, thread)
-//! - BM25 relevance ranking with score extraction
+//! - Stable SQL fallback ordering for searches handled outside the primary index
 //! - Stable cursor-based pagination using (score, id)
 //! - Query explain output for debugging/trust
 //! - Permission-aware visibility with contact-policy enforcement
@@ -101,7 +101,7 @@ impl TimeRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RankingMode {
-    /// BM25 relevance (default).
+    /// Backend relevance (default).
     #[default]
     Relevance,
     /// Most recent first.
@@ -243,7 +243,7 @@ impl AuditAction {
 /// A structured search query with optional facets, pagination, and ranking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchQuery {
-    /// Free-text query string (will be sanitized for FTS5).
+    /// Free-text query string for the selected search backend or SQL fallback.
     pub text: String,
 
     /// Entity kind to search. Default: `Message`.
@@ -457,7 +457,7 @@ pub struct SearchResult {
     pub title: String,
     pub body: String,
 
-    /// BM25 score (lower = more relevant for FTS5).
+    /// Backend-specific relevance score, when the selected engine provides one.
     pub score: Option<f64>,
 
     // ── Message-specific fields ────────────────────────────────────
@@ -586,7 +586,7 @@ pub struct RecoverySuggestion {
 pub struct QueryExplain {
     /// The plan method chosen.
     pub method: String,
-    /// The normalized/sanitized FTS query (or None if LIKE fallback).
+    /// The normalized backend query, when one was produced.
     pub normalized_query: Option<String>,
     /// Whether LIKE fallback was used.
     pub used_like_fallback: bool,
@@ -641,7 +641,7 @@ pub enum PlanParam {
 /// What query strategy the planner chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMethod {
-    /// Text-matched search with relevance ranking (Tantivy BM25 or similar).
+    /// Text-matched search with relevance ranking in the primary search backend.
     TextMatch,
     /// LIKE fallback (query was malformed or empty after sanitization).
     Like,
@@ -766,13 +766,6 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
 
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
-    let cursor_score_expr = if query.ranking == RankingMode::Recency {
-        // Recency cursor is encoded as negative created_ts so ASC score order
-        // corresponds to newest-first message ordering.
-        "-CAST(COALESCE(m.created_ts, 0) AS REAL)"
-    } else {
-        "0.0"
-    };
     let message_order_clause = if query.ranking == RankingMode::Recency {
         "ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC"
     } else {
@@ -922,12 +915,22 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         && let Some(cursor) = SearchCursor::decode(cursor_str)
     {
         // Cursor means: continue after the last emitted (score, id) pair,
-        // where `score` is ranking-dependent (`relevance` or encoded recency).
-        where_clauses.push(format!(
-            "({cursor_score_expr} > ? OR ({cursor_score_expr} = ? AND m.id > ?))"
-        ));
-        params.push(PlanParam::Float(cursor.score));
-        params.push(PlanParam::Float(cursor.score));
+        // where `score` is ranking-dependent. Relevance-mode SQL fallback
+        // assigns every row score 0.0, so comparing the literal score can make
+        // stale or cross-path cursors duplicate/suppress whole pages. In that
+        // mode, the SQL order is effectively id-only.
+        if query.ranking == RankingMode::Recency {
+            // Recency cursor is encoded as negative created_ts so ASC score
+            // order corresponds to newest-first message ordering.
+            let cursor_score_expr = "-CAST(COALESCE(m.created_ts, 0) AS REAL)";
+            where_clauses.push(format!(
+                "({cursor_score_expr} > ? OR ({cursor_score_expr} = ? AND m.id > ?))"
+            ));
+            params.push(PlanParam::Float(cursor.score));
+            params.push(PlanParam::Float(cursor.score));
+        } else {
+            where_clauses.push("m.id > ?".to_string());
+        }
         params.push(PlanParam::Int(cursor.id));
         facets_applied.push("cursor".to_string());
     }
@@ -1548,8 +1551,8 @@ mod tests {
         let mut q = SearchQuery::messages("test", 1);
         q.cursor = Some(cursor.encode());
         let plan = plan_search(&q);
-        assert!(plan.sql.contains("0.0 > ?"));
         assert!(plan.sql.contains("m.id > ?"));
+        assert!(!plan.sql.contains("0.0 > ?"));
         assert!(plan.facets_applied.contains(&"cursor".to_string()));
     }
 

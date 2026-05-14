@@ -9,7 +9,16 @@
     {
       "category": "live_incident",
       "check": "db_file_sanity",
-      "detail": "quick_check OK (430080 bytes)",
+      "detail": "quick_check OK (217088 bytes)",
+      "status": "ok"
+    },
+    {
+      "active": false,
+      "category": "environment",
+      "check": "recovery_lock",
+      "detail": "No recovery lock present",
+      "lock_path": "<TMP_ROOT>/mailbox.sqlite3.recovery.lock",
+      "pid": null,
       "status": "ok"
     },
     {
@@ -23,6 +32,161 @@
       "check": "foreign_key_integrity",
       "detail": "No foreign key violations detected",
       "status": "ok"
+    },
+    {
+      "category": "environment",
+      "check": "query_plan_hot_paths",
+      "detail": "2 of 4 hot query plan(s) have scan or missing-index warnings",
+      "status": "warn",
+      "summary": {
+        "detail": "2 of 4 hot query plan(s) have scan or missing-index warnings",
+        "diagnostics": [
+          {
+            "detail": "missing expected index group(s): message_recipients(agent_id)",
+            "missing_expected_indexes": [
+              "message_recipients(agent_id)"
+            ],
+            "path": "inbox",
+            "plan_hash": "4f40400108c10acfa2846759cab9dd9fd9df634c7d791091645d005fddb8d602",
+            "status": "warn",
+            "steps": [
+              {
+                "detail": "SEARCH m USING INDEX idx_messages_project_created (project_id=?)",
+                "id": 8,
+                "notused": 61,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH r USING INDEX sqlite_autoindex_message_recipients_1 (message_id=? AND agent_id=?)",
+                "id": 15,
+                "notused": 46,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH s USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN",
+                "id": 23,
+                "notused": 45,
+                "parent": 0
+              }
+            ]
+          },
+          {
+            "detail": "missing expected index group(s): message_recipients(agent_id)",
+            "missing_expected_indexes": [
+              "message_recipients(agent_id)"
+            ],
+            "path": "product_inbox",
+            "plan_hash": "1ae6b335e6a18e45495579b919d8cb214585bc83379b4247dea15f5392b37fdd",
+            "status": "warn",
+            "steps": [
+              {
+                "detail": "SEARCH ppl USING COVERING INDEX sqlite_autoindex_product_project_links_1 (product_id=?)",
+                "id": 11,
+                "notused": 55,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH m USING INDEX idx_messages_project_created (project_id=?)",
+                "id": 17,
+                "notused": 61,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH recipient USING COVERING INDEX idx_agents_project_name (project_id=?)",
+                "id": 26,
+                "notused": 53,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH r USING INDEX sqlite_autoindex_message_recipients_1 (message_id=? AND agent_id=?)",
+                "id": 36,
+                "notused": 46,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH s USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN",
+                "id": 42,
+                "notused": 45,
+                "parent": 0
+              },
+              {
+                "detail": "USE TEMP B-TREE FOR ORDER BY",
+                "id": 77,
+                "notused": 0,
+                "parent": 0
+              }
+            ]
+          },
+          {
+            "detail": "plan uses expected indexed access",
+            "path": "active_reservations",
+            "plan_hash": "940e518a81a820a6e94d699a7a8b8bdff4a210cca8f8f1db28e4405a7f43255e",
+            "status": "ok",
+            "steps": [
+              {
+                "detail": "SEARCH fr USING INDEX idx_file_reservations_project_agent_released (project_id=?)",
+                "id": 4,
+                "notused": 62,
+                "parent": 0
+              },
+              {
+                "detail": "CORRELATED SCALAR SUBQUERY 1",
+                "id": 80,
+                "notused": 0,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH file_reservation_releases USING INTEGER PRIMARY KEY (rowid=?)",
+                "id": 84,
+                "notused": 33,
+                "parent": 80
+              },
+              {
+                "detail": "SEARCH rr USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN",
+                "id": 91,
+                "notused": 45,
+                "parent": 0
+              }
+            ]
+          },
+          {
+            "detail": "plan uses expected indexed access",
+            "path": "search_fallback",
+            "plan_hash": "d26dc6acb7ef73e7c8647a4af00e2460cdf726e7a462d148392278857ce46811",
+            "status": "ok",
+            "steps": [
+              {
+                "detail": "SEARCH m USING INDEX idx_messages_project_created (project_id=?)",
+                "id": 6,
+                "notused": 61,
+                "parent": 0
+              },
+              {
+                "detail": "SEARCH a USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN",
+                "id": 19,
+                "notused": 45,
+                "parent": 0
+              },
+              {
+                "detail": "USE TEMP B-TREE FOR ORDER BY",
+                "id": 48,
+                "notused": 0,
+                "parent": 0
+              }
+            ]
+          }
+        ],
+        "status": "warn"
+      }
+    },
+    {
+      "category": "environment",
+      "check": "git_binary_path",
+      "detail": "git 2.51.2 at git is not on the known-bad list",
+      "path": "git",
+      "source": "path",
+      "status": "ok",
+      "version": "2.51.2"
     },
     {
       "category": "archive_hygiene",
@@ -102,19 +266,19 @@
         {
           "display": "<TMP_ROOT>/home/.local/bin/am",
           "matches_source_version": true,
-          "parsed_version": "0.2.52",
+          "parsed_version": "0.2.53",
           "path": "<TMP_ROOT>/home/.local/bin/am",
           "source": "path",
-          "version_line": "am 0.2.52"
+          "version_line": "am 0.2.53"
         }
       ],
       "category": "environment",
       "check": "binary_version",
-      "detail": "am on PATH/install matches source version v0.2.52",
+      "detail": "am on PATH/install matches source version v0.2.53",
       "expected_install_path": "<TMP_ROOT>/home/.local/bin/am",
       "path_binary": "<TMP_ROOT>/home/.local/bin/am",
       "running_exe": "<RUNNING_EXE>",
-      "source_version": "0.2.52",
+      "source_version": "0.2.53",
       "status": "ok"
     },
     {
@@ -123,19 +287,19 @@
         {
           "display": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
           "matches_source_version": true,
-          "parsed_version": "0.2.52",
+          "parsed_version": "0.2.53",
           "path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
           "source": "path",
-          "version_line": "mcp-agent-mail 0.2.52"
+          "version_line": "mcp-agent-mail 0.2.53"
         }
       ],
       "category": "environment",
       "check": "server_binary_version",
-      "detail": "mcp-agent-mail on PATH/install matches source version v0.2.52",
+      "detail": "mcp-agent-mail on PATH/install matches source version v0.2.53",
       "expected_install_path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
       "path_binary": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
       "running_exe": "<RUNNING_EXE>",
-      "source_version": "0.2.52",
+      "source_version": "0.2.53",
       "status": "ok"
     },
     {
@@ -208,7 +372,7 @@
   "diagnostic_payload": {
     "artifacts": [
       {
-        "detail": "bytes=430080",
+        "detail": "bytes=217088",
         "kind": "sqlite_db",
         "label": "SQLite database",
         "path": "<TMP_ROOT>/mailbox.sqlite3",
@@ -218,8 +382,8 @@
     "finding_counts": {
       "critical": 0,
       "info": 0,
-      "total": 16,
-      "warning": 16
+      "total": 17,
+      "warning": 17
     },
     "generated_at": "<GENERATED_AT>",
     "headline": "All doctor checks passed.",
@@ -232,13 +396,55 @@
     "source": "doctor-check",
     "status": "warn"
   },
+  "forensic_timeline": {
+    "archive_commits": {
+      "head": null,
+      "project_slug": "<TMP_DOCTOR_PROJECT_SLUG>",
+      "recent": [],
+      "repo_path": "<TMP_ROOT>/storage_root/projects/<TMP_DOCTOR_PROJECT_SLUG>"
+    },
+    "artifacts": [],
+    "changes_since_last_healthy": [],
+    "checkpoint_status": "no_checkpoint",
+    "current": {
+      "binary_version": "0.2.53",
+      "database_path": "<TMP_ROOT>/mailbox.sqlite3",
+      "generated_at": "<GENERATED_AT>",
+      "schema_version": "0",
+      "search_index_generation": {
+        "db_identity": "<TMP_ROOT>/mailbox.sqlite3",
+        "index_dir": "<SEARCH_INDEX_ROOT>/<HASH>",
+        "indexed_messages": 0,
+        "last_backfill_at_micros": null,
+        "rebuild_in_progress": false,
+        "skipped_messages": 0,
+        "source_messages": null,
+        "stale_reason": "lexical backfill has not completed for this database",
+        "state": "delayed"
+      },
+      "status": "warn",
+      "storage_root": "<TMP_ROOT>/storage_root"
+    },
+    "last_healthy_timestamp": null,
+    "next_actions": [
+      "am doctor check --json",
+      "am doctor support-bundle --json"
+    ],
+    "recent_recovery_runs": [],
+    "schema": "forensic-timeline.v1"
+  },
   "healthy": true,
   "summary": {
     "archive_hygiene": null,
     "category_breakdown": {
       "archive_hygiene_findings": 4,
-      "environment_findings": 6,
+      "environment_findings": 7,
       "live_incident_findings": 6
+    },
+    "database_fix_strategy": {
+      "detail": "Database at <TMP_ROOT>/mailbox.sqlite3 passed file, integrity, and relational consistency probes",
+      "next_action": "No database repair action is currently recommended.",
+      "strategy": "none"
     },
     "overall_status": "warn",
     "primary_issue": {
@@ -249,6 +455,6 @@
       "status": "warn"
     },
     "secondary_fail_count": 0,
-    "secondary_warning_count": 15
+    "secondary_warning_count": 16
   }
 }

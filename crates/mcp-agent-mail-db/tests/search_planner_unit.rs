@@ -411,9 +411,9 @@ fn facet_agent_name_without_direction_matches_both() {
     q.direction = None;
     let plan = plan_search(&q);
     assert!(plan.facets_applied.contains(&"agent_name".to_string()));
-    // Should have OR for sender and recipient
+    // Agent filter without direction matches sender or durable recipient envelope JSON.
     assert!(plan.sql.contains("a.name = ? COLLATE NOCASE"));
-    assert!(plan.sql.contains("message_recipients"));
+    assert!(plan.sql.contains("recipients_json"));
 }
 
 #[test]
@@ -432,7 +432,7 @@ fn facet_inbox_direction() {
     q.direction = Some(Direction::Inbox);
     q.agent_name = Some("Agent".to_string());
     let plan = plan_search(&q);
-    assert!(plan.sql.contains("message_recipients"));
+    assert!(plan.sql.contains("recipients_json"));
 }
 
 #[test]
@@ -504,30 +504,29 @@ fn facet_project_id_takes_priority_over_product_id() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn ranking_fts_orders_by_score_asc() {
+fn ranking_like_relevance_uses_deterministic_score_id_order() {
     let plan = plan_search(&msg_query("hello", 1));
     assert_eq!(plan.method, PlanMethod::Like);
     assert!(
         plan.sql.contains("ORDER BY score ASC"),
-        "FTS should order by score ASC: {}",
+        "LIKE fallback should order by deterministic score/id order: {}",
         plan.sql
     );
 }
 
 #[test]
 fn ranking_like_orders_by_recency() {
-    // LIKE fallback: ORDER BY m.created_ts DESC
-    // Hard to trigger LIKE via planner — need text that sanitizes to None but has terms
-    // Instead, verify FilterOnly which uses same recency ordering
-    let q = SearchQuery {
+    // FilterOnly has no text score, so recency mode orders by newest message.
+    let mut q = SearchQuery {
         doc_kind: DocKind::Message,
         project_id: Some(1),
         ..Default::default()
     };
+    q.ranking = RankingMode::Recency;
     let plan = plan_search(&q);
     assert_eq!(plan.method, PlanMethod::FilterOnly);
     assert!(
-        plan.sql.contains("ORDER BY m.created_ts DESC"),
+        plan.sql.contains("ORDER BY COALESCE(m.created_ts, 0) DESC"),
         "FilterOnly should order by recency: {}",
         plan.sql
     );
@@ -535,7 +534,7 @@ fn ranking_like_orders_by_recency() {
 
 #[test]
 fn ranking_filter_only_both_modes_use_recency() {
-    // FilterOnly with Relevance ranking → still uses recency
+    // FilterOnly respects the requested ranking mode.
     let q1 = SearchQuery {
         doc_kind: DocKind::Message,
         project_id: Some(1),
@@ -550,8 +549,12 @@ fn ranking_filter_only_both_modes_use_recency() {
     };
     let plan1 = plan_search(&q1);
     let plan2 = plan_search(&q2);
-    assert!(plan1.sql.contains("ORDER BY m.created_ts DESC"));
-    assert!(plan2.sql.contains("ORDER BY m.created_ts DESC"));
+    assert!(plan1.sql.contains("ORDER BY score ASC, m.id ASC"));
+    assert!(
+        plan2
+            .sql
+            .contains("ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC")
+    );
 }
 
 #[test]
@@ -723,8 +726,7 @@ fn cursor_roundtrip_infinity() {
         score: f64::INFINITY,
         id: 1,
     };
-    let decoded = SearchCursor::decode(&cursor.encode()).unwrap();
-    assert!(decoded.score.is_infinite() && decoded.score.is_sign_positive());
+    assert!(SearchCursor::decode(&cursor.encode()).is_none());
 }
 
 #[test]
@@ -733,8 +735,7 @@ fn cursor_roundtrip_neg_infinity() {
         score: f64::NEG_INFINITY,
         id: 1,
     };
-    let decoded = SearchCursor::decode(&cursor.encode()).unwrap();
-    assert!(decoded.score.is_infinite() && decoded.score.is_sign_negative());
+    assert!(SearchCursor::decode(&cursor.encode()).is_none());
 }
 
 #[test]
@@ -743,8 +744,7 @@ fn cursor_roundtrip_nan() {
         score: f64::NAN,
         id: 1,
     };
-    let decoded = SearchCursor::decode(&cursor.encode()).unwrap();
-    assert!(decoded.score.is_nan());
+    assert!(SearchCursor::decode(&cursor.encode()).is_none());
 }
 
 #[test]
@@ -789,8 +789,8 @@ fn cursor_in_plan_adds_pagination_clause() {
     let mut q = msg_query("test", 1);
     q.cursor = Some(cursor.encode());
     let plan = plan_search(&q);
-    assert!(plan.sql.contains("score > ?"));
     assert!(plan.sql.contains("m.id > ?"));
+    assert!(!plan.sql.contains("0.0 > ?"));
     assert!(plan.facets_applied.contains(&"cursor".to_string()));
 }
 
@@ -1026,12 +1026,12 @@ fn limit_clamped_to_1() {
 }
 
 #[test]
-fn limit_clamped_to_1000() {
+fn limit_clamped_to_5000() {
     let q = SearchQuery {
         limit: Some(99_999),
         ..Default::default()
     };
-    assert_eq!(q.effective_limit(), 1000);
+    assert_eq!(q.effective_limit(), 5000);
 }
 
 #[test]
@@ -1283,8 +1283,8 @@ fn param_count_with_cursor() {
     let mut q = msg_query("hello", 1);
     q.cursor = Some(cursor.encode());
     let plan = plan_search(&q);
-    // Params: LIKE subject, LIKE body, project_id, score×2, id, LIMIT → 7
-    assert_eq!(plan.params.len(), 7);
+    // Params: LIKE subject, LIKE body, project_id, id, LIMIT → 5
+    assert_eq!(plan.params.len(), 5);
 }
 
 #[test]
@@ -1502,14 +1502,14 @@ fn cursor_applied_to_filter_only() {
         "cursor facet should be tracked for FilterOnly"
     );
     assert!(
-        plan.sql.contains("score > ?"),
+        plan.sql.contains("m.id > ?") && !plan.sql.contains("0.0 > ?"),
         "cursor pagination clause should appear: {}",
         plan.sql
     );
 }
 
 #[test]
-fn cursor_with_fts_message_search() {
+fn cursor_with_like_message_search_uses_id_keyset() {
     let cursor = SearchCursor {
         score: -5.0,
         id: 200,
@@ -1519,8 +1519,10 @@ fn cursor_with_fts_message_search() {
     let plan = plan_search(&q);
     assert_eq!(plan.method, PlanMethod::Like);
     assert!(plan.facets_applied.contains(&"cursor".to_string()));
-    // Should have the compound cursor clause
-    assert!(plan.sql.contains("(score > ? OR (score = ? AND m.id > ?))"));
+    // LIKE relevance fallback assigns constant scores, so cursoring is by the
+    // deterministic id tie-breaker only.
+    assert!(plan.sql.contains("m.id > ?"));
+    assert!(!plan.sql.contains("0.0 > ?"));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1528,21 +1530,22 @@ fn cursor_with_fts_message_search() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn fts_ignores_recency_ranking_mode() {
+fn like_respects_recency_ranking_mode() {
     let mut q = msg_query("hello world", 1);
     q.ranking = RankingMode::Recency;
     let plan = plan_search(&q);
     assert_eq!(plan.method, PlanMethod::Like);
-    // FTS always uses score ordering, regardless of ranking mode
+    // Search V3 fallback SQL respects the requested ranking mode.
     assert!(
-        plan.sql.contains("ORDER BY score ASC"),
-        "FTS should always order by score: {}",
+        plan.sql
+            .contains("ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC"),
+        "LIKE fallback should order by recency: {}",
         plan.sql
     );
 }
 
 #[test]
-fn fts_relevance_mode_uses_score() {
+fn like_relevance_mode_uses_score_alias() {
     let mut q = msg_query("hello world", 1);
     q.ranking = RankingMode::Relevance;
     let plan = plan_search(&q);
@@ -1551,7 +1554,7 @@ fn fts_relevance_mode_uses_score() {
 }
 
 #[test]
-fn like_always_uses_recency_ordering() {
+fn like_relevance_mode_uses_deterministic_score_id_ordering() {
     // LIKE path uses score ASC, id ASC for cursor-based pagination compatibility.
     let mut q = msg_query("🔥 xy 🔥", 1);
     q.ranking = RankingMode::Relevance;
@@ -1646,7 +1649,7 @@ fn direction_agent_exhaustive_matrix() {
                 );
                 assert!(
                     plan.sql.contains("a.name = ? COLLATE NOCASE")
-                        && plan.sql.contains("message_recipients"),
+                        && plan.sql.contains("recipients_json"),
                     "agent without direction should match both: {}",
                     plan.sql
                 );
@@ -1721,13 +1724,13 @@ fn complex_combined_query() {
     assert!(plan.sql.contains("LIKE ? ESCAPE")); // LIKE text matching
     assert!(plan.sql.contains("m.project_id = ?"));
     assert!(plan.sql.contains("m.importance IN (?, ?)"));
-    assert!(plan.sql.contains("message_recipients")); // Inbox direction
+    assert!(plan.sql.contains("recipients_json")); // Inbox direction
     assert!(plan.sql.contains("m.thread_id = ?"));
     assert!(plan.sql.contains("m.ack_required = ?"));
     assert!(plan.sql.contains("m.created_ts >= ?"));
     assert!(plan.sql.contains("m.created_ts <= ?"));
     assert!(plan.sql.contains("m.project_id IN (?, ?)")); // scope
-    assert!(plan.sql.contains("score > ?")); // cursor
+    assert!(plan.sql.contains("m.id > ?")); // cursor
     assert!(plan.sql.contains("LIMIT ?"));
 }
 

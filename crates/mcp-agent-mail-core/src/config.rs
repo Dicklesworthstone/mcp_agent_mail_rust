@@ -1215,7 +1215,7 @@ impl Default for Config {
             http_port: 8765,
             http_path: "/mcp/".to_string(),
             http_bearer_token: None,
-            http_allow_localhost_unauthenticated: true,
+            http_allow_localhost_unauthenticated: false,
             http_request_log_enabled: false,
             http_otel_enabled: false,
             http_otel_service_name: "mcp-agent-mail".to_string(),

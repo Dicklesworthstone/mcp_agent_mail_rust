@@ -100,14 +100,56 @@ fn canonicalize_json(v: &Value) -> Value {
 
 fn normalize_json(v: Value, tmp_root: &Path) -> Value {
     let tmp = tmp_root.to_string_lossy().to_string();
-    fn walk(v: Value, tmp: &str) -> Value {
+    let tmp_slug = tmp_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("tmp-{}-doctor-repo", name.to_ascii_lowercase()));
+    let search_index_root = std::env::temp_dir()
+        .join("mcp-agent-mail-search-index")
+        .to_string_lossy()
+        .to_string();
+
+    fn normalize_string(
+        s: String,
+        tmp: &str,
+        tmp_slug: Option<&str>,
+        search_index_root: &str,
+    ) -> String {
+        let mut normalized = s.replace(tmp, "<TMP_ROOT>");
+        if let Some(slug) = tmp_slug {
+            normalized = normalized.replace(slug, "<TMP_DOCTOR_PROJECT_SLUG>");
+        }
+        while let Some(start) = normalized.find("tmp-tmp") {
+            let suffix_offset = start + "tmp-tmp".len();
+            let Some(relative_end) = normalized[suffix_offset..].find("-doctor-repo") else {
+                break;
+            };
+            let end = suffix_offset + relative_end + "-doctor-repo".len();
+            normalized.replace_range(start..end, "<TMP_DOCTOR_PROJECT_SLUG>");
+        }
+        if let Some(rest) = normalized.strip_prefix(search_index_root)
+            && (rest.starts_with('/') || rest.starts_with('\\'))
+            && rest[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return "<SEARCH_INDEX_ROOT>/<HASH>".to_string();
+        }
+        normalized
+    }
+
+    fn walk(v: Value, tmp: &str, tmp_slug: Option<&str>, search_index_root: &str) -> Value {
         match v {
-            Value::String(s) => Value::String(s.replace(tmp, "<TMP_ROOT>")),
-            Value::Array(arr) => Value::Array(arr.into_iter().map(|x| walk(x, tmp)).collect()),
+            Value::String(s) => {
+                Value::String(normalize_string(s, tmp, tmp_slug, search_index_root))
+            }
+            Value::Array(arr) => Value::Array(
+                arr.into_iter()
+                    .map(|x| walk(x, tmp, tmp_slug, search_index_root))
+                    .collect(),
+            ),
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, val) in map {
-                    out.insert(k, walk(val, tmp));
+                    out.insert(k, walk(val, tmp, tmp_slug, search_index_root));
                 }
                 if let Some(check_name) = out.get("check").and_then(Value::as_str) {
                     match check_name {
@@ -171,7 +213,12 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
         }
     }
 
-    walk(canonicalize_json(&v), &tmp)
+    walk(
+        canonicalize_json(&v),
+        &tmp,
+        tmp_slug.as_deref(),
+        &search_index_root,
+    )
 }
 
 #[derive(Debug)]

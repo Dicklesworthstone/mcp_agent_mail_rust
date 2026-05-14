@@ -456,15 +456,24 @@ first body
             .expect("tmpdir override utf-8")
             .to_string();
 
-        with_mail_ui_env(&storage_root, &db_path, || {
-            let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("TMPDIR", tmpdir.as_str())],
-                || dispatch("/mail/ahead-project", "", "GET", ""),
-            )
-            .expect_err("dispatch should fail closed when archive snapshot setup fails");
-            assert_eq!(err.0, 500);
-            assert!(err.1.contains("Mail UI read pool unavailable"), "{}", err.1);
-        });
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("mail ui storage root utf-8")
+            .to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+                ("TMPDIR", tmpdir.as_str()),
+            ],
+            || {
+                let err = dispatch("/mail/ahead-project", "", "GET", "")
+                    .expect_err("dispatch should fail closed when archive snapshot setup fails");
+                assert_eq!(err.0, 500);
+                assert!(err.1.contains("Mail UI read pool unavailable"), "{}", err.1);
+            },
+        );
     }
 
     #[test]
