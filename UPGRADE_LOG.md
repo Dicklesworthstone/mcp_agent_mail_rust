@@ -21,11 +21,23 @@
 
 ### Compatible registry updates
 
-- Pending.
+- `tru`/`toon`: `0.2.2` -> `0.2.3`.
+- `zip`: manifest floor tightened to `8.6.0` after lockfile resolution selected it.
 
 ### Manifest-level latest-stable updates
 
-- Pending.
+- `comrak`: `0.50.0` -> `0.52.0`.
+- `crossterm`: `0.28.1` -> `0.29.0`.
+- `getrandom`: `0.2.17` -> `0.4.2`; call sites now use `getrandom::fill`.
+- `insta`: manifest floor tightened from `1.38` to the resolved current `1.47.2`.
+- `json5`: `0.4.1` -> `1.3.1`.
+- `plist`: `1.8.0` -> `1.9.0`.
+- `sha1`: `0.10.6` -> `0.11.0`.
+- `sha2`: `0.10.9` -> `0.11.0`.
+- `similar`: `2.7.0` -> `3.1.0`.
+- `tantivy`: `0.25.0` -> `0.26.1`.
+- `tokenizers`: `0.22.2` -> `0.23.1`.
+- `unicode-width`: `0.1.14` -> `0.2.2`.
 
 ## Failed
 

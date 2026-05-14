@@ -907,7 +907,7 @@ fn push_pascal_case_word(out: &mut String, word: &str) {
 pub fn generate_agent_name() -> String {
     let mut seed_bytes = [0u8; 8];
     // Fall back to a time-based pseudo-random value if getrandom fails
-    if getrandom::getrandom(&mut seed_bytes).is_err() {
+    if getrandom::fill(&mut seed_bytes).is_err() {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());

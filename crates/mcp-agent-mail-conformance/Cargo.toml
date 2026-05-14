@@ -22,7 +22,7 @@ chrono.workspace = true
 mcp-agent-mail-server = { path = "../mcp-agent-mail-server" }
 
 [dev-dependencies]
-insta = { version = "1.38", features = ["json"] }
+insta = { version = "1.47.2", features = ["json"] }
 fastmcp.workspace = true
 fastmcp-core.workspace = true
 fastmcp-transport.workspace = true

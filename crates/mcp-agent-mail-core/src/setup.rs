@@ -321,7 +321,7 @@ fn fill_random_bytes(bytes: &mut [u8]) -> Result<(), SetupError> {
         ));
     }
 
-    getrandom::getrandom(bytes).map_err(|error| {
+    getrandom::fill(bytes).map_err(|error| {
         SetupError::Other(format!(
             "CSPRNG failure: cannot generate secure token: {error}"
         ))
