@@ -1884,7 +1884,14 @@ fn run_fixtures_against_rust_server_router() {
         use sha1::Digest;
         let mut hasher = sha1::Sha1::new();
         hasher.update(path_pattern.as_bytes());
-        let sha1_hex = format!("{:x}", hasher.finalize());
+        let digest = hasher.finalize();
+        let digest_bytes: &[u8] = digest.as_ref();
+        let mut sha1_hex = String::with_capacity(digest.len() * 2);
+        for &byte in digest_bytes {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            sha1_hex.push(char::from(HEX[usize::from(byte >> 4)]));
+            sha1_hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
         let sha1_file = format!("{res_dir_prefix}{sha1_hex}.json");
         assert!(
             res_in_dir.iter().any(|f| *f == sha1_file),
