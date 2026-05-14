@@ -90,6 +90,37 @@ fn am_doctor_fix_only_writes_latest_run_artifacts() {
 }
 
 #[test]
+fn am_doctor_fix_only_surfaces_latest_update_failure() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let doctor_root = td.path().join(".doctor");
+    std::fs::create_dir(&doctor_root).expect("doctor root");
+    std::fs::write(doctor_root.join("latest"), "operator data\n").expect("regular latest");
+    let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_gitignore_entry::FM_ID;
+
+    let (code, stdout, stderr) = run_am(
+        td.path(),
+        &["doctor", "fix", "--only", fm_id, "--yes", "--json"],
+    );
+
+    assert_ne!(
+        code, 0,
+        "doctor fix must not report success when .doctor/latest cannot be updated"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "failed latest update must not emit a success envelope on stdout"
+    );
+    assert!(
+        stderr.contains("updating .doctor/latest"),
+        "stderr must explain the latest-update failure: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(doctor_root.join("latest")).expect("latest preserved"),
+        "operator data\n"
+    );
+}
+
+#[test]
 fn am_doctor_fix_only_dry_run_writes_no_persistent_run_dir() {
     let td = tempfile::TempDir::new().expect("tempdir");
     let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_gitignore_entry::FM_ID;

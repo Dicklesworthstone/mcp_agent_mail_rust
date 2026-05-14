@@ -543,15 +543,16 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
             .map_err(|e| CliError::Other(format!("writing doctor run artifacts: {e}")))?;
     }
 
+    if !dry_run && outcome.actions_taken > 0 {
+        runs::update_latest_symlink(&repo_root, &run_id)
+            .map_err(|e| CliError::Other(format!("updating .doctor/latest: {e}")))?;
+    }
+
     println!(
         "{}",
         serde_json::to_string_pretty(&envelope)
             .map_err(|e| CliError::Other(format!("serializing fix-only envelope: {e}")))?
     );
-
-    if !dry_run && outcome.actions_taken > 0 {
-        runs::update_latest_symlink(&repo_root, &run_id).ok();
-    }
     Ok(())
 }
 

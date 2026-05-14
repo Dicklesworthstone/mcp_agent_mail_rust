@@ -86,8 +86,12 @@ pub fn doctor_root(target: &Path) -> PathBuf {
 /// Idempotent — calling twice with the same run_id is a no-op.
 pub fn scaffold_run_dir(target: &Path, run_id: &str) -> std::io::Result<PathBuf> {
     let root = doctor_root(target);
+    ensure_dir_without_symlink(&root)?;
+    let runs_dir = root.join("runs");
+    ensure_dir_without_symlink(&runs_dir)?;
     let run_dir = root.join("runs").join(run_id);
-    fs::create_dir_all(run_dir.join("backups"))?;
+    ensure_dir_without_symlink(&run_dir)?;
+    ensure_dir_without_symlink(&run_dir.join("backups"))?;
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -101,6 +105,8 @@ pub fn write_run_artifacts(
     run_id: &str,
     report: &serde_json::Value,
 ) -> std::io::Result<()> {
+    ensure_existing_dir_without_symlink(run_dir)?;
+
     let pretty = serde_json::to_vec_pretty(report).map_err(std::io::Error::other)?;
     let mut json = pretty;
     json.push(b'\n');
@@ -120,6 +126,61 @@ pub fn write_run_artifacts(
     Ok(())
 }
 
+fn ensure_dir_without_symlink(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => ensure_existing_dir_without_symlink(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent()
+                && parent != path
+                && !parent.as_os_str().is_empty()
+            {
+                ensure_dir_without_symlink(parent)?;
+            }
+            fs::create_dir(path)?;
+            ensure_existing_dir_tree_without_symlink(path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn ensure_existing_dir_without_symlink(path: &Path) -> std::io::Result<()> {
+    ensure_existing_dir_tree_without_symlink(path)
+}
+
+fn ensure_existing_dir_tree_without_symlink(path: &Path) -> std::io::Result<()> {
+    let mut ancestors: Vec<&Path> = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        ensure_existing_dir_leaf_without_symlink(ancestor)?;
+    }
+    Ok(())
+}
+
+fn ensure_existing_dir_leaf_without_symlink(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(symlink_dir_error(path)),
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists but is not a directory", path.display()),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+fn symlink_dir_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to use symlinked doctor artifact directory {}",
+            path.display()
+        ),
+    )
+}
+
 fn atomic_write_bytes(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -127,7 +188,7 @@ fn atomic_write_bytes(path: &Path, content: &[u8], mode: u32) -> std::io::Result
             format!("path has no parent: {}", path.display()),
         )
     })?;
-    fs::create_dir_all(parent)?;
+    ensure_dir_without_symlink(parent)?;
 
     let file_name = path
         .file_name()
@@ -211,7 +272,7 @@ fn shell_single_quote(value: &str) -> String {
 /// then `rename(tmp, latest)`. Never touches user data.
 pub fn update_latest_symlink(target: &Path, run_id: &str) -> std::io::Result<()> {
     let root = doctor_root(target);
-    fs::create_dir_all(&root)?;
+    ensure_dir_without_symlink(&root)?;
     let latest = root.join("latest");
     if let Ok(meta) = fs::symlink_metadata(&latest)
         && !meta.file_type().is_symlink()
@@ -265,7 +326,7 @@ pub fn ensure_gitignore_entry(target: &Path) -> std::io::Result<()> {
 /// Append one line to `<doctor_root>/scorecard_history.jsonl`.
 pub fn append_scorecard_history(target: &Path, line_json: &str) -> std::io::Result<()> {
     let root = doctor_root(target);
-    fs::create_dir_all(&root)?;
+    ensure_dir_without_symlink(&root)?;
     let path = root.join("scorecard_history.jsonl");
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
     f.write_all(line_json.as_bytes())?;
@@ -399,6 +460,26 @@ mod tests {
         assert!(run_dir.join("actions.jsonl").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_refuses_symlinked_run_dir_without_writing_target() {
+        let td = TempDir::new().expect("tempdir");
+        let target = td.path().join("outside");
+        fs::create_dir(&target).expect("target dir");
+        let runs = doctor_root(td.path()).join("runs");
+        fs::create_dir_all(&runs).expect("runs dir");
+        let run_id = "2026-05-09T16-30-15Z__abc123";
+        std::os::unix::fs::symlink(&target, runs.join(run_id)).expect("symlink run dir");
+
+        let err = scaffold_run_dir(td.path(), run_id).expect_err("symlink run dir must refuse");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !target.join("actions.jsonl").exists(),
+            "scaffold must not follow run-dir symlinks"
+        );
+    }
+
     #[test]
     fn write_run_artifacts_persists_report_stdout_markdown_and_undo() {
         let td = TempDir::new().expect("tempdir");
@@ -425,6 +506,67 @@ mod tests {
         assert!(run_dir.join("report.md").is_file());
         let undo = fs::read_to_string(run_dir.join("undo.sh")).unwrap();
         assert!(undo.contains("am doctor undo '2026-05-09T16-30-15Z__abc123'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_run_artifacts_refuses_symlinked_run_dir_without_writing_target() {
+        let td = TempDir::new().expect("tempdir");
+        let target = td.path().join("outside");
+        fs::create_dir(&target).expect("target dir");
+        let link = td.path().join("run-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink run dir");
+        let report = serde_json::json!({
+            "run_id": "2026-05-09T16-30-15Z__abc123",
+            "mode": "fix",
+            "fm_id": "fm-test",
+            "ok": true,
+            "actions_taken": 1,
+            "summary": {
+                "total_findings": 0
+            }
+        });
+
+        let err = write_run_artifacts(&link, "2026-05-09T16-30-15Z__abc123", &report)
+            .expect_err("symlink run dir must refuse");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !target.join("report.json").exists(),
+            "artifact writer must not follow run-dir symlinks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_run_artifacts_refuses_symlinked_parent_without_writing_target() {
+        let td = TempDir::new().expect("tempdir");
+        let target = td.path().join("outside");
+        let target_run = target.join("run");
+        fs::create_dir(&target).expect("target dir");
+        fs::create_dir(&target_run).expect("target run dir");
+        let link = td.path().join("linked-parent");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink parent");
+        let run_dir = link.join("run");
+        let report = serde_json::json!({
+            "run_id": "2026-05-09T16-30-15Z__abc123",
+            "mode": "fix",
+            "fm_id": "fm-test",
+            "ok": true,
+            "actions_taken": 1,
+            "summary": {
+                "total_findings": 0
+            }
+        });
+
+        let err = write_run_artifacts(&run_dir, "2026-05-09T16-30-15Z__abc123", &report)
+            .expect_err("symlinked parent must refuse");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !target_run.join("report.json").exists(),
+            "artifact writer must not follow symlinked parents"
+        );
     }
 
     #[test]
@@ -457,6 +599,24 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("latest")).unwrap(),
             "operator data\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_latest_symlink_refuses_symlinked_doctor_root_without_writing_target() {
+        let td = TempDir::new().expect("tempdir");
+        let target = td.path().join("outside");
+        fs::create_dir(&target).expect("target dir");
+        std::os::unix::fs::symlink(&target, doctor_root(td.path())).expect("symlink doctor root");
+
+        let err = update_latest_symlink(td.path(), "2026-05-09T16-30-15Z__abc123")
+            .expect_err("symlinked doctor root must refuse");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !target.join("latest").exists(),
+            "latest update must not follow a symlinked doctor root"
         );
     }
 
