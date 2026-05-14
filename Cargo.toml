@@ -27,31 +27,31 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.3.0", package = "fastmcp-rust" }
-fastmcp-core = "0.3.0"
-fastmcp-server = "0.3.0"
-fastmcp-transport = "0.3.0"
-fastmcp-protocol = "0.3.0"
+fastmcp = { version = "0.3.1", package = "fastmcp-rust" }
+fastmcp-core = "0.3.1"
+fastmcp-server = "0.3.1"
+fastmcp-transport = "0.3.1"
+fastmcp-protocol = "0.3.1"
 
 asupersync = { version = "0.3.1", features = ["tls-webpki-roots"] }
 
-sqlmodel = "0.2.1"
-sqlmodel-core = "0.2.1"
-sqlmodel-query = "0.2.1"
-sqlmodel-schema = "0.2.1"
-sqlmodel-session = "0.2.1"
-sqlmodel-pool = "0.2.1"
-sqlmodel-frankensqlite = "0.2.1"
-sqlmodel-sqlite = "0.2.1"
+sqlmodel = "0.2.2"
+sqlmodel-core = "0.2.2"
+sqlmodel-query = "0.2.2"
+sqlmodel-schema = "0.2.2"
+sqlmodel-session = "0.2.2"
+sqlmodel-pool = "0.2.2"
+sqlmodel-frankensqlite = "0.2.2"
+sqlmodel-sqlite = "0.2.2"
 
-ftui = "0.3.1"
-ftui-runtime = { version = "0.3.1", features = ["native-backend"] }
-ftui-extras = { version = "0.3.1", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
-ftui-widgets = { version = "0.3.1", features = ["debug-overlay", "regex-search"] }
-ftui-tty = "0.3.1"
-ftui-harness = "0.3.1"
-ftui-render = "0.3.1"
-beads_rust = "0.2.6"
+ftui = "0.4.0"
+ftui-runtime = { version = "0.4.0", features = ["native-backend"] }
+ftui-extras = { version = "0.4.0", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
+ftui-widgets = { version = "0.4.0", features = ["debug-overlay", "regex-search"] }
+ftui-tty = "0.4.0"
+ftui-harness = "0.4.0"
+ftui-render = "0.4.0"
+beads_rust = "0.2.7"
 toon = { version = "0.2.2", package = "tru" }
 
 # Internal workspace crates
@@ -68,7 +68,7 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
-franken-agent-detection = "0.1.3"
+franken-agent-detection = "0.1.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1.1.2"
@@ -98,12 +98,12 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
 fs2 = "0.4"
 walkdir = "2"
 tantivy = "0.25"
 indexmap = "2"
-nix = "0.31.1"
+nix = "0.31.3"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
 #
@@ -118,13 +118,13 @@ frankensearch-fusion = { version = "0.2.0", path = "../frankensearch/crates/fran
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
-wide = "1"
+wide = "1.4.0"
 safetensors = "0.7"
 tokenizers = "0.22"
 rayon = "1"
 dirs = "6"
 smallvec = { version = "1", features = ["serde"] }
-atty = "0.2"
+atty = "0.2.14"
 
 # WASM dependencies
 serde-wasm-bindgen = "0.6"
@@ -188,7 +188,6 @@ sqlmodel-query = { path = "../sqlmodel_rust/crates/sqlmodel-query" }
 sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
 sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
 sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
 sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
 fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 fsqlite-core = { path = "../frankensqlite/crates/fsqlite-core" }
@@ -204,7 +203,7 @@ fsqlite-parser = { path = "../frankensqlite/crates/fsqlite-parser" }
 fsqlite-planner = { path = "../frankensqlite/crates/fsqlite-planner" }
 fsqlite-vdbe = { path = "../frankensqlite/crates/fsqlite-vdbe" }
 fsqlite-func = { path = "../frankensqlite/crates/fsqlite-func" }
-# ftui patches needed until ftui v0.2.2 is published (local code uses newer APIs)
+# ftui patches keep the repo on the latest local /dp frankentui APIs.
 ftui = { path = "../frankentui/crates/ftui" }
 ftui-core = { path = "../frankentui/crates/ftui-core" }
 ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
