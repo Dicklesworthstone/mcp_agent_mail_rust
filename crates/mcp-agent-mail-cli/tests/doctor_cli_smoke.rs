@@ -48,6 +48,79 @@ fn run_am(tempdir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn am_doctor_fix_only_writes_latest_run_artifacts() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_gitignore_entry::FM_ID;
+    let (code, stdout, stderr) = run_am(
+        td.path(),
+        &["doctor", "fix", "--only", fm_id, "--yes", "--json"],
+    );
+    assert_eq!(
+        code, 0,
+        "am doctor fix --only must exit 0; stderr: {stderr}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("fix-only must emit valid JSON");
+    assert_eq!(envelope["fm_id"], fm_id);
+    assert_eq!(envelope["actions_taken"], 1);
+    assert_eq!(envelope["summary"]["total_findings"], 0);
+
+    let run_id = envelope["run_id"].as_str().expect("run_id must be string");
+    let run_dir = PathBuf::from(
+        envelope["run_dir"]
+            .as_str()
+            .expect("mutating run_dir must be string"),
+    );
+    let report_path = run_dir.join("report.json");
+    assert!(report_path.is_file(), "report.json must be persisted");
+    assert!(run_dir.join("stdout.json").is_file());
+    assert!(run_dir.join("report.md").is_file());
+    assert!(run_dir.join("undo.sh").is_file());
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(report_path).expect("read report"))
+            .expect("report must parse");
+    assert_eq!(report["run_id"], run_id);
+    assert_eq!(report["ok"], true);
+
+    let latest = std::fs::read_link(td.path().join(".doctor").join("latest"))
+        .expect("latest symlink must be updated");
+    assert_eq!(latest, PathBuf::from("runs").join(run_id));
+}
+
+#[test]
+fn am_doctor_fix_only_dry_run_writes_no_persistent_run_dir() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_gitignore_entry::FM_ID;
+    let (code, stdout, stderr) = run_am(
+        td.path(),
+        &[
+            "doctor",
+            "fix",
+            "--only",
+            fm_id,
+            "--dry-run",
+            "--yes",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "am doctor fix --only --dry-run must exit 0; stderr: {stderr}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("dry-run must emit valid JSON");
+    assert_eq!(envelope["dry_run"], true);
+    assert!(envelope["run_dir"].is_null());
+    assert!(
+        !td.path().join(".doctor").join("runs").exists(),
+        "dry-run must not scaffold persistent doctor runs"
+    );
+}
+
+#[test]
 fn am_doctor_fixers_emits_registry_as_json() {
     let td = tempfile::TempDir::new().expect("tempdir");
     let (code, stdout, stderr) = run_am(td.path(), &["doctor", "fixers", "--format", "json"]);
