@@ -1479,7 +1479,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert_eq!(hits.len(), 1);
 
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
@@ -1496,7 +1498,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert!(!hits.is_empty());
         }
 
@@ -1515,7 +1519,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert_eq!(hits.len(), 1);
         }
 
@@ -1528,7 +1534,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert_eq!(hits.len(), 1);
         }
 
@@ -1552,7 +1560,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert_eq!(hits.len(), 1);
 
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
@@ -1571,7 +1581,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             // "deployment" is in subject of doc2 ("Deployment checklist")
             // "search" is in body of doc2 ("deploying the new search engine")
             assert!(!hits.is_empty());
@@ -1591,7 +1603,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             // Should match doc 1 (migration) and doc 2 (deployment)
             assert_eq!(hits.len(), 2);
         }
@@ -1609,7 +1623,9 @@ mod tests {
                 .expect("fallback should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             // "migration" term should still match doc 1
             assert!(!hits.is_empty());
         }
@@ -1620,7 +1636,9 @@ mod tests {
             let query = match_all_query();
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&*query, &TopDocs::with_limit(100)).unwrap();
+            let hits = searcher
+                .search(&*query, &TopDocs::with_limit(100).order_by_score())
+                .unwrap();
             assert_eq!(hits.len(), 3);
         }
 
@@ -1630,7 +1648,9 @@ mod tests {
             let query = match_none_query();
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&*query, &TopDocs::with_limit(100)).unwrap();
+            let hits = searcher
+                .search(&*query, &TopDocs::with_limit(100).order_by_score())
+                .unwrap();
             assert!(hits.is_empty());
         }
 
@@ -1645,7 +1665,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert!(!hits.is_empty());
             // Doc 1 has "plan" in subject (boosted 2x) — should rank first
             let doc: TantivyDocument = searcher.doc(hits[0].1).unwrap();
@@ -1748,7 +1770,9 @@ mod tests {
             let query = outcome.into_query().expect("should produce a query");
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
-            let hits = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+            let hits = searcher
+                .search(&query, &TopDocs::with_limit(10).order_by_score())
+                .unwrap();
             assert!(!hits.is_empty());
         }
 

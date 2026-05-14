@@ -258,9 +258,10 @@ pub fn execute_search(
 
     // Fetch more results than needed to handle offset + count total
     let fetch_limit = offset.saturating_add(limit).max(1);
-    let Ok((total_count, top_docs)) =
-        searcher.search(query, &(Count, TopDocs::with_limit(fetch_limit)))
-    else {
+    let Ok((total_count, top_docs)) = searcher.search(
+        query,
+        &(Count, TopDocs::with_limit(fetch_limit).order_by_score()),
+    ) else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
 

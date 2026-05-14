@@ -851,13 +851,13 @@ fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, Str
             max_id: 0,
         });
     }
-    let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher
+    let top_docs: Vec<(Option<u64>, tantivy::DocAddress)> = searcher
         .search(
             &message_query,
             &TopDocs::with_limit(1).order_by_fast_field::<u64>("id", Order::Desc),
         )
         .map_err(|e| format!("backfill index max-id query failed: {e}"))?;
-    let max_id = top_docs.first().map_or(0, |(id, _)| *id);
+    let max_id = top_docs.first().and_then(|(id, _)| *id).unwrap_or(0);
 
     Ok(MessageStats {
         count: u64::try_from(count).unwrap_or(u64::MAX),

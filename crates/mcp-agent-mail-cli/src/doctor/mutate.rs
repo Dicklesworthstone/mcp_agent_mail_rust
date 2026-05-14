@@ -218,7 +218,7 @@ pub enum MutateError {
 /// Stream SHA-256 over the file's bytes without loading the entire file into
 /// memory. Returns the empty-file hash if the path doesn't exist.
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 fn sha256_path_bytes(path: &Path) -> String {
@@ -258,7 +258,7 @@ fn sha256_of_path(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn open_regular_file_no_follow(path: &Path) -> std::io::Result<File> {

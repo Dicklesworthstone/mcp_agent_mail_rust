@@ -290,7 +290,9 @@ mod tests {
 
         let query_parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
         let query = query_parser.parse_query("migration").unwrap();
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
 
         assert_eq!(top_docs.len(), 1);
         let retrieved: TantivyDocument = searcher.doc(top_docs[0].1).unwrap();
@@ -325,7 +327,9 @@ mod tests {
 
         let query_parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
         let query = query_parser.parse_query("search").unwrap();
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
 
         assert_eq!(top_docs.len(), 1);
     }
@@ -362,7 +366,7 @@ mod tests {
         let searcher = reader.searcher();
 
         let top_docs = searcher
-            .search(&AllQuery, &TopDocs::with_limit(10))
+            .search(&AllQuery, &TopDocs::with_limit(10).order_by_score())
             .unwrap();
         assert_eq!(top_docs.len(), 1);
         let retrieved: TantivyDocument = searcher.doc(top_docs[0].1).unwrap();
@@ -543,7 +547,7 @@ mod tests {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let top_docs = searcher
-            .search(&AllQuery, &TopDocs::with_limit(10))
+            .search(&AllQuery, &TopDocs::with_limit(10).order_by_score())
             .unwrap();
         assert_eq!(top_docs.len(), 3);
     }
@@ -572,7 +576,9 @@ mod tests {
         let searcher = reader.searcher();
         let parser = QueryParser::for_index(&index, vec![handles.body]);
         let query = parser.parse_query("fox").unwrap();
-        let results = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let results = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -673,7 +679,9 @@ mod tests {
         let searcher = reader.searcher();
         let parser = QueryParser::for_index(&index, vec![handles.subject]);
         let query = parser.parse_query("unique_keyword_subject").unwrap();
-        let results = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let results = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -692,7 +700,7 @@ mod tests {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let results = searcher
-            .search(&AllQuery, &TopDocs::with_limit(10))
+            .search(&AllQuery, &TopDocs::with_limit(10).order_by_score())
             .unwrap();
         assert!(results.is_empty());
     }
@@ -726,7 +734,9 @@ mod tests {
         let searcher = reader.searcher();
         let parser = QueryParser::for_index(&index, vec![handles.subject, handles.body]);
         let query = parser.parse_query("migration").unwrap();
-        let results = searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let results = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
         assert_eq!(results.len(), 5);
     }
 
