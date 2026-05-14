@@ -10,6 +10,73 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+### `am doctor` — per-FM dispatcher surface (passes 14-32)
+
+The world-class doctor surface (added in commit `641990d8`, hardened in passes 1-13) gained a registry-backed per-FM dispatcher across passes 14-32. Every entry below is reachable from the CLI via `am doctor ...` or the library API in `crates/mcp-agent-mail-cli/src/doctor/`.
+
+**New verbs** (handbook count: 8 → 15)
+
+- `am doctor fixers [--format json|table]` — enumerate the FM registry (pass-14). JSON envelope schema `1.0`; table renderer for TTY.
+- `am doctor fix --only <fm-id>` — invoke a single registered FM through `mutate()` with full chokepoint guarantees (pass-15). Replaces the legacy multi-detector flow for targeted recovery.
+- `am doctor fix --only <fm-id> --list` — detect a single FM, no chokepoint exercised (pass-16). ~10× cheaper than `--dry-run`.
+- `am doctor fix --list` (without `--only`) — detect every registered FM in one round-trip (pass-24). Emits a `{ mode: "list_all", per_fm: [...], skipped: [...] }` envelope; `skipped[]` carries FMs missing required inputs with the missing-field name.
+- `am doctor explain <id>` registry fallback (pass-23) — when no recent run includes the id, falls back to `fixers::registry()` and emits the static `FixerSpec` under `mode: "registry"`. Agents can `explain` any registered FM cold without first running `--fix`.
+
+**FM registry** (9 entries as of pass-28)
+
+| FM id | Severity | Op | Subsystem |
+|-------|----------|----|-----------|
+| `fm-archive-state-files-missing-doctor-gitignore-entry` | P2 | `Op::AppendFile` | archive_state_files |
+| `fm-archive-state-files-stale-archive-lock-from-dead-pid` | P1 | `Op::Rename` | archive_state_files |
+| `fm-archive-state-files-stale-head-or-ref-update-lock` | P2 | `Op::Rename` | archive_state_files |
+| `fm-db-state-files-world-readable-storage-db` | P0 | `Op::Chmod` | db_state_files |
+| `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
+| `fm-environment_toolchain-known-bad-git-no-override` | P0 | detect-only | environment_toolchain |
+| `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
+| `fm-runtime-processes-stale-listener-pid-hint` | P1 | `Op::Rename` | runtime_processes |
+| `fm-secrets_env_state-bak-tokens-readable` | P1 | `Op::Chmod` | secrets_env_state |
+
+Op coverage at FM level: 6 of 7 canonical Ops (Rename×3, Chmod×2, WriteFile×1, AppendFile×1, SymlinkAtomic×1, detect-only×1). `Op::DbExec`/`Op::DbMigrate` remain stubbed in the chokepoint pending `DbConn` plumbing.
+
+**Capabilities envelope** (`am doctor capabilities --json`)
+
+- Pass-17 added `fm_fixers: Vec<FixerSpec>` and `fm_fixer_count: usize` so agents discovering the contract see the per-FM registry without a second call to `am doctor fixers`. The pre-existing `fixers[]` field continues to enumerate the legacy multi-detector flow.
+
+**Drift-class closures** (three distinct duplicated-source-of-truth bugs fixed)
+
+- Pass-18: `world_readable_token_bak::BACKUP_SUFFIX_HINTS` promoted to `pub`. Handler's candidate-discovery list now references the module's canonical const directly — broadening the detector's accept-set automatically broadens the handler's enumeration.
+- Pass-19: `DispatchInputs.stale_seconds: u64` → `stale_seconds_override: Option<u64>`. Each stale-* FM now uses its own canonical `DEFAULT_STALE_SECONDS` (300/120/600s) instead of all inheriting archive-lock's 300s. Metamorphic drift test plants a 200s-old HEAD.lock and asserts ref-lock's 120s default flags it (pre-pass-19 the unified 300s would have missed).
+- Pass-20: `known_bad_git_no_override` now consults `mcp_agent_mail_core::git_binary::match_known_bad` instead of a hardcoded `["2.51.0"]` list. Operators extending `AM_EXTRA_KNOWN_BAD_GIT_JSON` automatically get the new entries flagged by `--only`; `KnownBadEntry.code` (e.g. `GIT_2_51_0_INDEX_RACE`) surfaces in finding evidence.
+
+**Chokepoint sovereignty** (pass-21, pass-22)
+
+- Pass-21 lifted `runs::ensure_gitignore_entry` into a proper FM-level fixer (`missing_gitignore_entry`) routed through `Op::AppendFile`, so the operation is verbatim-backed-up, hash-witnessed in `actions.jsonl`, and reversible via `am doctor undo`.
+- Pass-22 removed the side-effect call to `runs::ensure_gitignore_entry` from `handle_fix_only`. Unrelated `--only` invocations no longer silently mutate `.gitignore` (the regression test `dispatch_only_unrelated_fm_does_not_touch_gitignore` pins this).
+
+**Test infrastructure**
+
+- Pass-26: `dispatch_only_handles_every_registered_id` + `detect_only_handles_every_registered_id` iterate `fixers::registry()` and pin the invariant that every registered FM has matching dispatcher arms. Catches future "added to registry but not dispatched" regressions.
+- Pass-27: `doctor_handbook_contract.rs` (4 tests) pins the handbook's verb count, required topics (`mutate()`, `actions.jsonl`, `.doctor/runs/`, etc.), and per-FM workflow recipe.
+- Pass-29: `doctor_cli_smoke.rs` (5 tests) invokes the `am` binary via `std::process::Command` and verifies the JSON envelopes agents actually see (`fixers --format json`, `fix --list --json`, `explain` registry fallback, exit-code 64 for unknown ids, `fixers --format table` human readability).
+- Pass-31 + pass-32: `doctor_fm_round_trip.rs` (5 tests) asserts the full `plant → fix → undo → byte-identical` lifecycle for each distinct auto-fixable Op pattern (Rename, Chmod, AppendFile, WriteFile, SymlinkAtomic) at the FM-dispatch boundary.
+
+Test totals across the doctor surface (per-package, hermetic):
+
+| Suite | Tests |
+|-------|-------|
+| `doctor_fix_only_integration` | 16 |
+| `doctor_capabilities_contract` | 9 |
+| `doctor_cli_smoke` | 5-8 |
+| `doctor_fm_round_trip` | 5 |
+| `doctor_handbook_contract` | 4 |
+| `doctor_explain_fallback` | 3 |
+| `doctor_selftest_integration` | 1 |
+| Module tests across `fixers/*` | 60+ |
+
+**AGENTS.md refresh** (pass-30)
+
+`AGENTS.md`'s `am doctor` section grew from an 8-verb table to a 15-verb table, plus a new per-FM registry table (all 9 entries) and a new per-FM workflow recipe walking through enumerate → list-all → list-one → dry-run → fix → undo.
+
 ### Bug fixes
 
 - **`am doctor` reports listener CPU samples for verified Agent Mail servers
