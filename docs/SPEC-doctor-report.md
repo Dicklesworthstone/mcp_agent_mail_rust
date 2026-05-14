@@ -28,7 +28,7 @@ discover the doctor's surface programmatically.
 {
   "schema_version": "1.0",          // bumps with major contract changes
   "tool": "am",                      // always "am" for this binary
-  "tool_version": "0.2.52",          // CARGO_PKG_VERSION at build time
+  "tool_version": "0.2.53",          // CARGO_PKG_VERSION at build time
   "doctor_version": "1.0.0",         // implementation version (minor for new fixers)
   "doctor_contract_version": "1.0",  // agent-facing contract (the pinned one)
   "platform": { "os": "linux", "arch": "x86_64" },
@@ -135,7 +135,7 @@ Written to `<repo>/.doctor/runs/<ISO8601>__<run-id>/report.json` by every
 {
   "schema_version": "1.0",
   "tool": "am",
-  "tool_version": "0.2.52",
+  "tool_version": "0.2.53",
   "doctor_version": "1.0.0",
   "run_id": "2026-05-10T12-34-56Z__a3f9b2",
   "run_dir": ".doctor/runs/2026-05-10T12-34-56Z__a3f9b2",
@@ -275,7 +275,7 @@ isolated tempdir. Reports JSON envelope:
   "doctor_version": "1.0.0",
   "doctor_contract_version": "1.0",
   "tool": "am",
-  "tool_version": "0.2.52",
+  "tool_version": "0.2.53",
   "ok": true,
   "checks": [
     {"name": "write_file_mutation",            "ok": true},

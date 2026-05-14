@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*"]
 
 [workspace.package]
-version = "0.2.52"
+version = "0.2.53"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -51,7 +51,7 @@ ftui-widgets = { version = "0.4.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.4.0"
 ftui-harness = "0.4.0"
 ftui-render = "0.4.0"
-beads_rust = "0.2.7"
+beads_rust = "0.2.8"
 toon = { version = "0.2.3", package = "tru" }
 
 # Internal workspace crates
@@ -98,7 +98,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
-jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs"] }
 fs2 = "0.4"
 walkdir = "2"
 tantivy = "0.26.1"
@@ -124,7 +124,6 @@ tokenizers = "0.23.1"
 rayon = "1"
 dirs = "6"
 smallvec = { version = "1", features = ["serde"] }
-atty = "0.2.14"
 
 # WASM dependencies
 serde-wasm-bindgen = "0.6"
@@ -217,3 +216,5 @@ ftui-style = { path = "../frankentui/crates/ftui-style" }
 ftui-text = { path = "../frankentui/crates/ftui-text" }
 ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
+tru = { path = "../toon_rust" }
+rich_rust = { path = "../rich_rust" }

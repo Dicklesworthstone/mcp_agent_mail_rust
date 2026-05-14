@@ -31,6 +31,9 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -48,13 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Weekly audit lane stays green by pinning the known current baseline:
-          # - RUSTSEC-2023-0071: rsa timing advisory, no published fix yet
-          # - RUSTSEC-2026-0098 / 0099: rustls-webpki lockfile pin pending dependency refresh
-          cargo audit \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099
+          cargo audit
 
       - name: Enforce cargo-deny async/runtime policy
         shell: bash

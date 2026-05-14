@@ -263,19 +263,45 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 `am doctor` diagnoses and (with `--fix`) repairs Agent Mail's mailbox state. The world-class surface (added in commit `641990d8`, hardened in pass-2) provides reversible, hash-witnessed, agent-ergonomic remediation with strict scope isolation.
 
-### Verbs
+### Verbs (15 total — pass-30 baseline)
 
 | Verb | Mutates? | Default exit |
 |------|----------|--------------|
 | `am doctor` (or `check`) | No | 0 healthy / 1 findings |
 | `am doctor --fix` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
 | `am doctor --dry-run --fix` | No | 0 |
+| `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
+| `am doctor fix --only <fm-id> --list` | No | 0 |
+| `am doctor fix --list` | No | 0 |
 | `am doctor undo <run-id>` | Yes (restore-only) | 0 / 3 |
 | `am doctor capabilities --json` | No | 0 |
+| `am doctor fixers` | No | 0 |
+| `am doctor explain <id>` | No | 0 / 64 |
 | `am doctor robot-docs` | No | 0 |
 | `am doctor health` | No | 0 / 1 |
 | `am doctor ls` | No | 0 |
-| `am doctor repair`, `reconstruct`, `fix`, `archive-scan`, `archive-normalize`, `backups`, `restore`, `fix-orphan-refs`, `pack-archive` | (legacy verbs preserved) | varies |
+| `am doctor triage` | No | 0 |
+| `am doctor selftest` | No | 0 / 1 |
+
+Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
+
+### Per-FM registry (9 FMs as of pass-28)
+
+`am doctor fixers --format json` enumerates the registry. Current entries:
+
+| FM id | Severity | Op | Subsystem |
+|-------|----------|----|-----------|
+| `fm-archive-state-files-missing-doctor-gitignore-entry` | P2 | `Op::AppendFile` | archive_state_files |
+| `fm-archive-state-files-stale-archive-lock-from-dead-pid` | P1 | `Op::Rename` | archive_state_files |
+| `fm-archive-state-files-stale-head-or-ref-update-lock` | P2 | `Op::Rename` | archive_state_files |
+| `fm-db-state-files-world-readable-storage-db` | P0 | `Op::Chmod` | db_state_files |
+| `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
+| `fm-environment_toolchain-known-bad-git-no-override` | P0 | detect-only | environment_toolchain |
+| `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
+| `fm-runtime-processes-stale-listener-pid-hint` | P1 | `Op::Rename` | runtime_processes |
+| `fm-secrets_env_state-bak-tokens-readable` | P1 | `Op::Chmod` | secrets_env_state |
+
+Op coverage at FM level: **6 of 7** canonical Ops (Rename×3, Chmod×2, WriteFile×1, AppendFile×1, SymlinkAtomic×1, detect-only×1). `Op::DbExec`/`Op::DbMigrate` remain stubbed in the chokepoint pending `DbConn` plumbing.
 
 ### When to run `am doctor`
 
@@ -344,9 +370,38 @@ am doctor undo 2026-05-09T16-30-15Z__abc123     # specific run
 
 # Discover the contract programmatically
 am doctor capabilities --json | jq '.detectors | length'
-am doctor capabilities --json | jq '.fixers | map(.id)'
+am doctor capabilities --json | jq '.fm_fixers | map(.id)'      # per-FM registry
 am doctor capabilities --json | jq '.exit_codes | keys'
 ```
+
+### Per-FM workflow (recommended for agents — passes 14-28)
+
+The legacy `am doctor --fix` runs every detector + fixer in a single pass; the per-FM verbs let an agent target one failure mode at a time with full chokepoint guarantees.
+
+```bash
+# Enumerate the registry
+am doctor fixers --format json | jq '.fixers[] | {id, severity, op_pattern}'
+
+# Single round-trip: every registered FM's detector, aggregated
+am doctor fix --list --json | jq '{total: .total_findings, per_fm: .per_fm, skipped: .skipped}'
+
+# Cheap pre-flight for one FM (no chokepoint, no run-dir)
+am doctor fix --only fm-archive-state-files-stale-archive-lock-from-dead-pid --list --json
+
+# Rehearse through the chokepoint (run-dir + actions.jsonl recorded; no exec)
+am doctor fix --only <fm-id> --dry-run
+
+# Apply one FM through the chokepoint (full backup + hash-witnessed + reversible)
+am doctor fix --only <fm-id> --yes
+
+# Drill into a finding or the registry's static contract for one FM
+am doctor explain <fm-id-or-finding-id>        # falls back to registry if no recent run
+
+# Verify the chokepoint primitives on this machine
+am doctor selftest --format json
+```
+
+The `--list` (without `--only`) returns `{mode: "list_all", per_fm: [...], skipped: [...]}`. The `skipped[]` array carries FMs whose detector requires inputs not currently available (e.g., `known-bad-git` skipped when `git` isn't on PATH, `wrong-mcp-url` skipped when no canonical URL can be resolved) — agents decide whether the missing input is recoverable.
 
 ### Pre-commit hook integration (recommended; not auto-installed)
 

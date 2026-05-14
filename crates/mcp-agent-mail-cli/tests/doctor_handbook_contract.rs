@@ -65,13 +65,17 @@ fn handbook_covers_load_bearing_topics() {
 
 #[test]
 fn handbook_verb_count_matches_table_header() {
-    // The verb table header pins the count. If we add another verb,
-    // the header must be updated too — otherwise operators see "14
-    // Verbs" listing 15 rows, which is confusing.
+    // The verb table header pins the count. If a future pass adds or
+    // removes a verb, the header must be updated too — otherwise
+    // operators see "## The N Verbs" listing N+1 rows, which is
+    // confusing. Pass-27 set "14"; a parallel agent recounted to "15"
+    // (the original undercount included --dry-run --fix as a
+    // sub-form rather than a separate row). Pass-30 realigns the test
+    // to the canonical 15 count and pins it.
     let text = handbook();
     assert!(
-        text.contains("## The 14 Verbs"),
-        "handbook header must say `## The 14 Verbs` (pass-27 contract)"
+        text.contains("## The 15 Verbs"),
+        "handbook header must say `## The 15 Verbs` (pass-30 contract)"
     );
 }
 

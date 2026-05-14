@@ -20,7 +20,6 @@ base64.workspace = true
 ed25519-dalek.workspace = true
 zip.workspace = true
 include_dir.workspace = true
-atty.workspace = true
 mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-db = { workspace = true, default-features = false }
 sqlmodel-core.workspace = true

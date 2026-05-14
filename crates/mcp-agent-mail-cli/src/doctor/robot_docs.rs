@@ -12,7 +12,7 @@
 
 /// The full paste-ready handbook. Includes:
 /// - One-paragraph orientation
-/// - The 14-verb table (legacy + pass-14..26 additions)
+/// - The 15-verb table (legacy + pass-14..26 additions)
 /// - The 11-code exit table
 /// - 7 most common workflows (5 original + per-FM verbs + list-all)
 /// - Pointers to capabilities + JSON shapes
@@ -37,7 +37,7 @@ mutation is **backed up first**, **hash-witnessed**, and **reversible via
 `am doctor undo <run-id>`**. The doctor never deletes user files; it
 quarantines via rename.
 
-## The 14 Verbs
+## The 15 Verbs
 
 | Verb | Purpose | Mutates? | Default exit |
 |------|---------|----------|--------------|
@@ -295,13 +295,16 @@ mod tests {
             "am doctor",
             "--fix",
             "--dry-run",
+            "--only",
             "undo",
             "capabilities",
+            "fixers",
+            "explain",
             "robot-docs",
             "health",
             "ls",
-            "diff",
-            "gc",
+            "triage",
+            "selftest",
         ] {
             assert!(h.contains(verb), "handbook missing verb: {}", verb);
         }

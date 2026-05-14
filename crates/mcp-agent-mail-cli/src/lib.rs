@@ -6992,6 +6992,15 @@ fn storage_root_is_effectively_explicit(storage_root: &Path) -> bool {
     !mcp_agent_mail_core::config::is_default_storage_root(storage_root)
 }
 
+fn should_lock_mailbox_storage_root(
+    sqlite_path: &Path,
+    storage_root: &Path,
+    storage_root_override: Option<&Path>,
+) -> bool {
+    mailbox_activity_storage_root_is_explicit(storage_root, storage_root_override)
+        || sqlite_path.starts_with(storage_root)
+}
+
 fn acquire_cli_mailbox_read_locks_for_paths(
     sqlite_path: &Path,
     storage_root: &Path,
@@ -7016,7 +7025,23 @@ fn acquire_cli_mailbox_read_locks(
 ) -> CliResult<CliMailboxReadLocks> {
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
     let sqlite_path = resolve_mailbox_activity_sqlite_path(database_url)?;
-    acquire_cli_mailbox_read_locks_for_paths(&sqlite_path, &storage_root)
+    let storage_root_lock =
+        if should_lock_mailbox_storage_root(&sqlite_path, &storage_root, storage_root_override) {
+            acquire_cli_mailbox_activity_lock_for_storage_root(
+                &storage_root,
+                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+            )?
+        } else {
+            None
+        };
+    let sqlite_lock = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+        &sqlite_path,
+        mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+    )?;
+    Ok(CliMailboxReadLocks {
+        _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    })
 }
 
 fn acquire_cli_mailbox_mutation_locks(
@@ -7024,8 +7049,13 @@ fn acquire_cli_mailbox_mutation_locks(
     storage_root_override: Option<&Path>,
 ) -> CliResult<CliMailboxMutationLocks> {
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    let sqlite_path = resolve_mailbox_activity_sqlite_path(database_url)?;
     let storage_root_lock =
-        acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)?;
+        if should_lock_mailbox_storage_root(&sqlite_path, &storage_root, storage_root_override) {
+            acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)?
+        } else {
+            None
+        };
     let sqlite_lock = acquire_doctor_mailbox_activity_lock_for_database_url(database_url, false)?;
     Ok(CliMailboxMutationLocks {
         _storage_root_lock: storage_root_lock,
@@ -7681,12 +7711,15 @@ fn open_sqlite_with_fallback_internal(
     storage_root_override: Option<&Path>,
     allow_recovery: bool,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    let open_conn = |candidate: &str| {
-        if candidate == ":memory:" {
-            mcp_agent_mail_db::DbConn::open_memory().map_err(Box::new)
+    let open_conn = |candidate: &str| -> Result<mcp_agent_mail_db::DbConn, String> {
+        let conn = if candidate == ":memory:" {
+            mcp_agent_mail_db::DbConn::open_memory().map_err(|e| e.to_string())?
         } else {
-            mcp_agent_mail_db::DbConn::open_file(candidate).map_err(Box::new)
-        }
+            mcp_agent_mail_db::DbConn::open_file(candidate).map_err(|e| e.to_string())?
+        };
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL)
+            .map_err(|e| e.to_string())?;
+        Ok(conn)
     };
 
     retry_sync_sqlite_lock(|| match open_conn(path) {
@@ -44341,6 +44374,8 @@ startup_timeout_sec = 42
                     db_path.display()
                 )
             });
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL)
+            .expect("apply fixture connection pragmas");
         // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
         // any operation panics before COMMIT.
         conn.execute_raw("BEGIN IMMEDIATE").unwrap_or_else(|e| {
@@ -44351,6 +44386,17 @@ startup_timeout_sec = 42
         });
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
+        for trigger in [
+            "trg_agents_cascade_message_recipients",
+            "trg_agents_cascade_file_reservations",
+            "trg_agents_cascade_agent_links",
+            "trg_agents_cascade_inbox_stats",
+            "trg_messages_cascade_recipients",
+            "trg_file_reservations_cascade_releases",
+        ] {
+            conn.execute_raw(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+                .unwrap_or_else(|e| panic!("drop fixture trigger {trigger}: {e}"));
+        }
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
@@ -45608,12 +45654,25 @@ startup_timeout_sec = 42
             .unwrap_or_else(|e| {
                 panic!("seed_mail_status_db: open db at {}: {e}", db_path.display())
             });
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_CONN_SETTINGS_SQL)
+            .expect("apply fixture connection pragmas");
         // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
         // any operation panics before COMMIT.
         conn.execute_raw("BEGIN IMMEDIATE")
             .unwrap_or_else(|e| panic!("seed_mail_status_db: BEGIN at {}: {e}", db_path.display()));
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
+        for trigger in [
+            "trg_agents_cascade_message_recipients",
+            "trg_agents_cascade_file_reservations",
+            "trg_agents_cascade_agent_links",
+            "trg_agents_cascade_inbox_stats",
+            "trg_messages_cascade_recipients",
+            "trg_file_reservations_cascade_releases",
+        ] {
+            conn.execute_raw(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+                .unwrap_or_else(|e| panic!("drop fixture trigger {trigger}: {e}"));
+        }
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();
         let identity = resolve_project_identity(project_path);
@@ -48567,22 +48626,28 @@ startup_timeout_sec = 42
             "test setup requires a slug collision"
         );
 
-        block_on_async(|cx| async move {
-            let existing = mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &project_a_key)
-                .await
-                .into_result()
-                .expect("ensure project A");
-            assert_eq!(existing.human_key, project_a_key);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || {
+                block_on_async(|cx| async move {
+                    let existing =
+                        mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &project_a_key)
+                            .await
+                            .into_result()
+                            .expect("ensure project A");
+                    assert_eq!(existing.human_key, project_a_key);
 
-            let err = get_project_record(&cx, &pool, &project_b_key)
-                .await
-                .expect_err("colliding absolute path should not resolve to project A");
-            let err_msg = format!("{err}");
-            assert!(
-                err_msg.contains("not found"),
-                "expected not-found error for colliding path lookup, got: {err_msg}"
-            );
-        });
+                    let err = get_project_record(&cx, &pool, &project_b_key)
+                        .await
+                        .expect_err("colliding absolute path should not resolve to project A");
+                    let err_msg = format!("{err}");
+                    assert!(
+                        err_msg.contains("not found"),
+                        "expected not-found error for colliding path lookup, got: {err_msg}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
@@ -48612,22 +48677,30 @@ startup_timeout_sec = 42
             "test setup requires distinct path identities"
         );
 
-        block_on_async(|cx| async move {
-            let existing = mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &project_key)
-                .await
-                .into_result()
-                .expect("ensure project");
-            assert_eq!(existing.human_key, project_key);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || {
+                block_on_async(|cx| async move {
+                    let existing =
+                        mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &project_key)
+                            .await
+                            .into_result()
+                            .expect("ensure project");
+                    assert_eq!(existing.human_key, project_key);
 
-            let err = get_project_record(&cx, &pool, &lookup_key)
-                .await
-                .expect_err("case-variant absolute path should not resolve to existing project");
-            let err_msg = format!("{err}");
-            assert!(
-                err_msg.contains("not found"),
-                "expected not-found error for case-variant path lookup, got: {err_msg}"
-            );
-        });
+                    let err = get_project_record(&cx, &pool, &lookup_key)
+                        .await
+                        .expect_err(
+                            "case-variant absolute path should not resolve to existing project",
+                        );
+                    let err_msg = format!("{err}");
+                    assert!(
+                        err_msg.contains("not found"),
+                        "expected not-found error for case-variant path lookup, got: {err_msg}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
@@ -48734,6 +48807,18 @@ startup_timeout_sec = 42
             .to_string()
     }
 
+    fn with_isolated_doctor_runtime_for_test<T>(storage_root: &str, f: impl FnOnce() -> T) -> T {
+        let http_port = isolated_doctor_http_port_for_test();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", &http_port),
+            ],
+            f,
+        )
+    }
+
     #[test]
     fn doctor_check_reports_header_only_wal_without_quarantining_sidecars() {
         let _guard = stdio_capture_lock()
@@ -48742,31 +48827,28 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root_s = dir.path().display().to_string();
 
-        let parsed = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &storage_root_s)],
-            || {
-                let db_path = dir.path().join("doctor-check-header-only-wal.sqlite3");
-                seed_project_only_db(&db_path, "doctor-check-header-only-wal", "/doctor-check");
-                mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
-                    .expect("checkpoint seeded db before adding header-only wal");
+        let parsed = with_isolated_doctor_runtime_for_test(&storage_root_s, || {
+            let db_path = dir.path().join("doctor-check-header-only-wal.sqlite3");
+            seed_project_only_db(&db_path, "doctor-check-header-only-wal", "/doctor-check");
+            mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+                .expect("checkpoint seeded db before adding header-only wal");
 
-                let wal_path = sqlite_sidecar_path(&db_path, "-wal");
-                let shm_path = sqlite_sidecar_path(&db_path, "-shm");
-                std::fs::write(
-                    &wal_path,
-                    vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
-                )
-                .expect("write header-only wal");
-                std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+            let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+            let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+            std::fs::write(
+                &wal_path,
+                vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+            )
+            .expect("write header-only wal");
+            std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
 
-                let db_url = format!("sqlite:///{}", db_path.display());
-                let parsed = run_doctor_check_json(&db_url, dir.path());
+            let db_url = format!("sqlite:///{}", db_path.display());
+            let parsed = run_doctor_check_json(&db_url, dir.path());
 
-                assert!(wal_path.exists(), "doctor check must not quarantine WAL");
-                assert!(shm_path.exists(), "doctor check must not quarantine SHM");
-                parsed
-            },
-        );
+            assert!(wal_path.exists(), "doctor check must not quarantine WAL");
+            assert!(shm_path.exists(), "doctor check must not quarantine SHM");
+            parsed
+        });
 
         assert_eq!(
             parsed["healthy"],
@@ -48774,6 +48856,11 @@ startup_timeout_sec = 42
             "header-only WAL should make doctor check unhealthy"
         );
         let summary = parsed["summary"].as_object().expect("summary object");
+        assert_eq!(
+            summary["primary_issue"]["check"].as_str(),
+            Some("db_file_sanity"),
+            "header-only WAL should remain the primary doctor file-sanity issue"
+        );
         let strategy = summary
             .get("database_fix_strategy")
             .expect("database fix strategy summary");
@@ -48791,56 +48878,43 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let __storage_root_str = dir.path().display().to_string();
-        let parsed = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &__storage_root_str)],
-            || {
-                let db_path = dir.path().join("healthy.sqlite3");
-                let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = dir.path().display().to_string();
+        let parsed = with_isolated_doctor_runtime_for_test(&storage_root_str, || {
+            let db_path = dir.path().join("healthy.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
 
-                // Fully migrate and seed with a project + agent
-                handle_migrate_with_database_url(&db_url).expect("migrate");
-                let conn = open_db_sync_with_database_url(&db_url).expect("open");
-                conn.query_sync(
+            // Fully migrate and seed with a project + agent
+            handle_migrate_with_database_url(&db_url).expect("migrate");
+            let conn = open_db_sync_with_database_url(&db_url).expect("open");
+            conn.query_sync(
                     "INSERT INTO projects (slug, human_key, created_at) VALUES ('test-proj', '/tmp/test-proj', 0)",
                     &[],
                 )
                 .expect("insert project");
-                conn.query_sync(
+            conn.query_sync(
                     "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) \
                      VALUES (1, 'RedFox', 'test', 'test', 0, 0)",
                     &[],
                 )
                 .expect("insert agent");
-                let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
-                drop(conn);
+            let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
+            drop(conn);
 
-                // Manually remove sidecars so this test exercises the clean-file
-                // doctor path instead of the live-sidecar compatibility probe.
-                let _ = std::fs::remove_file(db_path.with_extension("sqlite3-wal"));
-                let _ = std::fs::remove_file(db_path.with_extension("sqlite3-shm"));
+            // Manually remove sidecars so this test exercises the clean-file
+            // doctor path instead of the live-sidecar compatibility probe.
+            let _ = std::fs::remove_file(db_path.with_extension("sqlite3-wal"));
+            let _ = std::fs::remove_file(db_path.with_extension("sqlite3-shm"));
 
-                let mut wal_os = db_path.as_os_str().to_os_string();
-                wal_os.push("-wal");
-                let _ = std::fs::remove_file(std::path::PathBuf::from(wal_os));
+            let mut wal_os = db_path.as_os_str().to_os_string();
+            wal_os.push("-wal");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(wal_os));
 
-                let mut shm_os = db_path.as_os_str().to_os_string();
-                shm_os.push("-shm");
-                let _ = std::fs::remove_file(std::path::PathBuf::from(&shm_os));
+            let mut shm_os = db_path.as_os_str().to_os_string();
+            shm_os.push("-shm");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(&shm_os));
 
-                let parsed = run_doctor_check_json(&db_url, dir.path());
-
-                if parsed["healthy"] != true {
-                    println!(
-                        "NOT HEALTHY! parsed: {}",
-                        serde_json::to_string_pretty(&parsed).unwrap()
-                    );
-                    // don't panic so we can see the full output
-                }
-
-                parsed
-            },
-        );
+            run_doctor_check_json(&db_url, dir.path())
+        });
 
         let checks = parsed["checks"].as_array().expect("checks array");
 
@@ -48962,33 +49036,30 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let __storage_root_str = dir.path().display().to_string();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &__storage_root_str)],
-            || {
-                let db_path = dir.path().join("storage.sqlite3");
-                let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = dir.path().display().to_string();
+        with_isolated_doctor_runtime_for_test(&storage_root_str, || {
+            let db_path = dir.path().join("storage.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
 
-                handle_migrate_with_database_url(&db_url).expect("migrate");
-                let parsed = run_doctor_check_json(&db_url, dir.path());
-                let checks = parsed["checks"].as_array().expect("checks array");
+            handle_migrate_with_database_url(&db_url).expect("migrate");
+            let parsed = run_doctor_check_json(&db_url, dir.path());
+            let checks = parsed["checks"].as_array().expect("checks array");
 
-                let expected = [
-                    "storage_root",
-                    "storage_root_writable",
-                    "storage_root_disk_space",
-                    "storage_root_git_repo",
-                    "storage_root_git_index_lock",
-                    "guard_hooks",
-                ];
-                for check in expected {
-                    assert!(
-                        checks.iter().any(|c| c["check"].as_str() == Some(check)),
-                        "missing check '{check}' in doctor output"
-                    );
-                }
-            },
-        );
+            let expected = [
+                "storage_root",
+                "storage_root_writable",
+                "storage_root_disk_space",
+                "storage_root_git_repo",
+                "storage_root_git_index_lock",
+                "guard_hooks",
+            ];
+            for check in expected {
+                assert!(
+                    checks.iter().any(|c| c["check"].as_str() == Some(check)),
+                    "missing check '{check}' in doctor output"
+                );
+            }
+        });
     }
 
     #[test]
@@ -48997,64 +49068,61 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let __storage_root_str = dir.path().display().to_string();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &__storage_root_str)],
-            || {
-                let git_init = std::process::Command::new("git")
-                    .args(["init", "-q", "-b", "main"])
-                    .current_dir(dir.path())
-                    .status()
-                    .expect("git init");
-                assert!(git_init.success(), "git init should succeed");
+        let storage_root_str = dir.path().display().to_string();
+        with_isolated_doctor_runtime_for_test(&storage_root_str, || {
+            let git_init = std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init");
+            assert!(git_init.success(), "git init should succeed");
 
-                let db_path = dir.path().join("storage.sqlite3");
-                let db_url = format!("sqlite:///{}", db_path.display());
+            let db_path = dir.path().join("storage.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
 
-                handle_migrate_with_database_url(&db_url).expect("migrate");
-                let parsed = run_doctor_check_json(&db_url, dir.path());
-                let checks = parsed["checks"].as_array().expect("checks array");
+            handle_migrate_with_database_url(&db_url).expect("migrate");
+            let parsed = run_doctor_check_json(&db_url, dir.path());
+            let checks = parsed["checks"].as_array().expect("checks array");
 
-                let storage_git_repo = checks
-                    .iter()
-                    .find(|c| c["check"].as_str() == Some("storage_root_git_repo"))
-                    .expect("storage_root_git_repo check");
-                assert_eq!(storage_git_repo["status"], "ok");
+            let storage_git_repo = checks
+                .iter()
+                .find(|c| c["check"].as_str() == Some("storage_root_git_repo"))
+                .expect("storage_root_git_repo check");
+            assert_eq!(storage_git_repo["status"], "ok");
 
-                let storage_git_lock = checks
-                    .iter()
-                    .find(|c| c["check"].as_str() == Some("storage_root_git_index_lock"))
-                    .expect("storage_root_git_index_lock check");
-                assert_eq!(storage_git_lock["status"], "ok");
+            let storage_git_lock = checks
+                .iter()
+                .find(|c| c["check"].as_str() == Some("storage_root_git_index_lock"))
+                .expect("storage_root_git_index_lock check");
+            assert_eq!(storage_git_lock["status"], "ok");
 
-                let schema_version = checks
-                    .iter()
-                    .find(|c| c["check"].as_str() == Some("schema_version"))
-                    .expect("schema_version check");
-                assert_eq!(schema_version["status"], "ok");
-                assert_eq!(
-                    schema_version["detail"],
-                    format!(
-                        "user_version = {}",
-                        mcp_agent_mail_db::schema::SCHEMA_VERSION
-                    )
-                );
+            let schema_version = checks
+                .iter()
+                .find(|c| c["check"].as_str() == Some("schema_version"))
+                .expect("schema_version check");
+            assert_eq!(schema_version["status"], "ok");
+            assert_eq!(
+                schema_version["detail"],
+                format!(
+                    "user_version = {}",
+                    mcp_agent_mail_db::schema::SCHEMA_VERSION
+                )
+            );
 
-                let fts5 = checks
-                    .iter()
-                    .find(|c| c["check"].as_str() == Some("fts5"))
-                    .expect("fts5 check");
-                assert_eq!(fts5["status"], "ok");
-                assert!(
-                    fts5["detail"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("Search V3/Tantivy"),
-                    "unexpected fts5 detail: {}",
-                    fts5["detail"]
-                );
-            },
-        );
+            let fts5 = checks
+                .iter()
+                .find(|c| c["check"].as_str() == Some("fts5"))
+                .expect("fts5 check");
+            assert_eq!(fts5["status"], "ok");
+            assert!(
+                fts5["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Search V3/Tantivy"),
+                "unexpected fts5 detail: {}",
+                fts5["detail"]
+            );
+        });
     }
 
     #[test]
@@ -49100,54 +49168,51 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let __storage_root_str = dir.path().display().to_string();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &__storage_root_str)],
-            || {
-                let db_path = dir.path().join("summary.sqlite3");
-                let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = dir.path().display().to_string();
+        with_isolated_doctor_runtime_for_test(&storage_root_str, || {
+            let db_path = dir.path().join("summary.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
 
-                handle_migrate_with_database_url(&db_url).expect("migrate");
+            handle_migrate_with_database_url(&db_url).expect("migrate");
 
-                let project_dir = dir.path().join("projects").join("tmp-summary-project");
-                let canonical_dir = project_dir.join("messages").join("2026").join("03");
-                std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
-                std::fs::write(
+            let project_dir = dir.path().join("projects").join("tmp-summary-project");
+            let canonical_dir = project_dir.join("messages").join("2026").join("03");
+            std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+            std::fs::write(
                     canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
                     "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
                 )
                 .expect("write canonical message");
-                std::fs::write(
+            std::fs::write(
                     canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
                     "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
                 )
                 .expect("write duplicate canonical message");
 
-                let parsed = run_doctor_check_json(&db_url, dir.path());
-                let summary = parsed["summary"].as_object().expect("summary object");
-                assert_eq!(
-                    summary
-                        .get("overall_status")
-                        .and_then(|value| value.as_str()),
-                    Some("fail")
-                );
-                assert_eq!(
-                    summary["primary_issue"]["check"].as_str(),
-                    Some("archive_db_parity")
-                );
-                assert_eq!(
-                    summary["archive_hygiene"]["check"].as_str(),
-                    Some("archive_hygiene")
-                );
-                let next_action = summary["primary_issue"]["next_action"]
-                    .as_str()
-                    .unwrap_or_default();
-                assert!(
-                    next_action.contains("am doctor reconstruct --dry-run"),
-                    "expected reconstruct guidance, got: {next_action}"
-                );
-            },
-        );
+            let parsed = run_doctor_check_json(&db_url, dir.path());
+            let summary = parsed["summary"].as_object().expect("summary object");
+            assert_eq!(
+                summary
+                    .get("overall_status")
+                    .and_then(|value| value.as_str()),
+                Some("fail")
+            );
+            assert_eq!(
+                summary["primary_issue"]["check"].as_str(),
+                Some("archive_db_parity")
+            );
+            assert_eq!(
+                summary["archive_hygiene"]["check"].as_str(),
+                Some("archive_hygiene")
+            );
+            let next_action = summary["primary_issue"]["next_action"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                next_action.contains("am doctor reconstruct --dry-run"),
+                "expected reconstruct guidance, got: {next_action}"
+            );
+        });
     }
 
     #[test]
@@ -49156,63 +49221,60 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let __storage_root_str = dir.path().display().to_string();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &__storage_root_str)],
-            || {
-                let db_path = dir.path().join("summary_table.sqlite3");
-                let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = dir.path().display().to_string();
+        with_isolated_doctor_runtime_for_test(&storage_root_str, || {
+            let db_path = dir.path().join("summary_table.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
 
-                handle_migrate_with_database_url(&db_url).expect("migrate");
+            handle_migrate_with_database_url(&db_url).expect("migrate");
 
-                let project_dir = dir.path().join("projects").join("tmp-summary-project");
-                let canonical_dir = project_dir.join("messages").join("2026").join("03");
-                std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
-                std::fs::write(
+            let project_dir = dir.path().join("projects").join("tmp-summary-project");
+            let canonical_dir = project_dir.join("messages").join("2026").join("03");
+            std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+            std::fs::write(
                     canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
                     "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
                 )
                 .expect("write canonical message");
-                std::fs::write(
+            std::fs::write(
                     canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
                     "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
                 )
                 .expect("write duplicate canonical message");
 
-                let capture = ftui_runtime::StdioCapture::install().expect("install capture");
-                let result = handle_doctor_check_with(
-                    &db_url,
-                    dir.path(),
-                    None,
-                    false,
-                    Some(output::CliOutputFormat::Table),
-                    false,
-                );
-                let output = capture.drain_to_string();
-                assert!(
-                    matches!(result, Err(CliError::ExitCode(1))),
-                    "doctor check should exit non-zero for parity failure: {result:?}"
-                );
+            let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+            let result = handle_doctor_check_with(
+                &db_url,
+                dir.path(),
+                None,
+                false,
+                Some(output::CliOutputFormat::Table),
+                false,
+            );
+            let output = capture.drain_to_string();
+            assert!(
+                matches!(result, Err(CliError::ExitCode(1))),
+                "doctor check should exit non-zero for parity failure: {result:?}"
+            );
 
-                let primary_pos = output
-                    .find("Primary issue: [FAIL]")
-                    .expect("primary summary");
-                let archive_pos = output
-                    .find("Archive hygiene (cosmetic): [WARN]")
-                    .expect("archive hygiene summary");
-                let check_pos = output
-                    .find("[FAIL] archive_db_parity")
-                    .expect("archive_db_parity check line");
-                assert!(
-                    primary_pos < check_pos,
-                    "primary summary should appear before raw check lines:\n{output}"
-                );
-                assert!(
-                    archive_pos < check_pos,
-                    "archive hygiene summary should appear before raw check lines:\n{output}"
-                );
-            },
-        );
+            let primary_pos = output
+                .find("Primary issue: [FAIL]")
+                .expect("primary summary");
+            let archive_pos = output
+                .find("Archive hygiene (cosmetic): [WARN]")
+                .expect("archive hygiene summary");
+            let check_pos = output
+                .find("[FAIL] archive_db_parity")
+                .expect("archive_db_parity check line");
+            assert!(
+                primary_pos < check_pos,
+                "primary summary should appear before raw check lines:\n{output}"
+            );
+            assert!(
+                archive_pos < check_pos,
+                "archive hygiene summary should appear before raw check lines:\n{output}"
+            );
+        });
     }
 
     #[test]
@@ -49221,30 +49283,27 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let __storage_root_str = dir.path().display().to_string();
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("STORAGE_ROOT", &__storage_root_str)],
-            || {
-                let db_path = dir.path().join("runtime.sqlite3");
-                let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_str = dir.path().display().to_string();
+        with_isolated_doctor_runtime_for_test(&storage_root_str, || {
+            let db_path = dir.path().join("runtime.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
 
-                handle_migrate_with_database_url(&db_url).expect("migrate");
-                let parsed = run_doctor_check_json(&db_url, dir.path());
-                let checks = parsed["checks"].as_array().expect("checks array");
+            handle_migrate_with_database_url(&db_url).expect("migrate");
+            let parsed = run_doctor_check_json(&db_url, dir.path());
+            let checks = parsed["checks"].as_array().expect("checks array");
 
-                for check in [
-                    "server_port",
-                    "server_http_health",
-                    "server_jsonrpc_health",
-                    "server_process_cpu",
-                ] {
-                    assert!(
-                        checks.iter().any(|c| c["check"].as_str() == Some(check)),
-                        "missing runtime check '{check}' in doctor output"
-                    );
-                }
-            },
-        );
+            for check in [
+                "server_port",
+                "server_http_health",
+                "server_jsonrpc_health",
+                "server_process_cpu",
+            ] {
+                assert!(
+                    checks.iter().any(|c| c["check"].as_str() == Some(check)),
+                    "missing runtime check '{check}' in doctor output"
+                );
+            }
+        });
     }
 
     #[cfg(unix)]

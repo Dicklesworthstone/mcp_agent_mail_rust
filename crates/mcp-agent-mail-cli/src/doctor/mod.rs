@@ -1,7 +1,7 @@
 //! World-class `am doctor` surface — the agent-ergonomic upgrade.
 //!
 //! This module adds the missing world-class verbs to `am doctor`:
-//! `capabilities`, `robot-docs`, `undo`, `ls`, `diff`, `gc`, `health`,
+//! `capabilities`, `robot-docs`, `undo`, `ls`, `health`,
 //! plus the per-run `.doctor/runs/<run-id>/` artifact layout, the
 //! `mutate()` chokepoint, and the agent-ergonomic JSON contract.
 //!
