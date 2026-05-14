@@ -33,8 +33,7 @@ const EMPTY_FILE_SHA256: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let h = Sha256::digest(bytes);
-    format!("sha256:{:x}", h)
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 fn sha256_path_bytes(path: &Path) -> String {
@@ -1539,7 +1538,7 @@ mod tests {
         let pending = serde_json::json!({
             "path": "crash.txt",
             "op": "WriteFile",
-            "before_hash": format!("sha256:{:x}", Sha256::digest(b"original\n")),
+            "before_hash": sha256_hex(b"original\n"),
             "after_hash": "",
             "started_at_ns": started_at_ns,
             "finished_at_ns": 0,
@@ -1596,7 +1595,7 @@ mod tests {
         let pending = serde_json::json!({
             "path": "crash.txt",
             "op": "WriteFile",
-            "before_hash": format!("sha256:{:x}", Sha256::digest(b"original\n")),
+            "before_hash": sha256_hex(b"original\n"),
             "after_hash": "",
             "started_at_ns": started_at_ns,
             "finished_at_ns": 0,
