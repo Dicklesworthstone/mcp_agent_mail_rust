@@ -5,11 +5,12 @@ Arguments:
   <CMD>...
 
 Options:
-  -p, --path <PATH>                [default: .]
+  -p, --path <PATH>                  [default: .]
   -a, --agent <AGENT>
-      --ttl-seconds <TTL_SECONDS>  [default: 3600]
+      --ttl-seconds <TTL_SECONDS>    [default: 3600]
       --shared
       --exclusive
       --block-on-conflicts
       --no-block-on-conflicts
-  -h, --help                       Print help
+      --artifact-dir <ARTIFACT_DIR>  Directory where stdout/stderr/command metadata will be preserved
+  -h, --help                         Print help

@@ -2311,7 +2311,7 @@ pub enum DoctorCommand {
         format: Option<output::CliOutputFormat>,
     },
 
-    /// Cheap one-line liveness summary based on `.doctor/latest/report.json`.
+    /// Cheap one-line liveness summary from live mailbox state and latest run history.
     ///
     /// Exit 0 healthy / exit 1 findings. For CI scheduling.
     #[command(name = "health")]
@@ -20726,6 +20726,39 @@ fn doctor_database_fix_strategy(
     database_url: &str,
     storage_root: &Path,
 ) -> CliResult<DoctorDatabaseFixStrategy> {
+    doctor_database_fix_strategy_with_wal_cleanup(database_url, storage_root, true)
+}
+
+fn doctor_database_fix_strategy_read_only(
+    database_url: &str,
+    storage_root: &Path,
+) -> CliResult<DoctorDatabaseFixStrategy> {
+    doctor_database_fix_strategy_with_wal_cleanup(database_url, storage_root, false)
+}
+
+fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
+    let mut wal_os = sqlite_path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal_path = PathBuf::from(wal_os);
+    let meta = std::fs::symlink_metadata(&wal_path).ok()?;
+    if meta.file_type().is_file()
+        && mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len())
+    {
+        Some(format!(
+            "SQLite WAL sidecar is header-only/truncated at {} ({} bytes)",
+            wal_path.display(),
+            meta.len()
+        ))
+    } else {
+        None
+    }
+}
+
+fn doctor_database_fix_strategy_with_wal_cleanup(
+    database_url: &str,
+    storage_root: &Path,
+    cleanup_truncated_wal: bool,
+) -> CliResult<DoctorDatabaseFixStrategy> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -20760,13 +20793,19 @@ fn doctor_database_fix_strategy(
         });
     }
 
-    // Issue #119: Run truncated-WAL self-heal BEFORE any open or integrity
-    // probe.  A header-only or 0-byte WAL sidecar (left by a force-killed
-    // daemon) makes every subsequent SQLite open trip "WAL file too small for
-    // header during rebuild", including the orphan-recipient probe further
-    // down this function.  The cleanup is idempotent and non-destructive: a
-    // <=32-byte WAL contains no committed frames by definition.
-    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved);
+    // Issue #119: cleanup-enabled callers run truncated-WAL self-heal BEFORE
+    // any open or integrity probe.  A header-only or 0-byte WAL sidecar (left
+    // by a force-killed daemon) makes every subsequent SQLite open trip "WAL
+    // file too small for header during rebuild", including the
+    // orphan-recipient probe further down this function.  Read-only callers
+    // report the repair need instead of quarantining sidecars themselves.
+    if cleanup_truncated_wal {
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved);
+    } else if let Some(detail) = doctor_truncated_wal_sidecar_detail(resolved) {
+        return Ok(DoctorDatabaseFixStrategy::Repair(format!(
+            "{detail}; run `am doctor repair` to quarantine it before opening the database"
+        )));
+    }
 
     match sqlite_doctor_file_sanity(&resolved_path) {
         Ok((false, detail, _, _)) => {
@@ -23099,7 +23138,8 @@ fn handle_doctor_check_with(
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
     let fail_count = checks.iter().filter(|c| c["status"] == "fail").count();
     let warn_count = checks.iter().filter(|c| c["status"] == "warn").count();
-    let database_fix_strategy = doctor_database_fix_strategy(database_url, storage_root).ok();
+    let database_fix_strategy =
+        doctor_database_fix_strategy_read_only(database_url, storage_root).ok();
     let summary = build_doctor_check_summary(
         &checks,
         database_fix_strategy.as_ref(),
@@ -38087,6 +38127,48 @@ startup_timeout_sec = 42
             rows[0].get_named::<i64>("count").expect("project count"),
             1,
             "doctor strategy should preserve the healthy main database"
+        );
+    }
+
+    #[test]
+    fn doctor_database_fix_strategy_read_only_reports_header_only_wal_without_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("read-only-header-wal.sqlite3");
+        seed_project_only_db(&db_path, "read-only-header-wal", "/read-only-header-wal");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("checkpoint seeded db before adding header-only wal");
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy =
+            doctor_database_fix_strategy_read_only(&db_url, dir.path()).expect("strategy");
+
+        match strategy {
+            DoctorDatabaseFixStrategy::Repair(detail) => {
+                assert!(
+                    detail.contains("header-only/truncated") && detail.contains("am doctor repair"),
+                    "read-only strategy should report repairable WAL detail, got: {detail}"
+                );
+            }
+            other => {
+                panic!("read-only strategy should not open through header-only WAL: {other:?}")
+            }
+        }
+        assert!(
+            wal_path.exists(),
+            "read-only strategy must not quarantine WAL"
+        );
+        assert!(
+            shm_path.exists(),
+            "read-only strategy must not quarantine SHM"
         );
     }
 

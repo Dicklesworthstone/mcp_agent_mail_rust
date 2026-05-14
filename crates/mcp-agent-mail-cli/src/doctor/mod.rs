@@ -1466,7 +1466,7 @@ fn support_recovery_decision(
     storage_root: &Path,
     redaction: &SupportRedactionContext,
 ) -> serde_json::Value {
-    match crate::doctor_database_fix_strategy(database_url, storage_root) {
+    match crate::doctor_database_fix_strategy_read_only(database_url, storage_root) {
         Ok(crate::DoctorDatabaseFixStrategy::None(detail)) => serde_json::json!({
             "decision": "none",
             "detail": redact_support_text(&detail, redaction),
@@ -1983,8 +1983,29 @@ fn redact_support_text(input: &str, ctx: &SupportRedactionContext) -> String {
 
 /// Print `am doctor health` — one-line liveness summary + exit 0/1.
 ///
-/// Cheap. For CI scheduling. Reads `.doctor/latest/report.json` if present.
+/// Cheap. For CI scheduling. Probes the live mailbox first, then reads
+/// `.doctor/latest/report.json` if present.
 pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    match crate::doctor_database_fix_strategy_read_only(&cfg.database_url, &config.storage_root) {
+        Ok(crate::DoctorDatabaseFixStrategy::None(_)) => {}
+        Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => {
+            println!("fail: live mailbox needs repair: {detail}; next: am doctor repair --dry-run");
+            return Err(CliError::ExitCode(1));
+        }
+        Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => {
+            println!(
+                "fail: live mailbox needs reconstruct: {detail}; next: am doctor reconstruct --dry-run"
+            );
+            return Err(CliError::ExitCode(1));
+        }
+        Err(error) => {
+            println!("fail: live mailbox health probe failed: {error}");
+            return Err(CliError::ExitCode(1));
+        }
+    }
+
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
     let runs_dir = root.join("runs");
@@ -1992,8 +2013,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     if path_absent_without_following_symlink(&latest)
         && path_absent_without_following_symlink(&runs_dir)
     {
-        // No prior run; doctor itself is healthy (no findings to report).
-        println!("ok: no prior runs");
+        println!("ok: live mailbox healthy; no prior runs");
         return Ok(());
     }
 
@@ -2197,6 +2217,105 @@ mod tests {
         assert!(s.contains(".doctor"));
         // Storage root is conditional; XDG paths are conditional. Just assert
         // the per-repo scopes are always present.
+    }
+
+    #[test]
+    fn doctor_health_accepts_healthy_live_mailbox_without_prior_runs() {
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open live db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize schema");
+        drop(conn);
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            || handle_health(target.path()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "healthy live mailbox should pass: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_fails_live_mailbox_before_trusting_latest_report() {
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open incomplete live db");
+        conn.execute_raw("CREATE TABLE placeholder(value TEXT)")
+            .expect("create non-mailbox table");
+        drop(conn);
+
+        let doctor_root = target.path().join(".doctor");
+        let run_id = "2026-05-14T00-00-00Z__healthy";
+        let run_dir = doctor_root.join("runs").join(run_id);
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("report.json"),
+            r#"{"ok":true,"summary":{"total_findings":0},"exit_code":0}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(Path::new("runs").join(run_id), doctor_root.join("latest"))
+            .unwrap();
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            || handle_health(target.path()),
+        );
+
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "live mailbox repair need must beat stale healthy report: {result:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_health_reports_truncated_wal_without_quarantine() {
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open live db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize schema");
+        drop(conn);
+
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = PathBuf::from(wal_os);
+        fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            || handle_health(target.path()),
+        );
+
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "truncated WAL should fail health without cleanup: {result:?}"
+        );
+        assert!(wal_path.exists(), "health must not quarantine WAL sidecars");
     }
 
     #[cfg(unix)]
