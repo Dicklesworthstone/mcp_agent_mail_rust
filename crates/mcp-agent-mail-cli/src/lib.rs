@@ -43708,25 +43708,36 @@ startup_timeout_sec = 42
         let db_path = dir.path().join("doctor_missing_agent_only.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         seed_startup_self_heal_missing_agent_only_recipient(&db_path);
+        let storage_root = dir.path().display().to_string();
+        let http_port = isolated_doctor_http_port_for_test();
 
-        let parsed = run_doctor_check_json(&db_url, dir.path());
-        assert_eq!(
-            parsed["healthy"],
-            serde_json::Value::Bool(true),
-            "preserved missing-agent recipients should not make doctor check unhealthy"
-        );
-        let checks = parsed["checks"].as_array().expect("checks array");
-        let fk_check = checks
-            .iter()
-            .find(|c| c["check"].as_str() == Some("foreign_key_integrity"))
-            .expect("foreign_key_integrity check should be present");
-        assert_eq!(fk_check["status"].as_str(), Some("warn"));
-        let detail = fk_check["detail"].as_str().unwrap_or_default();
-        assert!(
-            detail.contains("Preserved 1 recipient row")
-                && detail.contains("missing agent metadata")
-                && detail.contains("--prune-orphan-recipients"),
-            "expected preserved missing-agent warning, got: {detail}"
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", &storage_root),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", &http_port),
+            ],
+            || {
+                let parsed = run_doctor_check_json(&db_url, dir.path());
+                assert_eq!(
+                    parsed["healthy"],
+                    serde_json::Value::Bool(true),
+                    "preserved missing-agent recipients should not make doctor check unhealthy"
+                );
+                let checks = parsed["checks"].as_array().expect("checks array");
+                let fk_check = checks
+                    .iter()
+                    .find(|c| c["check"].as_str() == Some("foreign_key_integrity"))
+                    .expect("foreign_key_integrity check should be present");
+                assert_eq!(fk_check["status"].as_str(), Some("warn"));
+                let detail = fk_check["detail"].as_str().unwrap_or_default();
+                assert!(
+                    detail.contains("Preserved 1 recipient row")
+                        && detail.contains("missing agent metadata")
+                        && detail.contains("--prune-orphan-recipients"),
+                    "expected preserved missing-agent warning, got: {detail}"
+                );
+            },
         );
     }
 
@@ -48713,6 +48724,16 @@ startup_timeout_sec = 42
         panic!("doctor check produced no matching JSON output after 2 attempts");
     }
 
+    fn isolated_doctor_http_port_for_test() -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("allocate isolated doctor test port");
+        listener
+            .local_addr()
+            .expect("read isolated doctor test port")
+            .port()
+            .to_string()
+    }
+
     #[test]
     fn doctor_check_reports_header_only_wal_without_quarantining_sidecars() {
         let _guard = stdio_capture_lock()
@@ -49047,18 +49068,29 @@ startup_timeout_sec = 42
         let storage_dir = tempfile::tempdir().unwrap();
         let db_path = storage_dir.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = storage_dir.path().display().to_string();
+        let http_port = isolated_doctor_http_port_for_test();
 
-        handle_migrate_with_database_url(&db_url).expect("migrate");
-        let parsed = run_doctor_check_json(&db_url, storage_dir.path());
-        let checks = parsed["checks"].as_array().expect("checks array");
-        let guard_hooks = checks
-            .iter()
-            .find(|c| c["check"].as_str() == Some("guard_hooks"))
-            .expect("guard_hooks check");
-        assert_eq!(guard_hooks["status"], "ok");
-        assert_eq!(
-            guard_hooks["detail"],
-            "Skipped: current directory is not inside a Git repository"
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", &storage_root),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", &http_port),
+            ],
+            || {
+                handle_migrate_with_database_url(&db_url).expect("migrate");
+                let parsed = run_doctor_check_json(&db_url, storage_dir.path());
+                let checks = parsed["checks"].as_array().expect("checks array");
+                let guard_hooks = checks
+                    .iter()
+                    .find(|c| c["check"].as_str() == Some("guard_hooks"))
+                    .expect("guard_hooks check");
+                assert_eq!(guard_hooks["status"], "ok");
+                assert_eq!(
+                    guard_hooks["detail"],
+                    "Skipped: current directory is not inside a Git repository"
+                );
+            },
         );
     }
 
@@ -49226,27 +49258,41 @@ startup_timeout_sec = 42
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-        handle_migrate_with_database_url(&db_url).expect("migrate");
 
         let storage_dir = tempfile::tempdir().unwrap();
+        let db_storage_root = db_dir.path().display().to_string();
+        let http_port = isolated_doctor_http_port_for_test();
         let original_mode = std::fs::metadata(storage_dir.path())
             .expect("metadata")
             .permissions()
             .mode();
-        std::fs::set_permissions(storage_dir.path(), std::fs::Permissions::from_mode(0o555))
-            .expect("set read-only dir");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", &db_storage_root),
+                ("HTTP_HOST", "127.0.0.1"),
+                ("HTTP_PORT", &http_port),
+            ],
+            || {
+                handle_migrate_with_database_url(&db_url).expect("migrate");
+                std::fs::set_permissions(
+                    storage_dir.path(),
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .expect("set read-only dir");
 
-        let parsed = run_doctor_check_json(&db_url, storage_dir.path());
-        let checks = parsed["checks"].as_array().expect("checks array");
-        let writable = checks
-            .iter()
-            .find(|c| c["check"].as_str() == Some("storage_root_writable"))
-            .expect("storage_root_writable check");
-        assert_eq!(writable["status"], "fail");
-        let detail = writable["detail"].as_str().unwrap_or("");
-        assert!(
-            detail.contains("not writable") || detail.contains("permissions"),
-            "unexpected writable failure detail: {detail}"
+                let parsed = run_doctor_check_json(&db_url, storage_dir.path());
+                let checks = parsed["checks"].as_array().expect("checks array");
+                let writable = checks
+                    .iter()
+                    .find(|c| c["check"].as_str() == Some("storage_root_writable"))
+                    .expect("storage_root_writable check");
+                assert_eq!(writable["status"], "fail");
+                let detail = writable["detail"].as_str().unwrap_or("");
+                assert!(
+                    detail.contains("not writable") || detail.contains("permissions"),
+                    "unexpected writable failure detail: {detail}"
+                );
+            },
         );
 
         std::fs::set_permissions(
