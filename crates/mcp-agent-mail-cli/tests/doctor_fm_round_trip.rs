@@ -253,6 +253,140 @@ fn round_trip_world_readable_token_bak_op_chmod() {
 }
 
 #[test]
+fn round_trip_wrong_mcp_url_json_op_write_file() {
+    // Plant an MCP client JSON config pointing at the wrong URL →
+    // fix (re-write the URL via Op::WriteFile) →
+    // undo (restore the original JSON byte-identical).
+    let td = TempDir::new().expect("tempdir");
+    let cfg = td.path().join("mcp.json");
+    let original_body = r#"{
+  "mcpServers": {
+    "agent-mail": {
+      "url": "http://127.0.0.1:9999/mcp/"
+    },
+    "other": {
+      "url": "http://example.com/other"
+    }
+  }
+}
+"#;
+    fs::write(&cfg, original_body).expect("plant mcp.json");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+    let pre_body = pre_fix
+        .iter()
+        .find(|(p, _, _)| p == &PathBuf::from("mcp.json"))
+        .map(|(_, b, _)| b.clone())
+        .unwrap();
+    assert_eq!(pre_body, original_body.as_bytes());
+
+    let run_id = "2026-05-14T00-00-00Z__rt_mcp_url";
+    let fm_id = fixers::wrong_mcp_url_json::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let canonical = "http://127.0.0.1:8765/mcp/";
+    let inputs = DispatchInputs {
+        mcp_config_candidates: vec![cfg.clone()],
+        canonical_mcp_url: Some(canonical.to_string()),
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(outcome.actions_taken, 1);
+
+    let post_fix_body = fs::read_to_string(&cfg).unwrap();
+    assert!(
+        post_fix_body.contains("127.0.0.1:8765"),
+        "post-fix body must contain canonical URL; got:\n{post_fix_body}"
+    );
+    assert_ne!(
+        post_fix_body, original_body,
+        "post-fix body must differ from original"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("wrong_mcp_url_json", &pre_fix, &post_undo);
+}
+
+#[test]
+fn round_trip_dangling_doctor_latest_op_symlink_atomic() {
+    // Plant a dangling `.doctor/latest` symlink + a surviving
+    // runs/<id> → fix (re-aim via Op::SymlinkAtomic) →
+    // undo (restore the original dangling symlink byte-for-byte).
+    //
+    // The FM under test resolves `runs_dir` from the symlink's
+    // parent, which is `<td>/.doctor/`. We isolate the FM's tree
+    // under `<td>/repo/` so the chokepoint's run-dir (created at
+    // `<td>/.doctor/runs/<run_id>/` by build_ctx) doesn't bleed
+    // into the FM's discovery scan — same isolation pattern as
+    // the pass-28 module test.
+    let td = TempDir::new().expect("tempdir");
+    let isolated = td.path().join("repo");
+    let doctor_root = isolated.join(".doctor");
+    let runs = doctor_root.join("runs");
+    let surviving = "2026-05-14T00-00-00Z__alive";
+    fs::create_dir_all(runs.join(surviving)).expect("mkdir surviving run");
+
+    let latest = doctor_root.join("latest");
+    let dangling = PathBuf::from("runs").join("2026-05-14T00-00-00Z__gone");
+    std::os::unix::fs::symlink(&dangling, &latest).expect("plant dangling symlink");
+
+    // Snapshot the isolated tree (not td.path() — that includes
+    // the chokepoint's `<td>/.doctor/` scaffold).
+    let pre_fix = snapshot_tree(&isolated, false);
+    let pre_link = pre_fix
+        .iter()
+        .find(|(p, _, _)| p == &PathBuf::from(".doctor/latest"))
+        .map(|(_, b, _)| b.clone())
+        .expect("pre-fix snapshot must capture the dangling symlink");
+    let dangling_bytes = dangling.clone().into_os_string().into_encoded_bytes();
+    assert_eq!(
+        pre_link, dangling_bytes,
+        "pre-fix symlink target must match what we planted"
+    );
+
+    let run_id = "2026-05-14T00-00-00Z__rt_dangling";
+    let fm_id = fixers::dangling_doctor_latest::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        doctor_latest_target: Some(latest.clone()),
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(outcome.actions_taken, 1);
+
+    // Post-fix: symlink re-aimed; no longer dangling.
+    let post_fix_target = fs::read_link(&latest).expect("read symlink");
+    assert_ne!(
+        post_fix_target, dangling,
+        "fix must have updated the symlink target"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(&isolated, false);
+    assert_byte_identical("dangling_doctor_latest", &pre_fix, &post_undo);
+}
+
+#[test]
 fn round_trip_missing_gitignore_entry_op_append_file() {
     // Plant a .gitignore lacking `.doctor/` → fix (append) →
     // undo (restore the original file byte-identical).

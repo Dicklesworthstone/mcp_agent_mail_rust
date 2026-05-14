@@ -1552,8 +1552,7 @@ impl SystemHealthScreen {
             }
         }
 
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::from_spans([
+        let footer_line = Line::from_spans([
             Span::styled("r", action_key_style),
             Span::styled(" Refresh  ", hint_style),
             Span::styled("v", action_key_style),
@@ -1562,7 +1561,18 @@ impl SystemHealthScreen {
             Span::styled(" Open Mail UI  ", hint_style),
             Span::styled("y", action_key_style),
             Span::styled(" Copy Mail UI", hint_style),
-        ]));
+        ]);
+        let visible_line_count = usize::from(area.height.saturating_sub(2));
+        if visible_line_count > 0 {
+            let reserved_footer_lines = if visible_line_count >= 2 { 2 } else { 1 };
+            if lines.len().saturating_add(reserved_footer_lines) > visible_line_count {
+                lines.truncate(visible_line_count.saturating_sub(reserved_footer_lines));
+            }
+            if reserved_footer_lines == 2 {
+                lines.push(Line::raw(String::new()));
+            }
+        }
+        lines.push(footer_line);
 
         let block = Block::default()
             .title("System Health")
@@ -1897,7 +1907,7 @@ impl SystemHealthScreen {
         );
 
         let body = format!(
-            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}\ncanary={} attention={} worst={}",
+            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={} canary={} attention={} worst={}",
             tick_age,
             tick_p95,
             atc_tick_is_stale(&snap.atc),
