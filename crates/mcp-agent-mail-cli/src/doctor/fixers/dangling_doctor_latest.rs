@@ -195,6 +195,12 @@ fn pick_newest_run_dir(runs_dir: &Path) -> Option<std::ffi::OsString> {
     let entries = fs::read_dir(runs_dir).ok()?;
     let mut best: Option<(std::time::SystemTime, std::ffi::OsString)> = None;
     for entry in entries.flatten() {
+        if entry
+            .file_type()
+            .map_or(true, |file_type| !file_type.is_dir())
+        {
+            continue;
+        }
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -370,6 +376,22 @@ mod tests {
         // Symlink unchanged (still dangling).
         let target = fs::read_link(&latest).unwrap();
         assert_eq!(target, dangling);
+    }
+
+    #[test]
+    fn newest_run_picker_ignores_symlinked_directories() {
+        let td = TempDir::new().unwrap();
+        let runs = td.path().join("runs");
+        let outside = td.path().join("outside-run");
+        fs::create_dir_all(&runs).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, runs.join("linked-run")).unwrap();
+
+        assert_eq!(
+            pick_newest_run_dir(&runs),
+            None,
+            "symlinked directories under .doctor/runs must not be selected"
+        );
     }
 
     #[test]
