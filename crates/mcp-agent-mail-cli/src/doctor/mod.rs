@@ -429,10 +429,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         tempfile::tempfile()
             .map_err(|e| CliError::Other(format!("creating dry-run actions sink: {e}")))?
     } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(run_dir.join("actions.jsonl"))
+        runs::open_actions_log(&run_dir)
             .map_err(|e| CliError::Other(format!("opening actions.jsonl: {e}")))?
     };
 
@@ -967,11 +964,7 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
             return Err(CliError::Other(format!("scaffold_run_dir failed: {e}")));
         }
     };
-    let actions_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(run_dir.join("actions.jsonl"))
-    {
+    let actions_file = match runs::open_actions_log(&run_dir) {
         Ok(f) => f,
         Err(e) => {
             return Err(CliError::Other(format!(

@@ -31,7 +31,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -92,11 +92,14 @@ pub fn scaffold_run_dir(target: &Path, run_id: &str) -> std::io::Result<PathBuf>
     let run_dir = root.join("runs").join(run_id);
     ensure_dir_without_symlink(&run_dir)?;
     ensure_dir_without_symlink(&run_dir.join("backups"))?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(run_dir.join("actions.jsonl"))?;
+    open_actions_log(&run_dir)?;
     Ok(run_dir)
+}
+
+/// Open a run's `actions.jsonl` for append without following symlinks.
+pub fn open_actions_log(run_dir: &Path) -> std::io::Result<File> {
+    ensure_existing_dir_without_symlink(run_dir)?;
+    open_append_regular_file_without_symlink(&run_dir.join("actions.jsonl"))
 }
 
 /// Persist the user-facing run artifacts for a completed mutating doctor run.
@@ -176,6 +179,59 @@ fn symlink_dir_error(path: &Path) -> std::io::Error {
         std::io::ErrorKind::InvalidInput,
         format!(
             "refusing to use symlinked doctor artifact directory {}",
+            path.display()
+        ),
+    )
+}
+
+fn open_append_regular_file_without_symlink(path: &Path) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        ensure_dir_without_symlink(parent)?;
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(symlink_file_error(path)),
+        Ok(meta) if meta.file_type().is_file() => open_append_no_follow(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists but is not a regular file", path.display()),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => open_append_no_follow(path),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_append_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc_consts::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+mod libc_consts {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    pub const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    )))]
+    pub const O_NOFOLLOW: i32 = 0;
+}
+
+fn symlink_file_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to use symlinked doctor artifact file {}",
             path.display()
         ),
     )
@@ -328,7 +384,7 @@ pub fn append_scorecard_history(target: &Path, line_json: &str) -> std::io::Resu
     let root = doctor_root(target);
     ensure_dir_without_symlink(&root)?;
     let path = root.join("scorecard_history.jsonl");
-    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut f = open_append_regular_file_without_symlink(&path)?;
     f.write_all(line_json.as_bytes())?;
     if !line_json.ends_with('\n') {
         f.write_all(b"\n")?;
@@ -477,6 +533,27 @@ mod tests {
         assert!(
             !target.join("actions.jsonl").exists(),
             "scaffold must not follow run-dir symlinks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_refuses_symlinked_actions_log_without_writing_target() {
+        let td = TempDir::new().expect("tempdir");
+        let target = td.path().join("outside");
+        fs::create_dir(&target).expect("target dir");
+        let run_id = "2026-05-09T16-30-15Z__abc123";
+        let run_dir = doctor_root(td.path()).join("runs").join(run_id);
+        fs::create_dir_all(run_dir.join("backups")).expect("run dir");
+        std::os::unix::fs::symlink(target.join("actions.jsonl"), run_dir.join("actions.jsonl"))
+            .expect("symlink actions log");
+
+        let err = scaffold_run_dir(td.path(), run_id).expect_err("symlink actions log must refuse");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !target.join("actions.jsonl").exists(),
+            "scaffold must not follow actions.jsonl symlinks"
         );
     }
 
@@ -670,5 +747,29 @@ mod tests {
         let s =
             fs::read_to_string(td.path().join(".doctor").join("scorecard_history.jsonl")).unwrap();
         assert_eq!(s.lines().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_scorecard_history_refuses_symlinked_file_without_writing_target() {
+        let td = TempDir::new().expect("tempdir");
+        let target = td.path().join("outside");
+        fs::create_dir(&target).expect("target dir");
+        let root = doctor_root(td.path());
+        fs::create_dir(&root).expect("doctor root");
+        std::os::unix::fs::symlink(
+            target.join("scorecard_history.jsonl"),
+            root.join("scorecard_history.jsonl"),
+        )
+        .expect("symlink scorecard");
+
+        let err = append_scorecard_history(td.path(), r#"{"run_id":"a","aggregate":700}"#)
+            .expect_err("symlinked scorecard must refuse");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !target.join("scorecard_history.jsonl").exists(),
+            "scorecard append must not follow symlinked files"
+        );
     }
 }
