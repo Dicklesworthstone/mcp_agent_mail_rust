@@ -28,6 +28,7 @@ pub mod jwt_enabled_without_keys;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
 pub mod path_order_shadows_am;
+pub mod port_bound_by_foreign_process;
 pub mod schema_version_mismatch;
 pub mod sqlite_sidecar_symlink;
 pub mod stale_archive_lock;
@@ -357,6 +358,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::wrong_mcp_url_json",
         },
         FixerSpec {
+            id: port_bound_by_foreign_process::FM_ID,
+            severity: "P0",
+            subsystem: "runtime_processes",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Configured HTTP_HOST:HTTP_PORT is held by a foreign process (am serve-http would fail to bind)",
+            source_module: "doctor::fixers::port_bound_by_foreign_process",
+        },
+        FixerSpec {
             id: stale_listener_pid_hint::FM_ID,
             severity: "P1",
             subsystem: "runtime_processes",
@@ -431,6 +441,9 @@ pub struct DispatchInputs {
     /// JWT config inputs for the
     /// `jwt_enabled_without_keys` FM. `None` skips it.
     pub jwt_detect: Option<jwt_enabled_without_keys::DetectInputs>,
+    /// Inputs for the port-bind probe FM
+    /// (`port_bound_by_foreign_process`). `None` skips the FM.
+    pub port_bind_probe: Option<port_bound_by_foreign_process::DetectInputs>,
     /// Path to the repo `.gitignore` for the
     /// `missing_gitignore_entry` FM. `None` skips the FM. Typically
     /// `<repo_root>/.gitignore`.
@@ -541,6 +554,22 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
+    } else if fm_id == port_bound_by_foreign_process::FM_ID {
+        let port_inputs = inputs
+            .port_bind_probe
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: port_bound_by_foreign_process::FM_ID,
+                field: "port_bind_probe",
+            })?;
+        let findings = port_bound_by_foreign_process::detect(port_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = port_bound_by_foreign_process::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == stale_python_server_shadow::FM_ID {
         let findings = stale_python_server_shadow::detect(&inputs.pid_hint_candidates);
@@ -863,6 +892,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .stale_seconds_override
             .unwrap_or(stale_listener_pid_hint::DEFAULT_STALE_SECONDS);
         stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, stale_secs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == port_bound_by_foreign_process::FM_ID {
+        let port_inputs = inputs
+            .port_bind_probe
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: port_bound_by_foreign_process::FM_ID,
+                field: "port_bind_probe",
+            })?;
+        port_bound_by_foreign_process::detect(port_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()

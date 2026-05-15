@@ -401,6 +401,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         git_detect: build_git_detect_inputs(),
         am_git_binary_detect: build_am_git_binary_detect_inputs(),
         jwt_detect: Some(build_jwt_detect_inputs(&config)),
+        port_bind_probe: Some(build_port_bind_probe_inputs(&config)),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -619,6 +620,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         git_detect: build_git_detect_inputs(),
         am_git_binary_detect: build_am_git_binary_detect_inputs(),
         jwt_detect: Some(build_jwt_detect_inputs(&config)),
+        port_bind_probe: Some(build_port_bind_probe_inputs(&config)),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -705,6 +707,7 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         git_detect: build_git_detect_inputs(),
         am_git_binary_detect: build_am_git_binary_detect_inputs(),
         jwt_detect: Some(build_jwt_detect_inputs(&config)),
+        port_bind_probe: Some(build_port_bind_probe_inputs(&config)),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -990,6 +993,18 @@ fn build_jwt_detect_inputs(config: &Config) -> fixers::jwt_enabled_without_keys:
             .is_some_and(|s| !s.is_empty()),
         http_jwt_issuer: config.http_jwt_issuer.clone(),
         http_jwt_audience: config.http_jwt_audience.clone(),
+    }
+}
+
+/// Build port-bind-probe inputs from the live `Config`. The
+/// detector will try a transient `TcpListener::bind` against
+/// host:port to determine whether the address is held.
+fn build_port_bind_probe_inputs(
+    config: &Config,
+) -> fixers::port_bound_by_foreign_process::DetectInputs {
+    fixers::port_bound_by_foreign_process::DetectInputs {
+        host: config.http_host.clone(),
+        port: config.http_port,
     }
 }
 
