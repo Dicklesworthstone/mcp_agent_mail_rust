@@ -153,11 +153,16 @@ pub fn detect(inputs: &DetectInputs) -> Vec<PathOrderShadowsAmFinding> {
     }
     let mut hits = Vec::new();
     let mut seen_canonical: BTreeMap<PathBuf, ()> = BTreeMap::new();
-    for (i, dir) in path_var.split(':').enumerate() {
-        if dir.is_empty() {
+    // Pass-35-review Gemini F3 / Codex F3 (P1): use
+    // `std::env::split_paths` so the platform's canonical PATH
+    // delimiter is honored (`:` on Unix, `;` on Windows). The
+    // pre-fix hardcoded `:` would treat the whole Windows PATH
+    // as one invalid entry.
+    for (i, dir) in std::env::split_paths(&path_var).enumerate() {
+        if dir.as_os_str().is_empty() {
             continue;
         }
-        let probed = std::path::Path::new(dir).join("am");
+        let probed = dir.join("am");
         let meta = match std::fs::symlink_metadata(&probed) {
             Ok(m) => m,
             Err(_) => continue,

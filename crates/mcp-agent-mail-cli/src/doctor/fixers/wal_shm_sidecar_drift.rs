@@ -242,7 +242,22 @@ pub fn detect(inputs: &DetectInputs) -> Vec<WalShmSidecarDriftFinding> {
                 wal_size_bytes: meta.len(),
             });
         }
+        // Pass-35-review Gemini F1 / Codex F1 (P0/P1): StaleWal
+        // pre-fix triggered on any DB whose mtime drifted >24h
+        // ahead of the WAL mtime, but a normal SQLite checkpoint
+        // updates the DB mtime AND leaves the WAL truncated to a
+        // 32-byte header. An idle-but-healthy DB after a
+        // checkpoint then sits with DB.mtime > WAL.mtime
+        // indefinitely — false positive.
+        //
+        // Fix: only flag StaleWal when the WAL has uncheckpointed
+        // frames (size > 32 bytes). A 32-byte-or-smaller WAL is
+        // either header-only (different signal, HeaderOnlyWal)
+        // or post-checkpoint, both of which legitimately have
+        // older mtimes than the main DB.
         if let (Ok(d), Ok(w)) = (&db_meta, &wal_meta)
+            && w.file_type().is_file()
+            && w.len() > WAL_HEADER_BYTES
             && let (Ok(d_mtime), Ok(w_mtime)) = (d.modified(), w.modified())
             && let Ok(diff) = d_mtime.duration_since(w_mtime)
             && diff.as_secs() > inputs.stale_wal_threshold_secs
@@ -411,6 +426,40 @@ mod tests {
                 threshold: 3
             }
         )));
+    }
+
+    #[test]
+    fn detector_does_not_flag_stale_wal_for_header_only_wal() {
+        // Pass-35-review Gemini F1 / Codex F1 (P0/P1): a normal
+        // SQLite `wal_checkpoint(TRUNCATE)` leaves the WAL at
+        // exactly the 32-byte header. An idle-but-healthy DB
+        // then drifts its mtime ahead of the WAL's, but that's
+        // not "drift" — it's normal post-checkpoint state.
+        // Pre-fix, this false-positived as StaleWal. Post-fix,
+        // the `w.len() > WAL_HEADER_BYTES` precondition gates
+        // StaleWal so a header-only WAL only fires the
+        // HeaderOnlyWal signal regardless of mtime drift.
+        //
+        // This test verifies the structural invariant: a
+        // 32-byte WAL (or smaller) never triggers StaleWal even
+        // if the stale_wal_threshold_secs is set to 0.
+        let td = TempDir::new().unwrap();
+        let db = make_db(&td);
+        touch(&td.path().join("storage.sqlite3-wal"), &[0u8; 32]);
+        touch(&td.path().join("storage.sqlite3-shm"), &[0u8; 32768]);
+        let mut inputs = DetectInputs::new(vec![db]);
+        inputs.stale_wal_threshold_secs = 0; // any drift > 0s would fire pre-fix.
+        let findings = detect(&inputs);
+        // HeaderOnlyWal will likely fire (32-byte WAL); StaleWal
+        // MUST NOT regardless.
+        for f in &findings {
+            for s in &f.signals {
+                assert!(
+                    !matches!(s, Signal::StaleWal { .. }),
+                    "header-only WAL must not trigger StaleWal (got {s:?})",
+                );
+            }
+        }
     }
 
     #[test]

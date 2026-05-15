@@ -45,6 +45,17 @@
 //! the manual_remediation envelope points operators at
 //! `ss -tlnp | grep <port>` or `lsof -i :<port>`.
 //!
+//! **Known limitation** (pass-35-review Gemini F4 / Codex F4):
+//! `TcpListener::bind` doesn't set `SO_REUSEADDR=1` on the
+//! probe socket, so a port in `TIME_WAIT` immediately after an
+//! `am serve-http` restart will be reported as held even
+//! though the real server (which uses `SO_REUSEADDR=1`) would
+//! be able to bind. Mitigation: operator awareness — re-run
+//! `am doctor` after ~60s if a finding appears right after a
+//! server restart. A future revision could wire the probe
+//! through `nix`'s socket API (requires the `socket` feature
+//! flag) to match server bind semantics.
+//!
 //! ## Fix
 //!
 //! **Detect-only.** Killing a foreign process is well outside
@@ -59,7 +70,7 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError};
 use serde::Serialize;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{TcpListener, ToSocketAddrs};
 
 pub const FM_ID: &str = "fm-runtime-processes-port-bound-by-foreign-process";
 const FM_SEVERITY: &str = "P0";
@@ -173,9 +184,20 @@ pub struct DetectInputs {
 /// probe but immediately drops the listener if it succeeds — no
 /// state is left behind.
 pub fn detect(inputs: &DetectInputs) -> Vec<PortBoundByForeignProcessFinding> {
-    let addr: SocketAddr = match format!("{}:{}", inputs.host, inputs.port).parse() {
-        Ok(a) => a,
+    // Pass-35-review Gemini F2 (P0): the pre-fix code built the
+    // address via `format!("{}:{}", host, port).parse()`, which
+    // broke IPv6 — `::1:8765` is not a valid SocketAddr literal
+    // (IPv6 needs bracket-form `[::1]:8765`). Use
+    // `(&str, u16).to_socket_addrs()` instead — it returns an
+    // iterator of resolved addresses and handles IPv4, IPv6, and
+    // host-name resolution correctly.
+    let mut addrs = match (inputs.host.as_str(), inputs.port).to_socket_addrs() {
+        Ok(it) => it,
         Err(_) => return Vec::new(), // malformed host — different FM
+    };
+    let addr = match addrs.next() {
+        Some(a) => a,
+        None => return Vec::new(),
     };
     match TcpListener::bind(addr) {
         Ok(_listener) => Vec::new(), // freed on drop here
@@ -247,6 +269,28 @@ mod tests {
         assert_eq!(findings[0].reason, Reason::AddrInUse);
         assert_eq!(findings[0].port, port);
         // _held drops here, releasing the port.
+    }
+
+    #[test]
+    fn detector_handles_ipv6_loopback_host() {
+        // Pass-35-review Gemini F2 (P0): pre-fix, `format!("{}:{}",
+        // "::1", 8765).parse()` failed because IPv6 needs the
+        // bracket-form `[::1]:8765`. Using
+        // `to_socket_addrs()` handles both forms.
+        let inputs = DetectInputs {
+            host: "::1".to_string(),
+            port: 0, // bind to OS-assigned ephemeral
+        };
+        // The probe should NOT silently abort (no finding); we
+        // either bind successfully (port 0 = OS-assigned, free)
+        // or get a finding — both are fine. The key is that
+        // `to_socket_addrs` doesn't reject `::1`.
+        let findings = detect(&inputs);
+        // Port 0 binds to an ephemeral port; expect empty result.
+        assert!(
+            findings.is_empty(),
+            "IPv6 loopback port 0 should bind freely; got: {findings:?}",
+        );
     }
 
     #[test]
