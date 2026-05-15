@@ -20,6 +20,7 @@
 
 pub mod am_git_binary_missing;
 pub mod codex_startup_timeout;
+pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod inbox_stats_divergence;
@@ -385,6 +386,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_python_server_shadow",
         },
         FixerSpec {
+            id: committed_env_file_in_repo::FM_ID,
+            severity: "P0",
+            subsystem: "secrets_env_state",
+            op_pattern: "Op::Chmod",
+            auto_fixable: true,
+            one_line_description: "Token-shape .env file committed to git OR present untracked with wide permissions (tracked lane is detect-only; untracked lane chmods to 0o600)",
+            source_module: "doctor::fixers::committed_env_file_in_repo",
+        },
+        FixerSpec {
             id: jwt_enabled_without_keys::FM_ID,
             severity: "P0",
             subsystem: "secrets_env_state",
@@ -594,6 +604,15 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = jwt_enabled_without_keys::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == committed_env_file_in_repo::FM_ID {
+        let findings = committed_env_file_in_repo::detect(&inputs.repo_root);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = committed_env_file_in_repo::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
