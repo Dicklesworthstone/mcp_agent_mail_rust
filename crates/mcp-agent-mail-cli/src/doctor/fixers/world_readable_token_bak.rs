@@ -382,7 +382,14 @@ mod tests {
         );
         drop(ctx);
         // Undo should restore to 0o644.
-        let summary = crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
+        let summary = crate::doctor::undo::run_undo_with_scopes(
+            td.path(),
+            run_id,
+            false,
+            true,
+            &[td.path().to_path_buf()],
+        )
+        .expect("undo");
         assert_eq!(summary.actions_replayed, 1);
         let restored = fs::metadata(&p).unwrap().permissions().mode();
         assert_eq!(

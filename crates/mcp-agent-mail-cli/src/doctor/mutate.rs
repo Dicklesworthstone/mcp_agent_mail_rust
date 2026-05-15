@@ -294,7 +294,7 @@ fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
 /// the nearest existing ancestor and joining the file name. This avoids
 /// "no such file or directory" when the path is a target we're about to
 /// CREATE.
-fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
     if path.exists() {
         return path.canonicalize();
     }
@@ -320,7 +320,7 @@ fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical_parent.join(name))
 }
 
-fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), MutateError> {
+pub(crate) fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), MutateError> {
     let canonical = canonicalize_existing_or_parent(path).map_err(MutateError::Io)?;
     for scope in &caps.write_scopes {
         if let Ok(canonical_scope) = canonicalize_existing_or_parent(scope)

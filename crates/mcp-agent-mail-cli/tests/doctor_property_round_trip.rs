@@ -18,7 +18,7 @@
 
 use mcp_agent_mail_cli::doctor::mutate::{Capabilities, MutateContext, MutateError, Op, mutate};
 use mcp_agent_mail_cli::doctor::runs::scaffold_run_dir;
-use mcp_agent_mail_cli::doctor::undo::run_undo;
+use mcp_agent_mail_cli::doctor::undo::run_undo_with_scopes;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -223,8 +223,11 @@ fn property_round_trip_undo_restores_byte_identical() {
         }
         drop(ctx);
 
-        // Now undo and verify.
-        let summary = run_undo(td.path(), &run_id, false, false).unwrap();
+        // Now undo and verify. Round-6 (Gemini F1 P0): pass
+        // explicit scope so the test td.path() is whitelisted.
+        let summary =
+            run_undo_with_scopes(td.path(), &run_id, false, false, &[td.path().to_path_buf()])
+                .unwrap();
         // Even with non-strict undo, no failures should remain — the
         // property holds: every committed action has a backup that
         // restores byte-identical.

@@ -1091,7 +1091,11 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
     }));
 
     // Step 6: Run undo. Verify byte-identical recovery.
-    let undo_summary = undo::run_undo(td.path(), run_id, false, false);
+    // Round-6: selftest exercises a temp-dir round trip, so it
+    // grants the temp dir explicit scope rather than relying on
+    // default_write_scopes() (which doesn't cover /tmp paths).
+    let undo_summary =
+        undo::run_undo_with_scopes(td.path(), run_id, false, false, &[td.path().to_path_buf()]);
     let ok6 = undo_summary
         .as_ref()
         .map(|s| s.failures.is_empty())
@@ -2195,7 +2199,7 @@ pub fn handle_undo(
 /// Compute the canonical write_scopes for `am doctor --fix`.
 ///
 /// These match `analysis/safety_envelope.md` (Phase 3 synthesis).
-fn default_write_scopes() -> Vec<PathBuf> {
+pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(home) = dirs::home_dir() {
         v.push(home.join(".config").join("mcp-agent-mail"));

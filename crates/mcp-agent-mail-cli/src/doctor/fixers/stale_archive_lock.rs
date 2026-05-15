@@ -363,7 +363,14 @@ mod tests {
         drop(ctx);
 
         // Undo should restore the lock to its original location.
-        let summary = crate::doctor::undo::run_undo(td.path(), run_id, false, true).expect("undo");
+        let summary = crate::doctor::undo::run_undo_with_scopes(
+            td.path(),
+            run_id,
+            false,
+            true,
+            &[td.path().to_path_buf()],
+        )
+        .expect("undo");
         assert_eq!(summary.actions_replayed, 1);
         assert!(lock_path.exists(), "undo must restore the lock file");
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), "999999999\n");

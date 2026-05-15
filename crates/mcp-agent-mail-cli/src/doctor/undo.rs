@@ -48,48 +48,46 @@ fn path_from_raw_bytes(bytes: Vec<u8>) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes))
 }
 
+/// Read a regular file into memory with O_NOFOLLOW + post-open
+/// metadata check.
+///
+/// Round-6 (Gemini F2): the pre-round-6 version used
+/// `fs::symlink_metadata` followed by `read_regular_file_no_follow_inner`,
+/// which only rejected symlinks via O_NOFOLLOW. An attacker could
+/// swap the target to a character device (e.g., `/dev/zero`) or a
+/// FIFO between the metadata check and the open, and `read_to_end`
+/// would consume memory until OOM (or block indefinitely). The fix
+/// routes through `open_regular_file_no_follow`, which verifies
+/// `file_type().is_file()` on the **held fd** — closes the race
+/// window because metadata-on-fd refers to the same inode the read
+/// will consume from.
 fn read_regular_file_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    read_regular_file_no_follow_inner(path)
-}
-
-#[cfg(unix)]
-fn read_regular_file_no_follow_inner(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file = open_regular_file_no_follow(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
-#[cfg(not(unix))]
-fn read_regular_file_no_follow_inner(path: &Path) -> std::io::Result<Vec<u8>> {
-    fs::read(path)
-}
-
-/// Open `path` for reading with O_NOFOLLOW; verify the opened fd is a
-/// regular file (defeats fifo/socket/device redirection); return the File.
+/// Open `path` for reading with `O_NOFOLLOW | O_NONBLOCK`; verify
+/// the opened fd is a regular file; return the File.
 ///
-/// Mirror of `mutate::open_regular_file_no_follow`. Round-5 (Codex F3)
-/// requires a streaming hasher so undo memory is O(1); building it on a
-/// File handle (not a `Vec<u8>`) is the foundation.
+/// Round-5 introduced the helper; round-6 (Gemini F4) added
+/// `O_NONBLOCK` so a FIFO-swap can't DoS the open by blocking on
+/// a missing writer. `O_NONBLOCK` is a no-op for regular files
+/// (which is what the post-open `is_file()` check enforces), so
+/// this never changes behavior on the legitimate paths.
+///
+/// Round-6 (Gemini F2 / Codex F1) also makes this the single
+/// gateway for both byte-reads and streaming hashes — the
+/// post-open `metadata().file_type().is_file()` check defeats the
+/// classic `symlink_metadata → open` TOCTOU.
 #[cfg(unix)]
 fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)?;
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
@@ -103,7 +101,15 @@ fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(not(unix))]
 fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    OpenOptions::new().read(true).open(path)
+    let f = OpenOptions::new().read(true).open(path)?;
+    let meta = f.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(f)
 }
 
 /// Stream-hash a regular file with O_NOFOLLOW. Memory is O(1) (64KB
@@ -127,32 +133,41 @@ fn sha256_stream_no_follow(path: &Path) -> std::io::Result<String> {
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
-/// Round-5 (Codex F1 + F2 + F3) — atomic streaming restore of a SQLite
-/// DB (or any large regular file) from a backup, with a per-chunk hash
-/// computed in the same pass:
+/// Round-5/round-6 — atomic streaming restore of a SQLite DB (or
+/// any large regular file) from a backup, with a per-chunk hash
+/// computed in the same pass and a final pre-rename re-check.
 ///
-/// 1. Refuse if `target_file` exists and is a symlink (G2 defense — match
-///    the existing WriteFile/Chmod paths). `rename(2)` over a symlink at
-///    `target_file` does not follow it, but `fs::copy` did — this guard
-///    blocks the symlink-overwrite path entirely.
-/// 2. Stream-copy `backup_file` → a tempfile in `target_file`'s parent
-///    dir while updating a `Sha256` hasher with each chunk.
-/// 3. Verify the streamed hash equals `expected_hash`. If not, drop the
-///    tempfile (tempfile crate auto-cleans on drop) and return an error —
-///    the live `target_file` is **untouched**, so a torn DB never appears
-///    on disk.
-/// 4. fsync the tempfile data, set its permissions via fd, and persist
-///    it over `target_file` via `rename(2)` (atomic, does not follow
-///    symlink at destination on Unix).
-/// 5. fsync the parent directory so the rename is durable.
+/// 1. Refuse if `target_file` exists and is a symlink (G2 defense
+///    — match the existing WriteFile/Chmod paths). `rename(2)` over
+///    a symlink at `target_file` does not follow it, but `fs::copy`
+///    did — this guard blocks the symlink-overwrite path entirely.
+/// 2. Stream-copy `backup_file` → a tempfile in `target_file`'s
+///    parent dir while updating a `Sha256` hasher with each chunk.
+/// 3. Verify the streamed hash equals `expected_hash`. If not,
+///    drop the tempfile (tempfile crate auto-cleans on drop) and
+///    return an error — the live `target_file` is **untouched**,
+///    so a torn DB never appears on disk.
+/// 4. fsync the tempfile data, set its permissions via fd.
+/// 5. Round-6 (Gemini F3): if `expected_target_after_hash` is
+///    `Some(...)`, re-stream-hash the live `target_file` and refuse
+///    the rename if it no longer matches. This closes the
+///    seconds-long race window between the outer user-edit defense
+///    and the rename, during which the operator could have
+///    modified the live DB while the streaming copy ran.
+/// 6. persist tmp over `target_file` via `rename(2)` (atomic, does
+///    not follow symlink at destination on Unix).
+/// 7. fsync the parent directory so the rename is durable.
+///    Round-6 (Codex F2): the parent-fsync error is now
+///    propagated, not silently discarded.
 ///
-/// `backup_file` is opened with O_NOFOLLOW; symlinks at the backup are
-/// refused (a tampered backup-as-symlink should fail at this step rather
-/// than leaking the referent through `fs::copy`).
+/// Note: `backup_file` is opened with O_NOFOLLOW + O_NONBLOCK
+/// (round-5 + round-6) — symlinks at the backup are refused
+/// and the FIFO-swap DoS is defeated.
 fn atomic_restore_db(
     backup_file: &Path,
     target_file: &Path,
     expected_hash: &str,
+    expected_target_after_hash: Option<&str>,
     mode: u32,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -161,17 +176,22 @@ fn atomic_restore_db(
 
     // 1. Refuse symlink at target. `rename(2)` is symlink-safe at dst, but
     // the symmetric existing G2 defense documents intent and gives a
-    // useful error message before any disk I/O.
-    if let Ok(meta) = fs::symlink_metadata(target_file)
-        && meta.file_type().is_symlink()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "target {} is a symlink; refusing to follow (round-5 G2 defense for DB restore)",
-                target_file.display()
-            ),
-        ));
+    // useful error message before any disk I/O. Round-6 (Codex F1 P2):
+    // fail closed if metadata fails for any reason other than ENOENT —
+    // EACCES/ELOOP/etc. must not silently downgrade to "target absent".
+    match fs::symlink_metadata(target_file) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "target {} is a symlink; refusing to follow (round-5 G2 defense for DB restore)",
+                    target_file.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
 
     // 2. Parent dir for tempfile + final rename.
@@ -210,13 +230,50 @@ fn atomic_restore_db(
         )));
     }
 
-    // 5. Atomic rename + parent fsync. `rename(2)` does not follow a
-    // symlink at the destination.
+    // 5. Round-6 (Gemini F3 P1): close the multi-second race between
+    // the outer user-edit defense (which streamed and hashed the
+    // target before we entered) and the rename. Re-stream-hash the
+    // live target and refuse if it no longer matches `after_hash`.
+    // We skip this if the target doesn't exist (target-was-removed
+    // case from round-4) or if no expectation was supplied
+    // (DbMigrate marker op or pre-pass-34 records).
+    if let Some(expected_after) = expected_target_after_hash
+        && fs::symlink_metadata(target_file).is_ok()
+    {
+        match sha256_stream_no_follow(target_file) {
+            Ok(cur_hash) => {
+                if cur_hash != expected_after {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "live target {} drifted during restore (hash {} != recorded after_hash {}); refusing to clobber",
+                            target_file.display(),
+                            cur_hash,
+                            expected_after,
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "could not re-hash live target {} for pre-rename re-check: {e}",
+                    target_file.display(),
+                )));
+            }
+        }
+    }
+
+    // 6. Atomic rename. `rename(2)` does not follow a symlink at
+    // the destination.
     tmp.persist(target_file).map_err(|e| e.error)?;
-    let _ = OpenOptions::new()
+
+    // 7. fsync the parent dir so the rename is durably recorded.
+    // Round-6 (Codex F2): error propagation. The pre-round-6 code
+    // discarded the result, which overstated the durability claim.
+    OpenOptions::new()
         .read(true)
         .open(parent)
-        .and_then(|d| d.sync_all());
+        .and_then(|d| d.sync_all())?;
     Ok(())
 }
 
@@ -308,6 +365,31 @@ fn logged_target_path(target: &Path, logged_path: &str) -> std::io::Result<PathB
     }
 }
 
+/// Round-6 Gemini F1 (P0): enforce the same `write_scopes` trust
+/// boundary that `mutate()` enforces at fix time. `actions.jsonl`
+/// is filesystem state — if an attacker can plant `.doctor/runs/`
+/// in the victim's repo (e.g., via a PR, a compromised dependency,
+/// or already-write-access social engineering), an unauthenticated
+/// `actions.jsonl` entry pointing at `/etc/passwd` or
+/// `~/.ssh/authorized_keys` would otherwise let `am doctor undo`
+/// silently overwrite system files with attacker-supplied bytes.
+/// The fix re-applies `ensure_in_scope` at undo time against the
+/// same defaults the runtime used at fix time.
+fn enforce_scope(write_scopes: &[PathBuf], path: &Path) -> std::io::Result<()> {
+    let caps = super::mutate::Capabilities {
+        write_scopes: write_scopes.to_vec(),
+    };
+    super::mutate::ensure_in_scope(&caps, path).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to restore {}: outside doctor write_scopes ({e})",
+                path.display(),
+            ),
+        )
+    })
+}
+
 fn artifact_relative_path(logged_path: &str) -> std::io::Result<PathBuf> {
     let path = Path::new(logged_path);
     let parts = checked_logged_components(path, logged_path)?;
@@ -375,6 +457,30 @@ pub struct UndoSummary {
 
 /// Replay `actions.jsonl` in reverse. Restore from `backups/`.
 ///
+/// Uses `default_write_scopes()` as the trust boundary. Round-6
+/// (Gemini F1 P0) — a malicious `actions.jsonl` could otherwise
+/// instruct undo to overwrite arbitrary files (e.g., `/etc/passwd`,
+/// `~/.ssh/authorized_keys`) because `logged_target_path` honors
+/// absolute paths verbatim. `mutate()` enforces scope at fix time,
+/// but the round-5 undo path did not, leaving a path-traversal /
+/// privilege-escalation vector for any attacker who could plant
+/// (or commit) `.doctor/runs/<id>/` files in a victim's repo.
+///
+/// Tests that need a custom scope (the per-fixer test harnesses
+/// pass `td.path()`) should call `run_undo_with_scopes`.
+pub fn run_undo(
+    target: &Path,
+    run_id: &str,
+    dry_run: bool,
+    strict: bool,
+) -> std::io::Result<UndoSummary> {
+    let scopes = super::default_write_scopes();
+    run_undo_with_scopes(target, run_id, dry_run, strict, &scopes)
+}
+
+/// Replay `actions.jsonl` in reverse, enforcing `write_scopes` as
+/// the trust boundary. See `run_undo` for the contract.
+///
 /// `dry_run` prints what would happen without writing.
 /// `strict` (default true) fails closed if any backup is missing or any
 /// after_hash mismatch is detected (C3 fix — caller manually modified
@@ -383,11 +489,12 @@ pub struct UndoSummary {
 /// Holds an exclusive advisory lock on `<run_dir>/undo.lock` for the
 /// duration of the body (H5 fix — prevents two concurrent undos from
 /// racing on the same run-id).
-pub fn run_undo(
+pub fn run_undo_with_scopes(
     target: &Path,
     run_id: &str,
     dry_run: bool,
     strict: bool,
+    write_scopes: &[PathBuf],
 ) -> std::io::Result<UndoSummary> {
     if !is_safe_run_id(run_id) {
         return Err(std::io::Error::new(
@@ -474,6 +581,14 @@ pub fn run_undo(
             // have completed (or may have completed after the pending log
             // but before the completed log was flushed).
             let target_file = logged_target_path(target, &action.path)?;
+            // Round-6 Gemini F1 (P0): scope check.
+            if let Err(e) = enforce_scope(write_scopes, &target_file) {
+                if strict {
+                    return Err(e);
+                }
+                summary.failures.push(format!("{e}"));
+                continue;
+            }
             let backup_file = action_backup_file(&backups_dir, &action)?;
             if dry_run {
                 eprintln!(
@@ -524,6 +639,14 @@ pub fn run_undo(
         }
 
         let target_file = logged_target_path(target, &action.path)?;
+        // Round-6 Gemini F1 (P0): scope check.
+        if let Err(e) = enforce_scope(write_scopes, &target_file) {
+            if strict {
+                return Err(e);
+            }
+            summary.failures.push(format!("{e}"));
+            continue;
+        }
         // Pass-4 fix: read the per-mutation backup at
         // `backups/seq_<started_at_ns>/<rel>`. If `started_at_ns == 0`
         // (legacy actions.jsonl from pre-pass-4 runs), fall back to the
@@ -792,6 +915,24 @@ pub fn run_undo(
                 };
                 let from_after = logged_target_path(target, rename_to)?;
                 let restore_to = logged_target_path(target, &action.path)?;
+                // Round-6 Gemini F1 (P0): scope check on BOTH ends
+                // of the rename. `action.path` was already checked
+                // via target_file above; `rename_to` is the
+                // additional surface and must also be in scope.
+                if let Err(e) = enforce_scope(write_scopes, &from_after) {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!("{e}"));
+                    continue;
+                }
+                if let Err(e) = enforce_scope(write_scopes, &restore_to) {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!("{e}"));
+                    continue;
+                }
                 if dry_run {
                     eprintln!(
                         "[dry-run] would rename back: {} -> {}",
@@ -996,34 +1137,46 @@ pub fn run_undo(
                         action.op, action.path,
                     );
                     if strict {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            msg,
-                        ));
+                        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
                     }
                     summary.failures.push(msg);
                     continue;
                 }
-                // Symlink defense at target. The atomic_restore_db
-                // helper also refuses, but we bail early for the
-                // user-modified hash check that comes next.
-                let target_meta = fs::symlink_metadata(&target_file).ok();
-                if let Some(ref m) = target_meta
-                    && m.file_type().is_symlink()
-                {
-                    let msg = format!(
-                        "target {} is a symlink; refusing to follow (round-5 G2 defense for DB restore)",
-                        action.path
-                    );
-                    if strict {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            msg,
-                        ));
+                // Round-6 (Codex F1 P2): fail-closed on metadata
+                // errors. The pre-round-6 `.ok()` silently turned
+                // EACCES/ELOOP/etc. into "target absent", which
+                // bypassed both the symlink defense and the
+                // user-edit check below. Now: ENOENT → None,
+                // is_symlink → refuse, any other error → bubble up.
+                let target_meta = match fs::symlink_metadata(&target_file) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        let msg = format!(
+                            "target {} is a symlink; refusing to follow (round-5 G2 defense for DB restore)",
+                            action.path
+                        );
+                        if strict {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                msg,
+                            ));
+                        }
+                        summary.failures.push(msg);
+                        continue;
                     }
-                    summary.failures.push(msg);
-                    continue;
-                }
+                    Ok(m) => Some(m),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        if strict {
+                            return Err(e);
+                        }
+                        summary.failures.push(format!(
+                            "could not stat {} for symlink/edit check: {}",
+                            target_file.display(),
+                            e,
+                        ));
+                        continue;
+                    }
+                };
                 // User-edit defense (Codex F1 / Gemini F3): if the
                 // target still exists and we have an after_hash
                 // recorded, verify the current target still hashes
@@ -1088,10 +1241,21 @@ pub fn run_undo(
                     continue;
                 }
                 let restore_mode = action.before_mode.unwrap_or(0o600);
+                // Round-6 Gemini F3 (P1): pass after_hash so
+                // atomic_restore_db re-checks the live target
+                // right before persist, closing the streaming-
+                // copy TOCTOU. None when target_meta was None
+                // (target was removed; nothing to re-check).
+                let expected_after = if target_meta.is_some() && !action.after_hash.is_empty() {
+                    Some(action.after_hash.as_str())
+                } else {
+                    None
+                };
                 match atomic_restore_db(
                     &backup_file,
                     &target_file,
                     &action.before_hash,
+                    expected_after,
                     restore_mode,
                 ) {
                     Ok(()) => {
@@ -1205,6 +1369,20 @@ mod tests {
         }
     }
 
+    /// Round-6 Gemini F1 (P0): production `run_undo` enforces
+    /// `default_write_scopes()`. Tests use temp dirs that aren't
+    /// in the default scope set, so they explicitly grant the
+    /// temp root via `run_undo_with_scopes`. Centralizing here
+    /// avoids 30+ inline expansions and keeps test intent clean.
+    fn test_undo(
+        target: &Path,
+        run_id: &str,
+        dry_run: bool,
+        strict: bool,
+    ) -> std::io::Result<UndoSummary> {
+        run_undo_with_scopes(target, run_id, dry_run, strict, &[target.to_path_buf()])
+    }
+
     #[test]
     fn undo_restores_a_write() {
         let td = TempDir::new().unwrap();
@@ -1224,7 +1402,7 @@ mod tests {
         // Drop ctx so its actions_file flushes and the file handle is released.
         drop(ctx);
         assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
         assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
     }
@@ -1246,7 +1424,7 @@ mod tests {
         )
         .unwrap();
         drop(ctx);
-        let _ = run_undo(td.path(), run_id, true, true).unwrap();
+        let _ = test_undo(td.path(), run_id, true, true).unwrap();
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "new\n",
@@ -1280,7 +1458,7 @@ mod tests {
         .unwrap();
         drop(ctx);
         assert!(!undo_complete(td.path(), run_id));
-        let _ = run_undo(td.path(), run_id, false, true).unwrap();
+        let _ = test_undo(td.path(), run_id, false, true).unwrap();
         assert!(undo_complete(td.path(), run_id));
     }
 
@@ -1303,7 +1481,7 @@ mod tests {
         drop(ctx);
         assert!(!target.exists());
         assert!(quarantine.exists());
-        let _ = run_undo(td.path(), run_id, false, true).unwrap();
+        let _ = test_undo(td.path(), run_id, false, true).unwrap();
         assert!(target.exists(), "rename should be reversed");
         assert!(
             !quarantine.exists(),
@@ -1334,7 +1512,7 @@ mod tests {
     #[test]
     fn run_undo_rejects_path_component_run_id_before_path_join() {
         let td = TempDir::new().unwrap();
-        let err = run_undo(td.path(), "../escape", false, true).unwrap_err();
+        let err = test_undo(td.path(), "../escape", false, true).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -1358,7 +1536,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = run_undo(td.path(), run_id, false, true).unwrap_err();
+        let err = test_undo(td.path(), run_id, false, true).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -1383,7 +1561,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = run_undo(td.path(), run_id, false, true).unwrap_err();
+        let err = test_undo(td.path(), run_id, false, true).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -1407,7 +1585,7 @@ mod tests {
 
         assert_eq!(fs::read_link(&latest).unwrap(), new_target);
 
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
         assert!(
             fs::symlink_metadata(&latest).is_err(),
@@ -1453,7 +1631,7 @@ mod tests {
 
         assert_eq!(fs::read_link(&latest).unwrap(), PathBuf::from("runs/new"));
 
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
         assert_eq!(fs::read_link(&latest).unwrap(), PathBuf::from("runs/old"));
     }
@@ -1478,7 +1656,7 @@ mod tests {
 
         std::fs::remove_file(&latest).unwrap();
 
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -1510,7 +1688,7 @@ mod tests {
         // User modifies the file post-fix.
         std::fs::write(&target, b"USER EDITED THIS\n").unwrap();
         // Undo in strict mode should refuse with AlreadyExists.
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err(), "strict undo must refuse to clobber");
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
@@ -1541,7 +1719,7 @@ mod tests {
         .unwrap();
         drop(ctx);
         std::fs::write(&target, b"USER EDITED THIS\n").unwrap();
-        let summary = run_undo(td.path(), run_id, false, false).unwrap();
+        let summary = test_undo(td.path(), run_id, false, false).unwrap();
         assert_eq!(summary.actions_replayed, 0);
         assert_eq!(summary.failures.len(), 1);
         assert!(
@@ -1578,7 +1756,7 @@ mod tests {
         // User edits the file post-fix.
         std::fs::write(&target, b"# user edited\n").unwrap();
         // Undo refuses (strict) — does not clobber user edits.
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
@@ -1608,7 +1786,7 @@ mod tests {
 
         std::fs::remove_file(&target).unwrap();
 
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -1641,7 +1819,7 @@ mod tests {
         // User modifies post-fix → undo refuses (in non-strict, records
         // failure but continues).
         std::fs::write(&target, b"USER\n").unwrap();
-        let summary = run_undo(td.path(), run_id, false, false).unwrap();
+        let summary = test_undo(td.path(), run_id, false, false).unwrap();
         assert_eq!(summary.failures.len(), 1);
         // Sentinel must NOT be present — repo is half-undone, retry should
         // be supported.
@@ -1677,7 +1855,7 @@ mod tests {
         std::fs::write(&sensitive, b"secret data\n").unwrap();
         std::os::unix::fs::symlink(&sensitive, &target).unwrap();
         // Undo must refuse to follow the symlink.
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -1724,9 +1902,25 @@ mod tests {
         .unwrap();
         drop(actions);
 
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        // Round-6 (Gemini F2 P1): `read_regular_file_no_follow`
+        // now flows through `open_regular_file_no_follow` which
+        // opens with O_NOFOLLOW, so a symlink at the backup path
+        // yields `FilesystemLoop` (ELOOP) rather than the prior
+        // `InvalidInput` from the post-open metadata check. Both
+        // are correct "refused symlink"; we accept either to keep
+        // this test resilient against future helper refactors.
+        let err = result.unwrap_err();
+        let kind = err.kind();
+        #[cfg(unix)]
+        let symlink_loop = err.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32);
+        #[cfg(not(unix))]
+        let symlink_loop = false;
+        assert!(
+            matches!(kind, std::io::ErrorKind::InvalidInput) || symlink_loop,
+            "expected InvalidInput or ELOOP, got {kind:?}",
+        );
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "doctor wrote\n",
@@ -1765,7 +1959,7 @@ mod tests {
         std::fs::write(&sensitive, b"doctor wrote this\n").unwrap();
         std::os::unix::fs::symlink(&sensitive, &target).unwrap();
 
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -1804,7 +1998,7 @@ mod tests {
         std::fs::remove_file(&target).unwrap();
         std::os::unix::fs::symlink(td.path().join("missing-target"), &target).unwrap();
 
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -1866,7 +2060,7 @@ mod tests {
         std::fs::write(&target, b"halfway through mutation\n").unwrap();
 
         // Run undo. It should detect the crash-window and restore.
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(
             summary.actions_replayed, 1,
             "crash-window recovery should count as 1 replay"
@@ -1919,7 +2113,7 @@ mod tests {
 
         std::fs::write(&target, b"halfway through mutation\n").unwrap();
 
-        let _ = run_undo(td.path(), run_id, true, true).unwrap();
+        let _ = test_undo(td.path(), run_id, true, true).unwrap();
         // Dry-run must not write.
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
@@ -1959,7 +2153,7 @@ mod tests {
         .unwrap();
         assert_eq!(actions.lines().count(), 2);
         // Run undo. Should restore via the standard completed-line path.
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "v0");
     }
@@ -2028,7 +2222,7 @@ mod tests {
         }
         drop(f);
 
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 2);
         assert_eq!(std::fs::read_to_string(&alpha).unwrap(), "alpha original\n");
         assert_eq!(std::fs::read_to_string(&beta).unwrap(), "beta original\n");
@@ -2074,7 +2268,17 @@ mod tests {
         drop(ctx);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside new\n");
 
-        let summary = run_undo(repo.path(), run_id, false, true).unwrap();
+        // Round-6 (Gemini F1 P0): undo scope must include the
+        // outside target. The fix granted `outside.path()` to the
+        // chokepoint capabilities; undo must mirror that grant.
+        let summary = run_undo_with_scopes(
+            repo.path(),
+            run_id,
+            false,
+            true,
+            &[repo.path().to_path_buf(), outside.path().to_path_buf()],
+        )
+        .unwrap();
         assert_eq!(summary.actions_replayed, 1);
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
@@ -2112,7 +2316,7 @@ mod tests {
         drop(ctx);
         // Operator deletes the DB between fix and undo.
         fs::remove_file(&db).unwrap();
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(
             summary.actions_replayed, 1,
             "DbExec undo must restore when target is missing (failures: {:?})",
@@ -2181,16 +2385,13 @@ mod tests {
         // changing existence.
         fs::write(&backup, b"corrupted backup\n").unwrap();
         // Non-strict mode: failure recorded, summary returned.
-        let summary = run_undo(td.path(), run_id, false, false).unwrap();
+        let summary = test_undo(td.path(), run_id, false, false).unwrap();
         assert_eq!(
             summary.actions_replayed, 0,
             "undo must not count tampered-backup restore as success",
         );
         assert!(
-            summary
-                .failures
-                .iter()
-                .any(|f| f.contains("hash mismatch")),
+            summary.failures.iter().any(|f| f.contains("hash mismatch")),
             "expected hash-mismatch failure, got: {:?}",
             summary.failures,
         );
@@ -2226,7 +2427,7 @@ mod tests {
         fs::write(&sensitive, b"do not overwrite\n").unwrap();
         std::os::unix::fs::symlink(&sensitive, &db).unwrap();
         // Strict mode: must return PermissionDenied.
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().kind(),
@@ -2263,7 +2464,7 @@ mod tests {
         // post-fix. The replacement's hash ≠ recorded after_hash.
         fs::write(&db, b"operator's new content\n").unwrap();
         let pre_undo_bytes = fs::read(&db).unwrap();
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().kind(),
@@ -2318,13 +2519,10 @@ mod tests {
         let backup = backup_path.expect("backup must exist");
         fs::write(&backup, b"tampered backup that wont match before_hash\n").unwrap();
         // Non-strict: failure recorded, live target untouched.
-        let summary = run_undo(td.path(), run_id, false, false).unwrap();
+        let summary = test_undo(td.path(), run_id, false, false).unwrap();
         assert_eq!(summary.actions_replayed, 0);
         assert!(
-            summary
-                .failures
-                .iter()
-                .any(|f| f.contains("hash mismatch")),
+            summary.failures.iter().any(|f| f.contains("hash mismatch")),
             "expected hash-mismatch failure: {:?}",
             summary.failures,
         );
@@ -2370,14 +2568,14 @@ mod tests {
         use fs2::FileExt;
         competitor.try_lock_exclusive().unwrap();
         // Now run_undo should refuse with WouldBlock.
-        let result = run_undo(td.path(), run_id, false, true);
+        let result = test_undo(td.path(), run_id, false, true);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         // Release the competitor's lock.
         FileExt::unlock(&competitor).unwrap();
         // Now run_undo should succeed.
-        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
     }
 }

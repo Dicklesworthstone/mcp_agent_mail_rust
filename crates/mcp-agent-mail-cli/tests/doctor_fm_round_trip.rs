@@ -23,7 +23,20 @@
 use mcp_agent_mail_cli::doctor::fixers::{self, DispatchInputs};
 use mcp_agent_mail_cli::doctor::mutate::{Capabilities, MutateContext};
 use mcp_agent_mail_cli::doctor::runs::scaffold_run_dir;
-use mcp_agent_mail_cli::doctor::undo::run_undo;
+use mcp_agent_mail_cli::doctor::undo::run_undo_with_scopes;
+
+/// Round-6 (Gemini F1 P0): `run_undo` now enforces
+/// `default_write_scopes()` (which doesn't include /tmp). FM
+/// round-trip tests grant the temp dir explicit scope via this
+/// shim so the original test intent is preserved.
+fn run_undo(
+    target: &std::path::Path,
+    run_id: &str,
+    dry_run: bool,
+    strict: bool,
+) -> std::io::Result<mcp_agent_mail_cli::doctor::undo::UndoSummary> {
+    run_undo_with_scopes(target, run_id, dry_run, strict, &[target.to_path_buf()])
+}
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

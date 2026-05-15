@@ -332,8 +332,11 @@ mod tests {
         let td = TempDir::new().unwrap();
         let fifo = td.path().join("fifo_db");
         // mkfifo via nix
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR)
-            .unwrap();
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
         assert!(
             fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
             "test setup: must be a FIFO"
