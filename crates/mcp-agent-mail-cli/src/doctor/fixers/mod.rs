@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod am_git_binary_missing;
 pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod known_bad_git_no_override;
@@ -191,6 +192,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::dangling_doctor_latest",
         },
         FixerSpec {
+            id: am_git_binary_missing::FM_ID,
+            severity: "P0",
+            subsystem: "environment_toolchain",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "AM_GIT_BINARY override points at a missing / non-file / non-executable path",
+            source_module: "doctor::fixers::am_git_binary_missing",
+        },
+        FixerSpec {
             id: known_bad_git_no_override::FM_ID,
             severity: "P0",
             subsystem: "environment_toolchain",
@@ -277,6 +287,9 @@ pub struct DispatchInputs {
     /// Inputs for the known-bad-git detect-only FM (system git path,
     /// version string, AM_GIT_BINARY override). `None` skips the FM.
     pub git_detect: Option<known_bad_git_no_override::DetectInputs>,
+    /// Inputs for the AM_GIT_BINARY-points-at-missing-file detect-only
+    /// FM. `None` skips the FM.
+    pub am_git_binary_detect: Option<am_git_binary_missing::DetectInputs>,
     /// Path to the repo `.gitignore` for the
     /// `missing_gitignore_entry` FM. `None` skips the FM. Typically
     /// `<repo_root>/.gitignore`.
@@ -412,6 +425,23 @@ pub fn dispatch_only(
             outcome.findings.push(f.to_finding());
             // Detect-only: fix is a no-op (returns actions_skipped: 1).
             let result = known_bad_git_no_override::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == am_git_binary_missing::FM_ID {
+        let am_inputs = inputs
+            .am_git_binary_detect
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: am_git_binary_missing::FM_ID,
+                field: "am_git_binary_detect",
+            })?;
+        let findings = am_git_binary_missing::detect(am_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only: fix is a no-op.
+            let result = am_git_binary_missing::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -591,6 +621,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
                 field: "git_detect",
             })?;
         known_bad_git_no_override::detect(git_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == am_git_binary_missing::FM_ID {
+        let am_inputs = inputs
+            .am_git_binary_detect
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: am_git_binary_missing::FM_ID,
+                field: "am_git_binary_detect",
+            })?;
+        am_git_binary_missing::detect(am_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()

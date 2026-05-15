@@ -127,6 +127,7 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
         canonical_mcp_url: None,
         canonical_bearer_token: None,
         git_detect: None,
+        am_git_binary_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
         doctor_latest_target: None,

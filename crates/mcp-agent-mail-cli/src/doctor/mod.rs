@@ -399,6 +399,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         canonical_mcp_url: Some(canonical_mcp_url),
         canonical_bearer_token: config.http_bearer_token.clone(),
         git_detect: build_git_detect_inputs(),
+        am_git_binary_detect: build_am_git_binary_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -615,6 +616,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         canonical_mcp_url: Some(canonical_mcp_url),
         canonical_bearer_token: config.http_bearer_token.clone(),
         git_detect: build_git_detect_inputs(),
+        am_git_binary_detect: build_am_git_binary_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -699,6 +701,7 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         canonical_mcp_url: Some(canonical_mcp_url),
         canonical_bearer_token: config.http_bearer_token.clone(),
         git_detect: build_git_detect_inputs(),
+        am_git_binary_detect: build_am_git_binary_detect_inputs(),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -945,6 +948,53 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
         am_git_binary_env,
         am_git_binary_version,
     })
+}
+
+/// Resolve `AM_GIT_BINARY` from the doctor-managed config file
+/// (`$XDG_CONFIG_HOME/mcp-agent-mail/config.env`) + process env,
+/// and hand off to the `am_git_binary_missing` detector.
+///
+/// Returns `None` when AM_GIT_BINARY is unset in BOTH surfaces —
+/// that case is the territory of `known_bad_git_no_override`, not
+/// this FM.
+fn build_am_git_binary_detect_inputs(
+) -> Option<fixers::am_git_binary_missing::DetectInputs> {
+    let config_env_value = read_am_git_binary_from_config_env();
+    let process_env_value = std::env::var("AM_GIT_BINARY").ok();
+    if config_env_value.is_none() && process_env_value.is_none() {
+        return None;
+    }
+    Some(fixers::am_git_binary_missing::DetectInputs {
+        config_env_value,
+        process_env_value,
+        home_override: None,
+    })
+}
+
+fn read_am_git_binary_from_config_env() -> Option<String> {
+    let cfg_dir = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    let cfg_path = cfg_dir.join("mcp-agent-mail").join("config.env");
+    let contents = std::fs::read_to_string(&cfg_path).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("AM_GIT_BINARY=") {
+            // Strip optional surrounding quotes (dotenv convention).
+            let v = rest.trim();
+            let unquoted = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v);
+            return Some(unquoted.to_string());
+        }
+    }
+    None
 }
 
 fn git_version_text_from_stdout(raw: &str) -> String {
