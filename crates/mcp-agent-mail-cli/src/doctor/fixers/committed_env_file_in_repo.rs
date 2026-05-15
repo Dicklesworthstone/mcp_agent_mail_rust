@@ -43,12 +43,23 @@
 //!   field points operators at the
 //!   `git rm --cached <file> && am setup --rotate-token` workflow.
 //!
-//! - **Untracked + token-shape**: chmod to `0o600`. Idempotent — if
-//!   the file is already 0o600 or stricter, `mutate(Op::Chmod)`
-//!   notices and skips. The Op::Rename-to-quarantine variant
-//!   documented in the repair_spec is intentionally NOT implemented
-//!   in this first cut — chmod is the minimum-action lane and
-//!   matches the existing `world_readable_token_bak` pattern.
+//! - **Untracked + token-shape**: chmod to `0o600`. The mode gate
+//!   lives in **two places** for defense-in-depth (pass-35T review
+//!   F3 / F4):
+//!
+//!   1. **Detector** (`mode & 0o077 == 0` precondition): owner-only
+//!      modes never produce a finding in the first place, so
+//!      already-strict files never enter the fix path.
+//!   2. **Fixer** (live re-stat before mutate): protects against a
+//!      TOCTOU window where the file is tightened between
+//!      `detect()` and `fix()`. Without this, a 0o644 finding plus
+//!      an external `chmod 0o400` between phases would still
+//!      result in the fixer broadening the file to 0o600.
+//!
+//!   The Op::Rename-to-quarantine variant documented in the
+//!   repair_spec is intentionally NOT implemented in this first
+//!   cut — chmod is the minimum-action lane and matches the
+//!   existing `world_readable_token_bak` pattern.
 //!
 //! ## Privacy
 //!
@@ -365,15 +376,38 @@ pub fn fix(
             quarantined_paths: Vec::new(),
         });
     }
-    if !finding.path.exists() {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-    // Skip if already at SAFE_MODE (idempotent).
-    if finding.current_mode & 0o777 == SAFE_MODE {
+    // Live re-stat at fix time. `finding.current_mode` is the
+    // detect-phase snapshot; the file may have been tightened or
+    // disappeared between detect() and fix(). Without this gate,
+    // a stale 0o644 finding plus an external `chmod 0o400` would
+    // still cause the fixer to broaden the file to 0o600 — the
+    // exact permission-widening bug the pass-35S detector gate
+    // tried to prevent (pass-35T review F3, both models).
+    let live_mode = match fs::symlink_metadata(&finding.path) {
+        Ok(m) if m.file_type().is_file() => m.permissions().mode(),
+        Ok(_) => {
+            // Symlink or other non-regular file at the target. Refuse
+            // to follow — same defense as the detector.
+            return Ok(FixOutcome {
+                actions_taken: 0,
+                actions_skipped: 1,
+                quarantined_paths: Vec::new(),
+            });
+        }
+        Err(_) => {
+            // File vanished between detect and fix.
+            return Ok(FixOutcome {
+                actions_taken: 0,
+                actions_skipped: 1,
+                quarantined_paths: Vec::new(),
+            });
+        }
+    };
+    if live_mode & 0o077 == 0 {
+        // Owner-only or stricter already (including exact SAFE_MODE).
+        // chmod(0o600) would only widen 0o400 / 0o500 modes here, so
+        // skip. The detector should have caught this; the live
+        // re-stat is the second backstop.
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
@@ -750,49 +784,50 @@ mod tests {
 
     /// Helper: initialize a temp git repo via `git init` so we can
     /// exercise the tracked lane through the real git binary
-    /// (pass-35S review F3, Gemini).
-    fn init_git_repo(dir: &Path) {
-        // Quiet init with a deterministic default branch name. We
-        // don't use `mcp_agent_mail_core::git_cmd::GitCmd` here
-        // because it expects an already-initialized repo for
-        // `--git-dir` resolution. Use std::process::Command
-        // directly.
-        let status = std::process::Command::new("git")
-            .args(["init", "-q", "-b", "main"])
+    /// (pass-35S review F3, Gemini). Test isolation env vars
+    /// pulled out so every git invocation in this module shares
+    /// the same hermetic setup (pass-35T review F2 — added
+    /// `GIT_CONFIG_NOSYSTEM=1` and dropped the `-b main` flag
+    /// which requires git 2.28+ and isn't needed since we never
+    /// commit).
+    fn hermetic_git(args: &[&str], dir: &Path) -> std::process::ExitStatus {
+        std::process::Command::new("git")
+            .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", dir)
             .status()
-            .expect("git init");
+            .expect("git invocation")
+    }
+
+    fn init_git_repo(dir: &Path) {
+        // `-q` keeps output quiet. We deliberately do NOT pass
+        // `-b <branch>` (added in git 2.28; older systems would
+        // fail with "unknown switch 'b'"). The default branch
+        // name is irrelevant because the tests only run
+        // `git add` and never commit.
+        let status = hermetic_git(&["init", "-q"], dir);
         assert!(status.success(), "git init failed");
-        // Minimal config so `git add` works without name/email.
-        for kv in [
+        // Minimal config so `git add` and any later `git commit`
+        // work without name/email errors.
+        for (k, v) in [
             ("user.name", "doctor-test"),
             ("user.email", "doctor@test.example"),
         ] {
-            let s = std::process::Command::new("git")
-                .args(["config", kv.0, kv.1])
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("HOME", dir)
-                .status()
-                .expect("git config");
-            assert!(s.success());
+            assert!(
+                hermetic_git(&["config", k, v], dir).success(),
+                "git config {k} failed"
+            );
         }
     }
 
     fn git_add(dir: &Path, file: &str) {
-        let status = std::process::Command::new("git")
-            .args(["add", file])
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("HOME", dir)
-            .status()
-            .expect("git add");
-        assert!(status.success(), "git add failed");
+        assert!(
+            hermetic_git(&["add", file], dir).success(),
+            "git add {file} failed"
+        );
     }
 
     #[test]
@@ -839,43 +874,94 @@ mod tests {
     fn detect_works_from_repo_subdirectory() {
         // pass-35S review F1 (Gemini): the previous `.git`-presence
         // guard short-circuited the tracked lane when `project_root`
-        // was a subdirectory of a git checkout. After the fix, the
-        // detector falls through to `git ls-files`, which walks up
-        // to find the enclosing `.git/`.
+        // was a subdirectory of a git checkout. After the fix,
+        // `list_tracked_files` defers to `git ls-files` exit status,
+        // which works from any subdir inside a checkout.
+        //
+        // pass-35T review F1 strengthened this test to assert the
+        // full detect() pipeline end-to-end, not just the helper.
+        // `git ls-files` from a subdirectory returns paths relative
+        // to CWD (verified in pass-35T fresh-eyes round-2), so
+        // `project_root.join(rel)` resolves correctly.
         let td = TempDir::new().unwrap();
         init_git_repo(td.path());
         let sub = td.path().join("nested");
         fs::create_dir(&sub).unwrap();
-        // Track an env file at the subdirectory's path. `git add`
-        // is invoked from the repo root with the relative path.
+        // Track an env file inside the subdir. `git add` is invoked
+        // from the repo root with the relative path.
         fs::write(sub.join(".env"), "HTTP_BEARER_TOKEN=in-subdir\n").unwrap();
         git_add(td.path(), "nested/.env");
-        // Drive detect() with the subdir as project_root. The fix
-        // removed the `.git/` literal check; `git ls-files` walks
-        // up the tree to find the index. It returns paths relative
-        // to the repo root, so `project_root.join(rel)` yields the
-        // wrong absolute path — the metadata check fails and the
-        // entry is dropped. The fix's value is that the tracked
-        // lane HAS A CHANCE to run (returns `Some(entries)`) rather
-        // than being short-circuited to `None`. Operators running
-        // `am doctor` from a subdir at least don't get spurious
-        // untracked-lane chmods on tracked files at the root.
-        //
-        // The acceptance criterion for this regression test is
-        // therefore narrower than "tracked finding emitted":
-        // calling `list_tracked_files(sub)` must return `Some(_)`,
-        // proving the subdir-presence guard is gone.
-        let tracked = list_tracked_files(&sub);
+
+        // `list_tracked_files(sub)` returns `Some(_)` and enumerates
+        // the tracked entry.
+        let tracked = list_tracked_files(&sub)
+            .expect("list_tracked_files must succeed from a subdirectory of a git checkout");
         assert!(
-            tracked.is_some(),
-            "list_tracked_files must succeed from a subdirectory of a git checkout"
-        );
-        let entries = tracked.unwrap();
-        // The relative path "nested/.env" should appear in the
-        // ls-files output.
-        assert!(
-            entries.iter().any(|e| e.ends_with(".env")),
+            tracked.iter().any(|e| e.ends_with(".env")),
             "ls-files from subdir must enumerate index entries"
         );
+
+        // End-to-end: detect(sub) emits a tracked finding for the
+        // subdir's .env (because `git ls-files` paths are relative
+        // to CWD, `sub.join(".env")` is the correct absolute path).
+        let findings = detect(&sub);
+        let tracked_findings: Vec<_> = findings.iter().filter(|f| f.tracked_by_git).collect();
+        assert_eq!(
+            tracked_findings.len(),
+            1,
+            "detect() from subdir must surface the tracked .env"
+        );
+        assert!(tracked_findings[0].path.ends_with(".env"));
+        assert!(
+            tracked_findings[0]
+                .matched_pattern
+                .contains("HTTP_BEARER_TOKEN"),
+        );
+    }
+
+    #[test]
+    fn fixer_re_stats_and_refuses_to_widen_a_tightened_file() {
+        // pass-35T review F3 (Codex + Gemini): if the file is
+        // tightened between detect() and fix() (e.g., operator
+        // ran `chmod 0o400` manually), the fixer MUST re-stat and
+        // refuse to broaden it to 0o600. The detect-time snapshot
+        // alone is unsafe.
+        let td = TempDir::new().unwrap();
+        let p = td.path().join(".env");
+        write_with_mode(&p, "HTTP_BEARER_TOKEN=x", 0o644);
+        // Construct a finding with the stale 0o644 mode snapshot,
+        // then tighten the file before calling fix().
+        let stale = CommittedEnvFileFinding {
+            path: p.clone(),
+            tracked_by_git: false,
+            current_mode: 0o100644,
+            matched_pattern: "HTTP_BEARER_TOKEN".into(),
+        };
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).unwrap();
+        let ctx = ctx_for(&td, "2026-05-15T09-31-00Z__restat");
+        let outcome = fix(&ctx, &stale).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+        // Mode must remain 0o400 — fixer must not have broadened it.
+        let mode = fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o400,
+            "fixer must NOT widen a tightened-since-detect file"
+        );
+    }
+
+    #[test]
+    fn fixer_re_stats_and_skips_vanished_file() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join(".env");
+        write_with_mode(&p, "HTTP_BEARER_TOKEN=x", 0o644);
+        let finding = detect(td.path()).into_iter().next().expect("finding");
+        // Remove the file between detect and fix.
+        fs::remove_file(&p).unwrap();
+        let ctx = ctx_for(&td, "2026-05-15T09-31-01Z__vanish");
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
     }
 }
