@@ -314,6 +314,85 @@ fn ensure_parent_dir_strict(dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)
 }
 
+/// Acquire the per-path `.<basename>.doctor-lock` for `target_file`.
+/// Round-10 (round-7 Gemini F6 / Codex F2): mirrors the chokepoint's
+/// own per-target advisory lock so concurrent `am doctor --fix` and
+/// `am doctor undo` are properly serialized on the same path.
+/// Without this, mutate could be hashing/writing the file while
+/// undo is hashing/restoring it, producing torn intermediate state.
+///
+/// Returns:
+/// - `Ok(Some(file))` — lock held; release on drop at scope exit.
+/// - `Ok(None)` — parent dir doesn't exist (no concurrent mutation
+///   possible against a non-existent dir; skip locking).
+/// - `Err(WouldBlock)` — another process holds the lock.
+/// - `Err(other)` — IO error opening or creating the lock file.
+fn acquire_target_lock(target_file: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    let parent = target_file.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        return Ok(None);
+    }
+    let basename = target_file
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "_root_".to_string());
+    let lock_path = parent.join(format!(".{basename}.doctor-lock"));
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    if let Err(error) = lock_file.try_lock_exclusive() {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "target {} is locked by another doctor process (concurrent fix?)",
+                    target_file.display()
+                ),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(Some(lock_file))
+}
+
+/// Acquire `.doctor-lock` files on TWO paths in a stable order
+/// (lexicographic) to prevent deadlock when concurrent operations
+/// touch the same pair (e.g., Rename + reverse-Rename undo).
+/// Returns both locks even if one of the inputs is the same path
+/// (in which case the second call hits WouldBlock since fs2 advisory
+/// locks are per-fd; we collapse same-path to a single lock).
+fn acquire_pair_locks(
+    a: &Path,
+    b: &Path,
+) -> std::io::Result<(Option<std::fs::File>, Option<std::fs::File>)> {
+    if a == b {
+        let lock = acquire_target_lock(a)?;
+        return Ok((lock, None));
+    }
+    // Lexicographic order on the raw OsStr bytes is stable and
+    // collision-free across concurrent processes.
+    let (first_path, second_path) = if a.as_os_str() <= b.as_os_str() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let first_lock = acquire_target_lock(first_path)?;
+    let second_lock = acquire_target_lock(second_path)?;
+    // Re-map back to (a, b) order so the caller can reason about
+    // which lock corresponds to which input path. The locks
+    // themselves are interchangeable for the purposes of holding
+    // exclusion until scope-drop.
+    if a.as_os_str() <= b.as_os_str() {
+        Ok((first_lock, second_lock))
+    } else {
+        Ok((second_lock, first_lock))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct StoredAction {
     path: String,
@@ -613,6 +692,35 @@ pub fn run_undo_with_scopes(
                 );
                 continue;
             }
+            // Round-10: per-path lock acquisition. The chokepoint
+            // takes `.<basename>.doctor-lock` exclusive for every
+            // mutation; undo must match so concurrent fix+undo
+            // can't tear the file between hash/write.
+            let _crash_target_lock: Option<std::fs::File> = match acquire_target_lock(&target_file)
+            {
+                Ok(g) => g,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!(
+                        "crash-window restore: {} held by concurrent fix; skipping",
+                        target_file.display()
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!(
+                        "could not acquire crash-window lock on {}: {}",
+                        target_file.display(),
+                        e,
+                    ));
+                    continue;
+                }
+            };
             if backup_file.exists() {
                 // Round-8 Gemini F1 (P2): DbExec/DbMigrate
                 // crash-window parent-dir recreation must use
@@ -745,6 +853,45 @@ pub fn run_undo_with_scopes(
             summary.failures.push(format!("{e}"));
             continue;
         }
+        // Round-10 (round-7 Codex F2 / Gemini F6): acquire the
+        // per-path `.<basename>.doctor-lock` so concurrent
+        // `am doctor --fix` and `am doctor undo` cannot interleave
+        // a hash/restore step on the same target. For `Rename`
+        // both sides need locking — handled inside the Rename arm
+        // via `acquire_pair_locks`; the target_file lock here is
+        // redundant in that case but harmless (mutate.rs also
+        // takes the source lock first for renames, so the pair is
+        // already serialized by the chokepoint).
+        //
+        // Dry-run skips the lock entirely — no mutation, no race.
+        let _target_lock: Option<std::fs::File> = if dry_run || action.op == "Rename" {
+            None
+        } else {
+            match acquire_target_lock(&target_file) {
+                Ok(g) => g,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!(
+                        "target {} held by concurrent fix; skipping",
+                        target_file.display()
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!(
+                        "could not acquire lock on {}: {}",
+                        target_file.display(),
+                        e,
+                    ));
+                    continue;
+                }
+            }
+        };
         // Pass-4 fix: read the per-mutation backup at
         // `backups/seq_<started_at_ns>/<rel>`. If `started_at_ns == 0`
         // (legacy actions.jsonl from pre-pass-4 runs), fall back to the
@@ -1050,6 +1197,39 @@ pub fn run_undo_with_scopes(
                     summary.failures.push(format!("{e}"));
                     continue;
                 }
+                // Round-10: pair-lock acquisition. Both ends of
+                // the rename need `.doctor-lock` so a concurrent
+                // mutate can't race against us on either path.
+                // `acquire_pair_locks` enforces stable
+                // lexicographic order to prevent deadlock. Dry-run
+                // skips since no mutation happens.
+                let _rename_locks: (Option<std::fs::File>, Option<std::fs::File>) = if dry_run {
+                    (None, None)
+                } else {
+                    match acquire_pair_locks(&from_after, &restore_to) {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary.failures.push(format!(
+                                "rename pair ({} ↔ {}) held by concurrent fix; skipping",
+                                from_after.display(),
+                                restore_to.display()
+                            ));
+                            continue;
+                        }
+                        Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary
+                                .failures
+                                .push(format!("could not acquire rename pair locks: {}", e));
+                            continue;
+                        }
+                    }
+                };
                 // Round-9 (Gemini F1 P3): the dry-run check was
                 // previously here, BEFORE the after_hash and
                 // destination-clobber checks. That made
@@ -2769,6 +2949,91 @@ mod tests {
             post_undo_hash, pre_undo_hash,
             "atomic restore must not corrupt the live target on backup-tamper failure",
         );
+    }
+
+    #[test]
+    fn undo_refuses_when_concurrent_fix_holds_target_lock() {
+        // Round-10 (round-7 Codex F2 / Gemini F6): undo must
+        // acquire the per-path `.<basename>.doctor-lock` so a
+        // concurrent `am doctor --fix` can't interleave a
+        // hash/write step against the same target. Simulated by
+        // manually grabbing the lock before invoking undo;
+        // strict mode must surface WouldBlock.
+        use fs2::FileExt;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("victim.txt");
+        fs::write(&target, b"original\n").unwrap();
+        let run_id = "2026-05-15T02-00-00Z__concurrent-fix";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"new\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        // Concurrent fix holds the per-path lock.
+        let lock_path = td.path().join(".victim.txt.doctor-lock");
+        let competitor = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        competitor.try_lock_exclusive().unwrap();
+        // Strict undo must surface WouldBlock.
+        let result = test_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        // Target unchanged (still in post-fix state).
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        // Release the competitor lock; undo succeeds on retry.
+        FileExt::unlock(&competitor).unwrap();
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn undo_dry_run_skips_target_lock_acquisition() {
+        // Round-10: dry-run undo doesn't mutate anything, so
+        // there's no need to take the per-path lock. A concurrent
+        // fix holding the lock must NOT block dry-run preview.
+        use fs2::FileExt;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("preview.txt");
+        fs::write(&target, b"original\n").unwrap();
+        let run_id = "2026-05-15T02-00-01Z__dryrun-lock-skip";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"new\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        let lock_path = td.path().join(".preview.txt.doctor-lock");
+        let competitor = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        competitor.try_lock_exclusive().unwrap();
+        let summary = test_undo(td.path(), run_id, true, true).unwrap();
+        // Dry-run reports 1 replayable action without mutating.
+        assert_eq!(summary.actions_replayed, 1);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        FileExt::unlock(&competitor).unwrap();
     }
 
     #[test]
