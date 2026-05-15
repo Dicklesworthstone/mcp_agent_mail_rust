@@ -960,8 +960,7 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
 /// Returns `None` when AM_GIT_BINARY is unset in BOTH surfaces —
 /// that case is the territory of `known_bad_git_no_override`, not
 /// this FM.
-fn build_am_git_binary_detect_inputs(
-) -> Option<fixers::am_git_binary_missing::DetectInputs> {
+fn build_am_git_binary_detect_inputs() -> Option<fixers::am_git_binary_missing::DetectInputs> {
     let config_env_value = read_am_git_binary_from_config_env();
     let process_env_value = std::env::var("AM_GIT_BINARY").ok();
     if config_env_value.is_none() && process_env_value.is_none() {

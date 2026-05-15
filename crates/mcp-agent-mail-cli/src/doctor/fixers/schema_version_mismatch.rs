@@ -183,10 +183,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<SchemaVersionMismatchFinding>
     let config = SqliteConfig::file(uri).flags(flags);
     let conn = SqliteConnection::open(&config).ok()?;
     let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
-    let on_disk: i64 = rows
-        .first()?
-        .get_named::<i64>("user_version")
-        .ok()?;
+    let on_disk: i64 = rows.first()?.get_named::<i64>("user_version").ok()?;
     let on_disk = i32::try_from(on_disk).ok()?;
     let compiled = SCHEMA_VERSION;
     if on_disk == compiled {

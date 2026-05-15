@@ -132,9 +132,8 @@ impl JwtEnabledWithoutKeysFinding {
     }
 
     pub fn manual_remediation_text(&self) -> String {
-        let mut steps = vec![
-            "JWT verifier configuration is incomplete. Choose ONE of:".to_string(),
-        ];
+        let mut steps =
+            vec!["JWT verifier configuration is incomplete. Choose ONE of:".to_string()];
         let needs_secret = self
             .problems
             .iter()
@@ -178,9 +177,7 @@ impl JwtEnabledWithoutKeysFinding {
                 self.algorithms,
             ));
         }
-        steps.push(
-            "  -- OR --".to_string(),
-        );
+        steps.push("  -- OR --".to_string());
         steps.push(
             "  (z) Set HTTP_JWT_ENABLED=false in config.env if JWT auth was unintentional. \
              `am doctor` will NOT auto-disable JWT for you because that silently drops a \
@@ -213,8 +210,9 @@ pub fn detect(inputs: &DetectInputs) -> Vec<JwtEnabledWithoutKeysFinding> {
     let needs_jwks = algos
         .iter()
         .any(|a| a.starts_with("RS") || a.starts_with("ES") || a.starts_with("PS"));
-    let known_family =
-        algos.iter().all(|a| a.starts_with("HS") || a.starts_with("RS") || a.starts_with("ES") || a.starts_with("PS"));
+    let known_family = algos.iter().all(|a| {
+        a.starts_with("HS") || a.starts_with("RS") || a.starts_with("ES") || a.starts_with("PS")
+    });
     let mut problems = Vec::new();
     if algos.is_empty() {
         problems.push(JwtProblem::NoAlgorithmsConfigured);
@@ -290,9 +288,11 @@ mod tests {
         inputs.http_jwt_secret_present = false;
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .problems
-            .contains(&JwtProblem::HsAlgoWithoutSecret));
+        assert!(
+            findings[0]
+                .problems
+                .contains(&JwtProblem::HsAlgoWithoutSecret)
+        );
     }
 
     #[test]
@@ -302,9 +302,11 @@ mod tests {
         // secret present is irrelevant for RS — JWKS required.
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .problems
-            .contains(&JwtProblem::AsymmetricAlgoWithoutJwks));
+        assert!(
+            findings[0]
+                .problems
+                .contains(&JwtProblem::AsymmetricAlgoWithoutJwks)
+        );
     }
 
     #[test]
@@ -322,9 +324,11 @@ mod tests {
         inputs.http_jwt_algorithms = Vec::new();
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .problems
-            .contains(&JwtProblem::NoAlgorithmsConfigured));
+        assert!(
+            findings[0]
+                .problems
+                .contains(&JwtProblem::NoAlgorithmsConfigured)
+        );
     }
 
     #[test]
@@ -333,9 +337,11 @@ mod tests {
         inputs.http_jwt_algorithms = vec!["GARBAGE".to_string()];
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .problems
-            .contains(&JwtProblem::UnknownAlgorithmFamily));
+        assert!(
+            findings[0]
+                .problems
+                .contains(&JwtProblem::UnknownAlgorithmFamily)
+        );
     }
 
     #[test]
@@ -346,12 +352,16 @@ mod tests {
         inputs.http_jwt_algorithms = vec!["HS256".to_string(), "RS256".to_string()];
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0]
-            .problems
-            .contains(&JwtProblem::AsymmetricAlgoWithoutJwks));
-        assert!(!findings[0]
-            .problems
-            .contains(&JwtProblem::HsAlgoWithoutSecret));
+        assert!(
+            findings[0]
+                .problems
+                .contains(&JwtProblem::AsymmetricAlgoWithoutJwks)
+        );
+        assert!(
+            !findings[0]
+                .problems
+                .contains(&JwtProblem::HsAlgoWithoutSecret)
+        );
     }
 
     #[test]

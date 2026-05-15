@@ -238,7 +238,10 @@ args = ["-m", "mcp_agent_mail"]
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].entries.len(), 1);
-        assert_eq!(findings[0].entries[0].entry_kind, McpAgentMailEntryKind::Python);
+        assert_eq!(
+            findings[0].entries[0].entry_kind,
+            McpAgentMailEntryKind::Python
+        );
         assert_eq!(findings[0].entries[0].tool, "codex");
     }
 

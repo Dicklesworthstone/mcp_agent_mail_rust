@@ -158,7 +158,9 @@ pub fn detect(locations: &[McpConfigLocation]) -> Vec<CodexStartupTimeoutFinding
         }
         let state = match extract_mcp_agent_mail_toml_startup_timeout(&contents) {
             None => TimeoutState::Missing,
-            Some(t) if t < CODEX_STARTUP_TIMEOUT_SECS => TimeoutState::TooShort { observed_secs: t },
+            Some(t) if t < CODEX_STARTUP_TIMEOUT_SECS => {
+                TimeoutState::TooShort { observed_secs: t }
+            }
             Some(_) => continue, // healthy — no finding
         };
         out.push(CodexStartupTimeoutFinding {
@@ -239,7 +241,10 @@ startup_timeout_sec = 5
         .unwrap();
         let findings = detect(&[loc_for(p, McpConfigTool::Codex, true)]);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].state, TimeoutState::TooShort { observed_secs: 5 });
+        assert_eq!(
+            findings[0].state,
+            TimeoutState::TooShort { observed_secs: 5 }
+        );
     }
 
     #[test]
@@ -309,7 +314,10 @@ mcp_agent_mail = { command = "mcp-agent-mail", startup_timeout_sec = 60 }
         .unwrap();
         let findings = detect(&[loc_for(p, McpConfigTool::Codex, true)]);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].state, TimeoutState::TooShort { observed_secs: 5 });
+        assert_eq!(
+            findings[0].state,
+            TimeoutState::TooShort { observed_secs: 5 }
+        );
     }
 
     #[test]
@@ -326,7 +334,10 @@ startup_timeout_sec = 5
         .unwrap();
         let findings = detect(&[loc_for(p, McpConfigTool::Codex, true)]);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].state, TimeoutState::TooShort { observed_secs: 5 });
+        assert_eq!(
+            findings[0].state,
+            TimeoutState::TooShort { observed_secs: 5 }
+        );
     }
 
     #[test]

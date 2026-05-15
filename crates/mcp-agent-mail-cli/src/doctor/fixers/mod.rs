@@ -27,13 +27,14 @@ pub mod integrity_page_malformed;
 pub mod jwt_enabled_without_keys;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
+pub mod path_order_shadows_am;
 pub mod schema_version_mismatch;
 pub mod sqlite_sidecar_symlink;
 pub mod stale_archive_lock;
 pub mod stale_bearer_token_skew;
-pub mod stale_python_launcher_entry;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
+pub mod stale_python_launcher_entry;
 pub mod stale_python_server_shadow;
 pub mod text_timestamp_contamination;
 pub mod wal_mode_disabled;
@@ -311,6 +312,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::known_bad_git_no_override",
         },
         FixerSpec {
+            id: path_order_shadows_am::FM_ID,
+            severity: "P1",
+            subsystem: "environment_toolchain",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Multiple distinct `am` binaries on PATH (first-match wins; ensure ~/.local/bin precedes others)",
+            source_module: "doctor::fixers::path_order_shadows_am",
+        },
+        FixerSpec {
             id: codex_startup_timeout::FM_ID,
             severity: "P1",
             subsystem: "mcp_config_files",
@@ -543,10 +553,13 @@ pub fn dispatch_only(
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
     } else if fm_id == jwt_enabled_without_keys::FM_ID {
-        let jwt_inputs = inputs.jwt_detect.as_ref().ok_or(DispatchError::MissingInput {
-            fm_id: jwt_enabled_without_keys::FM_ID,
-            field: "jwt_detect",
-        })?;
+        let jwt_inputs = inputs
+            .jwt_detect
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: jwt_enabled_without_keys::FM_ID,
+                field: "jwt_detect",
+            })?;
         let findings = jwt_enabled_without_keys::detect(jwt_inputs);
         outcome.findings_count = findings.len();
         for f in &findings {
@@ -572,14 +585,27 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == path_order_shadows_am::FM_ID {
+        // Reads PATH from process env; no DispatchInputs field
+        // needed.
+        let pa_inputs = path_order_shadows_am::DetectInputs::default();
+        let findings = path_order_shadows_am::detect(&pa_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = path_order_shadows_am::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == am_git_binary_missing::FM_ID {
-        let am_inputs = inputs
-            .am_git_binary_detect
-            .as_ref()
-            .ok_or(DispatchError::MissingInput {
-                fm_id: am_git_binary_missing::FM_ID,
-                field: "am_git_binary_detect",
-            })?;
+        let am_inputs =
+            inputs
+                .am_git_binary_detect
+                .as_ref()
+                .ok_or(DispatchError::MissingInput {
+                    fm_id: am_git_binary_missing::FM_ID,
+                    field: "am_git_binary_detect",
+                })?;
         let findings = am_git_binary_missing::detect(am_inputs);
         outcome.findings_count = findings.len();
         for f in &findings {
@@ -846,10 +872,13 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == jwt_enabled_without_keys::FM_ID {
-        let jwt_inputs = inputs.jwt_detect.as_ref().ok_or(DispatchError::MissingInput {
-            fm_id: jwt_enabled_without_keys::FM_ID,
-            field: "jwt_detect",
-        })?;
+        let jwt_inputs = inputs
+            .jwt_detect
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: jwt_enabled_without_keys::FM_ID,
+                field: "jwt_detect",
+            })?;
         jwt_enabled_without_keys::detect(jwt_inputs)
             .iter()
             .map(|f| f.to_finding())
@@ -866,14 +895,20 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == path_order_shadows_am::FM_ID {
+        path_order_shadows_am::detect(&path_order_shadows_am::DetectInputs::default())
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == am_git_binary_missing::FM_ID {
-        let am_inputs = inputs
-            .am_git_binary_detect
-            .as_ref()
-            .ok_or(DispatchError::MissingInput {
-                fm_id: am_git_binary_missing::FM_ID,
-                field: "am_git_binary_detect",
-            })?;
+        let am_inputs =
+            inputs
+                .am_git_binary_detect
+                .as_ref()
+                .ok_or(DispatchError::MissingInput {
+                    fm_id: am_git_binary_missing::FM_ID,
+                    field: "am_git_binary_detect",
+                })?;
         am_git_binary_missing::detect(am_inputs)
             .iter()
             .map(|f| f.to_finding())
@@ -936,7 +971,8 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == wal_shm_sidecar_drift::FM_ID {
-        let detect_inputs = wal_shm_sidecar_drift::DetectInputs::new(inputs.db_file_candidates.clone());
+        let detect_inputs =
+            wal_shm_sidecar_drift::DetectInputs::new(inputs.db_file_candidates.clone());
         wal_shm_sidecar_drift::detect(&detect_inputs)
             .iter()
             .map(|f| f.to_finding())

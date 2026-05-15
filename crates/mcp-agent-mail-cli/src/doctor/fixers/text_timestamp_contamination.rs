@@ -188,9 +188,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFin
         // migration in `mcp_agent_mail_db::migrate` ALSO only
         // converts TEXT → microseconds, so anchoring the
         // detector to TEXT keeps the contract aligned.
-        let sql = format!(
-            "SELECT COUNT(*) AS n FROM {table} WHERE typeof({column}) = 'text'"
-        );
+        let sql = format!("SELECT COUNT(*) AS n FROM {table} WHERE typeof({column}) = 'text'");
         let rows = match conn.query_sync(&sql, &[]) {
             Ok(r) => r,
             // The table may not exist on a freshly-created DB
@@ -304,7 +302,10 @@ mod tests {
             .contaminated_columns
             .iter()
             .any(|c| c.table == "messages" && c.column == "created_ts");
-        assert!(has_messages_col, "messages.created_ts contamination missing");
+        assert!(
+            has_messages_col,
+            "messages.created_ts contamination missing"
+        );
     }
 
     #[test]
@@ -348,7 +349,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let db = td.path().join("empty.sqlite3");
         let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
-        conn.execute_raw("CREATE TABLE unrelated (x INTEGER)").unwrap();
+        conn.execute_raw("CREATE TABLE unrelated (x INTEGER)")
+            .unwrap();
         drop(conn);
         let findings = detect(std::slice::from_ref(&db));
         assert!(findings.is_empty());

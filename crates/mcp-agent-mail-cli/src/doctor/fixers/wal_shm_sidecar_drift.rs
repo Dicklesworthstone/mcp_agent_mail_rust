@@ -86,7 +86,11 @@ pub enum Signal {
     HeaderOnlyWal { wal_size_bytes: u64 },
     /// DB mtime is `drift_secs` ahead of WAL mtime; threshold
     /// crossed.
-    StaleWal { db_mtime_secs: u64, wal_mtime_secs: u64, drift_secs: u64 },
+    StaleWal {
+        db_mtime_secs: u64,
+        wal_mtime_secs: u64,
+        drift_secs: u64,
+    },
     /// More than `count` `.cleanup-quarantine-*` /
     /// `.startup-quarantine-*` files mtime'd in the last 24h
     /// in the same storage dir.
@@ -146,9 +150,7 @@ impl WalShmSidecarDriftFinding {
     }
 
     pub fn manual_remediation_text(&self) -> String {
-        let mut steps = vec![
-            "Stop `am serve` (so no live writer races your repair).".to_string(),
-        ];
+        let mut steps = vec!["Stop `am serve` (so no live writer races your repair).".to_string()];
         for s in &self.signals {
             match s {
                 Signal::AsymmetricSidecars { .. } => steps.push(
@@ -302,8 +304,8 @@ fn count_recent_quarantine_files(dir: &Path, now_override: Option<SystemTime>) -
     for entry in read.flatten() {
         let name = entry.file_name();
         let name_s = name.to_string_lossy();
-        let matches = name_s.contains(".cleanup-quarantine-")
-            || name_s.contains(".startup-quarantine-");
+        let matches =
+            name_s.contains(".cleanup-quarantine-") || name_s.contains(".startup-quarantine-");
         if !matches {
             continue;
         }
@@ -397,21 +399,18 @@ mod tests {
         touch(&td.path().join("storage.sqlite3-shm"), &[0u8; 32768]);
         // Four quarantine files in the same dir — over threshold.
         for i in 0..4 {
-            fs::write(
-                td.path().join(format!(".cleanup-quarantine-{i}")),
-                b"x",
-            )
-            .unwrap();
+            fs::write(td.path().join(format!(".cleanup-quarantine-{i}")), b"x").unwrap();
         }
         let inputs = DetectInputs::new(vec![db]);
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0]
-                .signals
-                .iter()
-                .any(|s| matches!(s, Signal::QuarantinePileUp { count: 4, threshold: 3 }))
-        );
+        assert!(findings[0].signals.iter().any(|s| matches!(
+            s,
+            Signal::QuarantinePileUp {
+                count: 4,
+                threshold: 3
+            }
+        )));
     }
 
     #[test]
@@ -443,11 +442,7 @@ mod tests {
         touch(&td.path().join("storage.sqlite3-wal"), &[0u8; 32]);
         touch(&td.path().join("storage.sqlite3-shm"), &[0u8; 32768]);
         for i in 0..5 {
-            fs::write(
-                td.path().join(format!(".startup-quarantine-{i}")),
-                b"x",
-            )
-            .unwrap();
+            fs::write(td.path().join(format!(".startup-quarantine-{i}")), b"x").unwrap();
         }
         let findings = detect(&DetectInputs::new(vec![db]));
         assert_eq!(findings.len(), 1, "one aggregated finding");

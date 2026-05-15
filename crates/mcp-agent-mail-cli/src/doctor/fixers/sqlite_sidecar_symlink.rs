@@ -433,10 +433,6 @@ mod tests {
             sidecar: Sidecar::MainDb,
         };
         assert!(wal_f.manual_remediation_text().contains("quarantine"));
-        assert!(
-            main_f
-                .manual_remediation_text()
-                .contains("STORAGE_ROOT")
-        );
+        assert!(main_f.manual_remediation_text().contains("STORAGE_ROOT"));
     }
 }

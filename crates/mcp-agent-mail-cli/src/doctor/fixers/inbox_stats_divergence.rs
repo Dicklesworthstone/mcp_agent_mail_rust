@@ -384,7 +384,8 @@ mod tests {
         assert_eq!(findings.len(), 1);
         let div = &findings[0].divergent_agents;
         assert!(
-            div.iter().any(|d| d.agent_id == 99 && d.stored_unread == 0 && d.actual_unread == 1),
+            div.iter()
+                .any(|d| d.agent_id == 99 && d.stored_unread == 0 && d.actual_unread == 1),
             "missing-inbox_stats-row case must be surfaced; got: {div:?}",
         );
     }

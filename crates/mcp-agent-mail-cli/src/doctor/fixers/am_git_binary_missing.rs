@@ -165,16 +165,22 @@ impl AmGitBinaryMissingFinding {
     /// Operator-facing instruction text (manual_remediation envelope).
     pub fn manual_remediation_text(&self) -> String {
         let action = match self.source {
-            Source::ConfigFile => "Edit $XDG_CONFIG_HOME/mcp-agent-mail/config.env (or \
+            Source::ConfigFile => {
+                "Edit $XDG_CONFIG_HOME/mcp-agent-mail/config.env (or \
                                    `~/.config/mcp-agent-mail/config.env`) and either point \
-                                   AM_GIT_BINARY at a working git binary or remove the line.",
-            Source::ProcessEnv => "AM_GIT_BINARY is set in your shell. Either fix the path \
+                                   AM_GIT_BINARY at a working git binary or remove the line."
+            }
+            Source::ProcessEnv => {
+                "AM_GIT_BINARY is set in your shell. Either fix the path \
                                    in your shell rc OR set it explicitly in \
                                    $XDG_CONFIG_HOME/mcp-agent-mail/config.env (the doctor's \
-                                   managed surface).",
-            Source::Both => "AM_GIT_BINARY is set in BOTH config.env and your shell. Fix or \
+                                   managed surface)."
+            }
+            Source::Both => {
+                "AM_GIT_BINARY is set in BOTH config.env and your shell. Fix or \
                              remove from both surfaces; the config.env value takes precedence \
-                             for doctor operations.",
+                             for doctor operations."
+            }
         };
         format!(
             "AM_GIT_BINARY={} is {} ({}). {}",
@@ -248,8 +254,7 @@ pub fn detect(inputs: &DetectInputs) -> Vec<AmGitBinaryMissingFinding> {
         (Some(c), Some(e)) => {
             // Differing surfaces — validate independently and emit
             // a separate finding per broken side.
-            let mut out =
-                probe_single(c, Source::ConfigFile, inputs.home_override.as_deref());
+            let mut out = probe_single(c, Source::ConfigFile, inputs.home_override.as_deref());
             out.extend(probe_single(
                 e,
                 Source::ProcessEnv,
