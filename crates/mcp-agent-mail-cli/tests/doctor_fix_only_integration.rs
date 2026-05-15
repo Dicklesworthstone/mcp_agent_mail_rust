@@ -830,16 +830,23 @@ fn detect_only_suspicious_ephemeral_finds_tmp_rooted_project() {
 
     let outcome = fixers::detect_only(suspicious_ephemeral_archive_root::FM_ID, &inputs)
         .expect("detect_only must recognize FM5");
-    // Concrete behavior: this fixture is recognized as ephemeral
-    // by scan_archive_anomalies (which inspects the project.json's
-    // human_key against the canonical ephemeral path prefixes).
-    // The exact `findings.len()` may be 0 if the helper has stricter
-    // rules than our fixture satisfies; the goal of THIS test is
-    // to prove the dispatcher correctly THREADS storage_root and
-    // doesn't silently misroute it. So we just assert no
-    // dispatcher-level error, which is what FM5's pass-35AA bug
-    // was hiding.
-    let _ = outcome;
+    // pass-35BB round-2 review F3: assert findings_count > 0 so
+    // that if the dispatcher regresses to passing `archive_roots`
+    // instead of `storage_root`, the scan would find nothing and
+    // the test would fail loudly (instead of the previous
+    // `let _ = outcome;` which would silently accept that
+    // regression).
+    //
+    // The fixture's `project.json` has `human_key:"/tmp/..."`
+    // which `mcp_agent_mail_core::ephemeral::path_has_ephemeral_root`
+    // recognizes as ephemeral; the helper emits exactly one
+    // `SuspiciousEphemeralProject` anomaly, aggregated by FM5
+    // into a single finding with one entry.
+    assert!(
+        outcome.findings_count >= 1,
+        "FM5 must surface the planted ephemeral project; got findings_count={}",
+        outcome.findings_count,
+    );
 }
 
 #[test]
