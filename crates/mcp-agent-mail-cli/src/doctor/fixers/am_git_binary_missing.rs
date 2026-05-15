@@ -211,32 +211,68 @@ pub struct DetectInputs {
 
 /// Detector. PURE w.r.t. caller-supplied inputs; performs filesystem
 /// stat calls on the resolved path but never writes.
+///
+/// Pass-35-review Codex F2 (P1): validate BOTH surfaces independently
+/// when both are present. The runtime git resolution path
+/// (`mcp_agent_mail_core::git_binary`) is env-driven; if config.env
+/// is valid but the process env points at a broken path, that's
+/// the surface that actually breaks `am serve`'s git shell-outs.
+/// The pre-fix code only validated config.env when both were set,
+/// false-negating that scenario.
+///
+/// Behavior:
+/// - Both surfaces unset: not our FM.
+/// - Either surface set with equal values: validate once; if broken,
+///   emit a single finding with `Source::Both`.
+/// - Surfaces set with different values: validate each independently;
+///   emit one finding per broken surface (so an operator can see
+///   that config.env is fine but the shell rc / process env is
+///   broken, or vice versa).
 pub fn detect(inputs: &DetectInputs) -> Vec<AmGitBinaryMissingFinding> {
-    let (raw_value, source) = match (&inputs.config_env_value, &inputs.process_env_value) {
-        (None, None) => return Vec::new(), // not our FM
-        (Some(c), None) => (c.clone(), Source::ConfigFile),
-        (None, Some(e)) => (e.clone(), Source::ProcessEnv),
-        (Some(c), Some(_)) => {
-            // Both set; report the config.env value (the doctor-
-            // managed surface). If they differ, that's a higher-
-            // order config drift, but for this FM what matters is
-            // whether either surface is broken.
-            (c.clone(), Source::Both)
+    let cfg = inputs
+        .config_env_value
+        .as_deref()
+        .filter(|v| !v.trim().is_empty());
+    let env = inputs
+        .process_env_value
+        .as_deref()
+        .filter(|v| !v.trim().is_empty());
+    match (cfg, env) {
+        (None, None) => Vec::new(),
+        (Some(v), None) => probe_single(v, Source::ConfigFile, inputs.home_override.as_deref()),
+        (None, Some(v)) => probe_single(v, Source::ProcessEnv, inputs.home_override.as_deref()),
+        (Some(c), Some(e)) if c == e => {
+            // Same value in both surfaces — one finding, source=Both.
+            probe_single(c, Source::Both, inputs.home_override.as_deref())
         }
-    };
-
-    // Empty string in config.env means "explicitly cleared" — not
-    // a broken path; skip.
-    if raw_value.trim().is_empty() {
-        return Vec::new();
+        (Some(c), Some(e)) => {
+            // Differing surfaces — validate independently and emit
+            // a separate finding per broken side.
+            let mut out =
+                probe_single(c, Source::ConfigFile, inputs.home_override.as_deref());
+            out.extend(probe_single(
+                e,
+                Source::ProcessEnv,
+                inputs.home_override.as_deref(),
+            ));
+            out
+        }
     }
+}
 
-    let expanded = expand_tilde(&raw_value, inputs.home_override.as_deref());
+/// Run the path classifier against a single raw value/source pair.
+/// Returns `Vec::new()` when the path is healthy.
+fn probe_single(
+    raw_value: &str,
+    source: Source,
+    home_override: Option<&Path>,
+) -> Vec<AmGitBinaryMissingFinding> {
+    let expanded = expand_tilde(raw_value, home_override);
     match classify_path(&expanded) {
         None => Vec::new(),
         Some(reason) => vec![AmGitBinaryMissingFinding {
             configured_path: expanded,
-            raw_value,
+            raw_value: raw_value.to_string(),
             source,
             reason,
         }],
@@ -457,6 +493,58 @@ mod tests {
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].source, Source::Both);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_flags_each_surface_independently_when_values_differ() {
+        // Pass-35-review Codex F2 (P1): if config.env is valid but
+        // process env points at a broken path, the runtime git
+        // shell-outs (env-driven) will fail. The detector must
+        // surface the broken process env even when config.env is
+        // healthy. Pre-fix the detector only validated config.env
+        // when both were set, producing a false negative.
+        let td = TempDir::new().unwrap();
+        let good = td.path().join("good-git");
+        fs::write(&good, "#!/bin/sh\necho").unwrap();
+        make_executable(&good);
+        let bad = td.path().join("nope/git").to_string_lossy().into_owned();
+        let inputs = DetectInputs {
+            config_env_value: Some(good.to_string_lossy().into_owned()),
+            process_env_value: Some(bad),
+            ..Default::default()
+        };
+        let findings = detect(&inputs);
+        // Config.env is fine; process env is broken. Exactly one
+        // finding, sourced to ProcessEnv.
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].source, Source::ProcessEnv);
+        assert_eq!(findings[0].reason, Reason::Missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_flags_both_surfaces_when_each_is_independently_broken() {
+        // Pass-35-review Codex F2 (P1): differing surfaces with
+        // different brokenness — one finding per side.
+        let td = TempDir::new().unwrap();
+        // config.env path: a directory (NotAFile).
+        let cfg_dir = td.path().join("cfg-dir");
+        fs::create_dir(&cfg_dir).unwrap();
+        // process env path: doesn't exist (Missing).
+        let proc_missing = td.path().join("proc/nope");
+        let inputs = DetectInputs {
+            config_env_value: Some(cfg_dir.to_string_lossy().into_owned()),
+            process_env_value: Some(proc_missing.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let findings = detect(&inputs);
+        assert_eq!(findings.len(), 2);
+        // Order is deterministic: config.env first, then process_env.
+        assert_eq!(findings[0].source, Source::ConfigFile);
+        assert_eq!(findings[0].reason, Reason::NotAFile);
+        assert_eq!(findings[1].source, Source::ProcessEnv);
+        assert_eq!(findings[1].reason, Reason::Missing);
     }
 
     #[test]

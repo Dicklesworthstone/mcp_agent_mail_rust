@@ -321,18 +321,27 @@ fn ensure_parent_dir_strict(dir: &Path) -> std::io::Result<()> {
 /// Without this, mutate could be hashing/writing the file while
 /// undo is hashing/restoring it, producing torn intermediate state.
 ///
+/// Pass-35-review Codex F1 (P2): the parent directory is created
+/// up-front via `create_dir_all` so the lock file can be opened
+/// even when the operator removed the directory between fix and
+/// undo. The pre-fix shortcut "skip lock if parent missing" was
+/// unsound because `mutate()` also creates the parent before
+/// taking its own per-path lock (`mutate.rs` ~line 685) — a
+/// concurrent fix could `mkdir`+lock and start mutating after we
+/// returned `Ok(None)`, racing the restore.
+///
 /// Returns:
 /// - `Ok(Some(file))` — lock held; release on drop at scope exit.
-/// - `Ok(None)` — parent dir doesn't exist (no concurrent mutation
-///   possible against a non-existent dir; skip locking).
 /// - `Err(WouldBlock)` — another process holds the lock.
-/// - `Err(other)` — IO error opening or creating the lock file.
+/// - `Err(other)` — IO error opening / creating the lock file or
+///   the parent directory.
 fn acquire_target_lock(target_file: &Path) -> std::io::Result<Option<std::fs::File>> {
     use fs2::FileExt;
     let parent = target_file.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.exists() {
-        return Ok(None);
-    }
+    // Pass-35-review Codex F1: ensure the lock-file parent exists so
+    // we always own the lock fd before mutate could win the mkdir
+    // race.
+    fs::create_dir_all(parent)?;
     let basename = target_file
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
