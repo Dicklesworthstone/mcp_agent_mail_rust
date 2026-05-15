@@ -680,7 +680,11 @@ pub enum Commands {
     #[command(name = "upgrade")]
     Upgrade(legacy::UpgradeArgs),
     /// Check for updates or self-update the binary.
-    #[command(name = "self-update")]
+    ///
+    /// Accepts both `am self-update` (legacy form) and `am update` (short
+    /// alias matching `ntm update` / `caam update` conventions). Both
+    /// dispatch to the same handler with identical flags.
+    #[command(name = "self-update", alias = "update")]
     SelfUpdate {
         /// Only check for updates without installing.
         #[arg(long, default_value_t = false)]
