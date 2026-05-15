@@ -46,6 +46,7 @@ pub mod stale_python_launcher_entry;
 pub mod stale_python_server_shadow;
 pub mod suspicious_ephemeral_archive_root;
 pub mod text_timestamp_contamination;
+pub mod unexpected_symlink_in_archive;
 pub mod wal_mode_disabled;
 pub mod wal_shm_sidecar_drift;
 pub mod world_readable_storage_db;
@@ -225,6 +226,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Mailbox archive contains project entries rooted at ephemeral paths (/tmp, /var/tmp, tmp-XXXX) — leakage from test runs; manual review + archive-normalize",
             source_module: "doctor::fixers::suspicious_ephemeral_archive_root",
+        },
+        FixerSpec {
+            id: unexpected_symlink_in_archive::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Mailbox archive contains unexpected symlinks (possible filesystem tampering / migration artifact; manual review — could be SECURITY signal if target is outside storage_root)",
+            source_module: "doctor::fixers::unexpected_symlink_in_archive",
         },
         FixerSpec {
             id: empty_or_truncated_db::FM_ID,
@@ -665,6 +675,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == unexpected_symlink_in_archive::FM_ID {
+        let us_inputs = unexpected_symlink_in_archive::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        let findings = unexpected_symlink_in_archive::detect(&us_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = unexpected_symlink_in_archive::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == stale_listener_pid_hint::FM_ID {
         let stale_secs = inputs
             .stale_seconds_override
@@ -1094,6 +1117,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             report_override: None,
         };
         missing_or_malformed_project_json::detect(&mp_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == unexpected_symlink_in_archive::FM_ID {
+        let us_inputs = unexpected_symlink_in_archive::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        unexpected_symlink_in_archive::detect(&us_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
