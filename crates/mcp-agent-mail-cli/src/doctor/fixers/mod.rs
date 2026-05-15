@@ -19,7 +19,6 @@
 #![forbid(unsafe_code)]
 
 pub mod am_git_binary_missing;
-pub mod busy_timeout_missing;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
@@ -201,15 +200,6 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "Stale .git/HEAD.lock / packed-refs.lock / refs/**/*.lock files",
             source_module: "doctor::fixers::stale_head_or_ref_lock",
-        },
-        FixerSpec {
-            id: busy_timeout_missing::FM_ID,
-            severity: "P2",
-            subsystem: "db_state_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "storage.sqlite3 has PRAGMA busy_timeout below 30000 ms (default 0 ms causes spurious 'database is locked' under concurrent load; auto-fix deferred pending pool session-init plumbing)",
-            source_module: "doctor::fixers::busy_timeout_missing",
         },
         FixerSpec {
             id: empty_or_truncated_db::FM_ID,
@@ -789,16 +779,6 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
-    } else if fm_id == busy_timeout_missing::FM_ID {
-        let findings = busy_timeout_missing::detect(&inputs.db_file_candidates);
-        outcome.findings_count = findings.len();
-        for f in &findings {
-            outcome.findings.push(f.to_finding());
-            // Detect-only — fix is a no-op.
-            let result = busy_timeout_missing::fix(ctx, f)?;
-            outcome.actions_taken += result.actions_taken;
-            outcome.actions_skipped += result.actions_skipped;
-        }
     } else if fm_id == empty_or_truncated_db::FM_ID {
         let findings = empty_or_truncated_db::detect(&inputs.db_file_candidates);
         outcome.findings_count = findings.len();
@@ -960,11 +940,6 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
                 field: "jwt_detect",
             })?;
         jwt_enabled_without_keys::detect(jwt_inputs)
-            .iter()
-            .map(|f| f.to_finding())
-            .collect()
-    } else if fm_id == committed_env_file_in_repo::FM_ID {
-        committed_env_file_in_repo::detect(&inputs.repo_root)
             .iter()
             .map(|f| f.to_finding())
             .collect()
