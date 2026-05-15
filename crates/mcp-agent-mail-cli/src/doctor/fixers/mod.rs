@@ -30,6 +30,7 @@ pub mod known_bad_git_no_override;
 pub mod legacy_fts_residue;
 pub mod login_shell_path_leak;
 pub mod missing_gitignore_entry;
+pub mod missing_head_or_broken_git_shape;
 pub mod missing_or_malformed_project_json;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
@@ -190,6 +191,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "Repo .gitignore missing `.doctor/` so per-run artifacts get committed",
             source_module: "doctor::fixers::missing_gitignore_entry",
+        },
+        FixerSpec {
+            id: missing_head_or_broken_git_shape::FM_ID,
+            severity: "P0",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "One or more `<storage_root>/projects/<slug>/.git/HEAD` files are missing / empty / symlinked / dangling — archive replay broken; manual: `am doctor reconstruct`",
+            source_module: "doctor::fixers::missing_head_or_broken_git_shape",
         },
         FixerSpec {
             id: missing_or_malformed_project_json::FM_ID,
@@ -660,6 +670,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == missing_head_or_broken_git_shape::FM_ID {
+        let findings = missing_head_or_broken_git_shape::detect(&inputs.archive_roots);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = missing_head_or_broken_git_shape::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == missing_or_malformed_project_json::FM_ID {
         // Same storage_root threading as FM5; reuses
         // scan_archive_anomalies via a different anomaly filter.
@@ -1108,6 +1127,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             report_override: None,
         };
         suspicious_ephemeral_archive_root::detect(&se_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == missing_head_or_broken_git_shape::FM_ID {
+        missing_head_or_broken_git_shape::detect(&inputs.archive_roots)
             .iter()
             .map(|f| f.to_finding())
             .collect()
