@@ -27,6 +27,7 @@ pub mod inbox_stats_divergence;
 pub mod integrity_page_malformed;
 pub mod jwt_enabled_without_keys;
 pub mod known_bad_git_no_override;
+pub mod legacy_fts_residue;
 pub mod missing_gitignore_entry;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
@@ -227,6 +228,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "PRAGMA integrity_check reports malformed pages (slow check; opt-in via --only; recovery via `am doctor reconstruct`)",
             source_module: "doctor::fixers::integrity_page_malformed",
+        },
+        FixerSpec {
+            id: legacy_fts_residue::FM_ID,
+            severity: "P2",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "storage.sqlite3 retains legacy FTS5 tables/triggers/views after Search V3 migration (manual DROP sequence; auto-fix deferred)",
+            source_module: "doctor::fixers::legacy_fts_residue",
         },
         FixerSpec {
             id: schema_version_mismatch::FM_ID,
@@ -723,6 +733,16 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == legacy_fts_residue::FM_ID {
+        let findings = legacy_fts_residue::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = legacy_fts_residue::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == codex_startup_timeout::FM_ID {
         // `detect_mcp_config_locations_default` is a pure helper
         // that reads no env state beyond `dirs::home_dir()` + CWD;
@@ -943,6 +963,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == committed_env_file_in_repo::FM_ID {
+        committed_env_file_in_repo::detect(&inputs.repo_root)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == known_bad_git_no_override::FM_ID {
         let git_inputs = inputs
             .git_detect
@@ -1001,6 +1026,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == integrity_page_malformed::FM_ID {
         integrity_page_malformed::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == legacy_fts_residue::FM_ID {
+        legacy_fts_residue::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
