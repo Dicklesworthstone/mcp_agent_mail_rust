@@ -23,6 +23,7 @@ pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
+pub mod schema_version_mismatch;
 pub mod sqlite_sidecar_symlink;
 pub mod stale_archive_lock;
 pub mod stale_bearer_token_skew;
@@ -185,6 +186,19 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "storage.sqlite3 is empty / truncated / fails PRAGMA quick_check (manual reconstruct required)",
             source_module: "doctor::fixers::empty_or_truncated_db",
+        },
+        FixerSpec {
+            id: schema_version_mismatch::FM_ID,
+            // Severity is dynamic (P0 for ForwardMigrate, P1 for
+            // Newer); the registry surface picks the higher
+            // (P0) as the documented baseline. Findings still
+            // carry the precise per-direction severity.
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "DB user_version != compiled SCHEMA_VERSION (forward migration via `am serve` restart; newer-on-disk requires binary upgrade)",
+            source_module: "doctor::fixers::schema_version_mismatch",
         },
         FixerSpec {
             id: sqlite_sidecar_symlink::FM_ID,
@@ -518,6 +532,15 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
+    } else if fm_id == schema_version_mismatch::FM_ID {
+        let findings = schema_version_mismatch::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = schema_version_mismatch::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == text_timestamp_contamination::FM_ID {
         let findings = text_timestamp_contamination::detect(&inputs.db_file_candidates);
         outcome.findings_count = findings.len();
@@ -714,6 +737,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
     } else if fm_id == sqlite_sidecar_symlink::FM_ID {
         let paths = expand_db_candidates_with_sidecars(&inputs.db_file_candidates);
         sqlite_sidecar_symlink::detect(&paths)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == schema_version_mismatch::FM_ID {
+        schema_version_mismatch::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
