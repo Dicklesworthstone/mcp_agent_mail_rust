@@ -69,7 +69,16 @@ const FM_SUBSYSTEM: &str = "db_state_files";
 
 /// SQL used by the fixer. Public so doc tooling can surface the
 /// exact statement an operator would otherwise have to type.
+///
+/// Pass-35L review (Codex F2 + Gemini F2 P0): wrapped in
+/// `BEGIN IMMEDIATE` / `COMMIT` so a crash mid-statement cannot
+/// leave the table empty (DELETE committed, INSERT not yet
+/// applied). The `IMMEDIATE` mode also takes a write lock at
+/// statement start, which prevents trigger races with a live
+/// `am serve` (its INSERT-into-message_recipients trigger
+/// would otherwise interleave between our DELETE and INSERT).
 pub const REBUILD_SQL: &str = concat!(
+    "BEGIN IMMEDIATE; ",
     "DELETE FROM inbox_stats; ",
     "INSERT INTO inbox_stats ",
     "(agent_id, total_count, unread_count, ack_pending_count, last_message_ts) ",
@@ -79,7 +88,8 @@ pub const REBUILD_SQL: &str = concat!(
     "MAX(m.created_ts) ",
     "FROM message_recipients r ",
     "JOIN messages m ON m.id = r.message_id ",
-    "GROUP BY r.agent_id;",
+    "GROUP BY r.agent_id; ",
+    "COMMIT;",
 );
 
 /// Single agent's divergence record.
@@ -163,6 +173,24 @@ fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> 
     let config = SqliteConfig::file(uri).flags(flags);
     let conn = SqliteConnection::open(&config).ok()?;
 
+    // Pass-35L review (Codex F1 + Gemini F1 P0): the pre-fix
+    // detector drove from `inbox_stats LEFT JOIN aggregate`,
+    // which silently missed the most important divergence
+    // shape — agents with unread `message_recipients` rows but
+    // NO matching `inbox_stats` row (e.g., a dropped INSERT
+    // trigger after migration). The fix runs a `UNION ALL`
+    // of two queries:
+    //
+    //   (A) inbox_stats LEFT JOIN gt: stored count disagrees
+    //       with ground truth (or gt is missing → 0).
+    //   (B) gt anti-joined against inbox_stats: ground-truth
+    //       rows for agents with unread mail but no
+    //       inbox_stats row at all (the missing-row case).
+    //
+    // Both rows share the `(aid, stored, actual)` shape so the
+    // outer ResultSet decode loop is unchanged. `LIMIT 101`
+    // (101 = 100 + sentinel for `more_truncated`) is applied
+    // to the union.
     let query = concat!(
         "SELECT s.agent_id AS aid, s.unread_count AS stored, ",
         "       IFNULL(t.actual, 0) AS actual ",
@@ -174,6 +202,18 @@ fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> 
         "  GROUP BY agent_id ",
         ") t ON t.agent_id = s.agent_id ",
         "WHERE s.unread_count != IFNULL(t.actual, 0) ",
+        "UNION ALL ",
+        "SELECT t.agent_id AS aid, 0 AS stored, t.actual AS actual ",
+        "FROM ( ",
+        "  SELECT agent_id, COUNT(*) AS actual ",
+        "  FROM message_recipients ",
+        "  WHERE read_ts IS NULL ",
+        "  GROUP BY agent_id ",
+        ") t ",
+        "WHERE t.actual > 0 ",
+        "AND NOT EXISTS ( ",
+        "  SELECT 1 FROM inbox_stats s WHERE s.agent_id = t.agent_id ",
+        ") ",
         "LIMIT 101",
     );
     let rows = conn.query_sync(query, &[]).ok()?;
@@ -320,6 +360,33 @@ mod tests {
         assert_eq!(findings[0].divergent_agents[0].stored_unread, 1);
         assert_eq!(findings[0].divergent_agents[0].actual_unread, 3);
         assert!(!findings[0].more_truncated);
+    }
+
+    #[test]
+    fn detector_flags_missing_inbox_stats_row_for_agent_with_unread() {
+        // Pass-35L review (Codex F1 + Gemini F1 P0): agents with
+        // unread `message_recipients` but no `inbox_stats` row
+        // at all (trigger drift / partial repair). Pre-fix this
+        // was silently missed because the detector drove from
+        // `inbox_stats LEFT JOIN gt`. The fix unions in an
+        // anti-join branch.
+        let td = TempDir::new().unwrap();
+        let db = make_minimal_schema(&td);
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (id, ack_required, created_ts) VALUES (1, 0, 1000);
+             INSERT INTO message_recipients (agent_id, message_id, read_ts) VALUES (99, 1, NULL);
+             -- NOTE: no inbox_stats row for agent 99 (the drift scenario).",
+        )
+        .unwrap();
+        drop(conn);
+        let findings = detect(std::slice::from_ref(&db));
+        assert_eq!(findings.len(), 1);
+        let div = &findings[0].divergent_agents;
+        assert!(
+            div.iter().any(|d| d.agent_id == 99 && d.stored_unread == 0 && d.actual_unread == 1),
+            "missing-inbox_stats-row case must be surfaced; got: {div:?}",
+        );
     }
 
     #[test]
