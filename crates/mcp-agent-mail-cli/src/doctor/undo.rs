@@ -669,6 +669,14 @@ pub fn run_undo_with_scopes(
                             );
                             if write_res.is_err() {
                                 write_res
+                            // Round-9 (Gemini F2 P3 clarification):
+                            // `.is_empty()` only matches the
+                            // literal empty string `""` from
+                            // legacy / partial-flush actions.jsonl.
+                            // The 0-byte file case uses the
+                            // 71-char `EMPTY_FILE_SHA256` sentinel,
+                            // so `.is_empty()` is `false` and the
+                            // hash check correctly fires.
                             } else if !action.before_hash.is_empty() {
                                 match read_regular_file_no_follow(&target_file) {
                                     Ok(restored) => {
@@ -697,7 +705,9 @@ pub fn run_undo_with_scopes(
                     summary.failures.push(format!(
                         "crash-window restore failed for {}: {}",
                         action.path,
-                        restore_result.err().map_or_else(String::new, |e| e.to_string()),
+                        restore_result
+                            .err()
+                            .map_or_else(String::new, |e| e.to_string()),
                     ));
                 }
             } else if action.before_hash == EMPTY_FILE_SHA256 {
@@ -1040,15 +1050,15 @@ pub fn run_undo_with_scopes(
                     summary.failures.push(format!("{e}"));
                     continue;
                 }
-                if dry_run {
-                    eprintln!(
-                        "[dry-run] would rename back: {} -> {}",
-                        from_after.display(),
-                        restore_to.display()
-                    );
-                    summary.actions_replayed += 1;
-                    continue;
-                }
+                // Round-9 (Gemini F1 P3): the dry-run check was
+                // previously here, BEFORE the after_hash and
+                // destination-clobber checks. That made
+                // `am doctor undo --dry-run` falsely report
+                // "would succeed" for renames that a real run
+                // would rightly refuse. Moved below all
+                // non-mutating safety checks so dry-run mirrors
+                // the actual decision.
+                //
                 // Round-8 (Codex F1 P2): defer parent-dir creation
                 // until after every non-mutating safety check
                 // passes — a strict undo that should refuse must
@@ -1110,6 +1120,17 @@ pub fn run_undo_with_scopes(
                     summary.failures.push(msg);
                     continue;
                 }
+                // Round-9 (Gemini F1 P3): dry-run hits HERE so it
+                // mirrors a real run's decision.
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would rename back: {} -> {}",
+                        from_after.display(),
+                        restore_to.display()
+                    );
+                    summary.actions_replayed += 1;
+                    continue;
+                }
                 // Round-8 (Codex F1 P2): parent dir creation
                 // moved here — only happens once we've decided
                 // the rename will proceed.
@@ -1135,22 +1156,22 @@ pub fn run_undo_with_scopes(
                 // single `Result` silently treated EACCES/ELOOP as
                 // "not present as symlink", which downstream
                 // branches read as "ok to restore".
-                let (current_exists, current_is_symlink) =
-                    match fs::symlink_metadata(&target_file) {
-                        Ok(meta) => (true, meta.file_type().is_symlink()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, false),
-                        Err(e) => {
-                            if strict {
-                                return Err(e);
-                            }
-                            summary.failures.push(format!(
-                                "could not stat {} for SymlinkAtomic undo: {}",
-                                target_file.display(),
-                                e,
-                            ));
-                            continue;
+                let (current_exists, current_is_symlink) = match fs::symlink_metadata(&target_file)
+                {
+                    Ok(meta) => (true, meta.file_type().is_symlink()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, false),
+                    Err(e) => {
+                        if strict {
+                            return Err(e);
                         }
-                    };
+                        summary.failures.push(format!(
+                            "could not stat {} for SymlinkAtomic undo: {}",
+                            target_file.display(),
+                            e,
+                        ));
+                        continue;
+                    }
+                };
 
                 if !current_exists && backup_file.exists() && !action.after_hash.is_empty() {
                     let msg = format!(
