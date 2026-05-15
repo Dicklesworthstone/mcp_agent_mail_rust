@@ -22,6 +22,7 @@ pub mod am_git_binary_missing;
 pub mod codex_startup_timeout;
 pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
+pub mod inbox_stats_divergence;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
 pub mod schema_version_mismatch;
@@ -190,6 +191,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "storage.sqlite3 is empty / truncated / fails PRAGMA quick_check (manual reconstruct required)",
             source_module: "doctor::fixers::empty_or_truncated_db",
+        },
+        FixerSpec {
+            id: inbox_stats_divergence::FM_ID,
+            severity: "P1",
+            subsystem: "db_state_files",
+            op_pattern: "Op::DbExec",
+            auto_fixable: true,
+            one_line_description: "inbox_stats materialized aggregate drifts from ground-truth message_recipients counts (rebuild via Op::DbExec)",
+            source_module: "doctor::fixers::inbox_stats_divergence",
         },
         FixerSpec {
             id: schema_version_mismatch::FM_ID,
@@ -554,6 +564,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == inbox_stats_divergence::FM_ID {
+        let findings = inbox_stats_divergence::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = inbox_stats_divergence::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == codex_startup_timeout::FM_ID {
         // `detect_mcp_config_locations_default` is a pure helper
         // that reads no env state beyond `dirs::home_dir()` + CWD;
@@ -768,6 +787,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == schema_version_mismatch::FM_ID {
         schema_version_mismatch::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == inbox_stats_divergence::FM_ID {
+        inbox_stats_divergence::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
