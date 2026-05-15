@@ -791,6 +791,12 @@ mod tests {
     /// which requires git 2.28+ and isn't needed since we never
     /// commit).
     fn hermetic_git(args: &[&str], dir: &Path) -> std::process::ExitStatus {
+        // Test-only hardening (pass-35U review F1, Codex): clear
+        // GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY / GIT_TEMPLATE_DIR /
+        // GIT_ALTERNATE_OBJECT_DIRECTORIES from the parent env to
+        // prevent unusual developer or CI environments from
+        // perturbing `git add` / `git ls-files`. XDG_CONFIG_HOME
+        // also redirects config lookup paths in some git versions.
         std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
@@ -798,6 +804,13 @@ mod tests {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", dir)
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_TEMPLATE_DIR")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("XDG_CONFIG_HOME")
             .status()
             .expect("git invocation")
     }
