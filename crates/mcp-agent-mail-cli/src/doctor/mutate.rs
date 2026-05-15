@@ -320,6 +320,13 @@ pub(crate) fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<Pa
         })?;
         missing.push(name.to_os_string());
         cur = match cur.parent() {
+            // Round-8 Gemini F2 (P2): bare relative paths like
+            // `Path::new("file.txt")` have an empty-string parent
+            // which doesn't exist on disk and has no file_name —
+            // the loop would error on the second iteration even
+            // though the intent is "resolve relative to cwd".
+            // Map empty path → `.` so the cwd canonicalizes.
+            Some(p) if p.as_os_str().is_empty() => PathBuf::from("."),
             Some(p) => p.to_path_buf(),
             None => {
                 return Err(std::io::Error::new(

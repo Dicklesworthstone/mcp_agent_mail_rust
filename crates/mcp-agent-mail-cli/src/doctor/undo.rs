@@ -156,9 +156,15 @@ fn sha256_stream_no_follow(path: &Path) -> std::io::Result<String> {
 ///    modified the live DB while the streaming copy ran.
 /// 6. persist tmp over `target_file` via `rename(2)` (atomic, does
 ///    not follow symlink at destination on Unix).
-/// 7. fsync the parent directory so the rename is durable.
-///    Round-6 (Codex F2): the parent-fsync error is now
-///    propagated, not silently discarded.
+/// 7. Best-effort parent-directory fsync. Round-6 Codex F2
+///    asked to propagate the error; round-7 Gemini F1 showed
+///    propagating an fsync error AFTER a successful rename
+///    strands undo mid-replay (live target matches before_hash
+///    on retry, user-edit defense refuses). Reverted to
+///    best-effort `let _ = ...` matching
+///    `mutate::atomic_write_file`'s pattern. Durability is "as
+///    durable as `rename(2)`" — sufficient for ext4/xfs crash
+///    recovery on Linux.
 ///
 /// Note: `backup_file` is opened with O_NOFOLLOW + O_NONBLOCK
 /// (round-5 + round-6) — symlinks at the backup are refused
@@ -608,8 +614,18 @@ pub fn run_undo_with_scopes(
                 continue;
             }
             if backup_file.exists() {
+                // Round-8 Gemini F1 (P2): DbExec/DbMigrate
+                // crash-window parent-dir recreation must use
+                // the tight 0o700 mode, matching the completed-
+                // branch behavior (round-5 Gemini F6). Other ops
+                // keep `fs::create_dir_all` (default umask).
+                let is_db_op = matches!(action.op.as_str(), "DbExec" | "DbMigrate");
                 if let Some(parent) = target_file.parent() {
-                    fs::create_dir_all(parent)?;
+                    if is_db_op {
+                        ensure_parent_dir_strict(parent)?;
+                    } else {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
                 // Round-7 Gemini F5 (P2): DbExec/DbMigrate crash-
                 // window restore routes through the streaming
@@ -621,8 +637,17 @@ pub fn run_undo_with_scopes(
                 // records (post-state may not match anything), so
                 // we skip the post-rename re-check by passing
                 // None.
-                let restore_mode = action.before_mode.unwrap_or(0o644);
-                let restore_result = if matches!(action.op.as_str(), "DbExec" | "DbMigrate") {
+                //
+                // Round-8 Gemini F4 (P3): DbExec/DbMigrate
+                // default mode tightens to 0o600 (sensitive DB
+                // storage), matching the completed branch. Other
+                // ops keep 0o644.
+                let restore_mode = if is_db_op {
+                    action.before_mode.unwrap_or(0o600)
+                } else {
+                    action.before_mode.unwrap_or(0o644)
+                };
+                let restore_result = if is_db_op {
                     atomic_restore_db(
                         &backup_file,
                         &target_file,
@@ -631,21 +656,49 @@ pub fn run_undo_with_scopes(
                         restore_mode,
                     )
                 } else {
+                    // Round-8 Gemini F3 (P2): post-restore
+                    // hash verification was missing for non-DB
+                    // crash-window restores. Mirror the
+                    // completed-branch Codex-C2 defense.
                     match read_regular_file_no_follow(&backup_file) {
-                        Ok(bytes) => super::mutate::atomic_write_file(
-                            &target_file,
-                            &bytes,
-                            restore_mode,
-                        ),
+                        Ok(bytes) => {
+                            let write_res = super::mutate::atomic_write_file(
+                                &target_file,
+                                &bytes,
+                                restore_mode,
+                            );
+                            if write_res.is_err() {
+                                write_res
+                            } else if !action.before_hash.is_empty() {
+                                match read_regular_file_no_follow(&target_file) {
+                                    Ok(restored) => {
+                                        let restored_hash = sha256_hex(&restored);
+                                        if restored_hash != action.before_hash {
+                                            Err(std::io::Error::other(format!(
+                                                "crash-window post-restore hash mismatch: expected {}, got {}",
+                                                action.before_hash, restored_hash,
+                                            )))
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
                         Err(e) => Err(e),
                     }
                 };
                 if restore_result.is_ok() {
                     summary.actions_replayed += 1;
                 } else {
-                    summary
-                        .failures
-                        .push(format!("crash-window restore failed for {}", action.path));
+                    summary.failures.push(format!(
+                        "crash-window restore failed for {}: {}",
+                        action.path,
+                        restore_result.err().map_or_else(String::new, |e| e.to_string()),
+                    ));
                 }
             } else if action.before_hash == EMPTY_FILE_SHA256 {
                 // File didn't exist before mutation. If it now exists,
@@ -996,9 +1049,11 @@ pub fn run_undo_with_scopes(
                     summary.actions_replayed += 1;
                     continue;
                 }
-                if let Some(parent) = restore_to.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                // Round-8 (Codex F1 P2): defer parent-dir creation
+                // until after every non-mutating safety check
+                // passes — a strict undo that should refuse must
+                // not leave behind directories as a side-effect.
+                //
                 // Round-7 (Codex F1 P1): before renaming
                 // `from_after` back into place, verify it still
                 // matches `action.after_hash`. Without this check,
@@ -1054,6 +1109,12 @@ pub fn run_undo_with_scopes(
                     }
                     summary.failures.push(msg);
                     continue;
+                }
+                // Round-8 (Codex F1 P2): parent dir creation
+                // moved here — only happens once we've decided
+                // the rename will proceed.
+                if let Some(parent) = restore_to.parent() {
+                    fs::create_dir_all(parent)?;
                 }
                 match fs::rename(&from_after, &restore_to) {
                     Ok(_) => summary.actions_replayed += 1,
