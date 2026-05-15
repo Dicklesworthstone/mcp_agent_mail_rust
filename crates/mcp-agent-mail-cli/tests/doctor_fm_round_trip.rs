@@ -112,6 +112,7 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
         token_backup_candidates: Vec::new(),
         mcp_config_candidates: Vec::new(),
         canonical_mcp_url: None,
+        canonical_bearer_token: None,
         git_detect: None,
         gitignore_target: None,
         db_file_candidates: Vec::new(),
@@ -288,6 +289,7 @@ fn round_trip_wrong_mcp_url_json_op_write_file() {
     let inputs = DispatchInputs {
         mcp_config_candidates: vec![cfg.clone()],
         canonical_mcp_url: Some(canonical.to_string()),
+        canonical_bearer_token: None,
         ..empty_inputs(&td)
     };
 

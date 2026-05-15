@@ -19,9 +19,11 @@
 #![forbid(unsafe_code)]
 
 pub mod dangling_doctor_latest;
+pub mod empty_or_truncated_db;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
 pub mod stale_archive_lock;
+pub mod stale_bearer_token_skew;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
 pub mod wal_mode_disabled;
@@ -152,6 +154,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_head_or_ref_lock",
         },
         FixerSpec {
+            id: empty_or_truncated_db::FM_ID,
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "storage.sqlite3 is empty / truncated / fails PRAGMA quick_check (manual reconstruct required)",
+            source_module: "doctor::fixers::empty_or_truncated_db",
+        },
+        FixerSpec {
             id: wal_mode_disabled::FM_ID,
             severity: "P1",
             subsystem: "db_state_files",
@@ -186,6 +197,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "git 2.51.0 (segfault under multi-process load) with no AM_GIT_BINARY override",
             source_module: "doctor::fixers::known_bad_git_no_override",
+        },
+        FixerSpec {
+            id: stale_bearer_token_skew::FM_ID,
+            severity: "P1",
+            subsystem: "mcp_config_files",
+            op_pattern: "Op::WriteFile",
+            auto_fixable: true,
+            one_line_description: "MCP client JSON config has stale bearer token (rotated since config write)",
+            source_module: "doctor::fixers::stale_bearer_token_skew",
         },
         FixerSpec {
             id: wrong_mcp_url_json::FM_ID,
@@ -240,6 +260,10 @@ pub struct DispatchInputs {
     /// Canonical MCP URL the configs are expected to point at, e.g.
     /// `http://127.0.0.1:8765/mcp/`. Required only for the wrong-url FM.
     pub canonical_mcp_url: Option<String>,
+    /// Canonical HTTP bearer token from server config. `None`
+    /// skips the `stale_bearer_token_skew` FM. Empty string is
+    /// treated as "unconfigured" by the detector (never flag).
+    pub canonical_bearer_token: Option<String>,
     /// Inputs for the known-bad-git detect-only FM (system git path,
     /// version string, AM_GIT_BINARY override). `None` skips the FM.
     pub git_detect: Option<known_bad_git_no_override::DetectInputs>,
@@ -398,6 +422,16 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == empty_or_truncated_db::FM_ID {
+        let findings = empty_or_truncated_db::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = empty_or_truncated_db::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == dangling_doctor_latest::FM_ID {
         let latest = inputs
             .doctor_latest_target
@@ -427,6 +461,22 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = wrong_mcp_url_json::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == stale_bearer_token_skew::FM_ID {
+        let canonical = inputs
+            .canonical_bearer_token
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: stale_bearer_token_skew::FM_ID,
+                field: "canonical_bearer_token",
+            })?;
+        let findings = stale_bearer_token_skew::detect(canonical, &inputs.mcp_config_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = stale_bearer_token_skew::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -533,6 +583,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == empty_or_truncated_db::FM_ID {
+        empty_or_truncated_db::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == dangling_doctor_latest::FM_ID {
         let latest = inputs
             .doctor_latest_target
@@ -554,6 +609,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
                 field: "canonical_mcp_url",
             })?;
         wrong_mcp_url_json::detect(canonical, &inputs.mcp_config_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_bearer_token_skew::FM_ID {
+        let canonical = inputs
+            .canonical_bearer_token
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: stale_bearer_token_skew::FM_ID,
+                field: "canonical_bearer_token",
+            })?;
+        stale_bearer_token_skew::detect(canonical, &inputs.mcp_config_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -690,7 +757,7 @@ mod tests {
     fn registry_is_non_empty_and_alphabetically_sorted() {
         // Pass-14: every FM-level fixer must register a FixerSpec.
         let r = registry();
-        assert!(r.len() >= 10, "registry has fewer fixers than expected");
+        assert!(r.len() >= 12, "registry has fewer fixers than expected");
         // Alphabetical sort by id helps `am doctor fixers` produce
         // stable output (operators rely on this for diffing).
         let ids: Vec<&str> = r.iter().map(|s| s.id).collect();
