@@ -400,6 +400,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         canonical_bearer_token: config.http_bearer_token.clone(),
         git_detect: build_git_detect_inputs(),
         am_git_binary_detect: build_am_git_binary_detect_inputs(),
+        jwt_detect: Some(build_jwt_detect_inputs(&config)),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -617,6 +618,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         canonical_bearer_token: config.http_bearer_token.clone(),
         git_detect: build_git_detect_inputs(),
         am_git_binary_detect: build_am_git_binary_detect_inputs(),
+        jwt_detect: Some(build_jwt_detect_inputs(&config)),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -702,6 +704,7 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         canonical_bearer_token: config.http_bearer_token.clone(),
         git_detect: build_git_detect_inputs(),
         am_git_binary_detect: build_am_git_binary_detect_inputs(),
+        jwt_detect: Some(build_jwt_detect_inputs(&config)),
         gitignore_target: Some(repo_root.join(".gitignore")),
         db_file_candidates: default_db_file_candidates(),
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
@@ -969,6 +972,26 @@ fn build_am_git_binary_detect_inputs(
         process_env_value,
         home_override: None,
     })
+}
+
+/// Build JWT detector inputs from the live `Config`. Secret bytes
+/// are NEVER read; only `is_some() && !is_empty()` presence is
+/// captured.
+fn build_jwt_detect_inputs(config: &Config) -> fixers::jwt_enabled_without_keys::DetectInputs {
+    fixers::jwt_enabled_without_keys::DetectInputs {
+        http_jwt_enabled: config.http_jwt_enabled,
+        http_jwt_algorithms: config.http_jwt_algorithms.clone(),
+        http_jwt_secret_present: config
+            .http_jwt_secret
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()),
+        http_jwt_jwks_url_present: config
+            .http_jwt_jwks_url
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()),
+        http_jwt_issuer: config.http_jwt_issuer.clone(),
+        http_jwt_audience: config.http_jwt_audience.clone(),
+    }
 }
 
 fn read_am_git_binary_from_config_env() -> Option<String> {

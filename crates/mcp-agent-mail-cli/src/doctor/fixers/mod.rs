@@ -24,6 +24,7 @@ pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod inbox_stats_divergence;
 pub mod integrity_page_malformed;
+pub mod jwt_enabled_without_keys;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
 pub mod schema_version_mismatch;
@@ -364,6 +365,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_python_server_shadow",
         },
         FixerSpec {
+            id: jwt_enabled_without_keys::FM_ID,
+            severity: "P0",
+            subsystem: "secrets_env_state",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "HTTP_JWT_ENABLED=true but JWT verifier keys are missing or algorithm family is wrong (every request 401s)",
+            source_module: "doctor::fixers::jwt_enabled_without_keys",
+        },
+        FixerSpec {
             id: world_readable_token_bak::FM_ID,
             severity: "P1",
             subsystem: "secrets_env_state",
@@ -408,6 +418,9 @@ pub struct DispatchInputs {
     /// Inputs for the AM_GIT_BINARY-points-at-missing-file detect-only
     /// FM. `None` skips the FM.
     pub am_git_binary_detect: Option<am_git_binary_missing::DetectInputs>,
+    /// JWT config inputs for the
+    /// `jwt_enabled_without_keys` FM. `None` skips it.
+    pub jwt_detect: Option<jwt_enabled_without_keys::DetectInputs>,
     /// Path to the repo `.gitignore` for the
     /// `missing_gitignore_entry` FM. `None` skips the FM. Typically
     /// `<repo_root>/.gitignore`.
@@ -528,6 +541,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
+    } else if fm_id == jwt_enabled_without_keys::FM_ID {
+        let jwt_inputs = inputs.jwt_detect.as_ref().ok_or(DispatchError::MissingInput {
+            fm_id: jwt_enabled_without_keys::FM_ID,
+            field: "jwt_detect",
+        })?;
+        let findings = jwt_enabled_without_keys::detect(jwt_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = jwt_enabled_without_keys::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == known_bad_git_no_override::FM_ID {
         let git_inputs = inputs
@@ -816,6 +842,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == stale_python_server_shadow::FM_ID {
         stale_python_server_shadow::detect(&inputs.pid_hint_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == jwt_enabled_without_keys::FM_ID {
+        let jwt_inputs = inputs.jwt_detect.as_ref().ok_or(DispatchError::MissingInput {
+            fm_id: jwt_enabled_without_keys::FM_ID,
+            field: "jwt_detect",
+        })?;
+        jwt_enabled_without_keys::detect(jwt_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
