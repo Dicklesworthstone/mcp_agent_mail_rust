@@ -75,10 +75,27 @@ const SERVERS_CONTAINER_KEYS: &[&str] = &["mcpServers", "mcp_servers"];
 /// configs that opt out of full HTTP-header verbiage.
 const TOKEN_FIELDS: &[&str] = &["Authorization", "authorization", "bearer", "token"];
 
+/// Structured pointer to the token field. Keep this separate from
+/// `display_pointer()` so server names containing `.` remain addressable.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenLocation {
+    /// `"mcpServers"` or `"mcp_servers"`.
+    pub container_key: String,
+    /// The server name as-is, including any `.` characters.
+    pub server_name: String,
+    /// True if the token lives at
+    /// `<container>.<server>.headers.<field>`; false if it's a
+    /// direct field on the server object.
+    pub inside_headers: bool,
+    /// The token-bearing field name (`Authorization`,
+    /// `authorization`, `bearer`, `token`).
+    pub field: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StaleBearerTokenSkewFinding {
     pub config_path: PathBuf,
-    pub json_pointer: String,
+    pub location: TokenLocation,
     /// Current token value as it appears in the file (with any
     /// `Bearer ` prefix preserved for fidelity).
     pub current_token: String,
@@ -87,11 +104,28 @@ pub struct StaleBearerTokenSkewFinding {
 }
 
 impl StaleBearerTokenSkewFinding {
+    /// Human-readable JSON-pointer-style string for titles and
+    /// evidence display. Built from the structured `TokenLocation`;
+    /// only used for display, never for fix() navigation (the
+    /// fixer consumes `self.location` directly to avoid the
+    /// pre-pass-34 dotted-string ambiguity).
+    pub fn display_pointer(&self) -> String {
+        let loc = &self.location;
+        if loc.inside_headers {
+            format!(
+                "{}.{}.headers.{}",
+                loc.container_key, loc.server_name, loc.field
+            )
+        } else {
+            format!("{}.{}.{}", loc.container_key, loc.server_name, loc.field)
+        }
+    }
+
     pub fn to_finding(&self) -> super::Finding {
         let title = format!(
             "MCP config {} field {} has stale bearer token (rotated)",
             self.config_path.display(),
-            self.json_pointer
+            self.display_pointer()
         );
         super::Finding {
             id: FM_ID,
@@ -101,7 +135,8 @@ impl StaleBearerTokenSkewFinding {
             confidence: 0.95,
             evidence: serde_json::json!({
                 "config_path": self.config_path.to_string_lossy(),
-                "json_pointer": self.json_pointer,
+                "location": self.location,
+                "display_pointer": self.display_pointer(),
                 // Token values redacted in evidence — never echo to
                 // logs / report.json. Only the existence + path is
                 // surfaced. Operators who need the actual values open
@@ -127,20 +162,28 @@ fn redact(s: &str) -> String {
         return format!("<redacted len={}>", s.len());
     }
     let head: String = s.chars().take(4).collect();
-    let tail: String = s.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{head}...{tail} (len={})", s.len())
 }
 
 /// Strip a leading `Bearer ` prefix (case-insensitive) for value
 /// comparison. The Authorization header's value is conventionally
 /// `Bearer <token>`; we compare just the `<token>` part.
+///
+/// Use `str::get` rather than byte slicing so malformed-looking
+/// non-ASCII token values cannot panic at a UTF-8 boundary.
 fn strip_bearer_prefix(s: &str) -> &str {
-    let lowered_prefix_len = 7;
-    if s.len() >= lowered_prefix_len {
-        let head = &s[..lowered_prefix_len];
-        if head.eq_ignore_ascii_case("bearer ") {
-            return s[lowered_prefix_len..].trim_start();
-        }
+    if let Some(head) = s.get(..7)
+        && head.eq_ignore_ascii_case("bearer ")
+    {
+        return s.get(7..).unwrap_or(s).trim_start();
     }
     s
 }
@@ -188,9 +231,12 @@ pub fn detect(
                     {
                         out.push(StaleBearerTokenSkewFinding {
                             config_path: path.clone(),
-                            json_pointer: format!(
-                                "{container_key}.{server_name}.{token_field}"
-                            ),
+                            location: TokenLocation {
+                                container_key: (*container_key).to_string(),
+                                server_name: server_name.clone(),
+                                inside_headers: false,
+                                field: (*token_field).to_string(),
+                            },
                             current_token: val.to_string(),
                             canonical_token: canonical_token.to_string(),
                         });
@@ -202,9 +248,12 @@ pub fn detect(
                     {
                         out.push(StaleBearerTokenSkewFinding {
                             config_path: path.clone(),
-                            json_pointer: format!(
-                                "{container_key}.{server_name}.headers.{token_field}"
-                            ),
+                            location: TokenLocation {
+                                container_key: (*container_key).to_string(),
+                                server_name: server_name.clone(),
+                                inside_headers: true,
+                                field: (*token_field).to_string(),
+                            },
                             current_token: val.to_string(),
                             canonical_token: canonical_token.to_string(),
                         });
@@ -239,22 +288,14 @@ pub fn fix(
         });
     }
 
-    let body = fs::read_to_string(&finding.config_path)
-        .map_err(crate::doctor::mutate::MutateError::Io)?;
+    let body =
+        fs::read_to_string(&finding.config_path).map_err(crate::doctor::mutate::MutateError::Io)?;
     let mut v: serde_json::Value =
         serde_json::from_str(&body).map_err(crate::doctor::mutate::MutateError::Serde)?;
 
-    // Walk the JSON pointer. May be 3 segments
-    // (container.server.field) or 4 (container.server.headers.field).
-    let parts: Vec<&str> = finding.json_pointer.split('.').collect();
-    if !(parts.len() == 3 || parts.len() == 4) {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-
+    // Walk the structured location directly; dotted display strings
+    // are ambiguous for server names such as "agent-mail.prod".
+    let loc = &finding.location;
     let Some(obj) = v.as_object_mut() else {
         return Ok(FixOutcome {
             actions_taken: 0,
@@ -262,14 +303,20 @@ pub fn fix(
             quarantined_paths: Vec::new(),
         });
     };
-    let Some(servers) = obj.get_mut(parts[0]).and_then(|x| x.as_object_mut()) else {
+    let Some(servers) = obj
+        .get_mut(&loc.container_key)
+        .and_then(|x| x.as_object_mut())
+    else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
             quarantined_paths: Vec::new(),
         });
     };
-    let Some(server_obj) = servers.get_mut(parts[1]).and_then(|x| x.as_object_mut()) else {
+    let Some(server_obj) = servers
+        .get_mut(&loc.server_name)
+        .and_then(|x| x.as_object_mut())
+    else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
@@ -277,10 +324,11 @@ pub fn fix(
         });
     };
 
-    // Descend into headers.<field> if pointer has 4 segments.
     let (target_obj, field): (&mut serde_json::Map<String, serde_json::Value>, &str) =
-        if parts.len() == 4 {
-            let Some(headers) = server_obj.get_mut(parts[2]).and_then(|x| x.as_object_mut())
+        if loc.inside_headers {
+            let Some(headers) = server_obj
+                .get_mut("headers")
+                .and_then(|x| x.as_object_mut())
             else {
                 return Ok(FixOutcome {
                     actions_taken: 0,
@@ -288,9 +336,9 @@ pub fn fix(
                     quarantined_paths: Vec::new(),
                 });
             };
-            (headers, parts[3])
+            (headers, loc.field.as_str())
         } else {
-            (server_obj, parts[2])
+            (server_obj, loc.field.as_str())
         };
 
     let cur = target_obj.get(field).and_then(|x| x.as_str()).unwrap_or("");
@@ -303,7 +351,10 @@ pub fn fix(
         });
     }
     // Preserve `Bearer ` prefix iff the original had one.
-    let had_bearer_prefix = cur.len() >= 7 && cur[..7].eq_ignore_ascii_case("bearer ");
+    // Use `get(..7)` to avoid panicking on non-ASCII UTF-8 boundaries.
+    let had_bearer_prefix = cur
+        .get(..7)
+        .is_some_and(|h| h.eq_ignore_ascii_case("bearer "));
     let new_value = if had_bearer_prefix {
         format!("Bearer {}", finding.canonical_token)
     } else {
@@ -388,7 +439,7 @@ mod tests {
         .unwrap();
         let findings = detect("canonical-xyz", std::slice::from_ref(&p));
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].json_pointer.contains("Authorization"));
+        assert!(findings[0].display_pointer().contains("Authorization"));
     }
 
     #[test]
@@ -415,7 +466,7 @@ mod tests {
         .unwrap();
         let findings = detect("canonical-xyz", std::slice::from_ref(&p));
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].json_pointer.ends_with("bearer"));
+        assert!(findings[0].display_pointer().ends_with("bearer"));
     }
 
     #[test]
@@ -435,11 +486,7 @@ mod tests {
     fn detector_skips_when_canonical_empty() {
         let td = TempDir::new().unwrap();
         let p = td.path().join("mcp.json");
-        fs::write(
-            &p,
-            r#"{"mcpServers":{"agent-mail":{"bearer":"anything"}}}"#,
-        )
-        .unwrap();
+        fs::write(&p, r#"{"mcpServers":{"agent-mail":{"bearer":"anything"}}}"#).unwrap();
         let findings = detect("", &[p]);
         assert!(
             findings.is_empty(),
@@ -517,14 +564,62 @@ mod tests {
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
         let body = fs::read_to_string(&p).unwrap();
-        assert!(body.contains("some-third-value"), "concurrent-writer value preserved");
+        assert!(
+            body.contains("some-third-value"),
+            "concurrent-writer value preserved"
+        );
+    }
+
+    #[test]
+    fn detector_handles_server_names_with_dots() {
+        // Structured TokenLocation must round-trip even when the MCP
+        // server key contains literal `.` characters.
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("mcp.json");
+        fs::write(
+            &p,
+            r#"{"mcpServers":{"agent-mail.prod":{"bearer":"stale-old"}}}"#,
+        )
+        .unwrap();
+        let findings = detect("canonical-xyz", std::slice::from_ref(&p));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location.server_name, "agent-mail.prod");
+
+        let ctx = ctx_for(&td, "2026-05-14T03-00-00Z__token_dotted_server");
+        let outcome = fix(&ctx, &findings[0]).expect("fix");
+        assert_eq!(
+            outcome.actions_taken, 1,
+            "structured TokenLocation must fix tokens for dotted server names"
+        );
+        let body = fs::read_to_string(&p).unwrap();
+        assert!(body.contains(r#""bearer": "canonical-xyz""#));
+    }
+
+    #[test]
+    fn strip_bearer_prefix_does_not_panic_on_multibyte_utf8() {
+        // `strip_bearer_prefix` must not panic on non-ASCII token values.
+        let inputs = [
+            "ééééé",           // 5 chars × 2 bytes = 10 bytes
+            "éBearer test",    // multi-byte at start
+            "🔒 secret-token", // 4-byte codepoint at start
+            "Bearer ééé",      // Bearer prefix + multi-byte token
+        ];
+        for s in inputs {
+            // Just call it — should never panic.
+            let _stripped = strip_bearer_prefix(s);
+        }
     }
 
     #[test]
     fn evidence_redacts_token_values() {
         let f = StaleBearerTokenSkewFinding {
             config_path: PathBuf::from("/x/mcp.json"),
-            json_pointer: "mcpServers.agent-mail.headers.Authorization".into(),
+            location: TokenLocation {
+                container_key: "mcpServers".into(),
+                server_name: "agent-mail".into(),
+                inside_headers: true,
+                field: "Authorization".into(),
+            },
             current_token: "Bearer super-secret-token-abc123".into(),
             canonical_token: "super-canonical-token-xyz789".into(),
         };

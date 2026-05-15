@@ -18,13 +18,21 @@
 //!
 //! ## Detection (pure function)
 //!
-//! 1. `fs::metadata(path)` — if file doesn't exist OR size is
-//!    below the SQLite header minimum (100 bytes), emit
-//!    `Reason::TooSmall { size }`.
+//! 1. `fs::metadata(path)` — if file doesn't exist (returns
+//!    `Reason::Missing`) OR size is below the SQLite header
+//!    minimum (100 bytes), emit `Reason::TooSmall { size }`.
 //! 2. Open via `SqliteConnection::open_file`. If open fails,
 //!    emit `Reason::OpenFailed { error }`.
-//! 3. `PRAGMA quick_check;`. If the result is anything other
-//!    than `"ok"`, emit `Reason::QuickCheckFailed { result }`.
+//! 3. `PRAGMA schema_version;` (pass-34 fresh-eyes Gemini F6).
+//!    A cheap O(1) header read that returns an integer for any
+//!    valid SQLite file. Replaces the original
+//!    `PRAGMA quick_check;` which did a full table+index scan
+//!    and could take minutes on large mailbox DBs — too slow
+//!    for `am doctor health`'s sub-200ms budget. If the PRAGMA
+//!    query fails entirely, emit `Reason::SchemaProbeFailed`.
+//!    Exhaustive `quick_check` belongs in a dedicated `am doctor
+//!    deep-check` verb (future); this FM only catches the gross
+//!    "file is empty / unparseable" cases that block startup.
 //! 4. Otherwise no finding.
 //!
 //! ## Fix
@@ -57,17 +65,15 @@ pub enum Reason {
     /// File doesn't exist on disk.
     Missing,
     /// File exists but is smaller than the SQLite header.
-    TooSmall {
-        size: u64,
-    },
+    TooSmall { size: u64 },
     /// `SqliteConnection::open_file` failed.
-    OpenFailed {
-        message: String,
-    },
-    /// `PRAGMA quick_check` returned something other than "ok".
-    QuickCheckFailed {
-        result: String,
-    },
+    OpenFailed { message: String },
+    /// `PRAGMA schema_version` query failed entirely. Pre-pass-34
+    /// fresh-eyes (Gemini F6) this was `QuickCheckFailed`; replaced
+    /// with the cheaper schema_version probe (O(1) header read vs.
+    /// O(N) full-table scan) so `am doctor health` stays under its
+    /// sub-200ms budget on large mailbox DBs.
+    SchemaProbeFailed { result: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,7 +88,7 @@ impl EmptyOrTruncatedDbFinding {
             Reason::Missing => "missing".to_string(),
             Reason::TooSmall { size } => format!("too_small (size={size})"),
             Reason::OpenFailed { message } => format!("open_failed ({message})"),
-            Reason::QuickCheckFailed { result } => format!("quick_check_failed ({result})"),
+            Reason::SchemaProbeFailed { result } => format!("schema_probe_failed ({result})"),
         };
         let title = format!(
             "DB {} is empty or corrupted ({reason_str}); recover via `am doctor reconstruct`",
@@ -155,23 +161,35 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<EmptyOrTruncatedDbFinding> {
                 continue;
             }
         };
-        // Stage 3: PRAGMA quick_check.
-        let result = quick_check(&conn).unwrap_or_else(|| "<query_failed>".to_string());
+        // Stage 3: cheap header probe via PRAGMA schema_version.
+        // Pass-34 fresh-eyes (Gemini F6): the original used
+        // PRAGMA quick_check which is a full-table scan; on large
+        // mailbox DBs this hung `am doctor health` past its
+        // <200ms budget. schema_version reads from the SQLite
+        // header directly (O(1)) and returns a sentinel integer
+        // for any valid DB. A genuinely corrupt file fails the
+        // query entirely.
+        let probe = schema_probe(&conn);
         drop(conn);
-        if !result.eq_ignore_ascii_case("ok") {
+        if let Err(msg) = probe {
             out.push(EmptyOrTruncatedDbFinding {
                 db_path: path.clone(),
-                reason: Reason::QuickCheckFailed { result },
+                reason: Reason::SchemaProbeFailed { result: msg },
             });
         }
     }
     out
 }
 
-fn quick_check(conn: &sqlmodel_sqlite::SqliteConnection) -> Option<String> {
-    let rows = conn.query_sync("PRAGMA quick_check;", &[]).ok()?;
-    let first = rows.first()?;
-    first.get_named::<String>("quick_check").ok()
+fn schema_probe(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<(), String> {
+    let rows = conn
+        .query_sync("PRAGMA schema_version;", &[])
+        .map_err(|e| format!("query failed: {e}"))?;
+    let first = rows.first().ok_or_else(|| "no rows returned".to_string())?;
+    first
+        .get_named::<i64>("schema_version")
+        .map_err(|e| format!("schema_version not parseable as i64: {e}"))?;
+    Ok(())
 }
 
 /// Detect-only FM. `fix()` is a no-op for API uniformity.
@@ -239,7 +257,7 @@ mod tests {
         let p = td.path().join("garbage.sqlite3");
         // Above the 100-byte minimum but not a real SQLite header.
         // Open may or may not fail depending on lazy-vs-eager
-        // header validation; quick_check is what catches it.
+        // header validation; schema_probe is what catches it.
         fs::write(&p, vec![0xFF_u8; 200]).unwrap();
         let findings = detect(std::slice::from_ref(&p));
         assert_eq!(
@@ -247,11 +265,11 @@ mod tests {
             1,
             "garbage-content file must flag (got: {findings:?})"
         );
-        // Acceptable: OpenFailed OR QuickCheckFailed.
+        // Acceptable: OpenFailed OR SchemaProbeFailed.
         assert!(
             matches!(
                 findings[0].reason,
-                Reason::OpenFailed { .. } | Reason::QuickCheckFailed { .. }
+                Reason::OpenFailed { .. } | Reason::SchemaProbeFailed { .. }
             ),
             "unexpected reason: {:?}",
             findings[0].reason

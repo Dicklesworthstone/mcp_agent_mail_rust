@@ -847,14 +847,15 @@ fn default_db_file_candidates() -> Vec<PathBuf> {
         return Vec::new();
     }
     let path = PathBuf::from(path_str);
-    if path.exists() {
-        vec![path]
-    } else {
-        // Not a real file (may be `:memory:` in disguise, or the DB
-        // hasn't been created yet). Skip rather than emit a spurious
-        // candidate.
-        Vec::new()
-    }
+    // Pass-34 fresh-eyes (Codex F4): return the resolved path
+    // even when it doesn't exist. The `empty_or_truncated_db`
+    // FM explicitly models `Reason::Missing` for the
+    // missing-DB case and needs the path to surface that
+    // finding. Detectors that don't want to flag missing files
+    // (e.g. `world_readable_storage_db`, `wal_mode_disabled`)
+    // check `is_file()` themselves and skip cleanly. The
+    // `:memory:` filter above already eliminates non-file URLs.
+    vec![path]
 }
 
 fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {

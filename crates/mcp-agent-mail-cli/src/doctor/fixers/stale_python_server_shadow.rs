@@ -36,25 +36,31 @@
 //! 4. If the binary is the operator's Rust `mcp-agent-mail` →
 //!    skip (healthy).
 //!
-//! ## Fix (`Op::Rename`)
+//! ## Fix — detect-only
 //!
-//! Per RULE 1, quarantine the stale `.pid` file via Op::Rename
-//! into `<run-dir>/quarantine/python-shadow/<basename>.<ns>`.
-//! Operator manually decides whether to kill the Python process
-//! (the doctor never SIGKILLs — that's `--server-runtime-stop-
-//! unhealthy` territory, which itself requires `--yes`).
+//! Auto-fixing this FM is **dangerous**. Quarantining the
+//! `.pid` file while the Python server is still running strips
+//! the only lock that prevents a concurrent Rust + Python
+//! server race — exactly the failure mode this FM is supposed
+//! to prevent. The Rust server would happily start up after
+//! the rename and proceed to write the same DB the Python
+//! server is still writing.
 //!
-//! ## Reversibility
+//! The correct workflow is:
 //!
-//! Standard via `am doctor undo <run-id>`: the chokepoint
-//! restores the .pid file byte-identical from the quarantine
-//! backup. The Python process is unaffected by the fix or undo
-//! — only the hint file is moved.
+//! 1. `am doctor fix --only fm-...-stale-python-server-shadow --list`
+//!    surfaces the finding (manual_remediation envelope).
+//! 2. Operator manually `kill <pid>` on the Python interpreter.
+//! 3. Next `am doctor` run sees a dead PID and the existing
+//!    `stale_listener_pid_hint` FM (pass-9) safely quarantines
+//!    the now-stale hint file via Op::Rename.
+//!
+//! So this FM is detect-only with auto_fixable=false; fix() is
+//! a no-op for API uniformity.
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{Op, mutate};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -90,13 +96,15 @@ impl StalePythonServerShadowFinding {
                 "recorded_pid": self.recorded_pid,
                 "resolved_exe": self.resolved_exe.to_string_lossy(),
                 "risk": "concurrent Python + Rust servers race on storage.sqlite3 → data corruption",
-                "manual_step": "After quarantining the hint file, decide whether to kill the Python PID (am doctor does not SIGKILL)",
+                "manual_step": "Stop the Python interpreter first; then rerun am doctor so the dead listener.pid hint can be quarantined safely",
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor --fix --only {FM_ID} --yes"),
+                // Detect-only: no auto-fix command. Operators must
+                // manually `kill <pid>` the Python interpreter.
+                command: format!("am doctor explain {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: true,
-                estimated_actions: 1,
+                auto_fixable: false,
+                estimated_actions: 0,
             },
         }
     }
@@ -167,43 +175,18 @@ fn is_python_interpreter(exe: &std::path::Path) -> bool {
         || lower == "python"
 }
 
-/// Fixer. Routes through `mutate()` with `Op::Rename`.
+/// Detect-only FM. `fix()` is a no-op for API uniformity —
+/// auto-quarantining the lock file while the Python server is
+/// still alive would cause the data race this FM is supposed
+/// to prevent.
 pub fn fix(
-    ctx: &crate::doctor::mutate::MutateContext,
-    finding: &StalePythonServerShadowFinding,
+    _ctx: &crate::doctor::mutate::MutateContext,
+    _finding: &StalePythonServerShadowFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
-    if !finding.hint_path.exists() {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-    let basename = finding
-        .hint_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "listener.pid".to_string());
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let quarantine = ctx
-        .run_dir
-        .join("quarantine")
-        .join("python-shadow")
-        .join(format!("{basename}.{now_ns}"));
-    mutate(
-        ctx,
-        &finding.hint_path,
-        Op::Rename {
-            to: quarantine.clone(),
-        },
-    )?;
     Ok(FixOutcome {
-        actions_taken: 1,
-        actions_skipped: 0,
-        quarantined_paths: vec![quarantine],
+        actions_taken: 0,
+        actions_skipped: 1,
+        quarantined_paths: Vec::new(),
     })
 }
 
@@ -251,7 +234,10 @@ mod tests {
         // all pid_max values.
         fs::write(&hint, "999999999\n").unwrap();
         let findings = detect(&[hint]);
-        assert!(findings.is_empty(), "dead-PID case is stale_listener_pid_hint");
+        assert!(
+            findings.is_empty(),
+            "dead-PID case is stale_listener_pid_hint"
+        );
     }
 
     #[test]
@@ -287,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn finding_is_p1_op_rename_with_python_evidence() {
+    fn finding_is_p1_detect_only_with_python_evidence() {
         let f = StalePythonServerShadowFinding {
             hint_path: PathBuf::from("/x/listener.pid"),
             recorded_pid: 1234,
@@ -297,9 +283,12 @@ mod tests {
         assert_eq!(g.id, FM_ID);
         assert_eq!(g.severity, "P1");
         assert_eq!(g.subsystem, "runtime_processes");
-        assert!(g.remediation.auto_fixable);
+        assert!(!g.remediation.auto_fixable);
+        assert_eq!(g.remediation.estimated_actions, 0);
+        assert!(g.remediation.command.contains("am doctor explain"));
         let s = serde_json::to_string(&g).unwrap();
         assert!(s.contains("python3.11"));
         assert!(s.contains("1234"));
+        assert!(s.contains("Stop the Python interpreter first"));
     }
 }

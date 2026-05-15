@@ -230,9 +230,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: stale_python_server_shadow::FM_ID,
             severity: "P1",
             subsystem: "runtime_processes",
-            op_pattern: "Op::Rename",
-            auto_fixable: true,
-            one_line_description: "listener.pid PID is a live Python interpreter (legacy server shadow risks data corruption)",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "listener.pid PID is a live Python interpreter (detect-only — auto-fixing the lock would cause the race it prevents; manual `kill <pid>` required)",
             source_module: "doctor::fixers::stale_python_server_shadow",
         },
         FixerSpec {
@@ -485,13 +485,14 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == stale_bearer_token_skew::FM_ID {
-        let canonical = inputs
-            .canonical_bearer_token
-            .as_deref()
-            .ok_or(DispatchError::MissingInput {
-                fm_id: stale_bearer_token_skew::FM_ID,
-                field: "canonical_bearer_token",
-            })?;
+        let canonical =
+            inputs
+                .canonical_bearer_token
+                .as_deref()
+                .ok_or(DispatchError::MissingInput {
+                    fm_id: stale_bearer_token_skew::FM_ID,
+                    field: "canonical_bearer_token",
+                })?;
         let findings = stale_bearer_token_skew::detect(canonical, &inputs.mcp_config_candidates);
         outcome.findings_count = findings.len();
         for f in &findings {
@@ -638,13 +639,14 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == stale_bearer_token_skew::FM_ID {
-        let canonical = inputs
-            .canonical_bearer_token
-            .as_deref()
-            .ok_or(DispatchError::MissingInput {
-                fm_id: stale_bearer_token_skew::FM_ID,
-                field: "canonical_bearer_token",
-            })?;
+        let canonical =
+            inputs
+                .canonical_bearer_token
+                .as_deref()
+                .ok_or(DispatchError::MissingInput {
+                    fm_id: stale_bearer_token_skew::FM_ID,
+                    field: "canonical_bearer_token",
+                })?;
         stale_bearer_token_skew::detect(canonical, &inputs.mcp_config_candidates)
             .iter()
             .map(|f| f.to_finding())

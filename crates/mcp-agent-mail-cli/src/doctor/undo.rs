@@ -801,11 +801,40 @@ pub fn run_undo(
                 }
             }
             "DbExec" | "DbMigrate" => {
-                // DB-row level undo requires the project's DbConn + a saved
-                // .dump of the affected rows. Wired by the dispatch layer
-                // in pass-2. For pass-1, mark as skipped (these ops aren't
-                // emitted by any pass-1 fixer yet).
-                summary.actions_skipped += 1;
+                // Pass-34 wired Op::DbExec at the chokepoint, and the
+                // chokepoint took a file-level byte backup of the DB
+                // before the exec. We can restore that backup here —
+                // it produces a byte-identical main DB file. The
+                // caveat (Codex F8 + Gemini F1/F2 fresh-eyes review)
+                // is that WAL/SHM siblings are NOT backed up, so a
+                // DbExec run that created/grew them leaves orphan
+                // sidecars. SQLite is robust to orphan WAL/SHM on
+                // open (it ignores them), so functional correctness
+                // is preserved even if the on-disk fileset isn't
+                // byte-for-byte identical.
+                if backup_file.exists() && target_file.exists() {
+                    if dry_run {
+                        summary.actions_replayed += 1;
+                    } else {
+                        match std::fs::copy(&backup_file, &target_file) {
+                            Ok(_) => {
+                                summary.actions_replayed += 1;
+                            }
+                            Err(e) => {
+                                summary.failures.push(format!(
+                                    "could not restore DB {} from backup {}: {}",
+                                    target_file.display(),
+                                    backup_file.display(),
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    // No backup (Op::DbMigrate marker op records no
+                    // file change) — skip cleanly.
+                    summary.actions_skipped += 1;
+                }
             }
             other => {
                 summary.failures.push(format!("unknown op kind: {}", other));
