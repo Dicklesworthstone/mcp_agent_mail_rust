@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod am_git_binary_missing;
+pub mod codex_startup_timeout;
 pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod known_bad_git_no_override;
@@ -262,6 +263,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "git 2.51.0 (segfault under multi-process load) with no AM_GIT_BINARY override",
             source_module: "doctor::fixers::known_bad_git_no_override",
+        },
+        FixerSpec {
+            id: codex_startup_timeout::FM_ID,
+            severity: "P1",
+            subsystem: "mcp_config_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Codex config.toml missing or too-short startup_timeout_sec (boot races mcp-agent-mail cold start)",
+            source_module: "doctor::fixers::codex_startup_timeout",
         },
         FixerSpec {
             id: stale_bearer_token_skew::FM_ID,
@@ -541,6 +551,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == codex_startup_timeout::FM_ID {
+        // `detect_mcp_config_locations_default` is a pure helper
+        // that reads no env state beyond `dirs::home_dir()` + CWD;
+        // we don't need a dedicated DispatchInputs field.
+        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let findings = codex_startup_timeout::detect(&locations);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = codex_startup_timeout::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == text_timestamp_contamination::FM_ID {
         let findings = text_timestamp_contamination::detect(&inputs.db_file_candidates);
         outcome.findings_count = findings.len();
@@ -742,6 +765,12 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == schema_version_mismatch::FM_ID {
         schema_version_mismatch::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == codex_startup_timeout::FM_ID {
+        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        codex_startup_timeout::detect(&locations)
             .iter()
             .map(|f| f.to_finding())
             .collect()

@@ -16055,13 +16055,33 @@ fn git_output_text(cwd: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+#[cfg(unix)]
+fn is_shared_ancestor_boundary(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_dir() && metadata.mode() & 0o1000 != 0 && metadata.mode() & 0o002 != 0
+}
+
+#[cfg(not(unix))]
+fn is_shared_ancestor_boundary(_path: &Path) -> bool {
+    false
+}
+
 fn git_repo_root(path: &Path) -> Option<PathBuf> {
-    git_output_text(path, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+    git_output_text(path, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .filter(|root| !is_shared_ancestor_boundary(root))
 }
 
 fn marker_discovered_repo_root(path: &Path) -> Option<PathBuf> {
     let resolved = path.canonicalize().ok()?;
     for candidate in resolved.ancestors() {
+        if is_shared_ancestor_boundary(candidate) {
+            break;
+        }
         if candidate.join("Cargo.toml").exists()
             || candidate.join("pyproject.toml").exists()
             || candidate.join(".git").exists()
@@ -18041,7 +18061,7 @@ enum McpAgentMailEntryKind {
     Unknown,
 }
 
-const CODEX_STARTUP_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CODEX_STARTUP_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct McpAgentMailStatusUrlParts {
@@ -18207,7 +18227,7 @@ fn extract_mcp_agent_mail_toml_url(content: &str) -> Option<String> {
     None
 }
 
-fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Option<u64> {
+pub(crate) fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Option<u64> {
     let mut in_target_section = false;
 
     for raw_line in content.lines() {
@@ -54912,16 +54932,25 @@ fn detect_project_root() -> PathBuf {
     // 2) pyproject.toml (legacy Python repos)
     // 3) .git (fallback)
     for candidate in resolved.ancestors() {
+        if is_shared_ancestor_boundary(candidate) {
+            break;
+        }
         if candidate.join("Cargo.toml").exists() {
             return candidate.to_path_buf();
         }
     }
     for candidate in resolved.ancestors() {
+        if is_shared_ancestor_boundary(candidate) {
+            break;
+        }
         if candidate.join("pyproject.toml").exists() {
             return candidate.to_path_buf();
         }
     }
     for candidate in resolved.ancestors() {
+        if is_shared_ancestor_boundary(candidate) {
+            break;
+        }
         if candidate.join(".git").exists() {
             return candidate.to_path_buf();
         }
