@@ -53,7 +53,29 @@ const FM_SUBSYSTEM: &str = "db_state_files";
 /// directory as managed by Search V3. Created by the frankensearch
 /// IndexBuilder on first activation; existence is the V3-active
 /// signal.
+///
+/// **Known limitation** (pass-35Y review F1): the marker location
+/// (`<storage_root>/search_index/.managed.json`) is an internal
+/// implementation detail of the external `frankensearch` crate.
+/// If frankensearch ever refactors the marker name or relative
+/// path, this detector silently downgrades to a no-op. A future
+/// hardening pass should swap this for
+/// `frankensearch::is_v3_managed(path)` once frankensearch
+/// exports that helper.
 pub const V3_MANAGED_MARKER: &str = ".managed.json";
+
+/// Canonical legacy FTS5 table-name prefixes. The detector emits a
+/// finding only when sqlite_master rows match one of these
+/// prefixes (plus optional FTS5 shadow-table or trigger
+/// suffixes: `_data`, `_idx`, `_content`, `_segments`, `_segdir`,
+/// `_docsize`, `_config`, `_ai`, `_au`, `_ad`).
+///
+/// Narrower than `fts_%` (pass-35Y review F2): a user-named
+/// table like `fts_metrics` or `fts_custom_index` won't be
+/// flagged. The canonical set is sourced from
+/// `crates/mcp-agent-mail-db/src/schema.rs` (the pre-V3 FTS5
+/// declarations).
+pub const LEGACY_FTS_PREFIXES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LegacyFtsResidueFinding {
@@ -159,22 +181,34 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
     out
 }
 
-/// Read all `sqlite_master` rows whose `name` matches the legacy
-/// FTS5 prefix. Returns `Some(rows)` on success (possibly empty),
-/// `None` on query error.
+/// Read all `sqlite_master` rows whose `name` matches one of the
+/// canonical legacy FTS5 prefixes (pass-35Y review F2 — narrowed
+/// from the previous `fts_%` glob to avoid false-positive matches
+/// against user-named tables like `fts_metrics`).
+///
+/// Returns `Some(rows)` on success (possibly empty), `None` on
+/// query error.
 fn read_fts_residue(conn: &sqlmodel_sqlite::SqliteConnection) -> Option<Vec<ResidualObject>> {
-    let rows = conn
-        .query_sync(
-            "SELECT type, name FROM sqlite_master \
-             WHERE name LIKE 'fts_%' AND type IN ('table', 'trigger', 'view')",
-            &[],
-        )
-        .ok()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let kind = r.get_named::<String>("type").ok()?;
-        let name = r.get_named::<String>("name").ok()?;
-        out.push(ResidualObject { kind, name });
+    let mut out = Vec::new();
+    for prefix in LEGACY_FTS_PREFIXES {
+        // Use a parameterized LIKE pattern. The `||` SQL operator
+        // concatenates the parameter with `%`. The detector
+        // matches `<prefix>`, `<prefix>_data`, `<prefix>_ai`,
+        // `<prefix>_au`, `<prefix>_ad`, and all other FTS5
+        // shadow-table / trigger suffixes.
+        let pattern = format!("{prefix}%");
+        let rows = conn
+            .query_sync(
+                "SELECT type, name FROM sqlite_master \
+                 WHERE name LIKE ?1 AND type IN ('table', 'trigger', 'view')",
+                &[sqlmodel_core::Value::Text(pattern)],
+            )
+            .ok()?;
+        for r in rows {
+            let kind = r.get_named::<String>("type").ok()?;
+            let name = r.get_named::<String>("name").ok()?;
+            out.push(ResidualObject { kind, name });
+        }
     }
     Some(out)
 }
@@ -265,6 +299,41 @@ mod tests {
         assert!(
             findings.is_empty(),
             "without V3 marker, fts_* residue is normal (FTS5 is the active backend)"
+        );
+    }
+
+    /// **NEGATIVE TEST** (pass-35Y review F2): a user-named table
+    /// with the prefix `fts_` but NOT one of the canonical legacy
+    /// table names must NOT be flagged. The narrower filter from
+    /// pass-35Y replaces the previous over-broad `fts_%` glob.
+    #[test]
+    fn detector_skips_user_named_fts_lookalike_tables() {
+        let td = TempDir::new().unwrap();
+        let db_path = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db_path.to_string_lossy().into_owned())
+            .expect("open new sqlite db");
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT);")
+            .expect("create main table");
+        // User-named tables with `fts_` prefix but NOT canonical
+        // legacy names. The previous `fts_%` glob would have
+        // flagged these.
+        conn.execute_raw("CREATE TABLE fts_metrics (id INTEGER, value REAL);")
+            .expect("create user table fts_metrics");
+        conn.execute_raw("CREATE TABLE fts_my_custom (id INTEGER);")
+            .expect("create user table fts_my_custom");
+        conn.execute_raw("CREATE TABLE fts_sync_state (k TEXT, v TEXT);")
+            .expect("create user table fts_sync_state");
+        drop(conn);
+
+        let marker_path = td.path().join("search_index").join(V3_MANAGED_MARKER);
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        fs::write(&marker_path, r#"{"version":1}"#).unwrap();
+
+        let findings = detect(&[db_path]);
+        assert!(
+            findings.is_empty(),
+            "user-named fts_* tables must NOT be flagged after pass-35Y narrowing; got {} finding(s)",
+            findings.len()
         );
     }
 
