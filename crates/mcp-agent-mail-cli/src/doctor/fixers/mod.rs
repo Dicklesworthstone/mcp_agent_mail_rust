@@ -23,6 +23,7 @@ pub mod codex_startup_timeout;
 pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod inbox_stats_divergence;
+pub mod integrity_page_malformed;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
 pub mod schema_version_mismatch;
@@ -200,6 +201,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "inbox_stats materialized aggregate drifts from ground-truth message_recipients counts (rebuild via Op::DbExec)",
             source_module: "doctor::fixers::inbox_stats_divergence",
+        },
+        FixerSpec {
+            id: integrity_page_malformed::FM_ID,
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "PRAGMA integrity_check reports malformed pages (slow check; opt-in via --only; recovery via `am doctor reconstruct`)",
+            source_module: "doctor::fixers::integrity_page_malformed",
         },
         FixerSpec {
             id: schema_version_mismatch::FM_ID,
@@ -573,6 +583,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == integrity_page_malformed::FM_ID {
+        let findings = integrity_page_malformed::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = integrity_page_malformed::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == codex_startup_timeout::FM_ID {
         // `detect_mcp_config_locations_default` is a pure helper
         // that reads no env state beyond `dirs::home_dir()` + CWD;
@@ -792,6 +811,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == inbox_stats_divergence::FM_ID {
         inbox_stats_divergence::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == integrity_page_malformed::FM_ID {
+        integrity_page_malformed::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
