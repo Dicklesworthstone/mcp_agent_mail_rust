@@ -267,7 +267,10 @@ fn open_regular_file_no_follow(path: &Path) -> std::io::Result<File> {
 
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc_consts::O_NOFOLLOW)
+        // Round-7 Gemini F2 (P1): O_NONBLOCK mirrors the undo
+        // helper — defeats the FIFO-blocks-open DoS in the
+        // chokepoint's hash/backup paths. No-op for regular files.
+        .custom_flags(libc_consts::O_NOFOLLOW | libc_consts::O_NONBLOCK)
         .open(path)?;
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
@@ -298,26 +301,40 @@ pub(crate) fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<Pa
     if path.exists() {
         return path.canonicalize();
     }
-    let mut cur = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // Round-7 Gemini F4 (P2): walk up to the first existing
+    // ancestor while accumulating ALL missing intermediate
+    // components. Pre-round-7 only kept `file_name()` and threw
+    // every intermediate dir away, so `scope/a/b/file.txt`
+    // (where `scope/a` is missing) canonicalized to
+    // `<canon scope>/file.txt` — and `ensure_in_scope` then
+    // false-rejected paths whose actual write_scope was
+    // `scope/a/...`.
+    let mut cur = path.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
     while !cur.exists() {
-        match cur.parent() {
-            Some(p) => cur = p.to_path_buf(),
+        let name = cur.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no existing ancestor for path",
+            )
+        })?;
+        missing.push(name.to_os_string());
+        cur = match cur.parent() {
+            Some(p) => p.to_path_buf(),
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "no existing ancestor for path",
                 ));
             }
-        }
+        };
     }
-    let canonical_parent = cur.canonicalize()?;
-    let name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
-    })?;
-    Ok(canonical_parent.join(name))
+    let mut result = cur.canonicalize()?;
+    // `missing` was pushed leaf-first; reverse for top-down order.
+    for name in missing.iter().rev() {
+        result.push(name);
+    }
+    Ok(result)
 }
 
 pub(crate) fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), MutateError> {
@@ -567,6 +584,26 @@ mod libc_consts {
         target_os = "freebsd"
     )))]
     pub const O_NOFOLLOW: i32 = 0;
+
+    /// `O_NONBLOCK` value. Round-7 Gemini F2 (P1): the same FIFO
+    /// DoS that motivated `O_NONBLOCK` on undo's helper applies to
+    /// the chokepoint's `open_regular_file_no_follow` — without
+    /// it, `open(2)` on a FIFO with no writer blocks indefinitely.
+    /// `O_NONBLOCK` is a no-op for regular files (and the
+    /// post-open `is_file()` check rejects the FIFO/socket case
+    /// before any I/O).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    pub const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    )))]
+    pub const O_NONBLOCK: i32 = 0;
 }
 
 /// Set permissions on `path` via the file descriptor.

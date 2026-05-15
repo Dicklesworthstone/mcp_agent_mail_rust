@@ -267,13 +267,23 @@ fn atomic_restore_db(
     // the destination.
     tmp.persist(target_file).map_err(|e| e.error)?;
 
-    // 7. fsync the parent dir so the rename is durably recorded.
-    // Round-6 (Codex F2): error propagation. The pre-round-6 code
-    // discarded the result, which overstated the durability claim.
-    OpenOptions::new()
+    // 7. Best-effort parent-dir fsync. Round-6 Codex F2 asked to
+    // propagate; round-7 Gemini F1 pointed out that propagating
+    // an fsync error AFTER a successful rename strands undo
+    // mid-replay: the on-disk state is restored, but undo bubbles
+    // the error and refuses to record the completion sentinel.
+    // The retry then sees the live target match `before_hash`
+    // (not `after_hash`) and the user-edit defense refuses,
+    // leaving the run permanently unrecoverable. We match the
+    // chokepoint's own `mutate::atomic_write_file` pattern:
+    // best-effort fsync, swallow the result. Durability is "as
+    // durable as the rename" — which is what fs::rename promises
+    // on Linux ext4/xfs even without an explicit parent fsync
+    // for the purpose of crash recovery.
+    let _ = OpenOptions::new()
         .read(true)
         .open(parent)
-        .and_then(|d| d.sync_all())?;
+        .and_then(|d| d.sync_all());
     Ok(())
 }
 
@@ -601,11 +611,36 @@ pub fn run_undo_with_scopes(
                 if let Some(parent) = target_file.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let backup_bytes = read_regular_file_no_follow(&backup_file)?;
+                // Round-7 Gemini F5 (P2): DbExec/DbMigrate crash-
+                // window restore routes through the streaming
+                // `atomic_restore_db` to avoid materializing
+                // multi-GB SQLite DBs into memory. Other ops keep
+                // the in-memory atomic_write_file path because
+                // their backups are bounded by config/source-file
+                // size. before_hash is empty for crash-window
+                // records (post-state may not match anything), so
+                // we skip the post-rename re-check by passing
+                // None.
                 let restore_mode = action.before_mode.unwrap_or(0o644);
-                if super::mutate::atomic_write_file(&target_file, &backup_bytes, restore_mode)
-                    .is_ok()
-                {
+                let restore_result = if matches!(action.op.as_str(), "DbExec" | "DbMigrate") {
+                    atomic_restore_db(
+                        &backup_file,
+                        &target_file,
+                        &action.before_hash,
+                        None,
+                        restore_mode,
+                    )
+                } else {
+                    match read_regular_file_no_follow(&backup_file) {
+                        Ok(bytes) => super::mutate::atomic_write_file(
+                            &target_file,
+                            &bytes,
+                            restore_mode,
+                        ),
+                        Err(e) => Err(e),
+                    }
+                };
+                if restore_result.is_ok() {
                     summary.actions_replayed += 1;
                 } else {
                     summary
@@ -665,7 +700,26 @@ pub fn run_undo_with_scopes(
                         // another process) modified the file post-mutation —
                         // refuse to clobber their changes (strict) or warn
                         // (non-strict).
-                        let target_meta = fs::symlink_metadata(&target_file).ok();
+                        //
+                        // Round-7 Gemini F3 (P2): explicit match — fail
+                        // closed on non-ENOENT errors (EACCES, ELOOP, etc.)
+                        // rather than silently treating them as "target
+                        // gone". Matches the DbExec branch's round-6 fix.
+                        let target_meta = match fs::symlink_metadata(&target_file) {
+                            Ok(m) => Some(m),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => {
+                                if strict {
+                                    return Err(e);
+                                }
+                                summary.failures.push(format!(
+                                    "could not stat {} for quarantine check: {}",
+                                    target_file.display(),
+                                    e,
+                                ));
+                                continue;
+                            }
+                        };
                         if target_meta.is_none() {
                             // Already gone (user already deleted it, perhaps).
                             // Idempotent — count as no-op replay.
@@ -945,6 +999,48 @@ pub fn run_undo_with_scopes(
                 if let Some(parent) = restore_to.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                // Round-7 (Codex F1 P1): before renaming
+                // `from_after` back into place, verify it still
+                // matches `action.after_hash`. Without this check,
+                // a stale or attacker-controlled actions.jsonl can
+                // relocate any in-scope file whose original path
+                // is currently absent — e.g., move
+                // `~/.codex/config` to `~/.codex/oldconfig` or
+                // displace operator hook files. Mirrors the
+                // WriteFile/DbExec user-edit defense.
+                if !action.after_hash.is_empty() {
+                    match sha256_stream_no_follow(&from_after) {
+                        Ok(cur_hash) => {
+                            if cur_hash != action.after_hash {
+                                let msg = format!(
+                                    "rename source {} no longer matches mutation result (hash {} != recorded after_hash {}); refusing to relocate operator-modified file",
+                                    from_after.display(),
+                                    cur_hash,
+                                    action.after_hash,
+                                );
+                                if strict {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::AlreadyExists,
+                                        msg,
+                                    ));
+                                }
+                                summary.failures.push(msg);
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary.failures.push(format!(
+                                "could not hash rename source {} for after_hash check: {}",
+                                from_after.display(),
+                                e,
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 // H6 fix: refuse if `restore_to` already exists — POSIX rename
                 // overwrites silently, which would functionally delete any file
                 // the user (or another fixer) recreated at the original path.
@@ -972,12 +1068,28 @@ pub fn run_undo_with_scopes(
                 }
             }
             "SymlinkAtomic" => {
-                let current_meta = fs::symlink_metadata(&target_file);
-                let current_exists = current_meta.is_ok();
-                let current_is_symlink = current_meta
-                    .as_ref()
-                    .map(|meta| meta.file_type().is_symlink())
-                    .unwrap_or(false);
+                // Round-7 Gemini F3 (P2): fail-closed on non-ENOENT
+                // stat errors. The pre-round-7 derivation of
+                // `current_exists` / `current_is_symlink` from a
+                // single `Result` silently treated EACCES/ELOOP as
+                // "not present as symlink", which downstream
+                // branches read as "ok to restore".
+                let (current_exists, current_is_symlink) =
+                    match fs::symlink_metadata(&target_file) {
+                        Ok(meta) => (true, meta.file_type().is_symlink()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, false),
+                        Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary.failures.push(format!(
+                                "could not stat {} for SymlinkAtomic undo: {}",
+                                target_file.display(),
+                                e,
+                            ));
+                            continue;
+                        }
+                    };
 
                 if !current_exists && backup_file.exists() && !action.after_hash.is_empty() {
                     let msg = format!(
@@ -1487,6 +1599,48 @@ mod tests {
             !quarantine.exists(),
             "quarantine should be empty after undo"
         );
+    }
+
+    #[test]
+    fn undo_rename_refuses_when_quarantined_file_was_modified() {
+        // Round-7 (Codex F1 P1): if the operator (or an attacker
+        // with write access to a quarantined file) changes the
+        // bytes at `rename_to` after the doctor moved the
+        // original target there, undo must refuse to relocate
+        // that modified file back into the operator-visible
+        // path. Without this defense, a stale/malicious
+        // actions.jsonl entry could relocate any in-scope file
+        // whose original path is currently absent.
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("victim.txt");
+        fs::write(&target, b"data\n").unwrap();
+        let quarantine = td.path().join("quar").join("victim.txt");
+        let run_id = "2026-05-15T01-00-00Z__rename-edit";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::Rename {
+                to: quarantine.clone(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        assert!(!target.exists());
+        assert!(quarantine.exists());
+        // Operator edits the quarantined file's bytes post-fix.
+        fs::write(&quarantine, b"operator overwrite\n").unwrap();
+        let pre_undo_bytes = fs::read(&quarantine).unwrap();
+        let result = test_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        // Quarantined file still has the operator's content.
+        assert_eq!(fs::read(&quarantine).unwrap(), pre_undo_bytes);
+        // Original target stays absent (the rename wasn't reversed).
+        assert!(!target.exists());
     }
 
     #[test]
