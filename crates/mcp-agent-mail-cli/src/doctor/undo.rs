@@ -77,6 +77,170 @@ fn read_regular_file_no_follow_inner(path: &Path) -> std::io::Result<Vec<u8>> {
     fs::read(path)
 }
 
+/// Open `path` for reading with O_NOFOLLOW; verify the opened fd is a
+/// regular file (defeats fifo/socket/device redirection); return the File.
+///
+/// Mirror of `mutate::open_regular_file_no_follow`. Round-5 (Codex F3)
+/// requires a streaming hasher so undo memory is O(1); building it on a
+/// File handle (not a `Vec<u8>`) is the foundation.
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(f)
+}
+
+#[cfg(not(unix))]
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+/// Stream-hash a regular file with O_NOFOLLOW. Memory is O(1) (64KB
+/// chunk buffer), so multi-GB SQLite DBs hash without OOM.
+///
+/// Round-5 (Codex F3): the round-4 verifier used `read_regular_file_no_follow`
+/// which materialized the entire DB into a `Vec<u8>`. For multi-GB mailbox
+/// DBs that is a recovery-time memory bomb. This helper streams 64KB chunks
+/// directly into Sha256 (mirrors `mutate::sha256_of_path`).
+fn sha256_stream_no_follow(path: &Path) -> std::io::Result<String> {
+    let mut f = open_regular_file_no_follow(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Round-5 (Codex F1 + F2 + F3) — atomic streaming restore of a SQLite
+/// DB (or any large regular file) from a backup, with a per-chunk hash
+/// computed in the same pass:
+///
+/// 1. Refuse if `target_file` exists and is a symlink (G2 defense — match
+///    the existing WriteFile/Chmod paths). `rename(2)` over a symlink at
+///    `target_file` does not follow it, but `fs::copy` did — this guard
+///    blocks the symlink-overwrite path entirely.
+/// 2. Stream-copy `backup_file` → a tempfile in `target_file`'s parent
+///    dir while updating a `Sha256` hasher with each chunk.
+/// 3. Verify the streamed hash equals `expected_hash`. If not, drop the
+///    tempfile (tempfile crate auto-cleans on drop) and return an error —
+///    the live `target_file` is **untouched**, so a torn DB never appears
+///    on disk.
+/// 4. fsync the tempfile data, set its permissions via fd, and persist
+///    it over `target_file` via `rename(2)` (atomic, does not follow
+///    symlink at destination on Unix).
+/// 5. fsync the parent directory so the rename is durable.
+///
+/// `backup_file` is opened with O_NOFOLLOW; symlinks at the backup are
+/// refused (a tampered backup-as-symlink should fail at this step rather
+/// than leaking the referent through `fs::copy`).
+fn atomic_restore_db(
+    backup_file: &Path,
+    target_file: &Path,
+    expected_hash: &str,
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    // 1. Refuse symlink at target. `rename(2)` is symlink-safe at dst, but
+    // the symmetric existing G2 defense documents intent and gives a
+    // useful error message before any disk I/O.
+    if let Ok(meta) = fs::symlink_metadata(target_file)
+        && meta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "target {} is a symlink; refusing to follow (round-5 G2 defense for DB restore)",
+                target_file.display()
+            ),
+        ));
+    }
+
+    // 2. Parent dir for tempfile + final rename.
+    let parent = target_file.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    // 3. Stream-copy with parallel hashing.
+    let mut src = open_regular_file_no_follow(backup_file)?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut hasher = Sha256::new();
+    {
+        let mut dst = tmp.as_file();
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n])?;
+            hasher.update(&buf[..n]);
+        }
+        dst.sync_data()?;
+        #[cfg(unix)]
+        dst.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        #[cfg(not(unix))]
+        let _ = mode;
+    }
+
+    // 4. Verify hash BEFORE swapping over the live target. On mismatch,
+    // the tempfile drops here (auto-cleaned), the live target is left
+    // intact, and the caller records the failure.
+    let restored_hash = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if restored_hash != expected_hash {
+        return Err(std::io::Error::other(format!(
+            "post-stream DB hash mismatch: expected {expected_hash}, got {restored_hash}",
+        )));
+    }
+
+    // 5. Atomic rename + parent fsync. `rename(2)` does not follow a
+    // symlink at the destination.
+    tmp.persist(target_file).map_err(|e| e.error)?;
+    let _ = OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .and_then(|d| d.sync_all());
+    Ok(())
+}
+
+/// Recreate `dir` (and ancestors) with `0o700` on Unix. Round-5
+/// Gemini F6: the default `fs::create_dir_all` applies `0o777 &
+/// !umask`, which on a default `umask=022` gives `0o755`. That
+/// strips the security envelope of sensitive DB-storage dirs (the
+/// canonical `~/.mcp_agent_mail_git_mailbox_repo` lives at
+/// `0o700`). We err on the side of restrictive: if the operator
+/// truly wants a wider mode they can chmod after recovery.
+#[cfg(unix)]
+fn ensure_parent_dir_strict(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn ensure_parent_dir_strict(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct StoredAction {
     path: String,
@@ -803,37 +967,147 @@ pub fn run_undo(
             "DbExec" | "DbMigrate" => {
                 // Pass-34 wired Op::DbExec at the chokepoint, and the
                 // chokepoint took a file-level byte backup of the DB
-                // before the exec. We can restore that backup here —
-                // it produces a byte-identical main DB file. The
-                // caveat (Codex F8 + Gemini F1/F2 fresh-eyes review)
-                // is that WAL/SHM siblings are NOT backed up, so a
-                // DbExec run that created/grew them leaves orphan
-                // sidecars. SQLite is robust to orphan WAL/SHM on
-                // open (it ignores them), so functional correctness
-                // is preserved even if the on-disk fileset isn't
-                // byte-for-byte identical.
-                if backup_file.exists() && target_file.exists() {
-                    if dry_run {
-                        summary.actions_replayed += 1;
-                    } else {
-                        match std::fs::copy(&backup_file, &target_file) {
-                            Ok(_) => {
-                                summary.actions_replayed += 1;
-                            }
-                            Err(e) => {
-                                summary.failures.push(format!(
-                                    "could not restore DB {} from backup {}: {}",
-                                    target_file.display(),
-                                    backup_file.display(),
-                                    e
-                                ));
+                // before the exec. The undo path restores that
+                // backup — byte-identical main DB file. WAL/SHM
+                // siblings are NOT backed up; SQLite is robust to
+                // orphan WAL/SHM on open (round-3 review).
+                //
+                // Round-4 (Codex F2 + Gemini F2): `backup_file.exists()`
+                // is the decisive precondition; the target may have
+                // been removed by an operator post-fix.
+                //
+                // Round-5 hardening (Codex F1 / Gemini F3 — symlink
+                // defense; Codex F2 / Gemini F5 — atomic restore;
+                // Codex F3 / Gemini F4 — streaming hash; Gemini F6 —
+                // tight parent-dir mode): the restore now flows
+                // through `atomic_restore_db`, which (a) refuses if
+                // target is a symlink, (b) streams backup → tempfile
+                // while hashing in one pass, (c) verifies the
+                // streamed hash equals before_hash BEFORE renaming
+                // over the target, and (d) atomically renames the
+                // tempfile into place. If the live target still
+                // exists and has a recorded after_hash, we also
+                // verify the target hasn't been modified by the
+                // operator post-fix (matches the WriteFile branch's
+                // user-edit defense).
+                if !backup_file.exists() {
+                    let msg = format!(
+                        "{} backup missing for {}; cannot restore",
+                        action.op, action.path,
+                    );
+                    if strict {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            msg,
+                        ));
+                    }
+                    summary.failures.push(msg);
+                    continue;
+                }
+                // Symlink defense at target. The atomic_restore_db
+                // helper also refuses, but we bail early for the
+                // user-modified hash check that comes next.
+                let target_meta = fs::symlink_metadata(&target_file).ok();
+                if let Some(ref m) = target_meta
+                    && m.file_type().is_symlink()
+                {
+                    let msg = format!(
+                        "target {} is a symlink; refusing to follow (round-5 G2 defense for DB restore)",
+                        action.path
+                    );
+                    if strict {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            msg,
+                        ));
+                    }
+                    summary.failures.push(msg);
+                    continue;
+                }
+                // User-edit defense (Codex F1 / Gemini F3): if the
+                // target still exists and we have an after_hash
+                // recorded, verify the current target still hashes
+                // to that value. If the operator modified the DB
+                // after the fix, refuse to clobber their changes.
+                if target_meta.is_some() && !action.after_hash.is_empty() {
+                    match sha256_stream_no_follow(&target_file) {
+                        Ok(cur_hash) => {
+                            if cur_hash != action.after_hash {
+                                let msg = format!(
+                                    "target {} no longer matches mutation result (hash {} != recorded after_hash {}); refusing to clobber operator-modified DB",
+                                    action.path, cur_hash, action.after_hash,
+                                );
+                                if strict {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::AlreadyExists,
+                                        msg,
+                                    ));
+                                }
+                                summary.failures.push(msg);
+                                continue;
                             }
                         }
+                        Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
+                            summary.failures.push(format!(
+                                "could not hash {} for after_hash check: {}",
+                                target_file.display(),
+                                e,
+                            ));
+                            continue;
+                        }
                     }
-                } else {
-                    // No backup (Op::DbMigrate marker op records no
-                    // file change) — skip cleanly.
-                    summary.actions_skipped += 1;
+                }
+                if dry_run {
+                    eprintln!(
+                        "[dry-run] would atomic-restore DB {} from backup {}",
+                        target_file.display(),
+                        backup_file.display(),
+                    );
+                    summary.actions_replayed += 1;
+                    continue;
+                }
+                // Recreate parent dir if target's dir was removed.
+                // Gemini F6: use 0o700 (sensitive DB storage), not
+                // the default 0o755 that DirBuilder applies via
+                // create_dir_all.
+                if let Some(parent) = target_file.parent()
+                    && !parent.exists()
+                    && let Err(e) = ensure_parent_dir_strict(parent)
+                {
+                    if strict {
+                        return Err(e);
+                    }
+                    summary.failures.push(format!(
+                        "could not create parent dir for {}: {}",
+                        target_file.display(),
+                        e,
+                    ));
+                    continue;
+                }
+                let restore_mode = action.before_mode.unwrap_or(0o600);
+                match atomic_restore_db(
+                    &backup_file,
+                    &target_file,
+                    &action.before_hash,
+                    restore_mode,
+                ) {
+                    Ok(()) => {
+                        summary.actions_replayed += 1;
+                    }
+                    Err(e) => {
+                        if strict {
+                            return Err(e);
+                        }
+                        summary.failures.push(format!(
+                            "could not atomic-restore DB {} from backup {}: {}",
+                            target_file.display(),
+                            backup_file.display(),
+                            e,
+                        ));
+                    }
                 }
             }
             other => {
@@ -1805,6 +2079,261 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "outside original\n"
+        );
+    }
+
+    #[test]
+    fn undo_db_exec_restores_when_target_is_missing() {
+        // Pass-34 round-4 (Codex F2 + Gemini F2): undo of
+        // DbExec/DbMigrate must restore from the backup even
+        // when the operator deleted the target between the fix
+        // run and the undo. Pre-fix, the branch required both
+        // backup_file AND target_file to exist and silently
+        // skipped otherwise — which broke the reversibility
+        // contract for a plausible recovery scenario.
+        use sqlmodel_sqlite::SqliteConnection;
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw("CREATE TABLE t (a INTEGER);").unwrap();
+        drop(conn);
+        let pre_bytes = fs::read(&db).unwrap();
+        let pre_hash = sha256_hex(&pre_bytes);
+        let run_id = "2026-05-14T00-00-00Z__dbexec-missing";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &db,
+            Op::DbExec {
+                sql: "INSERT INTO t VALUES (1);".to_string(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        // Operator deletes the DB between fix and undo.
+        fs::remove_file(&db).unwrap();
+        let summary = run_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(
+            summary.actions_replayed, 1,
+            "DbExec undo must restore when target is missing (failures: {:?})",
+            summary.failures,
+        );
+        assert!(
+            summary.failures.is_empty(),
+            "unexpected failures: {:?}",
+            summary.failures,
+        );
+        assert!(db.exists(), "DB must be re-created from backup");
+        let restored_bytes = fs::read(&db).unwrap();
+        let restored_hash = sha256_hex(&restored_bytes);
+        assert_eq!(
+            restored_hash, pre_hash,
+            "restored DB must hash to the pre-mutation before_hash",
+        );
+    }
+
+    #[test]
+    fn undo_db_exec_detects_hash_mismatch_after_copy() {
+        // Pass-34 round-4 (Codex F3): undo of DbExec/DbMigrate
+        // must verify the post-restore SHA-256 against
+        // action.before_hash. A short copy, partial overwrite,
+        // or tampered backup must NOT be recorded as a clean
+        // undo.
+        use sqlmodel_sqlite::SqliteConnection;
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw("CREATE TABLE t (a INTEGER);").unwrap();
+        drop(conn);
+        let run_id = "2026-05-14T00-00-00Z__dbexec-hashmismatch";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &db,
+            Op::DbExec {
+                sql: "INSERT INTO t VALUES (1);".to_string(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        // Tamper with the backup so post-restore hash will not
+        // match before_hash. Find the per-run backup of the DB.
+        let run_dir = doctor_root(td.path()).join("runs").join(run_id);
+        let backups = run_dir.join("backups");
+        // Walk the backups dir to find the DB backup. The
+        // chokepoint encodes the absolute path with a
+        // timestamp-suffix; we just hit the first regular file.
+        let mut backup_path = None;
+        fn walk(dir: &Path, out: &mut Option<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if out.is_none() {
+                    *out = Some(p);
+                }
+            }
+        }
+        walk(&backups, &mut backup_path);
+        let backup = backup_path.expect("backup must exist");
+        // Truncate the backup to corrupt the hash without
+        // changing existence.
+        fs::write(&backup, b"corrupted backup\n").unwrap();
+        // Non-strict mode: failure recorded, summary returned.
+        let summary = run_undo(td.path(), run_id, false, false).unwrap();
+        assert_eq!(
+            summary.actions_replayed, 0,
+            "undo must not count tampered-backup restore as success",
+        );
+        assert!(
+            summary
+                .failures
+                .iter()
+                .any(|f| f.contains("hash mismatch")),
+            "expected hash-mismatch failure, got: {:?}",
+            summary.failures,
+        );
+    }
+
+    #[test]
+    fn undo_db_exec_refuses_symlink_at_target() {
+        // Round-5 (Codex F1 + Gemini F3): if the target was
+        // swapped to a symlink between fix and undo, the restore
+        // path must refuse with PermissionDenied — never follow
+        // the link and clobber the referent. Mirrors the
+        // WriteFile G2 defense.
+        use sqlmodel_sqlite::SqliteConnection;
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw("CREATE TABLE t (a INTEGER);").unwrap();
+        drop(conn);
+        let run_id = "2026-05-15T00-00-00Z__dbexec-symlink-target";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &db,
+            Op::DbExec {
+                sql: "INSERT INTO t VALUES (1);".to_string(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        // Replace target with symlink to a sensitive file.
+        fs::remove_file(&db).unwrap();
+        let sensitive = td.path().join("attacker-target.bin");
+        fs::write(&sensitive, b"do not overwrite\n").unwrap();
+        std::os::unix::fs::symlink(&sensitive, &db).unwrap();
+        // Strict mode: must return PermissionDenied.
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        // Sensitive file untouched.
+        assert_eq!(fs::read(&sensitive).unwrap(), b"do not overwrite\n");
+    }
+
+    #[test]
+    fn undo_db_exec_refuses_when_target_user_modified() {
+        // Round-5 (Codex F1 / Gemini F3 user-edit defense): if the
+        // operator modified the DB between fix and undo, the
+        // current target's hash no longer matches the recorded
+        // after_hash and undo must refuse to clobber their work.
+        use sqlmodel_sqlite::SqliteConnection;
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw("CREATE TABLE t (a INTEGER);").unwrap();
+        drop(conn);
+        let run_id = "2026-05-15T00-00-00Z__dbexec-user-modified";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &db,
+            Op::DbExec {
+                sql: "INSERT INTO t VALUES (1);".to_string(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        // Operator clobbers the DB with unrelated content
+        // post-fix. The replacement's hash ≠ recorded after_hash.
+        fs::write(&db, b"operator's new content\n").unwrap();
+        let pre_undo_bytes = fs::read(&db).unwrap();
+        let result = run_undo(td.path(), run_id, false, true);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+        // Operator's content preserved.
+        assert_eq!(fs::read(&db).unwrap(), pre_undo_bytes);
+    }
+
+    #[test]
+    fn undo_db_exec_leaves_live_target_intact_on_tampered_backup() {
+        // Round-5 (Codex F2 / Gemini F5): tampered backup with
+        // wrong hash must NOT corrupt the live target. The
+        // atomic restore writes to a tempfile, hash-verifies
+        // BEFORE renaming, and refuses if mismatched — so the
+        // live target is untouched on failure.
+        use sqlmodel_sqlite::SqliteConnection;
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw("CREATE TABLE t (a INTEGER);").unwrap();
+        drop(conn);
+        let run_id = "2026-05-15T00-00-00Z__dbexec-tampered-backup-atomic";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &db,
+            Op::DbExec {
+                sql: "INSERT INTO t VALUES (1);".to_string(),
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        let pre_undo_bytes = fs::read(&db).unwrap();
+        let pre_undo_hash = sha256_hex(&pre_undo_bytes);
+        // Find and tamper the backup.
+        let run_dir = doctor_root(td.path()).join("runs").join(run_id);
+        let backups = run_dir.join("backups");
+        fn walk(dir: &Path, out: &mut Option<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if out.is_none() {
+                    *out = Some(p);
+                }
+            }
+        }
+        let mut backup_path = None;
+        walk(&backups, &mut backup_path);
+        let backup = backup_path.expect("backup must exist");
+        fs::write(&backup, b"tampered backup that wont match before_hash\n").unwrap();
+        // Non-strict: failure recorded, live target untouched.
+        let summary = run_undo(td.path(), run_id, false, false).unwrap();
+        assert_eq!(summary.actions_replayed, 0);
+        assert!(
+            summary
+                .failures
+                .iter()
+                .any(|f| f.contains("hash mismatch")),
+            "expected hash-mismatch failure: {:?}",
+            summary.failures,
+        );
+        // Critical: live target byte-identical to pre-undo state.
+        let post_undo_bytes = fs::read(&db).unwrap();
+        let post_undo_hash = sha256_hex(&post_undo_bytes);
+        assert_eq!(
+            post_undo_hash, pre_undo_hash,
+            "atomic restore must not corrupt the live target on backup-tamper failure",
         );
     }
 

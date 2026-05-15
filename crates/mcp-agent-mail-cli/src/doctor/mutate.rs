@@ -47,11 +47,12 @@ pub enum Op {
     Rename { to: PathBuf },
     /// Set the mode of `path`.
     Chmod { mode: u32 },
-    /// Execute `sql` against the project's DB inside a transaction. Wired
-    /// to the project's `DbConn` by the dispatch layer; this struct
-    /// only carries the SQL.
+    /// Execute `sql` against an existing SQLite DB file. The chokepoint
+    /// backs up the main DB file before execution; callers that require
+    /// WAL/SHM sidecar guarantees must checkpoint or lock externally.
     DbExec { sql: String },
-    /// Versioned schema migration; rolls back on error.
+    /// Versioned schema migration marker for an existing SQLite DB file.
+    /// Migration SQL is supplied separately through `DbExec`.
     DbMigrate { from: u32, to: u32 },
     /// Atomic symlink replacement (used for `.doctor/latest`).
     SymlinkAtomic { target: PathBuf },
@@ -345,6 +346,25 @@ fn reject_unexpected_symlink(path: &Path, op: &Op) -> Result<(), MutateError> {
     }
 }
 
+fn ensure_existing_regular_db_file(path: &Path, op: &'static str) -> Result<(), MutateError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err(MutateError::ExecFailed {
+            path: path.to_path_buf(),
+            op,
+            message: "database path is not a regular file".to_string(),
+            rolled_back: None,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(MutateError::ExecFailed {
+            path: path.to_path_buf(),
+            op,
+            message: "database file does not exist; DB mutations require a pre-existing file for reversible backup".to_string(),
+            rolled_back: None,
+        }),
+        Err(e) => Err(MutateError::Io(e)),
+    }
+}
+
 fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -598,6 +618,9 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         ensure_in_scope(&ctx.capabilities, to)?;
     }
     reject_unexpected_symlink(path, &op)?;
+    if matches!(op, Op::DbExec { .. } | Op::DbMigrate { .. }) {
+        ensure_existing_regular_db_file(path, op.op_kind())?;
+    }
 
     if ctx.dry_run {
         let before_hash = sha256_for_path_before_op(path, &op)?;
@@ -793,13 +816,25 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             Err(e) => Err(e),
         },
         Op::DbExec { sql } => {
-            // Pass-34: open the DB at `path`, run the SQL via
-            // `execute_raw` (handles DDL like PRAGMA + CREATE), close.
+            // Open the DB at `path`, run the SQL via `execute_raw`
+            // (handles DDL like PRAGMA + CREATE), then close.
             // The chokepoint already byte-copied `path` to
             // `backup_path` earlier, so the rollback path (on
-            // exec failure) restores the file. WAL/SHM siblings are
-            // NOT backed up; callers that care must checkpoint
-            // before invoking (e.g., `PRAGMA wal_checkpoint(TRUNCATE);`).
+            // exec failure) restores the file.
+            //
+            // WAL/SHM caveat: SQLite may write `<path>-wal` and
+            // `<path>-shm` siblings during exec, and these are NOT
+            // backed up. The file-level rollback restores `<path>`
+            // byte-identical but the siblings persist. SQLite is
+            // robust to stale WAL/SHM on the next open, so the
+            // operational impact is bounded. Callers that need
+            // stronger guarantees should `PRAGMA wal_checkpoint(TRUNCATE);`
+            // before invoking and ensure no other writers can race.
+            //
+            // **Connection scope:** the SqliteConnection is bound
+            // inside the match expression — when this arm returns
+            // (either Ok or Err) the binding drops, which closes the
+            // connection cleanly before the outer rollback runs.
             use sqlmodel_sqlite::SqliteConnection;
             match SqliteConnection::open_file(path.to_string_lossy().into_owned()) {
                 Ok(conn) => match conn.execute_raw(&sql) {
@@ -823,15 +858,12 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             }
         }
         Op::DbMigrate { from, to } => {
-            // Pass-34: DbMigrate is documented as a marker op — it
-            // records the migration intent (from → to) in
-            // actions.jsonl with file-level backup, but the actual
-            // migration SQL must be supplied via separate Op::DbExec
-            // calls. Callers (FMs) typically issue one Op::DbMigrate
-            // followed by a sequence of Op::DbExec PRAGMAs and DDL.
-            // This keeps the chokepoint simple: every SQL fragment
-            // is hash-witnessed independently, undo can replay in
-            // reverse.
+            // DbMigrate is a marker op: it records the migration
+            // intent (from → to) in actions.jsonl with file-level
+            // backup, but the actual migration SQL must be supplied
+            // via separate Op::DbExec calls. This keeps the chokepoint
+            // simple: every SQL fragment is hash-witnessed independently,
+            // and undo can replay in reverse.
             //
             // Records the (from, to) values in the trailing
             // actions.jsonl entry so undo can detect partial
@@ -1447,26 +1479,41 @@ mod tests {
     }
 
     #[test]
-    fn db_exec_returns_err_unsupported_in_this_module() {
-        // Wired by the dispatch layer; the chokepoint itself doesn't have a DbConn.
+    fn db_exec_executes_sql_and_records_completed_action() {
         let td = TempDir::new().unwrap();
         let run_id = "2026-05-09T16-30-15Z__dbexec";
         let ctx = make_ctx(&td, run_id);
-        let target = td.path().join("anything.txt");
-        let err = mutate(
+        let target = td.path().join("storage.sqlite3");
+        {
+            let conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(target.to_string_lossy().into_owned())
+                    .unwrap();
+            conn.execute_raw("CREATE TABLE doctor_preexisting (id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let result = mutate(
             &ctx,
             &target,
             Op::DbExec {
-                sql: "SELECT 1".into(),
+                sql: "\
+                    CREATE TABLE doctor_mutate_smoke (id INTEGER PRIMARY KEY, label TEXT NOT NULL);\
+                    INSERT INTO doctor_mutate_smoke (id, label) VALUES (1, 'ok');\
+                "
+                .into(),
             },
         )
-        .unwrap_err();
-        match err {
-            MutateError::ExecFailed { message, .. } => {
-                assert!(message.contains("DbConn"), "got: {message}")
-            }
-            other => panic!("expected ExecFailed, got: {other:?}"),
-        }
+        .unwrap();
+        assert!(result.ok);
+
+        let conn =
+            sqlmodel_sqlite::SqliteConnection::open_file(target.to_string_lossy().into_owned())
+                .unwrap();
+        let rows = conn
+            .query_sync("SELECT label FROM doctor_mutate_smoke WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("label").unwrap(), "ok");
+
         let actions = fs::read_to_string(
             td.path()
                 .join(".doctor")
@@ -1479,15 +1526,50 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 2, "failed exec must still be completed");
+        assert_eq!(lines.len(), 2, "successful exec must be hash-witnessed");
         assert_eq!(lines[0]["phase"], "pending");
         assert_eq!(lines[1]["phase"], "completed");
-        assert_eq!(lines[1]["ok"], false);
+        assert_eq!(lines[1]["ok"], true);
+        assert_eq!(lines[1]["op"], "DbExec");
+        assert!(lines[1]["error"].is_null());
+        assert_ne!(
+            lines[1]["before_hash"].as_str(),
+            Some(sha256_bytes(b"").as_str()),
+            "DbExec must run against a pre-existing DB so undo has a real backup"
+        );
+    }
+
+    #[test]
+    fn db_exec_refuses_missing_database_without_action_record() {
+        let td = TempDir::new().unwrap();
+        let run_id = "2026-05-09T16-30-15Z__dbexec_missing";
+        let ctx = make_ctx(&td, run_id);
+        let target = td.path().join("missing.sqlite3");
+        let err = mutate(
+            &ctx,
+            &target,
+            Op::DbExec {
+                sql: "CREATE TABLE should_not_exist (id INTEGER);".into(),
+            },
+        )
+        .unwrap_err();
+        match err {
+            MutateError::ExecFailed { message, .. } => {
+                assert!(
+                    message.contains("does not exist"),
+                    "missing DB refusal should explain reversible backup requirement: {message}"
+                );
+            }
+            other => panic!("expected ExecFailed for missing DB, got {other:?}"),
+        }
         assert!(
-            lines[1]["error"]
-                .as_str()
-                .expect("error string")
-                .contains("DbConn")
+            !target.exists(),
+            "DbExec must not create a fresh DB without a pre-mutation backup"
+        );
+        let actions = fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap();
+        assert!(
+            actions.is_empty(),
+            "precondition refusal must not write pending/completed action records"
         );
     }
 

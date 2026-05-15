@@ -18,22 +18,37 @@
 //!
 //! ## Detection (pure function)
 //!
-//! 1. `fs::metadata(path)` — if file doesn't exist (returns
-//!    `Reason::Missing`) OR size is below the SQLite header
-//!    minimum (100 bytes), emit `Reason::TooSmall { size }`.
-//! 2. Open via `SqliteConnection::open_file`. If open fails,
-//!    emit `Reason::OpenFailed { error }`.
-//! 3. `PRAGMA schema_version;` (pass-34 fresh-eyes Gemini F6).
-//!    A cheap O(1) header read that returns an integer for any
-//!    valid SQLite file. Replaces the original
-//!    `PRAGMA quick_check;` which did a full table+index scan
-//!    and could take minutes on large mailbox DBs — too slow
-//!    for `am doctor health`'s sub-200ms budget. If the PRAGMA
-//!    query fails entirely, emit `Reason::SchemaProbeFailed`.
-//!    Exhaustive `quick_check` belongs in a dedicated `am doctor
-//!    deep-check` verb (future); this FM only catches the gross
-//!    "file is empty / unparseable" cases that block startup.
-//! 4. Otherwise no finding.
+//! Bypasses `SqliteConnection` entirely (round-5 Gemini F1 + F2):
+//! even with `OpenFlags::read_only()`, opening a WAL-mode DB
+//! through SQLite mutates the `-shm` sidecar (or refuses to open
+//! if `-shm` is absent), and the metadata-then-open dance has a
+//! TOCTOU window where a symlink can be swapped to `/dev/zero`
+//! or a named pipe. Reading the SQLite header bytes directly off
+//! a held file descriptor closes both.
+//!
+//! 1. Open `path` for reading with `O_NONBLOCK` (cheap DoS
+//!    defense — opening a FIFO with no writer would otherwise
+//!    block indefinitely). Symlinks ARE followed, matching the
+//!    behavior SQLite would have at runtime, so a symlinked DB
+//!    file gets probed against its target (round-4 Gemini F1).
+//!    ENOENT → `Reason::Missing`. Any other open error →
+//!    `Reason::OpenFailed`.
+//! 2. `fd.metadata().file_type().is_file()` on the **open fd** —
+//!    this closes the round-4/round-5 TOCTOU window because the
+//!    fd is locked to whatever inode was resolved at open time.
+//!    If the fd is a dir/device/fifo/socket, skip silently (not
+//!    our domain).
+//! 3. If `meta.len() < SQLITE_HEADER_BYTES` (100), emit
+//!    `Reason::TooSmall { size }`.
+//! 4. `read_exact` the 100-byte SQLite header off the fd. The
+//!    first 16 bytes MUST equal the magic
+//!    `b"SQLite format 3\0"`; else `Reason::HeaderMagicFailed`.
+//!    Past-magic deeper validation (page-size sanity,
+//!    schema_cookie parse) lives in a dedicated
+//!    `am doctor deep-check` verb (future) — this FM only
+//!    catches the gross "file isn't even a SQLite header" case
+//!    that blocks startup.
+//! 5. Otherwise no finding.
 //!
 //! ## Fix
 //!
@@ -66,14 +81,19 @@ pub enum Reason {
     Missing,
     /// File exists but is smaller than the SQLite header.
     TooSmall { size: u64 },
-    /// `SqliteConnection::open_file` failed.
+    /// `open(2)` failed (permission, EISDIR, etc.). Round-5
+    /// Gemini F1+F2: open is `O_RDONLY | O_NONBLOCK` and follows
+    /// symlinks; `O_NONBLOCK` defeats the FIFO-blocks-open DoS,
+    /// and the subsequent `fd.metadata()` check ensures the held
+    /// inode is a regular file before any bytes are read.
     OpenFailed { message: String },
-    /// `PRAGMA schema_version` query failed entirely. Pre-pass-34
-    /// fresh-eyes (Gemini F6) this was `QuickCheckFailed`; replaced
-    /// with the cheaper schema_version probe (O(1) header read vs.
-    /// O(N) full-table scan) so `am doctor health` stays under its
-    /// sub-200ms budget on large mailbox DBs.
-    SchemaProbeFailed { result: String },
+    /// The first 16 bytes of `path` are not the SQLite magic
+    /// `"SQLite format 3\0"`. The header bytes that WERE read are
+    /// surfaced as a hex string for diagnostics. Round-5 Gemini F1:
+    /// replaces the pre-round-5 `SchemaProbeFailed` reason, which
+    /// required opening through SQLite (which mutated `-shm` on
+    /// healthy WAL DBs and false-positived on missing `-shm`).
+    HeaderMagicFailed { observed_prefix_hex: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,7 +108,9 @@ impl EmptyOrTruncatedDbFinding {
             Reason::Missing => "missing".to_string(),
             Reason::TooSmall { size } => format!("too_small (size={size})"),
             Reason::OpenFailed { message } => format!("open_failed ({message})"),
-            Reason::SchemaProbeFailed { result } => format!("schema_probe_failed ({result})"),
+            Reason::HeaderMagicFailed {
+                observed_prefix_hex,
+            } => format!("header_magic_failed (prefix={observed_prefix_hex})"),
         };
         let title = format!(
             "DB {} is empty or corrupted ({reason_str}); recover via `am doctor reconstruct`",
@@ -116,80 +138,106 @@ impl EmptyOrTruncatedDbFinding {
     }
 }
 
-/// Detector. PURE w.r.t. caller-supplied paths; opens each
-/// candidate via `SqliteConnection` to run `PRAGMA quick_check`.
+/// SQLite file format magic — the first 16 bytes of every valid
+/// SQLite database file. Documented at <https://sqlite.org/fileformat.html>.
+pub const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// Detector. PURE w.r.t. caller-supplied paths.
 ///
-/// Skips paths that aren't on disk as a regular file (e.g.,
-/// `:memory:` placeholders, symlinks, dirs). The caller's
-/// `default_db_file_candidates()` helper already filters those
-/// out for the canonical CLI path.
+/// Round-5 (Gemini F1 + F2): the detector opens the candidate
+/// file directly, checks `metadata()` on the held fd, then reads
+/// the 100-byte SQLite header off that same fd. Bypasses
+/// `SqliteConnection` entirely so the probe cannot create
+/// `-shm` sidecars, cannot fail with `SQLITE_READONLY_CANTINIT`
+/// on a healthy WAL DB whose `-shm` is missing, and is not racy
+/// against a symlink swap between `fs::metadata` and a later
+/// open.
+///
+/// Skips silently when the resolved fd is a dir/device/fifo
+/// (not our domain).
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<EmptyOrTruncatedDbFinding> {
-    use sqlmodel_sqlite::SqliteConnection;
     let mut out = Vec::new();
     for path in candidate_paths {
-        // Stage 1: file presence + size.
-        let meta = match std::fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(_) => {
-                out.push(EmptyOrTruncatedDbFinding {
-                    db_path: path.clone(),
-                    reason: Reason::Missing,
-                });
-                continue;
-            }
-        };
-        if !meta.file_type().is_file() {
-            continue; // symlink / dir / device — not our domain
-        }
-        if meta.len() < SQLITE_HEADER_BYTES {
-            out.push(EmptyOrTruncatedDbFinding {
+        match detect_one(path) {
+            Ok(Some(reason)) => out.push(EmptyOrTruncatedDbFinding {
                 db_path: path.clone(),
-                reason: Reason::TooSmall { size: meta.len() },
-            });
-            continue;
-        }
-        // Stage 2: open via SqliteConnection.
-        let conn = match SqliteConnection::open_file(path.to_string_lossy().into_owned()) {
-            Ok(c) => c,
-            Err(e) => {
-                out.push(EmptyOrTruncatedDbFinding {
-                    db_path: path.clone(),
-                    reason: Reason::OpenFailed {
-                        message: format!("{e}"),
-                    },
-                });
-                continue;
-            }
-        };
-        // Stage 3: cheap header probe via PRAGMA schema_version.
-        // Pass-34 fresh-eyes (Gemini F6): the original used
-        // PRAGMA quick_check which is a full-table scan; on large
-        // mailbox DBs this hung `am doctor health` past its
-        // <200ms budget. schema_version reads from the SQLite
-        // header directly (O(1)) and returns a sentinel integer
-        // for any valid DB. A genuinely corrupt file fails the
-        // query entirely.
-        let probe = schema_probe(&conn);
-        drop(conn);
-        if let Err(msg) = probe {
-            out.push(EmptyOrTruncatedDbFinding {
+                reason,
+            }),
+            Ok(None) => {}
+            Err(reason) => out.push(EmptyOrTruncatedDbFinding {
                 db_path: path.clone(),
-                reason: Reason::SchemaProbeFailed { result: msg },
-            });
+                reason,
+            }),
         }
     }
     out
 }
 
-fn schema_probe(conn: &sqlmodel_sqlite::SqliteConnection) -> Result<(), String> {
-    let rows = conn
-        .query_sync("PRAGMA schema_version;", &[])
-        .map_err(|e| format!("query failed: {e}"))?;
-    let first = rows.first().ok_or_else(|| "no rows returned".to_string())?;
-    first
-        .get_named::<i64>("schema_version")
-        .map_err(|e| format!("schema_version not parseable as i64: {e}"))?;
-    Ok(())
+/// Probe one candidate. Returns:
+/// - `Ok(None)` — healthy or not-our-domain (dir/device/fifo).
+/// - `Ok(Some(reason))` — a corruption finding to surface.
+/// - `Err(reason)` — same shape; matches `Reason::OpenFailed`
+///   convenience in the open path.
+fn detect_one(path: &std::path::Path) -> Result<Option<Reason>, Reason> {
+    use std::io::Read as _;
+
+    // Stage 1: O_NONBLOCK open. Symlinks are followed (so a
+    // symlinked DB is probed against its target — round-4 G1),
+    // but O_NONBLOCK defeats the FIFO-blocks-open DoS. ENOENT is
+    // surfaced as Missing; anything else is OpenFailed.
+    let mut f = match open_nonblock_for_read(path) {
+        Ok(f) => f,
+        Err(e) => {
+            return Ok(Some(if e.kind() == std::io::ErrorKind::NotFound {
+                Reason::Missing
+            } else {
+                Reason::OpenFailed {
+                    message: format!("{e}"),
+                }
+            }));
+        }
+    };
+
+    // Stage 2: metadata() on the OPEN fd. This is what closes the
+    // round-5 Gemini F2 TOCTOU window — the fd we read from is
+    // bound to the inode that existed at open time, and the
+    // file_type check below decides whether to read from it.
+    let meta = f.metadata().map_err(|e| Reason::OpenFailed {
+        message: format!("metadata: {e}"),
+    })?;
+    if !meta.file_type().is_file() {
+        // Dir / device / fifo / socket — not our domain.
+        return Ok(None);
+    }
+    if meta.len() < SQLITE_HEADER_BYTES {
+        return Ok(Some(Reason::TooSmall { size: meta.len() }));
+    }
+
+    // Stage 3: read first 100 bytes; verify SQLite magic.
+    let mut header = [0u8; SQLITE_HEADER_BYTES as usize];
+    f.read_exact(&mut header).map_err(|e| Reason::OpenFailed {
+        message: format!("header read: {e}"),
+    })?;
+    if &header[..16] != SQLITE_MAGIC {
+        return Ok(Some(Reason::HeaderMagicFailed {
+            observed_prefix_hex: hex::encode(&header[..16]),
+        }));
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Detect-only FM. `fix()` is a no-op for API uniformity.
@@ -256,8 +304,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let p = td.path().join("garbage.sqlite3");
         // Above the 100-byte minimum but not a real SQLite header.
-        // Open may or may not fail depending on lazy-vs-eager
-        // header validation; schema_probe is what catches it.
+        // Round-5: the detector reads bytes directly and verifies
+        // the SQLite magic, so this MUST land in HeaderMagicFailed.
         fs::write(&p, vec![0xFF_u8; 200]).unwrap();
         let findings = detect(std::slice::from_ref(&p));
         assert_eq!(
@@ -265,14 +313,111 @@ mod tests {
             1,
             "garbage-content file must flag (got: {findings:?})"
         );
-        // Acceptable: OpenFailed OR SchemaProbeFailed.
+        match &findings[0].reason {
+            Reason::HeaderMagicFailed {
+                observed_prefix_hex,
+            } => assert!(observed_prefix_hex.starts_with("ff")),
+            other => panic!("expected HeaderMagicFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detector_skips_fifo_silently_without_blocking() {
+        // Round-5 Gemini F2 defense: O_NONBLOCK | post-open
+        // fd.metadata() means a FIFO at the candidate path opens
+        // immediately (no DoS hang waiting for a writer) and is
+        // skipped silently as not-our-domain. The probe must
+        // return WITHOUT blocking and WITHOUT emitting a finding.
+        use std::os::unix::fs::FileTypeExt as _;
+        let td = TempDir::new().unwrap();
+        let fifo = td.path().join("fifo_db");
+        // mkfifo via nix
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR)
+            .unwrap();
         assert!(
-            matches!(
-                findings[0].reason,
-                Reason::OpenFailed { .. } | Reason::SchemaProbeFailed { .. }
-            ),
-            "unexpected reason: {:?}",
-            findings[0].reason
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "test setup: must be a FIFO"
+        );
+        let findings = detect(std::slice::from_ref(&fifo));
+        assert!(
+            findings.is_empty(),
+            "FIFO must be skipped silently (got: {findings:?})"
+        );
+    }
+
+    #[test]
+    fn detector_follows_symlinks_to_healthy_db() {
+        // Pass-34 round-4 (Gemini F1): a symlink to a healthy
+        // DB must NOT silently bypass detection. Pre-fix
+        // `symlink_metadata` reported `Symlink` and the loop
+        // continued past it; `fs::metadata` resolves to the
+        // target so a corrupt target is flagged and a healthy
+        // target leaves no finding.
+        use std::os::unix::fs::symlink;
+        let td = TempDir::new().unwrap();
+        let target = make_healthy_db(&td, "real.sqlite3");
+        let link = td.path().join("link.sqlite3");
+        symlink(&target, &link).unwrap();
+        let findings = detect(std::slice::from_ref(&link));
+        assert!(
+            findings.is_empty(),
+            "symlink to healthy DB must not flag (got: {findings:?})"
+        );
+    }
+
+    #[test]
+    fn detector_flags_symlink_to_corrupt_db() {
+        // Pass-34 round-4 (Gemini F1): symlink to a corrupt DB
+        // must still flag through the symlink. Verifies the
+        // is_file() check on resolved metadata still hits the
+        // corruption-flagging branches.
+        use std::os::unix::fs::symlink;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("corrupt.sqlite3");
+        fs::write(&target, vec![0xFF_u8; 200]).unwrap();
+        let link = td.path().join("link.sqlite3");
+        symlink(&target, &link).unwrap();
+        let findings = detect(std::slice::from_ref(&link));
+        assert_eq!(findings.len(), 1, "symlink to corrupt DB must flag");
+    }
+
+    #[test]
+    fn detector_is_pure_no_state_mutation_on_healthy_db() {
+        // Pass-34 round-4 (Codex F1 + Gemini F3): detect()
+        // must not mutate the DB file or create -wal/-shm
+        // siblings even on a freshly-closed DB. Read-only
+        // open suppresses journal replay and WAL creation.
+        use sha2::{Digest, Sha256};
+        let td = TempDir::new().unwrap();
+        let db = make_healthy_db(&td, "pure.sqlite3");
+        let before_bytes = fs::read(&db).unwrap();
+        let before_hash = {
+            let mut h = Sha256::new();
+            h.update(&before_bytes);
+            hex::encode(h.finalize())
+        };
+        let before_dir: Vec<String> = fs::read_dir(td.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = detect(std::slice::from_ref(&db));
+        let after_bytes = fs::read(&db).unwrap();
+        let after_hash = {
+            let mut h = Sha256::new();
+            h.update(&after_bytes);
+            hex::encode(h.finalize())
+        };
+        let after_dir: Vec<String> = fs::read_dir(td.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            before_hash, after_hash,
+            "detect() mutated DB bytes (before={before_hash}, after={after_hash})"
+        );
+        assert_eq!(
+            before_dir, after_dir,
+            "detect() created sibling files (before={before_dir:?}, after={after_dir:?})"
         );
     }
 
