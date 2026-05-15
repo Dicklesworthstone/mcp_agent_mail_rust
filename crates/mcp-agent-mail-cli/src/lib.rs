@@ -18053,8 +18053,8 @@ fn discover_archive_git_repos(storage_root: &Path) -> Vec<PathBuf> {
     repos
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum McpAgentMailEntryKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum McpAgentMailEntryKind {
     Rust,
     Python,
     HttpUrl,
@@ -21351,7 +21351,7 @@ fn startup_doctor_forensic_bundle_path(captured_doctor_output: &str) -> Option<&
     })
 }
 
-fn classify_mcp_agent_mail_config(
+pub(crate) fn classify_mcp_agent_mail_config(
     config_path: &Path,
     content: &str,
     rust_binary: &Path,

@@ -30,6 +30,7 @@ pub mod schema_version_mismatch;
 pub mod sqlite_sidecar_symlink;
 pub mod stale_archive_lock;
 pub mod stale_bearer_token_skew;
+pub mod stale_python_launcher_entry;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
 pub mod stale_python_server_shadow;
@@ -62,6 +63,17 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     }
 
     pid_probe_result_is_alive(nix::sys::signal::kill(Pid::from_raw(pid), None))
+}
+
+/// Canonical Rust-binary path used by the `stale_python_launcher_entry`
+/// detector to recognize "correctly-configured" entries vs. legacy
+/// Python launchers. Defaults to `~/.local/bin/mcp-agent-mail`,
+/// matching the installer's canonical location. Tests can override
+/// by constructing `DetectInputs` directly.
+pub(crate) fn default_rust_binary_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".local").join("bin").join("mcp-agent-mail"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin/mcp-agent-mail"))
 }
 
 /// For the `sqlite_sidecar_symlink` detector: expand each main-DB
@@ -304,6 +316,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "MCP client JSON config has stale bearer token (rotated since config write)",
             source_module: "doctor::fixers::stale_bearer_token_skew",
+        },
+        FixerSpec {
+            id: stale_python_launcher_entry::FM_ID,
+            severity: "P0",
+            subsystem: "mcp_config_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "MCP client config still uses Python launcher for mcp_agent_mail (rust binary or HTTP URL is canonical)",
+            source_module: "doctor::fixers::stale_python_launcher_entry",
         },
         FixerSpec {
             id: wrong_mcp_url_json::FM_ID,
@@ -605,6 +626,20 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == stale_python_launcher_entry::FM_ID {
+        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let inputs = stale_python_launcher_entry::DetectInputs {
+            locations,
+            rust_binary_path: default_rust_binary_path(),
+        };
+        let findings = stale_python_launcher_entry::detect(&inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = stale_python_launcher_entry::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == text_timestamp_contamination::FM_ID {
         let findings = text_timestamp_contamination::detect(&inputs.db_file_candidates);
         outcome.findings_count = findings.len();
@@ -822,6 +857,16 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
     } else if fm_id == codex_startup_timeout::FM_ID {
         let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
         codex_startup_timeout::detect(&locations)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_python_launcher_entry::FM_ID {
+        let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
+        let inputs = stale_python_launcher_entry::DetectInputs {
+            locations,
+            rust_binary_path: default_rust_binary_path(),
+        };
+        stale_python_launcher_entry::detect(&inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
