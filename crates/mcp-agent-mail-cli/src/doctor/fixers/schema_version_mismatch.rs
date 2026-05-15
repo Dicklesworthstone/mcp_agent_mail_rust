@@ -174,8 +174,13 @@ pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<SchemaVersionMismatchFinding> {
 }
 
 fn detect_one(db_path: &std::path::Path) -> Option<SchemaVersionMismatchFinding> {
-    let config = SqliteConfig::file(db_path.to_string_lossy().into_owned())
-        .flags(OpenFlags::read_only());
+    // Pass-35-review Gemini F1 (P1): URI + immutable=1 so the
+    // read-only open cannot create -shm on a WAL-mode DB. See the
+    // detailed rationale in text_timestamp_contamination.rs.
+    let uri = format!("file:{}?immutable=1", db_path.to_string_lossy());
+    let mut flags = OpenFlags::read_only();
+    flags.uri = true;
+    let config = SqliteConfig::file(uri).flags(flags);
     let conn = SqliteConnection::open(&config).ok()?;
     let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
     let on_disk: i64 = rows

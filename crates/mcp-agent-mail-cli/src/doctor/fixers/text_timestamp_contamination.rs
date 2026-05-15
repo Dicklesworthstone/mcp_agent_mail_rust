@@ -148,8 +148,25 @@ pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<TextTimestampContaminationFindin
 }
 
 fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFinding> {
-    let config = SqliteConfig::file(db_path.to_string_lossy().into_owned())
-        .flags(OpenFlags::read_only());
+    // Pass-35-review Gemini F1 (P1): opening a WAL-mode DB with
+    // plain `read_only` flags can still create the `-shm`
+    // sidecar (SQLite uses shared-memory tracking for WAL read
+    // pointers). Use URI filename + `immutable=1` so SQLite
+    // treats the file as truly immutable: no locking, no -shm
+    // creation, no journal/WAL replay. This preserves the pure-
+    // detector contract.
+    let uri = format!(
+        "file:{}?immutable=1",
+        // URI percent-encoding for path separators isn't needed
+        // on POSIX (path is already a path-shaped string and
+        // `?immutable=1` after the path terminates the path
+        // component). On Windows callers would need `\` → `/`
+        // normalization, but the doctor surface is Unix-targeted.
+        db_path.to_string_lossy(),
+    );
+    let mut flags = OpenFlags::read_only();
+    flags.uri = true;
+    let config = SqliteConfig::file(uri).flags(flags);
     let conn = SqliteConnection::open(&config).ok()?;
 
     let mut contaminated = Vec::new();
@@ -162,8 +179,17 @@ fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFin
         if !is_safe_sql_ident(table) || !is_safe_sql_ident(column) {
             continue;
         }
+        // Pass-35-review Codex F2 (P2): the FM is specifically
+        // about TEXT contamination from the pre-port Python
+        // writer. Narrow the query to `typeof = 'text'` so REAL
+        // or BLOB contamination (different root cause —
+        // possibly a corrupted vacuum, not a Python writer)
+        // doesn't get misrouted to this remediation. The boot
+        // migration in `mcp_agent_mail_db::migrate` ALSO only
+        // converts TEXT → microseconds, so anchoring the
+        // detector to TEXT keeps the contract aligned.
         let sql = format!(
-            "SELECT COUNT(*) AS n FROM {table} WHERE typeof({column}) NOT IN ('integer', 'null')"
+            "SELECT COUNT(*) AS n FROM {table} WHERE typeof({column}) = 'text'"
         );
         let rows = match conn.query_sync(&sql, &[]) {
             Ok(r) => r,

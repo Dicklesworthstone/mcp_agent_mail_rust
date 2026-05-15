@@ -18228,7 +18228,27 @@ fn extract_mcp_agent_mail_toml_url(content: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Option<u64> {
+    // Two TOML shapes are valid for declaring the
+    // `mcp_agent_mail` MCP server with a custom timeout:
+    //
+    //   (A) Section-table:
+    //         [mcp_servers.mcp_agent_mail]
+    //         startup_timeout_sec = 30
+    //
+    //   (B) Inline-table under [mcp_servers] (pass-35-review
+    //       Codex F1 / Gemini F4 — pre-fix only handled (A)):
+    //         [mcp_servers]
+    //         mcp_agent_mail = { startup_timeout_sec = 30, ... }
+    //         "mcp-agent-mail" = { startup_timeout_sec = 30, ... }
+    //
+    // Section-table loop catches (A); the in-`[mcp_servers]`
+    // sub-loop catches the single-line form of (B). Multi-line
+    // inline tables (rare in practice; TOML allows them) are
+    // NOT covered by this hand-rolled parser — operators who
+    // use that form will get a false-Missing finding until we
+    // switch to a real `toml` crate parse. Documented limitation.
     let mut in_target_section = false;
+    let mut in_mcp_servers_section = false;
 
     for raw_line in content.lines() {
         if let Some(section) = parse_toml_section_header(raw_line) {
@@ -18236,20 +18256,58 @@ pub(crate) fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Opti
                 section,
                 "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
             );
+            in_mcp_servers_section = section == "mcp_servers";
             continue;
         }
 
         let line = raw_line.trim();
-
-        if !in_target_section || line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        if let Some(timeout) = parse_simple_toml_u64_value(line, "startup_timeout_sec") {
+        if in_target_section
+            && let Some(timeout) = parse_simple_toml_u64_value(line, "startup_timeout_sec")
+        {
+            return Some(timeout);
+        }
+
+        if in_mcp_servers_section
+            && let Some(timeout) = extract_inline_table_timeout(line)
+        {
             return Some(timeout);
         }
     }
 
+    None
+}
+
+/// For lines inside `[mcp_servers]`, recognize an inline-table
+/// assignment for the `mcp_agent_mail` (or `"mcp-agent-mail"`)
+/// key and pull out `startup_timeout_sec`. Matches:
+///
+/// - `mcp_agent_mail = { startup_timeout_sec = N, ... }`
+/// - `"mcp-agent-mail" = { startup_timeout_sec = N, ... }`
+///
+/// Returns `None` if the line doesn't start with one of those
+/// key forms or the inline table doesn't have the timeout key.
+fn extract_inline_table_timeout(line: &str) -> Option<u64> {
+    // Find `key = {`.
+    let key_match = line.strip_prefix("mcp_agent_mail")
+        .or_else(|| line.strip_prefix("\"mcp-agent-mail\""))?;
+    let rest = key_match.trim_start();
+    let after_eq = rest.strip_prefix('=')?.trim_start();
+    let inner = after_eq.strip_prefix('{')?;
+    // Find the matching `}` — we accept the rest of the line up
+    // to `}` (assume single-line inline table; multi-line is a
+    // known limitation per the docstring above).
+    let end = inner.find('}')?;
+    let body = &inner[..end];
+    // The body is a comma-separated list of `key = value` pairs.
+    for pair in body.split(',') {
+        if let Some(timeout) = parse_simple_toml_u64_value(pair.trim(), "startup_timeout_sec") {
+            return Some(timeout);
+        }
+    }
     None
 }
 

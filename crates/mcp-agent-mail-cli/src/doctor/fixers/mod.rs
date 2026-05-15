@@ -63,20 +63,23 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
 }
 
 /// For the `sqlite_sidecar_symlink` detector: expand each main-DB
-/// candidate to include its WAL/SHM sidecars. The detector lstat()s
-/// each path; missing paths are silently skipped.
+/// candidate into a tagged `Candidate` triple (main + -wal + -shm).
+/// Pass-35-review Codex F3 / Gemini F3 (P2): the role is now
+/// passed explicitly, so an operator whose main DB filename
+/// happens to end with `-wal`/`-shm` doesn't get misclassified.
 pub(crate) fn expand_db_candidates_with_sidecars(
     db_paths: &[std::path::PathBuf],
-) -> Vec<std::path::PathBuf> {
+) -> Vec<sqlite_sidecar_symlink::Candidate> {
+    use sqlite_sidecar_symlink::Candidate;
     let mut out = Vec::with_capacity(db_paths.len() * 3);
     for db in db_paths {
-        out.push(db.clone());
+        out.push(Candidate::main_db(db.clone()));
         if let Some(parent) = db.parent()
             && let Some(name) = db.file_name()
         {
             let base = name.to_string_lossy();
-            out.push(parent.join(format!("{base}-wal")));
-            out.push(parent.join(format!("{base}-shm")));
+            out.push(Candidate::wal(parent.join(format!("{base}-wal"))));
+            out.push(Candidate::shm(parent.join(format!("{base}-shm"))));
         }
     }
     out

@@ -276,6 +276,43 @@ startup_timeout_sec = 60
     }
 
     #[test]
+    fn detector_accepts_inline_table_form() {
+        // Pass-35-review Codex F1 / Gemini F4 (P1): the
+        // inline-table form is valid TOML and operators write
+        // it; pre-fix the helper missed it and produced a
+        // false `Missing` finding.
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(
+            &p,
+            r#"
+[mcp_servers]
+mcp_agent_mail = { command = "mcp-agent-mail", startup_timeout_sec = 60 }
+"#,
+        )
+        .unwrap();
+        let findings = detect(&[loc_for(p, McpConfigTool::Codex, true)]);
+        assert!(findings.is_empty(), "inline-table form must be recognized");
+    }
+
+    #[test]
+    fn detector_flags_inline_table_too_short() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(
+            &p,
+            r#"
+[mcp_servers]
+"mcp-agent-mail" = { startup_timeout_sec = 5 }
+"#,
+        )
+        .unwrap();
+        let findings = detect(&[loc_for(p, McpConfigTool::Codex, true)]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].state, TimeoutState::TooShort { observed_secs: 5 });
+    }
+
+    #[test]
     fn detector_accepts_quoted_section_variant() {
         let td = TempDir::new().unwrap();
         let p = td.path().join("config.toml");
