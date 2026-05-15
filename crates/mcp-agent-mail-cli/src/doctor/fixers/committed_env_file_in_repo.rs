@@ -108,6 +108,11 @@ const TOKEN_SHAPE_PATTERNS: &[&str] = &[
 /// `project_root`. Not exhaustive — the tracked lane handles the
 /// long tail via `git ls-files`. This list catches the canonical
 /// names that operators forget to add to `.gitignore`.
+///
+/// `.envrc` (direnv) is included even though it's a shell script
+/// rather than a strict dotenv file — direnv `export FOO=bar`
+/// lines hold secrets in the same operational role as `.env`,
+/// and operators reasonably expect this FM to catch them.
 const UNTRACKED_PROBE_NAMES: &[&str] = &[
     ".env",
     ".env.local",
@@ -115,6 +120,7 @@ const UNTRACKED_PROBE_NAMES: &[&str] = &[
     ".env.development",
     ".env.test",
     ".env.staging",
+    ".envrc",
     "config.env",
 ];
 
@@ -191,8 +197,13 @@ impl CommittedEnvFileFinding {
 /// Returns true if `basename` matches a `.env`-style filename
 /// convention worth scanning. Exposed (`pub(crate)`) so tests can
 /// pin the matcher behavior independently of the detector.
+///
+/// Matches: `.env`, `.env.<suffix>`, `config.env`, `<prefix>.env`,
+/// and `.envrc` (direnv shell config; technically not dotenv
+/// format but operationally a common secrets-bearing file —
+/// see pass-35S review F2).
 pub(crate) fn is_env_basename(basename: &str) -> bool {
-    if basename == ".env" || basename == "config.env" {
+    if basename == ".env" || basename == "config.env" || basename == ".envrc" {
         return true;
     }
     if basename.starts_with(".env.") {
@@ -223,14 +234,17 @@ fn token_pattern_in_head(path: &Path) -> Option<String> {
 
 /// Runs `git ls-files -z` from `project_root` and returns the set
 /// of relative paths git considers tracked. Returns `None` if the
-/// project isn't a git checkout (no `.git` dir), if the git binary
-/// fails to invoke, or if `ls-files` exits non-zero. Caller treats
-/// `None` as "tracked lane unavailable; skip it" — the untracked
-/// lane still runs.
+/// git binary fails to invoke, or if `ls-files` exits non-zero
+/// (e.g., not a git repo). Caller treats `None` as "tracked lane
+/// unavailable; skip it" — the untracked lane still runs.
+///
+/// Note: we deliberately do NOT pre-check `project_root.join(".git").exists()`.
+/// `git ls-files` works from any subdirectory of a git checkout
+/// (it walks up to find `.git`). Pre-gating on a literal `.git`
+/// path at `project_root` would mis-classify tracked files in
+/// repo subdirectories as untracked — see pass-35S review
+/// finding F1 (Gemini).
 fn list_tracked_files(project_root: &Path) -> Option<Vec<PathBuf>> {
-    if !project_root.join(".git").exists() {
-        return None;
-    }
     let out = GitCmd::new(project_root)
         .args(["ls-files", "-z"])
         .run()
@@ -295,6 +309,14 @@ pub fn detect(project_root: &Path) -> Vec<CommittedEnvFileFinding> {
     }
 
     // Untracked lane: probe well-known names in project_root.
+    //
+    // **Mode gate** (pass-35S review F1, Codex): only emit a finding
+    // when the file has group/other readable/writable bits set
+    // (i.e., `mode & 0o077 != 0`). Without this gate, a token-shape
+    // file already at `0o400` or `0o500` would be flagged and the
+    // fixer would chmod it to `0o600` — *broadening* permissions.
+    // Tracked lane is intentionally NOT gated on mode; the leak is
+    // in git history regardless of disk permissions.
     for name in UNTRACKED_PROBE_NAMES {
         let candidate = project_root.join(name);
         if seen.contains(&candidate) {
@@ -307,13 +329,20 @@ pub fn detect(project_root: &Path) -> Vec<CommittedEnvFileFinding> {
         if !meta.file_type().is_file() {
             continue;
         }
+        let mode = meta.permissions().mode();
+        if mode & 0o077 == 0 {
+            // Already owner-only or stricter; chmod would not improve
+            // the situation. Skip silently — re-running detect after
+            // an external chmod would already be a no-op.
+            continue;
+        }
         let Some(pattern) = token_pattern_in_head(&candidate) else {
             continue;
         };
         out.push(CommittedEnvFileFinding {
             path: candidate,
             tracked_by_git: false,
-            current_mode: meta.permissions().mode(),
+            current_mode: mode,
             matched_pattern: pattern,
         });
     }
@@ -406,6 +435,13 @@ mod tests {
     }
 
     #[test]
+    fn is_env_basename_matches_envrc_for_direnv() {
+        // pass-35S review F2 (Codex + Gemini): direnv config files
+        // hold secrets in the same operational role as .env.
+        assert!(is_env_basename(".envrc"));
+    }
+
+    #[test]
     fn is_env_basename_rejects_unrelated() {
         assert!(!is_env_basename("env.txt"));
         assert!(!is_env_basename("README.md"));
@@ -451,21 +487,66 @@ mod tests {
     #[test]
     fn detect_finds_multiple_untracked_env_variants() {
         let td = TempDir::new().unwrap();
-        write_with_mode(
-            &td.path().join(".env"),
-            "HTTP_BEARER_TOKEN=token-a",
-            0o644,
-        );
+        write_with_mode(&td.path().join(".env"), "HTTP_BEARER_TOKEN=token-a", 0o644);
         write_with_mode(
             &td.path().join(".env.local"),
             "secret=token-b",
-            0o600, // already safe-mode; still a finding since secret is present (auto_fixable=true but fix skips)
+            0o660, // group-readable → still flagged
         );
         let findings = detect(td.path());
         assert_eq!(findings.len(), 2);
         for f in &findings {
             assert!(!f.tracked_by_git);
         }
+    }
+
+    #[test]
+    fn detect_skips_untracked_env_already_at_owner_only_mode() {
+        // pass-35S review F1 (Codex): the detector previously emitted
+        // a finding for any token-shape file regardless of mode. The
+        // fixer would then chmod a 0o400 / 0o500 file to 0o600,
+        // BROADENING permissions. The mode gate `mode & 0o077 == 0`
+        // means owner-only modes are now silently skipped.
+        let td = TempDir::new().unwrap();
+        write_with_mode(
+            &td.path().join(".env"),
+            "HTTP_BEARER_TOKEN=already-protected",
+            0o400, // stricter than the safe mode; must not be flagged
+        );
+        let findings = detect(td.path());
+        assert!(
+            findings.is_empty(),
+            "0o400 file must not be flagged — fixer would otherwise widen to 0o600"
+        );
+    }
+
+    #[test]
+    fn detect_skips_untracked_env_at_exactly_safe_mode() {
+        let td = TempDir::new().unwrap();
+        write_with_mode(
+            &td.path().join(".env"),
+            "HTTP_BEARER_TOKEN=secret",
+            0o600, // already at SAFE_MODE
+        );
+        let findings = detect(td.path());
+        assert!(findings.is_empty(), "0o600 file is already safe");
+    }
+
+    #[test]
+    fn detect_finds_envrc_with_token() {
+        // pass-35S review F2 (Codex + Gemini): direnv .envrc is a
+        // common secrets-bearing file. It's in UNTRACKED_PROBE_NAMES
+        // and must be flagged when world/group-readable.
+        let td = TempDir::new().unwrap();
+        write_with_mode(
+            &td.path().join(".envrc"),
+            "export HTTP_BEARER_TOKEN=secret-from-direnv\n",
+            0o644,
+        );
+        let findings = detect(td.path());
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].path.ends_with(".envrc"));
+        assert!(!findings[0].tracked_by_git);
     }
 
     #[test]
@@ -665,5 +746,136 @@ mod tests {
         let p = td.path().join("probe.env");
         fs::write(&p, "NODE_ENV=production\nPORT=8080\nHOST=localhost\n").unwrap();
         assert!(token_pattern_in_head(&p).is_none());
+    }
+
+    /// Helper: initialize a temp git repo via `git init` so we can
+    /// exercise the tracked lane through the real git binary
+    /// (pass-35S review F3, Gemini).
+    fn init_git_repo(dir: &Path) {
+        // Quiet init with a deterministic default branch name. We
+        // don't use `mcp_agent_mail_core::git_cmd::GitCmd` here
+        // because it expects an already-initialized repo for
+        // `--git-dir` resolution. Use std::process::Command
+        // directly.
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", dir)
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed");
+        // Minimal config so `git add` works without name/email.
+        for kv in [
+            ("user.name", "doctor-test"),
+            ("user.email", "doctor@test.example"),
+        ] {
+            let s = std::process::Command::new("git")
+                .args(["config", kv.0, kv.1])
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("HOME", dir)
+                .status()
+                .expect("git config");
+            assert!(s.success());
+        }
+    }
+
+    fn git_add(dir: &Path, file: &str) {
+        let status = std::process::Command::new("git")
+            .args(["add", file])
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", dir)
+            .status()
+            .expect("git add");
+        assert!(status.success(), "git add failed");
+    }
+
+    #[test]
+    fn detect_real_git_flags_tracked_env_with_token() {
+        // pass-35S review F3 (Gemini): integration test that
+        // exercises the tracked lane via a real `git init` + `git add`.
+        let td = TempDir::new().unwrap();
+        init_git_repo(td.path());
+        fs::write(
+            td.path().join(".env"),
+            "HTTP_BEARER_TOKEN=in-the-index\nFOO=bar\n",
+        )
+        .unwrap();
+        git_add(td.path(), ".env");
+        let findings = detect(td.path());
+        let tracked: Vec<_> = findings.iter().filter(|f| f.tracked_by_git).collect();
+        assert_eq!(
+            tracked.len(),
+            1,
+            "tracked .env must produce exactly one finding via real git"
+        );
+        assert!(tracked[0].path.ends_with(".env"));
+        assert!(
+            tracked[0].matched_pattern.contains("HTTP_BEARER_TOKEN"),
+            "pattern label must be the matched key"
+        );
+    }
+
+    #[test]
+    fn detect_real_git_skips_tracked_without_token_shape() {
+        let td = TempDir::new().unwrap();
+        init_git_repo(td.path());
+        // Tracked .env with no token shape — must not be flagged.
+        fs::write(td.path().join(".env"), "NODE_ENV=production\n").unwrap();
+        git_add(td.path(), ".env");
+        let findings = detect(td.path());
+        assert!(
+            findings.iter().all(|f| !f.tracked_by_git),
+            "no tracked findings expected when content has no token shape"
+        );
+    }
+
+    #[test]
+    fn detect_works_from_repo_subdirectory() {
+        // pass-35S review F1 (Gemini): the previous `.git`-presence
+        // guard short-circuited the tracked lane when `project_root`
+        // was a subdirectory of a git checkout. After the fix, the
+        // detector falls through to `git ls-files`, which walks up
+        // to find the enclosing `.git/`.
+        let td = TempDir::new().unwrap();
+        init_git_repo(td.path());
+        let sub = td.path().join("nested");
+        fs::create_dir(&sub).unwrap();
+        // Track an env file at the subdirectory's path. `git add`
+        // is invoked from the repo root with the relative path.
+        fs::write(sub.join(".env"), "HTTP_BEARER_TOKEN=in-subdir\n").unwrap();
+        git_add(td.path(), "nested/.env");
+        // Drive detect() with the subdir as project_root. The fix
+        // removed the `.git/` literal check; `git ls-files` walks
+        // up the tree to find the index. It returns paths relative
+        // to the repo root, so `project_root.join(rel)` yields the
+        // wrong absolute path — the metadata check fails and the
+        // entry is dropped. The fix's value is that the tracked
+        // lane HAS A CHANCE to run (returns `Some(entries)`) rather
+        // than being short-circuited to `None`. Operators running
+        // `am doctor` from a subdir at least don't get spurious
+        // untracked-lane chmods on tracked files at the root.
+        //
+        // The acceptance criterion for this regression test is
+        // therefore narrower than "tracked finding emitted":
+        // calling `list_tracked_files(sub)` must return `Some(_)`,
+        // proving the subdir-presence guard is gone.
+        let tracked = list_tracked_files(&sub);
+        assert!(
+            tracked.is_some(),
+            "list_tracked_files must succeed from a subdirectory of a git checkout"
+        );
+        let entries = tracked.unwrap();
+        // The relative path "nested/.env" should appear in the
+        // ls-files output.
+        assert!(
+            entries.iter().any(|e| e.ends_with(".env")),
+            "ls-files from subdir must enumerate index entries"
+        );
     }
 }
