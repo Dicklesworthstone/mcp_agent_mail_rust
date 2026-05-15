@@ -499,7 +499,31 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         .as_ref()
         .map(|detected| detected.findings_count)
         .unwrap_or(outcome.findings_count);
-    let ok = !dry_run && remaining_findings == 0 && outcome.actions_skipped == 0;
+
+    // Pass-34D fresh-eyes (Codex F5): decouple "the command
+    // succeeded" from "no findings remain." Three cases:
+    //
+    // 1. `--dry-run`: the dry-run itself is the success
+    //    condition. Remaining findings are *expected* (the
+    //    chokepoint didn't mutate anything). exit_code 0.
+    //
+    // 2. detect-only FM (spec.auto_fixable == false): the FM
+    //    can never repair itself; findings remaining is a
+    //    "needs operator action" signal, not a command
+    //    failure. We surface exit_code 1 IFF findings exist
+    //    (matches `am doctor`'s legacy "findings = 1"
+    //    convention), exit_code 0 if clean.
+    //
+    // 3. auto-fixable FM with --fix: succeed iff no findings
+    //    remain after the fix.
+    let exit_code: i32 = if dry_run {
+        0
+    } else if remaining_findings > 0 {
+        1
+    } else {
+        0
+    };
+    let ok = exit_code == 0;
 
     let run_dir_json = if dry_run {
         serde_json::Value::Null
@@ -514,7 +538,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         "tool": "am",
         "tool_version": env!("CARGO_PKG_VERSION"),
         "ok": ok,
-        "exit_code": if ok { 0 } else { 1 },
+        "exit_code": exit_code,
         "fm_id": fm_id,
         "severity": spec.severity,
         "subsystem": spec.subsystem,

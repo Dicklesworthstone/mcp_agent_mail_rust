@@ -152,6 +152,47 @@ fn am_doctor_fix_only_dry_run_writes_no_persistent_run_dir() {
 }
 
 #[test]
+fn am_doctor_fix_dry_run_envelope_reports_ok_true_and_exit_zero() {
+    // Pass-34D fresh-eyes (Codex F5): pre-fix, the envelope's
+    // `ok` and `exit_code` fields conflated "the command
+    // succeeded" with "no findings remain." A `--dry-run`
+    // invocation that successfully PLANNED a fix (but didn't
+    // apply it) reported `ok: false, exit_code: 1` in the
+    // envelope even though the process exited 0. Agents
+    // parsing the envelope saw apparent failures for clean
+    // dry-run plans.
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let gi = td.path().join(".gitignore");
+    std::fs::write(&gi, "target/\n").expect("plant .gitignore");
+    let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_gitignore_entry::FM_ID;
+    let (code, stdout, stderr) = run_am(
+        td.path(),
+        &[
+            "doctor",
+            "fix",
+            "--only",
+            fm_id,
+            "--dry-run",
+            "--yes",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "dry-run process exit must be 0; stderr: {stderr}");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("dry-run must emit valid JSON");
+    assert_eq!(envelope["dry_run"], true);
+    assert_eq!(
+        envelope["ok"], true,
+        "dry-run envelope must report ok=true even when findings remain (Codex F5)"
+    );
+    assert_eq!(
+        envelope["exit_code"].as_i64(),
+        Some(0),
+        "dry-run envelope must report exit_code=0 (Codex F5)"
+    );
+}
+
+#[test]
 fn am_doctor_fixers_emits_registry_as_json() {
     let td = tempfile::TempDir::new().expect("tempdir");
     let (code, stdout, stderr) = run_am(td.path(), &["doctor", "fixers", "--format", "json"]);
