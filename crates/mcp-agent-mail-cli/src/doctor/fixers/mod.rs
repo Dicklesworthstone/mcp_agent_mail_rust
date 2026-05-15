@@ -24,6 +24,7 @@ pub mod missing_gitignore_entry;
 pub mod stale_archive_lock;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
+pub mod wal_mode_disabled;
 pub mod world_readable_storage_db;
 pub mod world_readable_token_bak;
 pub mod wrong_mcp_url_json;
@@ -149,6 +150,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "Stale .git/HEAD.lock / packed-refs.lock / refs/**/*.lock files",
             source_module: "doctor::fixers::stale_head_or_ref_lock",
+        },
+        FixerSpec {
+            id: wal_mode_disabled::FM_ID,
+            severity: "P1",
+            subsystem: "db_state_files",
+            op_pattern: "Op::DbExec",
+            auto_fixable: true,
+            one_line_description: "storage.sqlite3 has journal_mode != 'wal' (reader/writer lock contention)",
+            source_module: "doctor::fixers::wal_mode_disabled",
         },
         FixerSpec {
             id: world_readable_storage_db::FM_ID,
@@ -379,6 +389,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == wal_mode_disabled::FM_ID {
+        let findings = wal_mode_disabled::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = wal_mode_disabled::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == dangling_doctor_latest::FM_ID {
         let latest = inputs
             .doctor_latest_target
@@ -506,6 +525,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == world_readable_storage_db::FM_ID {
         world_readable_storage_db::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == wal_mode_disabled::FM_ID {
+        wal_mode_disabled::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -666,7 +690,7 @@ mod tests {
     fn registry_is_non_empty_and_alphabetically_sorted() {
         // Pass-14: every FM-level fixer must register a FixerSpec.
         let r = registry();
-        assert!(r.len() >= 9, "registry has fewer fixers than expected");
+        assert!(r.len() >= 10, "registry has fewer fixers than expected");
         // Alphabetical sort by id helps `am doctor fixers` produce
         // stable output (operators rely on this for diffing).
         let ids: Vec<&str> = r.iter().map(|s| s.id).collect();

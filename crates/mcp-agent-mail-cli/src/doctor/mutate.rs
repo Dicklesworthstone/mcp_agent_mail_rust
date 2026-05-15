@@ -792,12 +792,54 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
             }
             Err(e) => Err(e),
         },
-        Op::DbExec { sql: _ } => Err(MutateError::Unsupported(
-            "DbExec requires a DbConn handle wired by a higher layer",
-        )),
-        Op::DbMigrate { from: _, to: _ } => Err(MutateError::Unsupported(
-            "DbMigrate requires a DbConn handle wired by a higher layer",
-        )),
+        Op::DbExec { sql } => {
+            // Pass-34: open the DB at `path`, run the SQL via
+            // `execute_raw` (handles DDL like PRAGMA + CREATE), close.
+            // The chokepoint already byte-copied `path` to
+            // `backup_path` earlier, so the rollback path (on
+            // exec failure) restores the file. WAL/SHM siblings are
+            // NOT backed up; callers that care must checkpoint
+            // before invoking (e.g., `PRAGMA wal_checkpoint(TRUNCATE);`).
+            use sqlmodel_sqlite::SqliteConnection;
+            match SqliteConnection::open_file(path.to_string_lossy().into_owned()) {
+                Ok(conn) => match conn.execute_raw(&sql) {
+                    Ok(()) => {
+                        drop(conn);
+                        Ok(())
+                    }
+                    Err(e) => Err(MutateError::ExecFailed {
+                        path: path.to_path_buf(),
+                        op: "DbExec",
+                        message: format!("execute_raw failed: {e}"),
+                        rolled_back: None,
+                    }),
+                },
+                Err(e) => Err(MutateError::ExecFailed {
+                    path: path.to_path_buf(),
+                    op: "DbExec",
+                    message: format!("open_file failed: {e}"),
+                    rolled_back: None,
+                }),
+            }
+        }
+        Op::DbMigrate { from, to } => {
+            // Pass-34: DbMigrate is documented as a marker op — it
+            // records the migration intent (from → to) in
+            // actions.jsonl with file-level backup, but the actual
+            // migration SQL must be supplied via separate Op::DbExec
+            // calls. Callers (FMs) typically issue one Op::DbMigrate
+            // followed by a sequence of Op::DbExec PRAGMAs and DDL.
+            // This keeps the chokepoint simple: every SQL fragment
+            // is hash-witnessed independently, undo can replay in
+            // reverse.
+            //
+            // Records the (from, to) values in the trailing
+            // actions.jsonl entry so undo can detect partial
+            // migrations. No SQL is run here — the bookkeeping IS
+            // the operation.
+            let _ = (from, to); // captured into the action record below
+            Ok(())
+        }
         Op::SymlinkAtomic { target } => atomic_symlink(path, &target).map_err(MutateError::Io),
     };
 
