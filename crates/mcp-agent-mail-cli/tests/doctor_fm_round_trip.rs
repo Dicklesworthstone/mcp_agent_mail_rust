@@ -121,6 +121,7 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
     DispatchInputs {
         repo_root: td.path().to_path_buf(),
         archive_roots: Vec::new(),
+        storage_root: None,
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
         mcp_config_candidates: Vec::new(),

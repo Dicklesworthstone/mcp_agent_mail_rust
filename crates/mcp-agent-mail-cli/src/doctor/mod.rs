@@ -393,6 +393,7 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
         archive_roots: enumerate_archive_roots(&storage_root),
+        storage_root: Some(storage_root.clone()),
         pid_hint_candidates: default_listener_pid_candidates(&storage_root),
         token_backup_candidates: default_token_backup_candidates(&storage_root),
         mcp_config_candidates: default_mcp_config_candidates(),
@@ -612,6 +613,7 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
         archive_roots: enumerate_archive_roots(&storage_root),
+        storage_root: Some(storage_root.clone()),
         pid_hint_candidates: default_listener_pid_candidates(&storage_root),
         token_backup_candidates: default_token_backup_candidates(&storage_root),
         mcp_config_candidates: default_mcp_config_candidates(),
@@ -699,6 +701,7 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
     let inputs = fixers::DispatchInputs {
         repo_root: repo_root.clone(),
         archive_roots: enumerate_archive_roots(&storage_root),
+        storage_root: Some(storage_root.clone()),
         pid_hint_candidates: default_listener_pid_candidates(&storage_root),
         token_backup_candidates: default_token_backup_candidates(&storage_root),
         mcp_config_candidates: default_mcp_config_candidates(),

@@ -48,14 +48,40 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
+use regex::Regex;
 use serde::Serialize;
+use std::sync::OnceLock;
 
 pub const FM_ID: &str = "fm-db-state-files-retained-autocommit-leak";
 const FM_SEVERITY: &str = "P0";
 const FM_SUBSYSTEM: &str = "db_state_files";
 
 /// PRAGMA directive that must appear in the pool init SQL.
+/// **Display value** — exact spelling used in finding evidence
+/// and manual_remediation guidance. The detector accepts any
+/// semantically equivalent form (case-insensitive, flexible
+/// whitespace around `=`) per pass-35AA review F3 (Codex P2).
 pub const REQUIRED_DIRECTIVE: &str = "autocommit_retain = OFF";
+
+/// Case-insensitive regex matching the semantic invariant
+/// `PRAGMA autocommit_retain = OFF` with flexible whitespace.
+/// Avoids false positives when an upstream formatter rewrites
+/// the PRAGMA without changing semantics (e.g.,
+/// `PRAGMA autocommit_retain=OFF;` or `pragma autocommit_retain
+/// = off`).
+fn directive_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)pragma\s+autocommit_retain\s*=\s*off\b")
+            .expect("autocommit_retain regex must compile")
+    })
+}
+
+/// Returns true if `sql` carries the required PRAGMA directive
+/// in any semantically-equivalent form.
+pub fn contains_required_directive(sql: &str) -> bool {
+    directive_regex().is_match(sql)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RetainedAutocommitLeakFinding {
@@ -131,8 +157,8 @@ pub fn detect(inputs: &DetectInputs) -> Vec<RetainedAutocommitLeakFinding> {
         )
     });
 
-    let static_ok = static_sql.contains(REQUIRED_DIRECTIVE);
-    let dynamic_ok = dynamic_sql.contains(REQUIRED_DIRECTIVE);
+    let static_ok = contains_required_directive(&static_sql);
+    let dynamic_ok = contains_required_directive(&dynamic_sql);
 
     if static_ok && dynamic_ok {
         return Vec::new();
@@ -222,6 +248,56 @@ mod tests {
         };
         let findings = detect(&inputs);
         assert!(findings.is_empty());
+    }
+
+    /// pass-35AA review F3 (Codex P2): the matcher must accept
+    /// semantically-equivalent forms — case-insensitive,
+    /// flexible whitespace around `=`. Otherwise an innocuous
+    /// formatter rewrite would start tripping a P0 doctor
+    /// finding.
+    #[test]
+    fn matcher_accepts_semantic_equivalents() {
+        // No whitespace around `=`.
+        assert!(contains_required_directive(
+            "PRAGMA autocommit_retain=OFF;"
+        ));
+        // Lowercase OFF.
+        assert!(contains_required_directive(
+            "PRAGMA autocommit_retain = off;"
+        ));
+        // Lowercase pragma.
+        assert!(contains_required_directive(
+            "pragma autocommit_retain = OFF;"
+        ));
+        // Extra whitespace.
+        assert!(contains_required_directive(
+            "PRAGMA  autocommit_retain  =   OFF;"
+        ));
+        // Tab as separator.
+        assert!(contains_required_directive(
+            "PRAGMA\tautocommit_retain\t=\tOFF;"
+        ));
+        // Mixed case OFF.
+        assert!(contains_required_directive(
+            "PRAGMA autocommit_retain = Off;"
+        ));
+    }
+
+    #[test]
+    fn matcher_rejects_off_in_unrelated_pragma() {
+        // The `\b` word-boundary anchor on `off` prevents
+        // matching `off_with_my_head` etc.
+        assert!(!contains_required_directive(
+            "PRAGMA autocommit_retain = off_some_extension;"
+        ));
+        // Not the autocommit_retain pragma.
+        assert!(!contains_required_directive(
+            "PRAGMA something_else = OFF;"
+        ));
+        // Different pragma name with the substring.
+        assert!(!contains_required_directive(
+            "PRAGMA autocommit_retain_disabled = OFF;"
+        ));
     }
 
     #[test]

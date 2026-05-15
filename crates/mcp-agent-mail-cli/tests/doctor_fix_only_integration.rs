@@ -61,6 +61,7 @@ fn dispatch_only_stale_archive_lock_quarantines_via_mutate() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: vec![archive.clone()],
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -119,6 +120,7 @@ fn dispatch_only_unknown_fm_id_returns_error() {
     let ctx = build_ctx(&td, "2026-05-11T00-00-00Z__unknown", "unknown");
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -147,6 +149,7 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: vec![archive.clone()],
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -233,6 +236,7 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: vec![archive],
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -286,6 +290,7 @@ fn dispatch_only_world_readable_storage_db_chmods_via_chokepoint() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -347,6 +352,7 @@ fn dispatch_only_dangling_doctor_latest_re_aims_via_chokepoint() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -407,6 +413,7 @@ fn dispatch_only_dangling_doctor_latest_requires_target_path() {
     let ctx = build_ctx(&td, "2026-05-13T00-00-00Z__no_input", fm_id);
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -459,6 +466,7 @@ fn dispatch_only_unrelated_fm_does_not_touch_gitignore() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: vec![archive],
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -506,6 +514,7 @@ fn dispatch_only_missing_gitignore_appends_via_chokepoint() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -555,6 +564,7 @@ fn dispatch_only_missing_gitignore_requires_target_path() {
 
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -603,6 +613,7 @@ fn list_all_iterates_registry_and_aggregates_findings() {
     // (no git_detect, no canonical_mcp_url).
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: vec![archive],
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
@@ -669,6 +680,7 @@ fn empty_inputs(td: &tempfile::TempDir) -> DispatchInputs {
     DispatchInputs {
         repo_root: td.path().to_path_buf(),
         archive_roots: Vec::new(),
+        storage_root: None,
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),
         mcp_config_candidates: Vec::new(),
@@ -794,6 +806,7 @@ fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
     );
     let inputs = DispatchInputs {
         repo_root: td.path().to_path_buf(),
+        storage_root: None,
         archive_roots: Vec::new(),
         pid_hint_candidates: Vec::new(),
         token_backup_candidates: Vec::new(),

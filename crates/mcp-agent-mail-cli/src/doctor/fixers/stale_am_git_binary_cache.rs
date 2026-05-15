@@ -66,6 +66,13 @@ pub enum StalenessKind {
     /// Cached path is a regular file; its bytes changed
     /// (different SHA-256 than what was validated).
     BinarySwapInPlace,
+    /// Cached path exists but the doctor process couldn't
+    /// read it (permission flipped, ACL denied, etc.). The
+    /// stale-cache invariant can't be verified — the operator
+    /// should investigate. pass-35AA review F1 (Gemini P2):
+    /// previously this case was silently swallowed and gave a
+    /// false clean bill of health.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +91,7 @@ impl StaleGitBinaryCacheFinding {
             StalenessKind::DanglingSymlink => "dangling_symlink",
             StalenessKind::SymlinkTargetSwap => "symlink_target_swap",
             StalenessKind::BinarySwapInPlace => "binary_swap_in_place",
+            StalenessKind::Unreadable => "unreadable",
         };
         let title = format!(
             "cached git binary at {} is stale: {kind_str} (cached version {}, age {}s, source {})",
@@ -166,11 +174,9 @@ pub fn detect(inputs: &DetectInputs) -> Vec<StaleGitBinaryCacheFinding> {
 
     if lmeta.file_type().is_symlink() {
         match fs::canonicalize(&cached.path) {
-            Ok(real) => {
-                let Some(live_sha) = sha256_of_path(&real) else {
-                    return Vec::new();
-                };
-                if live_sha != cached_sha {
+            Ok(real) => match sha256_of_path(&real) {
+                Some(live_sha) if live_sha == cached_sha => {}
+                Some(_) => {
                     return vec![StaleGitBinaryCacheFinding {
                         cached_path: cached.path,
                         cached_version: version,
@@ -179,7 +185,20 @@ pub fn detect(inputs: &DetectInputs) -> Vec<StaleGitBinaryCacheFinding> {
                         staleness_kind: StalenessKind::SymlinkTargetSwap,
                     }];
                 }
-            }
+                // Symlink target exists (canonicalize succeeded)
+                // but we couldn't hash it (permissions, ACL,
+                // etc.). pass-35AA review F1 (Gemini): surface
+                // this rather than silently skipping.
+                None => {
+                    return vec![StaleGitBinaryCacheFinding {
+                        cached_path: cached.path,
+                        cached_version: version,
+                        cached_source: source,
+                        cached_validated_age_secs: age,
+                        staleness_kind: StalenessKind::Unreadable,
+                    }];
+                }
+            },
             Err(_) => {
                 return vec![StaleGitBinaryCacheFinding {
                     cached_path: cached.path,
@@ -191,17 +210,28 @@ pub fn detect(inputs: &DetectInputs) -> Vec<StaleGitBinaryCacheFinding> {
             }
         }
     } else {
-        let Some(live_sha) = sha256_of_path(&cached.path) else {
-            return Vec::new();
-        };
-        if live_sha != cached_sha {
-            return vec![StaleGitBinaryCacheFinding {
-                cached_path: cached.path,
-                cached_version: version,
-                cached_source: source,
-                cached_validated_age_secs: age,
-                staleness_kind: StalenessKind::BinarySwapInPlace,
-            }];
+        match sha256_of_path(&cached.path) {
+            Some(live_sha) if live_sha == cached_sha => {}
+            Some(_) => {
+                return vec![StaleGitBinaryCacheFinding {
+                    cached_path: cached.path,
+                    cached_version: version,
+                    cached_source: source,
+                    cached_validated_age_secs: age,
+                    staleness_kind: StalenessKind::BinarySwapInPlace,
+                }];
+            }
+            // Existing file but unreadable — surface explicitly
+            // (pass-35AA review F1, Gemini P2).
+            None => {
+                return vec![StaleGitBinaryCacheFinding {
+                    cached_path: cached.path,
+                    cached_version: version,
+                    cached_source: source,
+                    cached_validated_age_secs: age,
+                    staleness_kind: StalenessKind::Unreadable,
+                }];
+            }
         }
     }
 
@@ -367,6 +397,39 @@ mod tests {
             findings[0].staleness_kind,
             StalenessKind::SymlinkTargetSwap
         );
+    }
+
+    /// **POSITIVE** (pass-35AA review F1, Gemini): cached path
+    /// exists but the doctor can't read it (chmod 0o000) — the
+    /// SHA-256 comparison must surface this as `Unreadable`
+    /// rather than silently giving a clean bill of health.
+    #[test]
+    fn detector_flags_unreadable_existing_file() {
+        let td = TempDir::new().unwrap();
+        let bin = td.path().join("git");
+        fs::write(&bin, b"#!/bin/sh\necho old\n").unwrap();
+        // Make the file completely unreadable so File::open
+        // fails. (Skip the assertion on the OS or environment
+        // we run as root, where 0o000 is still readable.)
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o000)).unwrap();
+        let opened = fs::File::open(&bin).is_ok();
+        if opened {
+            // Test environment runs as root or the test process
+            // can otherwise bypass 0o000 — skip the assertion
+            // rather than flake.
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let cache = cache_entry_for(bin.clone(), Some([0xAB; 32]));
+        let inputs = DetectInputs {
+            cache_override: Some(cache),
+        };
+        let findings = detect(&inputs);
+        // Restore permissions so the tempdir teardown can
+        // remove the file.
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).ok();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].staleness_kind, StalenessKind::Unreadable);
     }
 
     /// **POSITIVE**: cached path is a symlink that became

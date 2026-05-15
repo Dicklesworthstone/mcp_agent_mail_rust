@@ -488,6 +488,16 @@ pub struct DispatchInputs {
     /// Caller is responsible for enumerating; an empty slice short-circuits
     /// the relevant FMs to "no findings."
     pub archive_roots: Vec<std::path::PathBuf>,
+    /// The mailbox storage root (typically
+    /// `~/.mcp_agent_mail_git_mailbox_repo/` or the value of
+    /// `STORAGE_ROOT`). Used by
+    /// `suspicious_ephemeral_archive_root` which feeds this path
+    /// directly to `scan_archive_anomalies(root)` — the helper
+    /// appends `projects/` internally, so passing a project-dir
+    /// (an entry from `archive_roots`) would make the scanner
+    /// look in `<project_dir>/projects/` and silently find
+    /// nothing. `None` skips the FM (pass-35AA review F1 fix).
+    pub storage_root: Option<std::path::PathBuf>,
     /// PID-hint candidate paths for the listener-pid-hint FM (typically
     /// `<storage_root>/listener.pid` plus an operator override).
     pub pid_hint_candidates: Vec<std::path::PathBuf>,
@@ -613,13 +623,13 @@ pub fn dispatch_only(
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
     } else if fm_id == suspicious_ephemeral_archive_root::FM_ID {
-        // Use the first archive_roots entry as the storage_root
-        // probe site (the convention across the rest of the
-        // dispatcher). If multiple are configured, the detector
-        // is run per-root by the caller-level loop, but this
-        // dispatcher branch handles a single fm_id invocation.
+        // Use the dedicated `storage_root` DispatchInputs field
+        // (pass-35AA review F1, Codex). archive_roots entries
+        // are per-project directories — `scan_archive_anomalies`
+        // appends `projects/` internally so feeding it a
+        // project-dir made it scan the wrong subtree silently.
         let se_inputs = suspicious_ephemeral_archive_root::DetectInputs {
-            storage_root_override: inputs.archive_roots.first().cloned(),
+            storage_root_override: inputs.storage_root.clone(),
             report_override: None,
         };
         let findings = suspicious_ephemeral_archive_root::detect(&se_inputs);
@@ -1046,7 +1056,7 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == suspicious_ephemeral_archive_root::FM_ID {
         let se_inputs = suspicious_ephemeral_archive_root::DetectInputs {
-            storage_root_override: inputs.archive_roots.first().cloned(),
+            storage_root_override: inputs.storage_root.clone(),
             report_override: None,
         };
         suspicious_ephemeral_archive_root::detect(&se_inputs)

@@ -221,13 +221,39 @@ pub fn detect(inputs: &DetectInputs) -> Vec<LoginShellPathLeakFinding> {
     }]
 }
 
+/// Probe the shell's PATH startup behavior with a scrubbed
+/// environment so the inherited `am doctor` PATH does not bleed
+/// into the result.
+///
+/// pass-35AA review F2 (Codex P1) fix: the previous implementation
+/// used `Command::new(shell).args(...)` which inherits the parent
+/// process's env. If the operator launches `am doctor` from an
+/// interactive shell where `~/.local/bin` is already exported,
+/// both `bash -lc 'echo $PATH'` and `zsh -lc 'echo $PATH'` would
+/// inherit that PATH and report it even when the login-shell
+/// startup files were missing the export — masking the exact leak
+/// the detector is supposed to catch.
+///
+/// Fix: `.env_clear()` and explicitly set only the minimal set of
+/// variables the shell needs for startup (`HOME`, `USER`,
+/// `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `TERM`). PATH is
+/// intentionally NOT propagated; the shell starts fresh and rc
+/// files supply the only PATH content. `HOME` is forwarded so
+/// `$HOME`-relative rc-file references resolve correctly.
 fn probe_shell_path(shell: &str, label: &str) -> Option<String> {
     let args: &[&str] = if label.ends_with("-login") {
         &["-lc", "echo $PATH"]
     } else {
         &["-c", "echo $PATH"]
     };
-    let out = Command::new(shell).args(args).output().ok()?;
+    let mut cmd = Command::new(shell);
+    cmd.args(args).env_clear();
+    for key in &["HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM"] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
