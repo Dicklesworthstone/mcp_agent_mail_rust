@@ -136,6 +136,13 @@ pub struct ResolvedGitBinary {
     pub validated_at: Instant,
     /// Where the path came from: `"default"`, `"env"`, or `"test-override"`.
     pub source: &'static str,
+    /// SHA-256 of the resolved binary's file bytes at validation time.
+    /// Doctor uses this to detect post-cache binary swaps via the
+    /// `fm-environment_toolchain-stale-am-git-binary-cache` failure
+    /// mode. `None` for cache entries created before this field
+    /// existed (legacy cache hits) or when SHA-256 computation failed
+    /// (e.g., permissions denied at validation time).
+    pub validated_sha: Option<[u8; 32]>,
 }
 
 /// Process-wide cache of the resolved git binary.
@@ -297,12 +304,50 @@ where
         stdout: output.clone(),
     })?;
 
+    let validated_sha = sha256_of_path(&resolved_path);
     Ok(ResolvedGitBinary {
         path: resolved_path,
         version,
         validated_at: Instant::now(),
         source,
+        validated_sha,
     })
+}
+
+/// Returns SHA-256 of the file at `path`, or `None` on any error
+/// (open, read, large file slop). Reads the file in 64 KiB chunks
+/// so large git binaries don't blow up memory.
+fn sha256_of_path(path: &Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut f = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    use std::io::Read;
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hasher.finalize().into())
+}
+
+/// Diagnostic accessor: returns a snapshot of the current process-wide
+/// git-binary cache entry, if any. Used by the
+/// `fm-environment_toolchain-stale-am-git-binary-cache` doctor
+/// failure mode to validate cached resolution against live disk state
+/// without forcing a TTL-expiry refresh.
+///
+/// Returns `None` if the cache has never been populated (e.g., no
+/// `resolve_git_binary` call has run yet in this process).
+#[must_use]
+pub fn peek_cached_resolution() -> Option<ResolvedGitBinary> {
+    let mtx = CACHE.get()?;
+    let guard = mtx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.clone()
 }
 
 fn expand(raw: &str) -> String {

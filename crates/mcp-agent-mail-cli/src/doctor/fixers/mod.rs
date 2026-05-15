@@ -28,17 +28,22 @@ pub mod integrity_page_malformed;
 pub mod jwt_enabled_without_keys;
 pub mod known_bad_git_no_override;
 pub mod legacy_fts_residue;
+pub mod login_shell_path_leak;
 pub mod missing_gitignore_entry;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
+pub mod quarantined_bak_files;
+pub mod retained_autocommit_leak;
 pub mod schema_version_mismatch;
 pub mod sqlite_sidecar_symlink;
+pub mod stale_am_git_binary_cache;
 pub mod stale_archive_lock;
 pub mod stale_bearer_token_skew;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
 pub mod stale_python_launcher_entry;
 pub mod stale_python_server_shadow;
+pub mod suspicious_ephemeral_archive_root;
 pub mod text_timestamp_contamination;
 pub mod wal_mode_disabled;
 pub mod wal_shm_sidecar_drift;
@@ -203,6 +208,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_head_or_ref_lock",
         },
         FixerSpec {
+            id: suspicious_ephemeral_archive_root::FM_ID,
+            severity: "P3",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Mailbox archive contains project entries rooted at ephemeral paths (/tmp, /var/tmp, tmp-XXXX) — leakage from test runs; manual review + archive-normalize",
+            source_module: "doctor::fixers::suspicious_ephemeral_archive_root",
+        },
+        FixerSpec {
             id: empty_or_truncated_db::FM_ID,
             severity: "P0",
             subsystem: "db_state_files",
@@ -237,6 +251,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "storage.sqlite3 retains legacy FTS5 tables/triggers/views after Search V3 migration (manual DROP sequence; auto-fix deferred)",
             source_module: "doctor::fixers::legacy_fts_residue",
+        },
+        FixerSpec {
+            id: retained_autocommit_leak::FM_ID,
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "pool init SQL is missing `PRAGMA autocommit_retain = OFF` (durable visibility silently degraded; rebuild required)",
+            source_module: "doctor::fixers::retained_autocommit_leak",
         },
         FixerSpec {
             id: schema_version_mismatch::FM_ID,
@@ -324,6 +347,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::known_bad_git_no_override",
         },
         FixerSpec {
+            id: login_shell_path_leak::FM_ID,
+            severity: "P2",
+            subsystem: "environment_toolchain",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "$HOME/.local/bin missing from PATH in non-interactive / login shell contexts (am works in terminal but fails for cron, ssh, systemd; manual shell rc edit)",
+            source_module: "doctor::fixers::login_shell_path_leak",
+        },
+        FixerSpec {
             id: path_order_shadows_am::FM_ID,
             severity: "P1",
             subsystem: "environment_toolchain",
@@ -333,6 +365,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::path_order_shadows_am",
         },
         FixerSpec {
+            id: stale_am_git_binary_cache::FM_ID,
+            severity: "P2",
+            subsystem: "environment_toolchain",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Cached git binary path/SHA drifted from live disk state (binary swapped after cache validation; manual: restart serve or wait 24h TTL)",
+            source_module: "doctor::fixers::stale_am_git_binary_cache",
+        },
+        FixerSpec {
             id: codex_startup_timeout::FM_ID,
             severity: "P1",
             subsystem: "mcp_config_files",
@@ -340,6 +381,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Codex config.toml missing or too-short startup_timeout_sec (boot races mcp-agent-mail cold start)",
             source_module: "doctor::fixers::codex_startup_timeout",
+        },
+        FixerSpec {
+            id: quarantined_bak_files::FM_ID,
+            severity: "P1",
+            subsystem: "mcp_config_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Timestamped MCP config backups (`*.<YYYYMMDD>_<HHMMSS>.bak`) with token-shape content + world/group-readable mode (auto-fix via Op::Rename quarantine deferred)",
+            source_module: "doctor::fixers::quarantined_bak_files",
         },
         FixerSpec {
             id: stale_bearer_token_skew::FM_ID,
@@ -562,6 +612,24 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
+    } else if fm_id == suspicious_ephemeral_archive_root::FM_ID {
+        // Use the first archive_roots entry as the storage_root
+        // probe site (the convention across the rest of the
+        // dispatcher). If multiple are configured, the detector
+        // is run per-root by the caller-level loop, but this
+        // dispatcher branch handles a single fm_id invocation.
+        let se_inputs = suspicious_ephemeral_archive_root::DetectInputs {
+            storage_root_override: inputs.archive_roots.first().cloned(),
+            report_override: None,
+        };
+        let findings = suspicious_ephemeral_archive_root::detect(&se_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = suspicious_ephemeral_archive_root::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == stale_listener_pid_hint::FM_ID {
         let stale_secs = inputs
             .stale_seconds_override
@@ -655,6 +723,31 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == login_shell_path_leak::FM_ID {
+        // Reads dirs::home_dir() + spawns shell subprocesses;
+        // no DispatchInputs field needed for production.
+        let ls_inputs = login_shell_path_leak::DetectInputs::default();
+        let findings = login_shell_path_leak::detect(&ls_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = login_shell_path_leak::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == stale_am_git_binary_cache::FM_ID {
+        // Reads the process-wide git_binary cache via
+        // peek_cached_resolution(); no DispatchInputs field
+        // needed for production.
+        let sg_inputs = stale_am_git_binary_cache::DetectInputs::default();
+        let findings = stale_am_git_binary_cache::detect(&sg_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = stale_am_git_binary_cache::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == am_git_binary_missing::FM_ID {
         let am_inputs =
             inputs
@@ -743,6 +836,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == retained_autocommit_leak::FM_ID {
+        // Inspects mcp_agent_mail_db::schema constants; no
+        // DispatchInputs field needed for production.
+        let rl_inputs = retained_autocommit_leak::DetectInputs::default();
+        let findings = retained_autocommit_leak::detect(&rl_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = retained_autocommit_leak::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == codex_startup_timeout::FM_ID {
         // `detect_mcp_config_locations_default` is a pure helper
         // that reads no env state beyond `dirs::home_dir()` + CWD;
@@ -753,6 +859,18 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = codex_startup_timeout::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == quarantined_bak_files::FM_ID {
+        // Enumerates MCP config dirs via the same default
+        // helper; no DispatchInputs field needed for production.
+        let qb_inputs = quarantined_bak_files::DetectInputs::default();
+        let findings = quarantined_bak_files::detect(&qb_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = quarantined_bak_files::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -926,6 +1044,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == suspicious_ephemeral_archive_root::FM_ID {
+        let se_inputs = suspicious_ephemeral_archive_root::DetectInputs {
+            storage_root_override: inputs.archive_roots.first().cloned(),
+            report_override: None,
+        };
+        suspicious_ephemeral_archive_root::detect(&se_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == stale_listener_pid_hint::FM_ID {
         let stale_secs = inputs
             .stale_seconds_override
@@ -985,6 +1112,16 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == login_shell_path_leak::FM_ID {
+        login_shell_path_leak::detect(&login_shell_path_leak::DetectInputs::default())
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_am_git_binary_cache::FM_ID {
+        stale_am_git_binary_cache::detect(&stale_am_git_binary_cache::DetectInputs::default())
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == am_git_binary_missing::FM_ID {
         let am_inputs =
             inputs
@@ -1034,9 +1171,19 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == retained_autocommit_leak::FM_ID {
+        retained_autocommit_leak::detect(&retained_autocommit_leak::DetectInputs::default())
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == codex_startup_timeout::FM_ID {
         let locations = mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default();
         codex_startup_timeout::detect(&locations)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == quarantined_bak_files::FM_ID {
+        quarantined_bak_files::detect(&quarantined_bak_files::DetectInputs::default())
             .iter()
             .map(|f| f.to_finding())
             .collect()
