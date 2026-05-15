@@ -48,6 +48,15 @@ const FM_SEVERITY: &str = "P2";
 const FM_SUBSYSTEM: &str = "environment_toolchain";
 
 /// Shells we probe. Each entry is (label, binary_name).
+///
+/// Intentionally narrowed to bash + zsh (the two shells the
+/// project's install scripts target). `fish` and `csh` are
+/// excluded because they have different startup-file conventions
+/// and the failure mode this FM catches (`.bash_profile` /
+/// `.zshenv` missing the PATH export) doesn't transfer cleanly
+/// to those shells. Operators on other shells should add the
+/// equivalent rc-file edit per their shell's documentation
+/// (pass-35BB round-3 review F2, P3).
 const SHELLS: &[(&str, &str)] = &[
     ("bash-noninteractive", "bash"),
     ("bash-login", "bash"),
@@ -55,14 +64,10 @@ const SHELLS: &[(&str, &str)] = &[
     ("zsh-login", "zsh"),
 ];
 
-/// Rc file basenames we walk for PATH export hints.
-const RC_FILES: &[&str] = &[
-    ".bashrc",
-    ".bash_profile",
-    ".zshrc",
-    ".zshenv",
-    ".profile",
-];
+/// Rc file basenames we walk for PATH export hints. Matches
+/// the bash + zsh narrowing above plus `.profile` for
+/// sh-compatible login shells.
+const RC_FILES: &[&str] = &[".bashrc", ".bash_profile", ".zshrc", ".zshenv", ".profile"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginShellPathLeakFinding {
@@ -144,11 +149,7 @@ pub struct DetectInputs {
 /// Detector. Spawns shell subprocesses (production) or reads
 /// injected results (tests).
 pub fn detect(inputs: &DetectInputs) -> Vec<LoginShellPathLeakFinding> {
-    let Some(home) = inputs
-        .home_override
-        .clone()
-        .or_else(dirs::home_dir)
-    else {
+    let Some(home) = inputs.home_override.clone().or_else(dirs::home_dir) else {
         // No home dir → nothing to probe.
         return Vec::new();
     };
@@ -165,7 +166,7 @@ pub fn detect(inputs: &DetectInputs) -> Vec<LoginShellPathLeakFinding> {
             SHELLS
                 .iter()
                 .map(|(label, shell)| {
-                    let path_out = probe_shell_path(shell, *label);
+                    let path_out = probe_shell_path(shell, label);
                     ((*label).to_string(), path_out)
                 })
                 .collect()
@@ -175,7 +176,13 @@ pub fn detect(inputs: &DetectInputs) -> Vec<LoginShellPathLeakFinding> {
     let mut present = Vec::new();
     for (label, path_str) in &probed {
         match path_str {
-            Some(path_value) if path_contains_install_dir(path_value, &install_dir, install_canonical.as_deref()) => {
+            Some(path_value)
+                if path_contains_install_dir(
+                    path_value,
+                    &install_dir,
+                    install_canonical.as_deref(),
+                ) =>
+            {
                 present.push(label.clone());
             }
             Some(_) => {

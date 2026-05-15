@@ -69,6 +69,15 @@ pub const REQUIRED_DIRECTIVE: &str = "autocommit_retain = OFF";
 /// the PRAGMA without changing semantics (e.g.,
 /// `PRAGMA autocommit_retain=OFF;` or `pragma autocommit_retain
 /// = off`).
+///
+/// **Known limitation** (pass-35BB round-3 review F1, P3):
+/// the regex does NOT recognize function-style SQLite PRAGMA
+/// syntax `PRAGMA autocommit_retain(OFF)` or alternative
+/// boolean literals (`0`, `false`, `no`). Our codebase only
+/// emits the `name = value;` form, so the false-positive risk
+/// is zero in practice. If a future schema refactor adopts
+/// alternative spellings, this regex needs broadening to
+/// `(?i)pragma\s+autocommit_retain\s*(?:=|\()\s*(?:off|0|false|no)\b\)?`.
 fn directive_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -258,9 +267,7 @@ mod tests {
     #[test]
     fn matcher_accepts_semantic_equivalents() {
         // No whitespace around `=`.
-        assert!(contains_required_directive(
-            "PRAGMA autocommit_retain=OFF;"
-        ));
+        assert!(contains_required_directive("PRAGMA autocommit_retain=OFF;"));
         // Lowercase OFF.
         assert!(contains_required_directive(
             "PRAGMA autocommit_retain = off;"
@@ -291,9 +298,7 @@ mod tests {
             "PRAGMA autocommit_retain = off_some_extension;"
         ));
         // Not the autocommit_retain pragma.
-        assert!(!contains_required_directive(
-            "PRAGMA something_else = OFF;"
-        ));
+        assert!(!contains_required_directive("PRAGMA something_else = OFF;"));
         // Different pragma name with the substring.
         assert!(!contains_required_directive(
             "PRAGMA autocommit_retain_disabled = OFF;"
