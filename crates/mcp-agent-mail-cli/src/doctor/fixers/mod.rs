@@ -30,6 +30,7 @@ pub mod known_bad_git_no_override;
 pub mod legacy_fts_residue;
 pub mod login_shell_path_leak;
 pub mod missing_gitignore_entry;
+pub mod missing_or_malformed_project_json;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
@@ -188,6 +189,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "Repo .gitignore missing `.doctor/` so per-run artifacts get committed",
             source_module: "doctor::fixers::missing_gitignore_entry",
+        },
+        FixerSpec {
+            id: missing_or_malformed_project_json::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Mailbox archive contains projects whose `project.json` is missing OR has malformed JSON / missing required fields (manual: write/repair project.json)",
+            source_module: "doctor::fixers::missing_or_malformed_project_json",
         },
         FixerSpec {
             id: stale_archive_lock::FM_ID,
@@ -640,6 +650,21 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == missing_or_malformed_project_json::FM_ID {
+        // Same storage_root threading as FM5; reuses
+        // scan_archive_anomalies via a different anomaly filter.
+        let mp_inputs = missing_or_malformed_project_json::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        let findings = missing_or_malformed_project_json::detect(&mp_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = missing_or_malformed_project_json::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == stale_listener_pid_hint::FM_ID {
         let stale_secs = inputs
             .stale_seconds_override
@@ -1060,6 +1085,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             report_override: None,
         };
         suspicious_ephemeral_archive_root::detect(&se_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == missing_or_malformed_project_json::FM_ID {
+        let mp_inputs = missing_or_malformed_project_json::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        missing_or_malformed_project_json::detect(&mp_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()

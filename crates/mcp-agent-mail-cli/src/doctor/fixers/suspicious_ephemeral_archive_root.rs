@@ -235,11 +235,7 @@ mod tests {
     #[test]
     fn detector_aggregates_multiple_ephemerals_into_one_finding() {
         let mut report = ArchiveAnomalyReport::new();
-        for (path, slug) in &[
-            ("/tmp/a", "a"),
-            ("/var/tmp/b", "b"),
-            ("/tmp/c", "c"),
-        ] {
+        for (path, slug) in &[("/tmp/a", "a"), ("/var/tmp/b", "b"), ("/tmp/c", "c")] {
             report.anomalies.push(ArchiveAnomaly::now(
                 ArchiveAnomalyKind::SuspiciousEphemeralProject {
                     project_dir: (*path).into(),

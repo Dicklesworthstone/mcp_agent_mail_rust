@@ -269,7 +269,11 @@ mod tests {
         let marker_path = td.path().join("search_index").join(V3_MANAGED_MARKER);
         if create_v3_marker {
             fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-            fs::write(&marker_path, r#"{"version":1,"frankensearch_managed":true}"#).unwrap();
+            fs::write(
+                &marker_path,
+                r#"{"version":1,"frankensearch_managed":true}"#,
+            )
+            .unwrap();
         }
         (db_path, marker_path)
     }
@@ -342,7 +346,7 @@ mod tests {
     fn detector_flags_v3_active_db_with_fts_residue() {
         let td = TempDir::new().unwrap();
         let (db, marker) = setup_db(&td, /*residue=*/ true, /*v3_marker=*/ true);
-        let findings = detect(&[db.clone()]);
+        let findings = detect(std::slice::from_ref(&db));
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
         assert_eq!(f.db_path, db);

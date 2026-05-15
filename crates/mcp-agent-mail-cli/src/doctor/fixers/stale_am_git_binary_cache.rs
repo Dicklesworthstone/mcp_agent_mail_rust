@@ -363,10 +363,7 @@ mod tests {
         };
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].staleness_kind,
-            StalenessKind::BinarySwapInPlace
-        );
+        assert_eq!(findings[0].staleness_kind, StalenessKind::BinarySwapInPlace);
     }
 
     /// **POSITIVE**: cached path is a symlink whose target was
@@ -393,10 +390,7 @@ mod tests {
         };
         let findings = detect(&inputs);
         assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].staleness_kind,
-            StalenessKind::SymlinkTargetSwap
-        );
+        assert_eq!(findings[0].staleness_kind, StalenessKind::SymlinkTargetSwap);
     }
 
     /// **POSITIVE** (pass-35AA review F1, Gemini): cached path
