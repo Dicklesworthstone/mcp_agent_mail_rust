@@ -36,6 +36,7 @@ pub mod stale_listener_pid_hint;
 pub mod stale_python_server_shadow;
 pub mod text_timestamp_contamination;
 pub mod wal_mode_disabled;
+pub mod wal_shm_sidecar_drift;
 pub mod world_readable_storage_db;
 pub mod world_readable_token_bak;
 pub mod wrong_mcp_url_json;
@@ -262,6 +263,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "storage.sqlite3 has journal_mode != 'wal' (reader/writer lock contention)",
             source_module: "doctor::fixers::wal_mode_disabled",
+        },
+        FixerSpec {
+            id: wal_shm_sidecar_drift::FM_ID,
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "WAL/SHM sidecars drift from main DB (asymmetric, header-only, stale, or boot-quarantine pile-up)",
+            source_module: "doctor::fixers::wal_shm_sidecar_drift",
         },
         FixerSpec {
             id: world_readable_storage_db::FM_ID,
@@ -659,6 +669,16 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == wal_shm_sidecar_drift::FM_ID {
+        let inputs = wal_shm_sidecar_drift::DetectInputs::new(inputs.db_file_candidates.clone());
+        let findings = wal_shm_sidecar_drift::detect(&inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = wal_shm_sidecar_drift::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == empty_or_truncated_db::FM_ID {
         let findings = empty_or_truncated_db::detect(&inputs.db_file_candidates);
         outcome.findings_count = findings.len();
@@ -877,6 +897,12 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == wal_mode_disabled::FM_ID {
         wal_mode_disabled::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == wal_shm_sidecar_drift::FM_ID {
+        let detect_inputs = wal_shm_sidecar_drift::DetectInputs::new(inputs.db_file_candidates.clone());
+        wal_shm_sidecar_drift::detect(&detect_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
