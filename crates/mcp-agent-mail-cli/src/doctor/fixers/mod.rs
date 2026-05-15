@@ -23,6 +23,7 @@ pub mod dangling_doctor_latest;
 pub mod empty_or_truncated_db;
 pub mod known_bad_git_no_override;
 pub mod missing_gitignore_entry;
+pub mod sqlite_sidecar_symlink;
 pub mod stale_archive_lock;
 pub mod stale_bearer_token_skew;
 pub mod stale_head_or_ref_lock;
@@ -56,6 +57,26 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     }
 
     pid_probe_result_is_alive(nix::sys::signal::kill(Pid::from_raw(pid), None))
+}
+
+/// For the `sqlite_sidecar_symlink` detector: expand each main-DB
+/// candidate to include its WAL/SHM sidecars. The detector lstat()s
+/// each path; missing paths are silently skipped.
+pub(crate) fn expand_db_candidates_with_sidecars(
+    db_paths: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::with_capacity(db_paths.len() * 3);
+    for db in db_paths {
+        out.push(db.clone());
+        if let Some(parent) = db.parent()
+            && let Some(name) = db.file_name()
+        {
+            let base = name.to_string_lossy();
+            out.push(parent.join(format!("{base}-wal")));
+            out.push(parent.join(format!("{base}-shm")));
+        }
+    }
+    out
 }
 
 fn pid_probe_result_is_alive(result: Result<(), nix::errno::Errno>) -> bool {
@@ -163,6 +184,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "storage.sqlite3 is empty / truncated / fails PRAGMA quick_check (manual reconstruct required)",
             source_module: "doctor::fixers::empty_or_truncated_db",
+        },
+        FixerSpec {
+            id: sqlite_sidecar_symlink::FM_ID,
+            severity: "P0",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "SQLite -wal/-shm sidecar is a symlink (WAL writes redirected; manual quarantine)",
+            source_module: "doctor::fixers::sqlite_sidecar_symlink",
         },
         FixerSpec {
             id: wal_mode_disabled::FM_ID,
@@ -463,6 +493,21 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == sqlite_sidecar_symlink::FM_ID {
+        // Expand each db candidate into its sidecar paths so the
+        // detector lstats `storage.sqlite3`, `storage.sqlite3-wal`,
+        // and `storage.sqlite3-shm` together. Same db_file_candidates
+        // wiring that world_readable_storage_db uses.
+        let paths = expand_db_candidates_with_sidecars(&inputs.db_file_candidates);
+        let findings = sqlite_sidecar_symlink::detect(&paths);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = sqlite_sidecar_symlink::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+            outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
     } else if fm_id == wal_mode_disabled::FM_ID {
         let findings = wal_mode_disabled::detect(&inputs.db_file_candidates);
         outcome.findings_count = findings.len();
@@ -643,6 +688,12 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == world_readable_storage_db::FM_ID {
         world_readable_storage_db::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == sqlite_sidecar_symlink::FM_ID {
+        let paths = expand_db_candidates_with_sidecars(&inputs.db_file_candidates);
+        sqlite_sidecar_symlink::detect(&paths)
             .iter()
             .map(|f| f.to_finding())
             .collect()
