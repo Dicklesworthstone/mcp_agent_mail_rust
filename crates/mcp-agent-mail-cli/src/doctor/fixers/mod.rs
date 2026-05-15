@@ -26,6 +26,7 @@ pub mod stale_archive_lock;
 pub mod stale_bearer_token_skew;
 pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
+pub mod stale_python_server_shadow;
 pub mod wal_mode_disabled;
 pub mod world_readable_storage_db;
 pub mod world_readable_token_bak;
@@ -226,6 +227,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_listener_pid_hint",
         },
         FixerSpec {
+            id: stale_python_server_shadow::FM_ID,
+            severity: "P1",
+            subsystem: "runtime_processes",
+            op_pattern: "Op::Rename",
+            auto_fixable: true,
+            one_line_description: "listener.pid PID is a live Python interpreter (legacy server shadow risks data corruption)",
+            source_module: "doctor::fixers::stale_python_server_shadow",
+        },
+        FixerSpec {
             id: world_readable_token_bak::FM_ID,
             severity: "P1",
             subsystem: "secrets_env_state",
@@ -374,6 +384,16 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = stale_listener_pid_hint::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+            outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
+    } else if fm_id == stale_python_server_shadow::FM_ID {
+        let findings = stale_python_server_shadow::detect(&inputs.pid_hint_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = stale_python_server_shadow::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
@@ -553,6 +573,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .stale_seconds_override
             .unwrap_or(stale_listener_pid_hint::DEFAULT_STALE_SECONDS);
         stale_listener_pid_hint::detect(&inputs.pid_hint_candidates, stale_secs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_python_server_shadow::FM_ID {
+        stale_python_server_shadow::detect(&inputs.pid_hint_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -757,7 +782,7 @@ mod tests {
     fn registry_is_non_empty_and_alphabetically_sorted() {
         // Pass-14: every FM-level fixer must register a FixerSpec.
         let r = registry();
-        assert!(r.len() >= 12, "registry has fewer fixers than expected");
+        assert!(r.len() >= 13, "registry has fewer fixers than expected");
         // Alphabetical sort by id helps `am doctor fixers` produce
         // stable output (operators rely on this for diffing).
         let ids: Vec<&str> = r.iter().map(|s| s.id).collect();
