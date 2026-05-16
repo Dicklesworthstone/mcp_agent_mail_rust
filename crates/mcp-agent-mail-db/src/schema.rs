@@ -1996,11 +1996,11 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
-    // Step 7: cascade-trigger — when an agent is deleted, drop dependent
-    // `message_recipients` rows whose only purpose was to address that
-    // agent.  Issue #120: this prevents future steady accumulation of
-    // missing-agent recipient rows.  Fires inside the parent DELETE
-    // transaction, so the cascade is atomic.
+    // Step 7 originally cascaded message recipient rows when an agent was
+    // deleted. v24 below deliberately drops that trigger again: recipient rows
+    // are message history, and preserving them lets reconstruction render
+    // unknown-agent recipients instead of silently erasing who a message was
+    // addressed to.
     migrations.push(Migration::new(
         "v23_trg_agents_cascade_message_recipients".to_string(),
         "issue #120: cascade-delete message_recipients when an agent is removed".to_string(),

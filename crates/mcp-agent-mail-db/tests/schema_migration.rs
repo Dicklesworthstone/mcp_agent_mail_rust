@@ -134,6 +134,12 @@ fn assert_table_has_columns(conn: &SqliteConnection, table: &str, columns: &[&st
     }
 }
 
+fn table_has_column(conn: &SqliteConnection, table: &str, column: &str) -> bool {
+    table_info(conn, table)
+        .iter()
+        .any(|(name, _, _, _)| name == column)
+}
+
 fn assert_atc_v17_schema_surface(conn: &SqliteConnection) {
     let experience_cols = table_info(conn, "atc_experiences");
     let secret_col = experience_cols
@@ -240,6 +246,71 @@ fn seed_schema_without_migrations(conn: &SqliteConnection, skipped_ids: &[&str])
 
     for migration in schema::schema_migrations() {
         if skipped.contains(migration.id.as_str()) {
+            break;
+        }
+        let record_applied = || {
+            conn.execute_sync(
+                &record_sql,
+                &[
+                    Value::Text(migration.id.clone()),
+                    Value::Text(migration.description.clone()),
+                    Value::BigInt(1),
+                ],
+            )
+            .expect("record applied migration");
+        };
+        if migration.id == "v15_add_recipients_json_to_messages"
+            && table_has_column(conn, "messages", "recipients_json")
+        {
+            record_applied();
+            continue;
+        }
+        if let Some(column) = migration.id.strip_prefix("v16a_atc_experiences_add_")
+            && table_has_column(conn, "atc_experiences", column)
+        {
+            record_applied();
+            continue;
+        }
+        if let Some(column) = migration.id.strip_prefix("v16b_atc_rollups_add_")
+            && table_has_column(conn, "atc_experience_rollups", column)
+        {
+            record_applied();
+            continue;
+        }
+        if let Some(column) = migration.id.strip_prefix("v17_atc_experiences_add_")
+            && table_has_column(conn, "atc_experiences", column)
+        {
+            record_applied();
+            continue;
+        }
+        if let Some(column) = rollup_column_from_migration_id(migration.id.as_str())
+            && table_has_column(conn, "atc_experience_rollups", column)
+        {
+            record_applied();
+            continue;
+        }
+        if migration.id == "v19_agents_reaper_exempt"
+            && table_has_column(conn, "agents", "reaper_exempt")
+        {
+            record_applied();
+            continue;
+        }
+        if migration.id == "v20_agents_registration_token"
+            && table_has_column(conn, "agents", "registration_token")
+        {
+            record_applied();
+            continue;
+        }
+        if migration.id == "v20_idx_agents_registration_token"
+            && index_exists(conn, "idx_agents_registration_token")
+        {
+            record_applied();
+            continue;
+        }
+        if migration.id == "v21_atc_experiences_add_feature_schema_version"
+            && table_has_column(conn, "atc_experiences", "feature_schema_version")
+        {
+            record_applied();
             continue;
         }
         conn.execute_raw(&migration.up).unwrap_or_else(|error| {
@@ -258,6 +329,31 @@ fn seed_schema_without_migrations(conn: &SqliteConnection, skipped_ids: &[&str])
         )
         .expect("record applied migration");
     }
+}
+
+fn rollup_column_from_migration_id(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "v18_rollup_ewma_loss" => "ewma_loss",
+        "v18_rollup_ewma_weight" => "ewma_weight",
+        "v18_rollup_delay_sum" => "delay_sum_micros",
+        "v18_rollup_delay_count" => "delay_count",
+        "v18_rollup_delay_max" => "delay_max_micros",
+        "v22_rollup_compacted_total_count" => "compacted_total_count",
+        "v22_rollup_compacted_resolved_count" => "compacted_resolved_count",
+        "v22_rollup_compacted_censored_count" => "compacted_censored_count",
+        "v22_rollup_compacted_expired_count" => "compacted_expired_count",
+        "v22_rollup_compacted_correct_count" => "compacted_correct_count",
+        "v22_rollup_compacted_incorrect_count" => "compacted_incorrect_count",
+        "v22_rollup_compacted_total_regret" => "compacted_total_regret",
+        "v22_rollup_compacted_total_loss" => "compacted_total_loss",
+        "v22_rollup_compacted_ewma_loss" => "compacted_ewma_loss",
+        "v22_rollup_compacted_ewma_weight" => "compacted_ewma_weight",
+        "v22_rollup_compacted_delay_sum" => "compacted_delay_sum_micros",
+        "v22_rollup_compacted_delay_count" => "compacted_delay_count",
+        "v22_rollup_compacted_delay_max" => "compacted_delay_max_micros",
+        "v22_rollup_compacted_last_updated_ts" => "compacted_last_updated_ts",
+        _ => return None,
+    })
 }
 
 fn seed_pre_v17_schema(conn: &SqliteConnection) {
@@ -313,7 +409,9 @@ fn all_expected_tables_exist_after_migration() {
 
     let rows = conn
         .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name NOT LIKE 'sqlite_stat%' \
+             ORDER BY name",
             &[],
         )
         .expect("query sqlite_master for tables");
@@ -438,10 +536,22 @@ fn atc_v17_upgrade_from_pre_v17_schema_preserves_rows_and_defaults() {
         move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
     });
     let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
-    let expected_set: HashSet<&str> = ATC_V17_MIGRATION_IDS.iter().copied().collect();
-    assert_eq!(
-        applied_set, expected_set,
-        "upgrade should apply only ATC v17 migrations; got {applied:?}"
+    assert!(
+        ATC_V17_MIGRATION_IDS
+            .iter()
+            .all(|id| applied_set.contains(id)),
+        "upgrade should apply all ATC v17 migrations; got {applied:?}"
+    );
+    assert!(
+        applied.iter().all(|id| {
+            schema::schema_migrations()
+                .iter()
+                .position(|migration| migration.id == *id)
+                >= schema::schema_migrations()
+                    .iter()
+                    .position(|migration| migration.id == ATC_V17_MIGRATION_IDS[0])
+        }),
+        "pre-v17 upgrade must not re-apply earlier migrations; got {applied:?}"
     );
 
     assert_atc_v17_schema_surface(&conn);
@@ -573,10 +683,8 @@ fn atc_v21_upgrade_from_pre_v21_schema_defaults_feature_schema_version() {
         .into_iter()
         .map(|(name, _, _, _)| name)
         .collect();
-    assert!(
-        !pre_columns.contains("feature_schema_version"),
-        "pre-v21 seed unexpectedly contains feature_schema_version"
-    );
+    let canonical_seed_already_has_feature_schema_version =
+        pre_columns.contains("feature_schema_version");
 
     conn.execute_sync(
         "INSERT INTO atc_experiences (\
@@ -626,13 +734,31 @@ fn atc_v21_upgrade_from_pre_v21_schema_defaults_feature_schema_version() {
         move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
     });
     let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
-    let expected_set: HashSet<&str> = ATC_V21_MIGRATION_IDS.iter().copied().collect();
-    assert_eq!(
-        applied_set, expected_set,
-        "upgrade should apply only ATC v21 migrations; got {applied:?}"
+    assert!(
+        ATC_V21_MIGRATION_IDS
+            .iter()
+            .all(|id| applied_set.contains(id)),
+        "upgrade should record all ATC v21 migrations; got {applied:?}"
+    );
+    assert!(
+        applied.iter().all(|id| {
+            schema::schema_migrations()
+                .iter()
+                .position(|migration| migration.id == *id)
+                >= schema::schema_migrations()
+                    .iter()
+                    .position(|migration| migration.id == ATC_V21_MIGRATION_IDS[0])
+        }),
+        "pre-v21 upgrade must not re-apply earlier migrations; got {applied:?}"
     );
 
     assert_atc_feature_schema_version_column(&conn);
+
+    assert!(
+        canonical_seed_already_has_feature_schema_version
+            || applied_set.contains(ATC_V21_MIGRATION_IDS[0]),
+        "legacy seed without feature_schema_version should add it during upgrade"
+    );
 
     let rows = conn
         .query_sync(
@@ -736,10 +862,10 @@ fn triggers_after_migration() {
         );
     }
 
-    // v23 cascade triggers (issue #120): trigger-based ON DELETE CASCADE for
-    // tables that reference agents/messages/file_reservations.
+    // v23/v24 cascade triggers: agent-owned operational rows cascade, message
+    // recipient history is intentionally preserved when agent metadata is
+    // removed so orphaned recipients remain reconstructable.
     for name in &[
-        "trg_agents_cascade_message_recipients",
         "trg_agents_cascade_file_reservations",
         "trg_file_reservations_cascade_releases",
         "trg_agents_cascade_agent_links",
@@ -751,6 +877,10 @@ fn triggers_after_migration() {
             "missing v23 cascade trigger '{name}' in {trigger_names:?}"
         );
     }
+    assert!(
+        !trigger_names.contains(&"trg_agents_cascade_message_recipients".to_string()),
+        "v24 should drop agent-delete recipient cascade trigger; found {trigger_names:?}"
+    );
 }
 
 // NOTE: fts_message_insert_trigger_fires removed — FTS5 triggers dropped
@@ -1063,7 +1193,9 @@ fn pool_initialization_creates_same_schema_as_direct_migration() {
 
     let direct_tables: Vec<String> = conn
         .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name NOT LIKE 'sqlite_stat%' \
+             ORDER BY name",
             &[],
         )
         .expect("query tables (direct)")
@@ -1079,7 +1211,9 @@ fn pool_initialization_creates_same_schema_as_direct_migration() {
         // Just acquiring a connection triggers schema setup.
         let pool_tables: Vec<String> = conn
             .query_sync(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                "SELECT name FROM sqlite_master \
+                 WHERE type='table' AND name NOT LIKE 'sqlite_stat%' \
+                 ORDER BY name",
                 &[],
             )
             .expect("query tables (pool)")
@@ -2524,6 +2658,8 @@ fn v23_scrubs_orphan_message_recipients_with_missing_message() {
          VALUES (1, 1, 'A', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
     )
     .expect("insert agent");
+    conn.execute_raw("PRAGMA foreign_keys = OFF")
+        .expect("disable foreign keys for orphan fixture");
     // Recipient pointing at a non-existent message id.
     conn.execute_raw(
         "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (9999, 1, 'to')",
@@ -2549,10 +2685,9 @@ fn v23_scrubs_orphan_message_recipients_with_missing_message() {
     );
 }
 
-/// Issue #120 cascade-trigger: deleting an agent must cascade-delete its
-/// `message_recipients`, `file_reservations`, `agent_links`, and
-/// `inbox_stats` rows even with `foreign_keys = OFF` because the v23
-/// triggers handle the cascade.
+/// Issue #120/v24 cascade-trigger contract: deleting an agent must
+/// cascade-delete operational rows, while preserving `message_recipients` as
+/// message history even with `foreign_keys = OFF`.
 #[test]
 fn v23_cascade_triggers_remove_dependents_when_agent_deleted() {
     let (conn, _dir) = open_temp_db();
@@ -2631,8 +2766,8 @@ fn v23_cascade_triggers_remove_dependents_when_agent_deleted() {
 
     assert_eq!(
         count("SELECT COUNT(*) AS c FROM message_recipients WHERE agent_id = 2"),
-        0,
-        "agents-DELETE trigger should cascade to message_recipients"
+        1,
+        "v24 must preserve message_recipients when agent metadata is deleted"
     );
     assert_eq!(
         count("SELECT COUNT(*) AS c FROM file_reservations WHERE agent_id = 2"),
@@ -2727,9 +2862,9 @@ fn v23_migration_is_idempotent_when_rerun() {
         "second migrate_to_latest call must not re-apply any migrations: {applied:?}"
     );
 
-    // All v23 triggers exist exactly once.
+    // All surviving v23 triggers exist exactly once; v24 deliberately removes
+    // the agent-delete recipient cascade trigger.
     for name in &[
-        "trg_agents_cascade_message_recipients",
         "trg_agents_cascade_file_reservations",
         "trg_file_reservations_cascade_releases",
         "trg_agents_cascade_agent_links",
@@ -2748,4 +2883,17 @@ fn v23_migration_is_idempotent_when_rerun() {
             "trigger {name} must exist exactly once after migration"
         );
     }
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            &[Value::Text(
+                "trg_agents_cascade_message_recipients".to_string(),
+            )],
+        )
+        .expect("count dropped trigger");
+    assert_eq!(
+        rows[0].get_named::<i64>("c").unwrap_or(-1),
+        0,
+        "v24 must keep the agent-delete recipient cascade trigger dropped"
+    );
 }

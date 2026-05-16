@@ -150,14 +150,14 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
             Outcome::Panicked(p) => panic!("{p}"),
         };
 
-        let statuses = match schema::migration_status(&cx, &*conn).await {
+        let statuses = match schema::migration_runner_base().status(&cx, &*conn).await {
             Outcome::Ok(s) => s,
             Outcome::Err(e) => panic!("migration_status should succeed: {e:?}"),
             Outcome::Cancelled(r) => panic!("migration_status cancelled: {r:?}"),
             Outcome::Panicked(p) => panic!("{p}"),
         };
 
-        let expected = schema::schema_migrations().len();
+        let expected = schema::schema_migrations_base().len();
         assert_eq!(statuses.len(), expected, "all migrations should be tracked");
         assert!(
             statuses
@@ -3256,9 +3256,10 @@ fn set_contact_policy_updates_cache() {
             .unwrap();
 
             let agent_id = agent.id.unwrap();
+            let cache_scope = pool.sqlite_identity_key();
 
             // 2. Verify initial cache has policy="auto"
-            let cached = read_cache().get_agent_by_id(agent_id);
+            let cached = read_cache().get_agent_by_id_scoped(&cache_scope, agent_id);
             assert!(cached.is_some(), "agent should be cached after register");
             assert_eq!(cached.unwrap().contact_policy, "auto");
 
@@ -3269,7 +3270,7 @@ fn set_contact_policy_updates_cache() {
             assert_eq!(updated.contact_policy, "contacts_only");
 
             // 4. Verify cache was updated (this was the bug — cache was stale before the fix)
-            let cached2 = read_cache().get_agent_by_id(agent_id);
+            let cached2 = read_cache().get_agent_by_id_scoped(&cache_scope, agent_id);
             assert!(cached2.is_some(), "agent should still be in cache");
             assert_eq!(
                 cached2.unwrap().contact_policy,
@@ -3283,7 +3284,7 @@ fn set_contact_policy_updates_cache() {
                 .unwrap();
             assert_eq!(updated2.contact_policy, "block_all");
 
-            let cached3 = read_cache().get_agent_by_id(agent_id);
+            let cached3 = read_cache().get_agent_by_id_scoped(&cache_scope, agent_id);
             assert_eq!(
                 cached3.unwrap().contact_policy,
                 "block_all",

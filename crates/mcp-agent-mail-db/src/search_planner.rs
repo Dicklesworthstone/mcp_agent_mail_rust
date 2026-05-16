@@ -240,6 +240,12 @@ impl AuditAction {
 // SearchQuery
 // ────────────────────────────────────────────────────────────────────
 
+/// Maximum number of rows any single Search V3 planner request may materialize.
+///
+/// MCP tools can expose smaller returned-row caps while using the extra headroom
+/// for offset pagination windows.
+pub const SEARCH_QUERY_LIMIT_MAX: usize = 5_000;
+
 /// A structured search query with optional facets, pagination, and ranking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchQuery {
@@ -283,7 +289,7 @@ pub struct SearchQuery {
     #[serde(default)]
     pub ranking: RankingMode,
 
-    /// Maximum results to return (clamped to `1..=100_000`).
+    /// Maximum results to return (clamped to `1..=SEARCH_QUERY_LIMIT_MAX`).
     pub limit: Option<usize>,
 
     /// Cursor for stable pagination (opaque token from previous result).
@@ -347,11 +353,11 @@ impl SearchQuery {
         }
     }
 
-    /// Effective limit, clamped to `1..=5,000` to support deep pagination offsets
+    /// Effective limit, clamped to `1..=SEARCH_QUERY_LIMIT_MAX` to support deep pagination offsets
     /// without risking `DoS` via massive result sets.
     #[must_use]
     pub fn effective_limit(&self) -> usize {
-        self.limit.unwrap_or(50).clamp(1, 5000)
+        self.limit.unwrap_or(50).clamp(1, SEARCH_QUERY_LIMIT_MAX)
     }
 
     /// Convert query facets to a [`SearchFilter`] for cache key construction.

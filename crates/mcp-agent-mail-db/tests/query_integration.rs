@@ -29,13 +29,13 @@ use mcp_agent_mail_db::search_scope::{
 };
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
 #[cfg(feature = "tantivy-engine")]
-use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
+use mcp_agent_mail_db::search_v3::{get_bridge, init_or_switch_bridge};
 use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, QueryTracker};
 use sqlmodel_core::{Connection, Value};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "tantivy-engine")]
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "tantivy-engine")]
 use tantivy::doc;
 
@@ -53,12 +53,9 @@ fn tantivy_test_lock() -> &'static Mutex<()> {
 
 #[cfg(feature = "tantivy-engine")]
 fn ensure_tantivy_bridge_initialized() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let index_dir = std::env::temp_dir().join("mcp_agent_mail_search_v3_test_index");
-        std::fs::create_dir_all(&index_dir).expect("create tantivy test index dir");
-        init_bridge(&index_dir).expect("initialize Tantivy bridge");
-    });
+    let index_dir = std::env::temp_dir().join("mcp_agent_mail_search_v3_test_index");
+    std::fs::create_dir_all(&index_dir).expect("create tantivy test index dir");
+    init_or_switch_bridge(&index_dir).expect("initialize Tantivy bridge");
 }
 
 #[cfg(feature = "tantivy-engine")]

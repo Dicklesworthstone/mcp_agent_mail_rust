@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
 use crate::search_filter_compiler::compile_filters;
@@ -19,7 +19,7 @@ use tantivy::Order;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{AllQuery, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, ReloadPolicy, Term};
 
 use crate::DbConn;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
@@ -370,9 +370,14 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
 // ── Global bridge (lazy singleton) ──────────────────────────────────────
 
 static BRIDGE: OnceLock<RwLock<Option<Arc<TantivyBridge>>>> = OnceLock::new();
+static TANTIVY_WRITER_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn bridge_slot() -> &'static RwLock<Option<Arc<TantivyBridge>>> {
     BRIDGE.get_or_init(|| RwLock::new(None))
+}
+
+fn tantivy_writer_guard() -> &'static Mutex<()> {
+    TANTIVY_WRITER_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 fn same_index_dir(lhs: &Path, rhs: &Path) -> bool {
@@ -904,7 +909,7 @@ fn choose_backfill_plan(
 
 /// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
 /// for writers. In concurrent environments, this can fail. We retry a few times
-/// with exponential backoff to handle concurrent index updates.
+/// with exponential backoff to handle writers from older binaries or external tools.
 fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWriter, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
@@ -923,6 +928,17 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
     }
 }
 
+fn with_tantivy_writer<T>(
+    index: &tantivy::Index,
+    operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = tantivy_writer_guard()
+        .lock()
+        .map_err(|e| format!("Tantivy writer guard poisoned: {e}"))?;
+    let mut writer = acquire_writer_with_retry(index)?;
+    operation(&mut writer)
+}
+
 /// Index a single message into the global Tantivy bridge.
 ///
 /// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
@@ -936,12 +952,13 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    let mut writer = acquire_writer_with_retry(bridge.index())?;
-    upsert_indexable_message(&writer, handles, msg)?;
-
-    writer
-        .commit()
-        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+    with_tantivy_writer(bridge.index(), |writer| {
+        upsert_indexable_message(writer, handles, msg)?;
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        Ok(())
+    })?;
 
     refresh_index_health_metrics(&bridge);
 
@@ -967,15 +984,15 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     };
 
     let handles = bridge.handles();
-    let mut writer = acquire_writer_with_retry(bridge.index())?;
-
-    for msg in messages {
-        upsert_indexable_message(&writer, handles, msg)?;
-    }
-
-    writer
-        .commit()
-        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+    with_tantivy_writer(bridge.index(), |writer| {
+        for msg in messages {
+            upsert_indexable_message(writer, handles, msg)?;
+        }
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        Ok(())
+    })?;
 
     refresh_index_health_metrics(&bridge);
 
@@ -1052,16 +1069,15 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
         if index_stats.count > 0 {
-            let mut writer: tantivy::IndexWriter<TantivyDocument> = bridge
-                .index()
-                .writer(15_000_000)
-                .map_err(|e| format!("Tantivy writer error: {e}"))?;
-            writer
-                .delete_all_documents()
-                .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
-            writer
-                .commit()
-                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+            with_tantivy_writer(bridge.index(), |writer| {
+                writer
+                    .delete_all_documents()
+                    .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
+                writer
+                    .commit()
+                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
+                Ok(())
+            })?;
             crate::search_service::invalidate_search_cache(
                 crate::search_cache::InvalidationTrigger::IndexUpdate,
             );
@@ -1130,16 +1146,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         return Ok((0, usize::try_from(db_stats.count).unwrap_or(usize::MAX)));
     }
 
-    let mut writer = bridge
-        .index()
-        .writer(15_000_000)
-        .map_err(|e| format!("Tantivy writer error: {e}"))?;
     let handles = bridge.handles();
-    if matches!(plan, BackfillPlan::FullRebuild) {
-        writer
-            .delete_all_documents()
-            .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
-    }
 
     // Paged reads avoid loading the full mailbox into memory during startup.
     // Keep this query JOIN-free to avoid parity-cert fallback overhead on
@@ -1157,64 +1164,74 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
-    let mut pending_batches = 0_usize;
-    let mut total_indexed = 0_usize;
-    loop {
-        let rows = conn
-            .query_sync(
-                sql,
-                &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
-            )
-            .map_err(|e| format!("backfill: query failed: {e}"))?;
-        if rows.is_empty() {
-            break;
+    let total_indexed = with_tantivy_writer(bridge.index(), |writer| {
+        if matches!(plan, BackfillPlan::FullRebuild) {
+            writer
+                .delete_all_documents()
+                .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
         }
 
-        for row in &rows {
-            let project_id = row.get_as::<i64>(1).unwrap_or(0);
-            let sender_id = row.get_as::<i64>(2).unwrap_or(0);
-            let project_slug = project_slug_map
-                .get(&project_id)
-                .cloned()
-                .unwrap_or_default();
-            let sender_name = sender_name_map
-                .get(&sender_id)
-                .cloned()
-                .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
-            let msg = IndexableMessage {
-                id: row.get_as::<i64>(0).unwrap_or(0),
-                project_id,
-                project_slug,
-                sender_name,
-                subject: row.get_as::<String>(3).unwrap_or_default(),
-                body_md: row.get_as::<String>(4).unwrap_or_default(),
-                thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
-                importance: row
-                    .get_as::<String>(6)
-                    .unwrap_or_else(|_| "normal".to_string()),
-                created_ts: row.get_as::<i64>(7).unwrap_or(0),
-            };
-            add_indexable_message(&writer, handles, &msg)?;
-            total_indexed += 1;
-            if msg.id > last_id {
-                last_id = msg.id;
+        let mut pending_batches = 0_usize;
+        let mut total_indexed = 0_usize;
+        loop {
+            let rows = conn
+                .query_sync(
+                    sql,
+                    &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
+                )
+                .map_err(|e| format!("backfill: query failed: {e}"))?;
+            if rows.is_empty() {
+                break;
+            }
+
+            for row in &rows {
+                let project_id = row.get_as::<i64>(1).unwrap_or(0);
+                let sender_id = row.get_as::<i64>(2).unwrap_or(0);
+                let project_slug = project_slug_map
+                    .get(&project_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let sender_name = sender_name_map
+                    .get(&sender_id)
+                    .cloned()
+                    .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
+                let msg = IndexableMessage {
+                    id: row.get_as::<i64>(0).unwrap_or(0),
+                    project_id,
+                    project_slug,
+                    sender_name,
+                    subject: row.get_as::<String>(3).unwrap_or_default(),
+                    body_md: row.get_as::<String>(4).unwrap_or_default(),
+                    thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
+                    importance: row
+                        .get_as::<String>(6)
+                        .unwrap_or_else(|_| "normal".to_string()),
+                    created_ts: row.get_as::<i64>(7).unwrap_or(0),
+                };
+                add_indexable_message(writer, handles, &msg)?;
+                total_indexed += 1;
+                if msg.id > last_id {
+                    last_id = msg.id;
+                }
+            }
+
+            pending_batches += 1;
+            if pending_batches >= COMMIT_EVERY_BATCHES {
+                writer
+                    .commit()
+                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
+                pending_batches = 0;
             }
         }
 
-        pending_batches += 1;
-        if pending_batches >= COMMIT_EVERY_BATCHES {
+        if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0)
+        {
             writer
                 .commit()
                 .map_err(|e| format!("Tantivy commit error: {e}"))?;
-            pending_batches = 0;
         }
-    }
-
-    if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0) {
-        writer
-            .commit()
-            .map_err(|e| format!("Tantivy commit error: {e}"))?;
-    }
+        Ok(total_indexed)
+    })?;
 
     refresh_index_health_metrics(&bridge);
     crate::search_service::invalidate_search_cache(
@@ -1263,7 +1280,7 @@ mod tests {
 
     static BRIDGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     use crate::search_planner::{DocKind, SearchQuery as PlannerQuery};
-    use tantivy::doc;
+    use tantivy::{TantivyDocument, doc};
 
     fn setup_bridge_with_docs() -> TantivyBridge {
         let bridge = TantivyBridge::in_memory();
