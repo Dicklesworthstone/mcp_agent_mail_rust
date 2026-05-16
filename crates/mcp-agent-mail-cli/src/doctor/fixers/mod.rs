@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_profile_anomalies;
 pub mod am_git_binary_missing;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
@@ -185,6 +186,15 @@ pub struct FixerSpec {
 ///    automatically.)
 pub fn registry() -> Vec<FixerSpec> {
     vec![
+        FixerSpec {
+            id: agent_profile_anomalies::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Agent profile dirs are orphaned (parent project missing/unrecognized) OR have missing/unparseable `profile.json` (manual triage)",
+            source_module: "doctor::fixers::agent_profile_anomalies",
+        },
         FixerSpec {
             id: duplicate_canonical_message_ids::FM_ID,
             severity: "P0",
@@ -699,6 +709,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == agent_profile_anomalies::FM_ID {
+        let ap_inputs = agent_profile_anomalies::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        let findings = agent_profile_anomalies::detect(&ap_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = agent_profile_anomalies::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == duplicate_canonical_message_ids::FM_ID {
         let dc_inputs = duplicate_canonical_message_ids::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
@@ -1178,6 +1201,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == missing_head_or_broken_git_shape::FM_ID {
         missing_head_or_broken_git_shape::detect(&inputs.archive_roots)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == agent_profile_anomalies::FM_ID {
+        let ap_inputs = agent_profile_anomalies::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        agent_profile_anomalies::detect(&ap_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
