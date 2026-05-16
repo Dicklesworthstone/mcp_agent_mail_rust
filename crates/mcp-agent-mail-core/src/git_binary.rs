@@ -321,8 +321,7 @@ fn sha256_of_path(path: &Path) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let mut f = fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    use std::io::Read;
+    let mut buf = vec![0u8; 64 * 1024].into_boxed_slice();
     loop {
         let n = f.read(&mut buf).ok()?;
         if n == 0 {
@@ -333,11 +332,12 @@ fn sha256_of_path(path: &Path) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
-/// Diagnostic accessor: returns a snapshot of the current process-wide
-/// git-binary cache entry, if any. Used by the
-/// `fm-environment_toolchain-stale-am-git-binary-cache` doctor
-/// failure mode to validate cached resolution against live disk state
-/// without forcing a TTL-expiry refresh.
+/// Diagnostic accessor for the process-wide git-binary cache.
+///
+/// Returns a snapshot of the current cache entry, if any. Used by the
+/// `fm-environment_toolchain-stale-am-git-binary-cache` doctor failure
+/// mode to validate cached resolution against live disk state without
+/// forcing a TTL-expiry refresh.
 ///
 /// Returns `None` if the cache has never been populated (e.g., no
 /// `resolve_git_binary` call has run yet in this process).

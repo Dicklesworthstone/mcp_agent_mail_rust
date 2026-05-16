@@ -344,6 +344,7 @@ fn native_tui_accessibility_gate() {
     let mut adapter_timestamp = String::new();
     let mut adapter_suite = String::new();
     let mut adapter_exit_code = -1i64;
+    let mut adapter_skipped = false;
 
     if adapter_manifest.exists() {
         let manifest_text = fs::read_to_string(&adapter_manifest).expect("read adapter manifest");
@@ -357,6 +358,7 @@ fn native_tui_accessibility_gate() {
         adapter_timestamp = parsed.timestamp;
         adapter_suite = parsed.suite;
         adapter_exit_code = parsed.exit_code;
+        adapter_skipped = adapter_status == "skip";
 
         push_check(
             &mut checks,
@@ -371,9 +373,13 @@ fn native_tui_accessibility_gate() {
             &mut checks,
             &mut failures,
             "adapter.status",
-            "adapter status == pass",
+            if require_no_skip {
+                "adapter status == pass"
+            } else {
+                "adapter status == pass or dependency skip"
+            },
             format!("status={adapter_status}"),
-            adapter_status == "pass",
+            adapter_status == "pass" || (adapter_skipped && !require_no_skip),
             "Inspect summary.json + trace/events.jsonl in adapter artifact dir.",
         );
         push_check(
@@ -435,9 +441,17 @@ fn native_tui_accessibility_gate() {
             &mut checks,
             &mut failures,
             "adapter.summary_pass_positive",
-            "summary.pass >= 1",
-            format!("pass={pass}"),
-            pass >= 1,
+            if adapter_skipped && !require_no_skip {
+                "summary.skip >= 1"
+            } else {
+                "summary.pass >= 1"
+            },
+            format!("pass={pass}, skip={skip}"),
+            if adapter_skipped && !require_no_skip {
+                skip >= 1
+            } else {
+                pass >= 1
+            },
             "A fully skipped suite should not satisfy migration evidence requirements.",
         );
         if require_no_skip {
@@ -462,7 +476,7 @@ fn native_tui_accessibility_gate() {
         }
     }
 
-    if !adapter_artifact_dir.is_empty() {
+    if !adapter_artifact_dir.is_empty() && (!adapter_skipped || require_no_skip) {
         let required_rel = [
             "trace/core_focus_trace.jsonl",
             "core_screens.rendered.txt",

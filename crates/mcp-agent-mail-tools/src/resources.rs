@@ -4826,6 +4826,13 @@ mod resource_shape_tests {
     where
         F: FnOnce() -> T,
     {
+        with_serialized_resources_env(&[], f)
+    }
+
+    fn with_serialized_resources_env<F, T>(extra_overrides: &[(&str, &str)], f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
         let _lock = RESOURCE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4839,13 +4846,13 @@ mod resource_shape_tests {
             .expect("resource test storage root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            f,
-        )
+        let mut overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        overrides.extend_from_slice(extra_overrides);
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, f)
     }
 
     fn run_async<F, Fut, T>(f: F) -> T
@@ -6881,6 +6888,23 @@ mod resource_shape_tests {
                     &[mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id)],
                 )
                 .expect("delete holder row");
+                conn.execute_sync(
+                    "INSERT OR REPLACE INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                     VALUES (?, ?, ?, 'src/**', 1, 'orphaned holder cleanup test', ?, ?, NULL)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(2_000_000),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_add(3_600_000_000),
+                        ),
+                    ],
+                )
+                .expect("restore orphaned reservation fixture");
                 drop(conn);
 
                 let ctx = McpContext::new(cx.clone(), 1);
@@ -6924,70 +6948,58 @@ mod resource_shape_tests {
 
     #[test]
     fn product_details_accepts_orphaned_product_placeholder() {
-        with_serialized_resources(|| {
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("WORKTREES_ENABLED", "true")],
-                || {
-                    run_async(|cx| async move {
-                        let pool = get_db_pool().expect("db pool");
-                        let project_key =
-                            format!("/tmp/resources-orphaned-product-{}", unique_suffix());
-                        let project = ensure_project(&cx, &pool, &project_key).await;
-                        let project_id = project.id.unwrap_or(0);
+        with_serialized_resources_env(&[("WORKTREES_ENABLED", "true")], || {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-orphaned-product-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
 
-                        let product = match queries::ensure_product(
-                            &cx,
-                            &pool,
-                            Some("prod-orphaned-resource"),
-                            Some("Orphaned Resource Product"),
-                        )
-                        .await
-                        {
-                            Outcome::Ok(product) => product,
-                            other => panic!("ensure product failed: {other:?}"),
-                        };
-                        let product_id = product.id.unwrap_or(0);
+                let product = match queries::ensure_product(
+                    &cx,
+                    &pool,
+                    Some("prod-orphaned-resource"),
+                    Some("Orphaned Resource Product"),
+                )
+                .await
+                {
+                    Outcome::Ok(product) => product,
+                    other => panic!("ensure product failed: {other:?}"),
+                };
+                let product_id = product.id.unwrap_or(0);
 
-                        match queries::link_product_to_projects(
-                            &cx,
-                            &pool,
-                            product_id,
-                            &[project_id],
-                        )
-                        .await
-                        {
-                            Outcome::Ok(_) => {}
-                            other => panic!("link product failed: {other:?}"),
-                        }
+                match queries::link_product_to_projects(&cx, &pool, product_id, &[project_id]).await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("link product failed: {other:?}"),
+                }
 
-                        let conn = match pool.acquire(&cx).await {
-                            Outcome::Ok(c) => c,
-                            Outcome::Err(err) => panic!("acquire failed: {err}"),
-                            Outcome::Cancelled(_) => panic!("acquire cancelled"),
-                            Outcome::Panicked(panic) => {
-                                panic!("acquire panicked: {}", panic.message())
-                            }
-                        };
-                        conn.execute_sync(
-                            "DELETE FROM products WHERE id = ?",
-                            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(product_id)],
-                        )
-                        .expect("delete product row");
-                        drop(conn);
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "DELETE FROM products WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(product_id)],
+                )
+                .expect("delete product row");
+                drop(conn);
 
-                        let ctx = McpContext::new(cx.clone(), 1);
-                        let placeholder = format!("[unknown-product-{product_id}]");
-                        let payload = product_details(&ctx, placeholder.clone())
-                            .await
-                            .expect("product details");
-                        let value = parse_json(&payload);
-                        assert_eq!(value["product_uid"].as_str(), Some(placeholder.as_str()));
-                        assert_eq!(value["name"].as_str(), Some(placeholder.as_str()));
-                        assert_eq!(value["projects"].as_array().map_or(0, Vec::len), 1);
-                        assert_eq!(value["projects"][0]["id"].as_i64(), Some(project_id));
-                    });
-                },
-            );
+                let ctx = McpContext::new(cx.clone(), 1);
+                let placeholder = format!("[unknown-product-{product_id}]");
+                let payload = product_details(&ctx, placeholder.clone())
+                    .await
+                    .expect("product details");
+                let value = parse_json(&payload);
+                assert_eq!(value["product_uid"].as_str(), Some(placeholder.as_str()));
+                assert_eq!(value["name"].as_str(), Some(placeholder.as_str()));
+                assert_eq!(value["projects"].as_array().map_or(0, Vec::len), 1);
+                assert_eq!(value["projects"][0]["id"].as_i64(), Some(project_id));
+            });
         });
     }
 

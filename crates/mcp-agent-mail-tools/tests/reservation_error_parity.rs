@@ -1,6 +1,7 @@
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
+use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
     ensure_project, file_reservation_paths, force_release_file_reservation, register_agent,
 };
@@ -29,11 +30,24 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    let env_suffix = unique_suffix();
+    let db_path = format!("/tmp/reservation-error-parity-{env_suffix}.sqlite3");
+    let database_url = format!("sqlite://{db_path}");
+    let storage_root = format!("/tmp/reservation-error-parity-storage-{env_suffix}");
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+        ],
+        || {
+            Config::reset_cached();
+            let cx = Cx::for_testing();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(f(cx))
+        },
+    )
 }
 
 fn error_object(err: &fastmcp::McpError) -> serde_json::Map<String, Value> {

@@ -244,6 +244,13 @@ pub(crate) fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> Pa
     let mut scripts_candidate = None;
 
     for ancestor in fallback_root.ancestors() {
+        if crate::git::is_shared_ancestor_boundary(ancestor) {
+            return if ancestor == fallback_root && crate::is_real_dir(&resolved_bundle_path) {
+                resolved_bundle_path
+            } else {
+                scripts_candidate.unwrap_or_else(|| fallback_root.to_path_buf())
+            };
+        }
         if has_strong_project_root_marker(ancestor) {
             return ancestor.to_path_buf();
         }
@@ -296,6 +303,9 @@ fn resolve_path_against_root(root: &Path, path: &Path) -> PathBuf {
 
 fn resolve_git_repo_root(project_root: &Path) -> PathBuf {
     for ancestor in project_root.ancestors() {
+        if crate::git::is_shared_ancestor_boundary(ancestor) {
+            break;
+        }
         if is_real_file_or_dir(&ancestor.join(".git")) {
             return ancestor.to_path_buf();
         }
@@ -473,6 +483,7 @@ fn generate_github_pages_plan(
     let mut generated_files = Vec::new();
     let mut warnings = Vec::new();
     let repo_root = resolve_git_repo_root(project_root);
+    let repo_root_is_git = is_real_file_or_dir(&repo_root.join(".git"));
 
     // Determine output directory
     let output_dir = inputs
@@ -480,20 +491,24 @@ fn generate_github_pages_plan(
         .clone()
         .unwrap_or_else(|| bundle_path.parent().unwrap_or(bundle_path).join("docs"));
     let resolved_output_dir = resolve_path_against_root(project_root, &output_dir);
-    validate_github_pages_output_dir(&repo_root, &resolved_output_dir)?;
-    let output_dir_for_git = resolved_output_dir
-        .strip_prefix(&repo_root)
-        .map_err(|_| {
-            WizardError::new(
-                WizardErrorCode::InvalidOption,
-                format!(
-                    "GitHub Pages output directory must be inside the repository root: {}",
-                    repo_root.display()
-                ),
-            )
-            .with_context(resolved_output_dir.display().to_string())
-        })?
-        .to_path_buf();
+    let output_dir_for_git = if repo_root_is_git {
+        validate_github_pages_output_dir(&repo_root, &resolved_output_dir)?;
+        resolved_output_dir
+            .strip_prefix(&repo_root)
+            .map_err(|_| {
+                WizardError::new(
+                    WizardErrorCode::InvalidOption,
+                    format!(
+                        "GitHub Pages output directory must be inside the repository root: {}",
+                        repo_root.display()
+                    ),
+                )
+                .with_context(resolved_output_dir.display().to_string())
+            })?
+            .to_path_buf()
+    } else {
+        resolved_output_dir.clone()
+    };
 
     // Step 1: Create output directory
     steps.push(PlanStep {
@@ -1395,6 +1410,55 @@ mod tests {
             bundle.parent().expect("bundle parent"),
             "symlinked root markers should not pull detection root to the project ancestor"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_detection_root_does_not_trust_sticky_shared_bundle_parent_markers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let dir = tempfile::tempdir().expect("shared parent holder");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("create shared parent");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("make shared parent sticky");
+        std::fs::write(shared.join("wrangler.toml"), "name = \"unrelated\"")
+            .expect("write unrelated shared marker");
+
+        let bundle = shared.join("bundle");
+        std::fs::create_dir(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(
+            detection_root, bundle,
+            "bundle directly under a sticky shared parent must not inherit the shared parent's markers"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_detection_root_still_detects_project_inside_sticky_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let dir = tempfile::tempdir().expect("shared parent holder");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).expect("create shared parent");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("make shared parent sticky");
+        let project = shared.join("project");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::write(project.join("wrangler.toml"), "name = \"demo\"")
+            .expect("write project marker");
+
+        let bundle = project.join("nested/output/bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(detection_root, project);
     }
 
     #[test]

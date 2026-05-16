@@ -1,8 +1,12 @@
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
-use mcp_agent_mail_core::models::{
-    BROADCAST_TOKENS, KNOWN_PROGRAM_NAMES, MODEL_NAME_PATTERNS, detect_agent_name_mistake,
+use mcp_agent_mail_core::{
+    Config,
+    config::with_process_env_overrides_for_test,
+    models::{
+        BROADCAST_TOKENS, KNOWN_PROGRAM_NAMES, MODEL_NAME_PATTERNS, detect_agent_name_mistake,
+    },
 };
 use mcp_agent_mail_tools::{ensure_project, register_agent};
 use serde_json::Value;
@@ -30,11 +34,24 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    let env_suffix = unique_suffix();
+    let db_path = format!("/tmp/agent-name-parity-{env_suffix}.sqlite3");
+    let database_url = format!("sqlite://{db_path}");
+    let storage_root = format!("/tmp/agent-name-parity-storage-{env_suffix}");
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+        ],
+        || {
+            Config::reset_cached();
+            let cx = Cx::for_testing();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(f(cx))
+        },
+    )
 }
 
 fn assert_message_eq(expected: &str, actual: &str, name: &str) {

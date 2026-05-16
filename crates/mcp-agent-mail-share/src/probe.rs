@@ -1,8 +1,9 @@
 //! Native HTTP probe module for deployment verification.
 //!
-//! Provides synchronous HTTP probing without external dependencies (`curl`,
-//! `reqwest`, etc.). Uses `std::net::TcpStream` for plain HTTP and the
-//! `native-tls` crate (via the workspace) for HTTPS.
+//! Provides synchronous HTTP probing without external process dependencies
+//! (`curl`, `reqwest`, etc.). Uses `std::net::TcpStream` for plain HTTP.
+//! HTTPS URLs are parsed so callers get structured TLS errors until the native
+//! TLS client path is wired.
 //!
 //! Implements the probe contract from `SPEC-verify-live-contract.md`:
 //! - Configurable timeout, retry, and redirect policy
@@ -477,7 +478,7 @@ fn probe_single_get(
 fn parse_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, ProbeError> {
     let (header_section, body) =
         split_http_response(raw).ok_or_else(|| ProbeError::ProtocolError {
-            detail: "curl did not return a complete HTTP response".to_string(),
+            detail: "probe did not return a complete HTTP response".to_string(),
         })?;
 
     let header_text = String::from_utf8_lossy(header_section);
@@ -492,10 +493,16 @@ fn parse_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, Pr
         }
     }
 
-    let mut body_bytes = if capture_body {
-        body.to_vec()
-    } else {
+    let mut body_bytes = if !capture_body {
         Vec::new()
+    } else if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| transfer_encoding_is_chunked(value))
+    {
+        let mut reader = io::BufReader::new(body);
+        read_chunked_body(&mut reader)?
+    } else {
+        body.to_vec()
     };
     if body_bytes.len() > BODY_LIMIT {
         body_bytes.truncate(BODY_LIMIT);
@@ -505,6 +512,16 @@ fn parse_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, Pr
         status,
         headers,
         body: body_bytes,
+    })
+}
+
+fn transfer_encoding_is_chunked(value: &str) -> bool {
+    value.split(',').any(|encoding| {
+        encoding
+            .trim()
+            .split(';')
+            .next()
+            .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
     })
 }
 
@@ -584,7 +601,6 @@ fn parse_status_line(line: &str) -> Result<u16, ProbeError> {
         })
 }
 
-#[allow(dead_code)]
 fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, ProbeError> {
     let mut body = Vec::new();
     loop {
@@ -594,6 +610,11 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, ProbeError> 
             .map_err(|e| ProbeError::IoError {
                 detail: e.to_string(),
             })?;
+        if size_line.is_empty() {
+            return Err(ProbeError::ProtocolError {
+                detail: "truncated chunked body before chunk size".to_string(),
+            });
+        }
 
         let size_str = size_line.trim();
         // Strip chunk extensions (e.g., ";ext=val")
@@ -603,13 +624,15 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, ProbeError> 
         })?;
 
         if size == 0 {
-            // Read trailing \r\n
-            let mut trailer = String::new();
-            let _ = reader.read_line(&mut trailer);
+            read_chunk_trailers(reader)?;
             break;
         }
 
-        if body.len() + size > BODY_LIMIT {
+        let exceeds_body_limit = body
+            .len()
+            .checked_add(size)
+            .is_none_or(|total| total > BODY_LIMIT);
+        if exceeds_body_limit {
             // Cap at limit
             let remaining = BODY_LIMIT - body.len();
             let mut buf = vec![0u8; remaining];
@@ -630,12 +653,44 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, ProbeError> 
             })?;
         body.extend_from_slice(&buf);
 
-        // Read trailing \r\n after chunk data
-        let mut crlf = [0u8; 2];
-        let _ = reader.read_exact(&mut crlf);
+        read_chunk_crlf(reader)?;
     }
 
     Ok(body)
+}
+
+fn read_chunk_crlf<R: io::Read>(reader: &mut R) -> Result<(), ProbeError> {
+    let mut crlf = [0u8; 2];
+    reader
+        .read_exact(&mut crlf)
+        .map_err(|e| ProbeError::IoError {
+            detail: e.to_string(),
+        })?;
+    if crlf != *b"\r\n" {
+        return Err(ProbeError::ProtocolError {
+            detail: "invalid chunk data terminator".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn read_chunk_trailers<R: BufRead>(reader: &mut R) -> Result<(), ProbeError> {
+    loop {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| ProbeError::IoError {
+                detail: e.to_string(),
+            })?;
+        if line.is_empty() {
+            return Err(ProbeError::ProtocolError {
+                detail: "truncated chunked trailer".to_string(),
+            });
+        }
+        if matches!(line.as_str(), "\r\n" | "\n") {
+            return Ok(());
+        }
+    }
 }
 
 fn is_redirect(status: u16) -> bool {
@@ -1156,6 +1211,43 @@ mod tests {
         assert_eq!(response.body.len(), BODY_LIMIT);
     }
 
+    #[test]
+    fn parse_http_response_decodes_chunked_transfer_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let response = parse_http_response(raw, true).expect("parse chunked response");
+        assert_eq!(response.body, b"hello world");
+        assert_eq!(String::from_utf8_lossy(&response.body), "hello world");
+    }
+
+    #[test]
+    fn parse_http_response_detects_chunked_transfer_in_header_list_case_insensitively() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked; ext=1\r\n\r\n4\r\nbody\r\n0\r\n\r\n";
+        let response = parse_http_response(raw, true).expect("parse chunked response");
+        assert_eq!(response.body, b"body");
+    }
+
+    #[test]
+    fn parse_http_response_headers_only_skips_chunk_decoding() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let response = parse_http_response(raw, false).expect("parse headers-only response");
+        assert!(response.body.is_empty());
+        assert_eq!(
+            response.header("transfer-encoding"),
+            Some("chunked"),
+            "headers-only probes still need captured headers"
+        );
+    }
+
+    #[test]
+    fn parse_http_response_rejects_malformed_chunked_transfer_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n";
+        let err = parse_http_response(raw, true).expect_err("reject malformed chunk framing");
+        assert!(
+            matches!(err, ProbeError::ProtocolError { .. }),
+            "malformed chunk framing should be a protocol error, got {err:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn map_curl_failure_classifies_timeout() {
@@ -1431,11 +1523,41 @@ mod tests {
     }
 
     #[test]
+    fn chunked_body_with_trailer_headers() {
+        let data = b"5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let body = read_chunked_body(&mut std::io::BufReader::new(&mut cursor)).unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
     fn chunked_body_invalid_hex_returns_error() {
         let data = b"XZ\r\nbad\r\n0\r\n\r\n";
         let mut cursor = std::io::Cursor::new(data.as_ref());
         let result = read_chunked_body(&mut std::io::BufReader::new(&mut cursor));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn chunked_body_rejects_invalid_chunk_data_terminator() {
+        let data = b"5\r\nhelloXX0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let result = read_chunked_body(&mut std::io::BufReader::new(&mut cursor));
+        assert!(matches!(
+            result,
+            Err(ProbeError::ProtocolError { detail }) if detail.contains("terminator")
+        ));
+    }
+
+    #[test]
+    fn chunked_body_rejects_truncated_zero_chunk_trailer() {
+        let data = b"0\r\n";
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        let result = read_chunked_body(&mut std::io::BufReader::new(&mut cursor));
+        assert!(matches!(
+            result,
+            Err(ProbeError::ProtocolError { detail }) if detail.contains("truncated")
+        ));
     }
 
     #[test]

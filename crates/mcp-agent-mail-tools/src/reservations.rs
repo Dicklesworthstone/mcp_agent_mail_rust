@@ -2445,6 +2445,23 @@ mod tests {
                 )
                 .expect("delete holder row");
                 conn.execute_sync(
+                    "INSERT OR REPLACE INTO file_reservations \
+                     (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                     VALUES (?, ?, ?, 'src/**', 1, 'force release stale cache regression', ?, ?, NULL)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(2_000_000),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(1),
+                        ),
+                    ],
+                )
+                .expect("restore orphaned reservation fixture");
+                conn.execute_sync(
                     "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
                     &[
                         mcp_agent_mail_db::sqlmodel::Value::BigInt(

@@ -917,8 +917,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        let released_ts: i64 = rows[0].get_named("released_ts").unwrap();
-        assert_eq!(released_ts, 9001);
+        let released_ts: String = rows[0].get_named("released_ts").unwrap();
+        assert_eq!(released_ts, "9001");
 
         let rows = copy_conn
             .query_sync(
@@ -987,16 +987,16 @@ mod tests {
 
         let cc_kind: String = rows[0].get_named("kind").unwrap();
         let cc_read_ts: Option<i64> = rows[0].get_named("read_ts").unwrap();
-        let cc_ack_ts: Option<i64> = rows[0].get_named("ack_ts").unwrap();
+        let cc_ack_ts: Option<String> = rows[0].get_named("ack_ts").unwrap();
         assert_eq!(cc_kind, "cc");
         assert_eq!(cc_read_ts, None);
-        assert_eq!(cc_ack_ts, Some(222));
+        assert_eq!(cc_ack_ts.as_deref(), Some("222"));
 
         let to_kind: String = rows[1].get_named("kind").unwrap();
-        let to_read_ts: Option<i64> = rows[1].get_named("read_ts").unwrap();
-        let to_ack_ts: Option<i64> = rows[1].get_named("ack_ts").unwrap();
+        let to_read_ts: Option<String> = rows[1].get_named("read_ts").unwrap();
+        let to_ack_ts: Option<String> = rows[1].get_named("ack_ts").unwrap();
         assert_eq!(to_kind, "to");
-        assert_eq!(to_read_ts, Some(111));
+        assert_eq!(to_read_ts.as_deref(), Some("111"));
         assert_eq!(to_ack_ts, None);
     }
 

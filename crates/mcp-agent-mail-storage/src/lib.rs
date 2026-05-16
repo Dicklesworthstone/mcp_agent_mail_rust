@@ -4378,6 +4378,10 @@ fn normalize_repo_root_key(repo_root: &Path) -> PathBuf {
 // Archive initialization (br-2ei.2.1)
 // ---------------------------------------------------------------------------
 
+const ARCHIVE_GITIGNORE_HEADER: &str = "# Agent Mail runtime artifacts";
+const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
+    &[".mailbox.activity.lock", "diagnostics/", "search_index/"];
+
 /// Ensure the global archive root directory exists and is a git repository.
 ///
 /// Returns `(repo_root, was_freshly_initialized)`.
@@ -4557,6 +4561,14 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         if let Ok(existing) = Repository::open(root) {
             configure_archive_git_defaults(&existing);
         }
+        if ensure_archive_gitignore(root)? {
+            commit_paths_with_retry(
+                root,
+                config,
+                "chore: ignore archive runtime artifacts",
+                &[".gitignore"],
+            )?;
+        }
         repo_cache_insert(root);
         return Ok(false);
     }
@@ -4607,16 +4619,84 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
             true,
         )?;
     }
+    ensure_archive_gitignore(root)?;
 
     // Initial commit (retry-enabled for consistency with other archive writes)
     commit_paths_with_retry(
         root,
         config,
         "chore: initialize archive",
-        &[".gitattributes"],
+        &[".gitattributes", ".gitignore"],
     )?;
 
     repo_cache_insert(root);
+    Ok(true)
+}
+
+fn ensure_archive_gitignore(root: &Path) -> Result<bool> {
+    let ignore_path = root.join(".gitignore");
+    let mut content = match fs::symlink_metadata(&ignore_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to read archive .gitignore through symlink: {}",
+                    ignore_path.display()
+                ),
+            )));
+        }
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "archive .gitignore is not a regular file: {}",
+                    ignore_path.display()
+                ),
+            )));
+        }
+        Ok(_) => fs::read_to_string(&ignore_path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(StorageError::Io(err)),
+    };
+    let original = content.clone();
+
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    let mut needs_header = false;
+    for entry in ARCHIVE_GITIGNORE_ENTRIES {
+        let has_entry = content.lines().any(|line| line.trim() == *entry);
+        if !has_entry {
+            needs_header = true;
+        }
+    }
+
+    if needs_header
+        && !content
+            .lines()
+            .any(|line| line.trim() == ARCHIVE_GITIGNORE_HEADER)
+    {
+        if !content.is_empty() && !content.ends_with("\n\n") {
+            content.push('\n');
+        }
+        content.push_str(ARCHIVE_GITIGNORE_HEADER);
+        content.push('\n');
+    }
+
+    for entry in ARCHIVE_GITIGNORE_ENTRIES {
+        let has_entry = content.lines().any(|line| line.trim() == *entry);
+        if !has_entry {
+            content.push_str(entry);
+            content.push('\n');
+        }
+    }
+
+    if content == original {
+        return Ok(false);
+    }
+
+    write_text(&ignore_path, &content, true)?;
     Ok(true)
 }
 
@@ -9048,10 +9128,54 @@ mod tests {
         assert!(fresh);
         assert!(root.join(".git").exists());
         assert!(root.join(".gitattributes").exists());
+        let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gitignore.contains(".mailbox.activity.lock"));
+        assert!(gitignore.contains("diagnostics/"));
+        assert!(gitignore.contains("search_index/"));
 
         // Second call should not re-initialize
         let (_root2, fresh2) = ensure_archive_root(&config).unwrap();
         assert!(!fresh2);
+    }
+
+    #[test]
+    fn ensure_archive_gitignore_rejects_directory() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".gitignore")).unwrap();
+
+        let err = ensure_archive_gitignore(tmp.path())
+            .expect_err("directory .gitignore must not be treated as missing");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_archive_gitignore_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
+        let outside = outside_tmp.path().join("outside-gitignore");
+        fs::write(
+            &outside,
+            "# Agent Mail runtime artifacts\n.mailbox.activity.lock\ndiagnostics/\nsearch_index/\n",
+        )
+        .unwrap();
+        symlink(&outside, tmp.path().join(".gitignore")).unwrap();
+
+        let err = ensure_archive_gitignore(tmp.path())
+            .expect_err("symlinked .gitignore must not be accepted as compliant");
+        assert!(
+            err.to_string().contains("through symlink"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "# Agent Mail runtime artifacts\n.mailbox.activity.lock\ndiagnostics/\nsearch_index/\n"
+        );
     }
 
     #[test]

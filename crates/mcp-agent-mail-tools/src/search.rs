@@ -21,6 +21,9 @@ use crate::tool_util::{
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
 const MAX_MESSAGES_PER_SUMMARIZED_THREAD: usize = 1000;
+const SEARCH_MESSAGES_DEFAULT_LIMIT: usize = 20;
+const SEARCH_MESSAGES_RESULT_LIMIT_MAX: usize = 1000;
+const SEARCH_MESSAGES_RESULT_LIMIT_MAX_I32: i32 = 1000;
 
 fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
     if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
@@ -30,6 +33,60 @@ fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
             "failed to append tail-latency phase ledger evidence"
         );
     }
+}
+
+fn parse_search_messages_window(
+    limit: Option<i32>,
+    offset: Option<i32>,
+    cursor_present: bool,
+) -> McpResult<(usize, usize, usize)> {
+    let max_results = match limit {
+        Some(value) if value > 0 => {
+            usize::try_from(value.min(SEARCH_MESSAGES_RESULT_LIMIT_MAX_I32))
+                .unwrap_or(SEARCH_MESSAGES_RESULT_LIMIT_MAX)
+        }
+        _ => SEARCH_MESSAGES_DEFAULT_LIMIT,
+    };
+
+    let offset_val = if cursor_present {
+        0
+    } else {
+        match offset {
+            Some(value) if value > 0 => usize::try_from(value).map_err(|_| {
+                legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!("offset exceeds supported range: {value}"),
+                    true,
+                    json!({
+                        "field": "offset",
+                        "provided": value,
+                    }),
+                )
+            })?,
+            _ => 0,
+        }
+    };
+
+    let planner_limit = max_results.saturating_add(offset_val);
+    let max_window = mcp_agent_mail_db::search_planner::SEARCH_QUERY_LIMIT_MAX;
+    if planner_limit > max_window {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "offset plus limit must be at most {max_window}, got offset {offset_val} plus limit {max_results}. Use cursor pagination via next_cursor for deeper result sets."
+            ),
+            true,
+            json!({
+                "field": "offset",
+                "offset": offset_val,
+                "limit": max_results,
+                "max_window": max_window,
+                "remediation": "use cursor pagination via next_cursor for deeper result sets",
+            }),
+        ));
+    }
+
+    Ok((max_results, offset_val, planner_limit))
 }
 
 /// Search result entry
@@ -742,7 +799,7 @@ pub(crate) fn parse_time_range_with_aliases(
 /// - `project_key`: Project identifier
 /// - `query`: Search query string
 /// - `limit`: Max results (default: 20)
-/// - `offset`: Pagination offset (default: 0)
+/// - `offset`: Pagination offset (default: 0; offset + effective limit <= 5000)
 /// - `ranking`: Ranking mode: "relevance" (default) or "recency"
 /// - `sender`: Filter by sender agent name (`from_agent` and `sender_name` are aliases)
 /// - `importance`: Filter by importance: "low", "normal", "high", "urgent" (comma-separated)
@@ -769,7 +826,7 @@ pub(crate) fn parse_time_range_with_aliases(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Search over subject and body for a project using the unified Search V3 service.\n\nTips\n----\n- Query parser supports phrases (\"build plan\"), prefix (mig*), and boolean operators (plan AND users)\n- Results default to relevance ranking; set `ranking=\"recency\"` for newest-first\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```\n\nRust extension\n--------------\nSet `include_body_md=true` to include the full `body_md` field on each result. Use this when the caller intends to read message contents directly from search output rather than via `fetch_inbox` or `resource://thread/...`."
+    description = "Search over subject and body for a project using the unified Search V3 service.\n\nTips\n----\n- Query parser supports phrases (\"build plan\"), prefix (mig*), and boolean operators (plan AND users)\n- Results default to relevance ranking; set `ranking=\"recency\"` for newest-first\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
 )]
 pub async fn search_messages(
     ctx: &McpContext,
@@ -799,17 +856,8 @@ pub async fn search_messages(
     phase.mark("queue_wait");
     let include_body_md = include_body_md.unwrap_or(false);
     phase.set_include_bodies(include_body_md);
-    let max_results_raw = match limit {
-        Some(l) if l > 0 => l.clamp(1, 1000),
-        _ => 20,
-    };
-    let max_results = max_results_raw.unsigned_abs() as usize;
-    let offset_val = if cursor.is_some() {
-        0
-    } else {
-        offset.unwrap_or(0).max(0).unsigned_abs() as usize
-    };
-    let planner_limit = max_results.saturating_add(offset_val);
+    let (max_results, offset_val, planner_limit) =
+        parse_search_messages_window(limit, offset, cursor.is_some())?;
 
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
@@ -1383,6 +1431,37 @@ mod tests {
             parse_summarize_thread_limit(Some(5_000)).expect("large limit should cap"),
             MAX_MESSAGES_PER_SUMMARIZED_THREAD
         );
+    }
+
+    #[test]
+    fn search_messages_window_caps_returned_rows_but_allows_offset_headroom() {
+        let (limit, offset, planner_limit) =
+            parse_search_messages_window(Some(5_000), Some(3_500), false)
+                .expect("window within planner cap should pass");
+
+        assert_eq!(limit, SEARCH_MESSAGES_RESULT_LIMIT_MAX);
+        assert_eq!(offset, 3_500);
+        assert_eq!(planner_limit, 4_500);
+    }
+
+    #[test]
+    fn search_messages_window_rejects_silent_planner_truncation() {
+        let err = parse_search_messages_window(Some(1_000), Some(4_001), false)
+            .expect_err("offset plus limit beyond planner cap should fail");
+
+        assert!(err.to_string().contains("offset plus limit"));
+        assert!(err.to_string().contains("next_cursor"));
+    }
+
+    #[test]
+    fn search_messages_window_ignores_offset_when_cursor_is_present() {
+        let (limit, offset, planner_limit) =
+            parse_search_messages_window(Some(1_000), Some(i32::MAX), true)
+                .expect("cursor pagination should ignore legacy offset");
+
+        assert_eq!(limit, SEARCH_MESSAGES_RESULT_LIMIT_MAX);
+        assert_eq!(offset, 0);
+        assert_eq!(planner_limit, SEARCH_MESSAGES_RESULT_LIMIT_MAX);
     }
 
     fn make_msg(from: &str, body: &str) -> ThreadMessageRow {

@@ -1055,17 +1055,8 @@ fn run_startup_server_once_at_with_env(
     env_vars: &[(String, String)],
     cwd: &Path,
 ) -> TimedProcessOutput {
-    let startup_port = unused_loopback_port().to_string();
-    let startup_args = [
-        "serve-http",
-        "--no-tui",
-        "--no-auth",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        startup_port.as_str(),
-    ];
-    run_am_with_timeout(env_vars, Some(cwd), &startup_args, Duration::from_secs(10))
+    let startup_args = ["serve-stdio"];
+    run_am_with_timeout(env_vars, Some(cwd), &startup_args, Duration::from_secs(60))
 }
 
 #[test]
@@ -3093,6 +3084,10 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
     write_text_artifact(&run_root, "startup_stdout.txt", &startup.stdout);
     write_text_artifact(&run_root, "startup_stderr.txt", &startup.stderr);
     let startup_combined = format!("{}\n{}", startup.stdout, startup.stderr);
+    assert!(
+        !startup.timed_out,
+        "startup repair should finish before the harness timeout:\n{startup_combined}"
+    );
     assert!(
         startup_combined.contains("Automatic mailbox repair completed"),
         "startup output should show automatic repair completion:\n{startup_combined}"
