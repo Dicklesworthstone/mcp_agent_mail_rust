@@ -29,6 +29,7 @@ pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
 pub mod duplicate_canonical_message_ids;
 pub mod empty_or_truncated_db;
+pub mod guard_chain_runner_missing_or_stale;
 pub mod guard_foreign_runner_overwrite;
 pub mod guard_hooks_path_divergence;
 pub mod guard_plugin_not_executable;
@@ -521,6 +522,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Cached git binary path/SHA drifted from live disk state (binary swapped after cache validation; manual: restart serve or wait 24h TTL)",
             source_module: "doctor::fixers::stale_am_git_binary_cache",
+        },
+        FixerSpec {
+            id: guard_chain_runner_missing_or_stale::FM_ID,
+            severity: "P1",
+            subsystem: "guard_install",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Agent-mail plugin is installed at `hooks.d/<hook>/` but the chain runner is missing OR lacks our sentinel — `git commit` silently bypasses the guard; manual: re-run `am install-precommit-guard` (auto-fix needs the installer's render fn pub'd)",
+            source_module: "doctor::fixers::guard_chain_runner_missing_or_stale",
         },
         FixerSpec {
             id: guard_foreign_runner_overwrite::FM_ID,
@@ -1022,6 +1032,16 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = committed_env_file_in_repo::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == guard_chain_runner_missing_or_stale::FM_ID {
+        let findings = guard_chain_runner_missing_or_stale::detect(&inputs.repo_root);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = guard_chain_runner_missing_or_stale::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1559,6 +1579,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == committed_env_file_in_repo::FM_ID {
         committed_env_file_in_repo::detect(&inputs.repo_root)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == guard_chain_runner_missing_or_stale::FM_ID {
+        guard_chain_runner_missing_or_stale::detect(&inputs.repo_root)
             .iter()
             .map(|f| f.to_finding())
             .collect()

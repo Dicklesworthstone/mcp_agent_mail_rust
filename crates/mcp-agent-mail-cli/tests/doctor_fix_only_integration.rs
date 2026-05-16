@@ -697,6 +697,108 @@ fn empty_inputs(td: &tempfile::TempDir) -> DispatchInputs {
     }
 }
 
+fn seed_db_only_message_fixture(
+    td: &tempfile::TempDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let storage_root = td.path().join("storage");
+    let db_path = td.path().join("storage.sqlite3");
+    std::fs::create_dir_all(storage_root.join("projects")).expect("mkdir archive projects");
+
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+        .expect("open db");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        .expect("init schema");
+    conn.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at)
+         VALUES (1, 'demo-project', '/data/projects/demo-project', 0);
+         INSERT INTO agents (
+            id, project_id, name, program, model, task_description,
+            inception_ts, last_active_ts, attachments_policy, contact_policy
+         ) VALUES
+            (10, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+            (11, 1, 'GreenField', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto');
+         INSERT INTO messages (
+            id, project_id, sender_id, thread_id, subject, body_md,
+            importance, ack_required, created_ts, recipients_json, attachments
+         ) VALUES
+            (7, 1, 10, 'thread-7', 'DB only', 'body', 'normal', 0, 0, '{}', '[]');
+         INSERT INTO message_recipients (message_id, agent_id, kind)
+         VALUES (7, 11, 'to');",
+    )
+    .expect("seed db-only message");
+
+    (storage_root, db_path)
+}
+
+#[test]
+fn detect_only_archive_db_drift_uses_db_aware_scan() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let (storage_root, db_path) = seed_db_only_message_fixture(&td);
+
+    let mut inputs = empty_inputs(&td);
+    inputs.storage_root = Some(storage_root);
+    inputs.db_file_candidates = vec![db_path];
+
+    let outcome = fixers::detect_only(fixers::archive_db_drift_anomalies::FM_ID, &inputs)
+        .expect("detect_only archive DB drift");
+    assert_eq!(outcome.findings_count, 1);
+    let count_drifts = outcome.findings[0]
+        .evidence
+        .get("count_drifts")
+        .and_then(serde_json::Value::as_array)
+        .expect("count_drifts evidence array");
+    assert!(
+        !count_drifts.is_empty(),
+        "DB-aware scan must surface message-count drift"
+    );
+}
+
+#[test]
+fn detect_only_archive_message_artifact_uses_db_aware_scan() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let (storage_root, db_path) = seed_db_only_message_fixture(&td);
+
+    let mut inputs = empty_inputs(&td);
+    inputs.storage_root = Some(storage_root);
+    inputs.db_file_candidates = vec![db_path];
+
+    let outcome = fixers::detect_only(fixers::archive_message_artifact_anomalies::FM_ID, &inputs)
+        .expect("detect_only archive message artifacts");
+    assert_eq!(outcome.findings_count, 1);
+    let missing_canonical = outcome.findings[0]
+        .evidence
+        .get("missing_canonical")
+        .and_then(serde_json::Value::as_array)
+        .expect("missing_canonical evidence array");
+    assert!(
+        !missing_canonical.is_empty(),
+        "DB-aware scan must surface DB rows missing canonical archive files"
+    );
+}
+
+#[test]
+fn detect_only_archive_identity_artifact_uses_db_aware_scan() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let (storage_root, db_path) = seed_db_only_message_fixture(&td);
+
+    let mut inputs = empty_inputs(&td);
+    inputs.storage_root = Some(storage_root);
+    inputs.db_file_candidates = vec![db_path];
+
+    let outcome = fixers::detect_only(fixers::archive_identity_artifact_mismatches::FM_ID, &inputs)
+        .expect("detect_only archive identity artifacts");
+    assert_eq!(outcome.findings_count, 1);
+    let agent_profile_mismatches = outcome.findings[0]
+        .evidence
+        .get("agent_profile_mismatches")
+        .and_then(serde_json::Value::as_array)
+        .expect("agent_profile_mismatches evidence array");
+    assert!(
+        !agent_profile_mismatches.is_empty(),
+        "DB-aware scan must surface DB agent rows missing archive profile artifacts"
+    );
+}
+
 #[test]
 fn dispatch_only_handles_every_registered_id() {
     // Pass-26 invariant: for every FM in fixers::registry(),

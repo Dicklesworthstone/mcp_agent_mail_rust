@@ -127,11 +127,17 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
             let end = suffix_offset + relative_end + "-doctor-repo".len();
             normalized.replace_range(start..end, "<TMP_DOCTOR_PROJECT_SLUG>");
         }
-        if let Some(rest) = normalized.strip_prefix(search_index_root)
-            && (rest.starts_with('/') || rest.starts_with('\\'))
-            && rest[1..].chars().all(|ch| ch.is_ascii_hexdigit())
-        {
-            return "<SEARCH_INDEX_ROOT>/<HASH>".to_string();
+        normalized = normalized.replace(
+            "data-<TMP_DOCTOR_PROJECT_SLUG>",
+            "<TMP_DOCTOR_PROJECT_SLUG>",
+        );
+        for root in [search_index_root, "/tmp/mcp-agent-mail-search-index"] {
+            if let Some(rest) = normalized.strip_prefix(root)
+                && (rest.starts_with('/') || rest.starts_with('\\'))
+                && rest[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+            {
+                return "<SEARCH_INDEX_ROOT>/<HASH>".to_string();
+            }
         }
         normalized
     }
@@ -190,6 +196,19 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                             out.insert(
                                 "detail".to_string(),
                                 Value::String("<SERVER_PROCESS_CPU_SUMMARY>".to_string()),
+                            );
+                        }
+                        "git_binary_path" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String(
+                                    "git <GIT_VERSION> at git is not on the known-bad list"
+                                        .to_string(),
+                                ),
+                            );
+                            out.insert(
+                                "version".to_string(),
+                                Value::String("<GIT_VERSION>".to_string()),
                             );
                         }
                         _ => {}
