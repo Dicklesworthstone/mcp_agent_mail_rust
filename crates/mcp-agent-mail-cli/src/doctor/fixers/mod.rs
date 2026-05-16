@@ -30,6 +30,7 @@ pub mod jwt_enabled_without_keys;
 pub mod known_bad_git_no_override;
 pub mod legacy_fts_residue;
 pub mod login_shell_path_leak;
+pub mod malformed_message_frontmatter;
 pub mod missing_gitignore_entry;
 pub mod missing_head_or_broken_git_shape;
 pub mod missing_or_malformed_project_json;
@@ -192,6 +193,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Two or more archive .md files resolve to the same positive message_id — breaks thread reconstruction + ack accounting (manual triage + quarantine)",
             source_module: "doctor::fixers::duplicate_canonical_message_ids",
+        },
+        FixerSpec {
+            id: malformed_message_frontmatter::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Archive .md files with missing / unparseable / invalid-id / incomplete JSON frontmatter — breaks canonical-id mapping + FTS V3 indexing (manual: inspect, fix, reparse)",
+            source_module: "doctor::fixers::malformed_message_frontmatter",
         },
         FixerSpec {
             id: missing_gitignore_entry::FM_ID,
@@ -702,6 +712,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == malformed_message_frontmatter::FM_ID {
+        let mf_inputs = malformed_message_frontmatter::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        let findings = malformed_message_frontmatter::detect(&mf_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = malformed_message_frontmatter::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == missing_or_malformed_project_json::FM_ID {
         // Same storage_root threading as FM5; reuses
         // scan_archive_anomalies via a different anomaly filter.
@@ -1164,6 +1187,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             report_override: None,
         };
         duplicate_canonical_message_ids::detect(&dc_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == malformed_message_frontmatter::FM_ID {
+        let mf_inputs = malformed_message_frontmatter::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        malformed_message_frontmatter::detect(&mf_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
