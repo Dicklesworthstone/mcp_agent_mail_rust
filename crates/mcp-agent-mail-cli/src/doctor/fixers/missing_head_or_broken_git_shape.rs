@@ -71,6 +71,7 @@ pub enum BrokenShape {
     },
 }
 
+#[cfg(test)]
 impl BrokenShape {
     fn repo_path(&self) -> &PathBuf {
         match self {
@@ -107,7 +108,7 @@ impl MissingHeadOrBrokenGitShapeFinding {
                     "steps": [
                         "For each broken repo: run `am doctor reconstruct --project <repo_path>` to rebuild the archive from the SQLite mirror.",
                         "Reconstruct refuses by default; pass `--yes` after backing up the broken repo.",
-                        "After reconstruct, re-run `am doctor --only fm-archive-state-files-missing-head-or-broken-git-shape` to confirm.",
+                        "After reconstruct, re-run `am doctor fix --only fm-archive-state-files-missing-head-or-broken-git-shape --list` to confirm.",
                     ],
                     "warning": "A symlinked HEAD is a SECURITY signal (attacker may be aliasing HEAD at an arbitrary file). Investigate the symlink target before reconstructing.",
                     "note": "Auto-fix via Op::WriteFile is intentionally not implemented — repairing a broken git shape needs operator judgment about which branch HEAD should point at.",
@@ -269,7 +270,11 @@ mod tests {
         let repo = td.path().join("a");
         let git_dir = repo.join(".git");
         fs::create_dir_all(&git_dir).unwrap();
-        fs::write(git_dir.join("HEAD"), "deadbeefcafebabe1234567890abcdef00000000\n").unwrap();
+        fs::write(
+            git_dir.join("HEAD"),
+            "deadbeefcafebabe1234567890abcdef00000000\n",
+        )
+        .unwrap();
         let findings = detect(&[repo]);
         assert!(findings.is_empty());
     }
@@ -303,7 +308,10 @@ mod tests {
         fs::write(git_dir.join("HEAD"), "  \n").unwrap();
         let findings = detect(&[repo]);
         assert_eq!(findings.len(), 1);
-        assert!(matches!(&findings[0].broken[0], BrokenShape::HeadEmpty { .. }));
+        assert!(matches!(
+            &findings[0].broken[0],
+            BrokenShape::HeadEmpty { .. }
+        ));
     }
 
     #[test]

@@ -122,7 +122,7 @@ impl LegacyFtsResidueFinding {
                     "steps": [
                         "Take a `sqlite3 storage.sqlite3 .dump` backup of the fts_% rows BEFORE dropping them (so an undo is possible).",
                         "Drop triggers first (DROP TRIGGER IF EXISTS <name>;), then views (DROP VIEW IF EXISTS <name>;), then virtual tables (DROP TABLE IF EXISTS <name>;) — order matters for FK / dependency reasons.",
-                        "Re-run `am doctor --only fm-db-state-files-legacy-fts-residue` to confirm sqlite_master is clean.",
+                        "Re-run `am doctor fix --only fm-db-state-files-legacy-fts-residue --list` to confirm sqlite_master is clean.",
                     ],
                     "note": "Auto-fix via Op::DbExec is intentionally deferred in this first cut — the dependency-ordered drop sequence + backup of dropped rows needs additional chokepoint plumbing.",
                     "residue_summary": object_summary,

@@ -78,7 +78,7 @@ impl UnexpectedSymlinkFinding {
                         "For each path: `ls -la <path>` to inspect the symlink + target.",
                         "If the target is the canonical source the archive should point at: `rm <path>` then `cp <target> <path>` to convert to a regular file.",
                         "If the symlink is unintentional (post-migration artifact, attacker insertion): back up the target file content first, then `rm <path>`.",
-                        "Re-run `am doctor --only fm-archive-state-files-unexpected-symlink-in-archive` to confirm the archive is clean.",
+                        "Re-run `am doctor fix --only fm-archive-state-files-unexpected-symlink-in-archive --list` to confirm the archive is clean.",
                     ],
                     "warning": "Symlinks in the archive can be a SECURITY signal (attacker aliasing archive files at sensitive system paths). Investigate any target outside `<storage_root>` carefully BEFORE removing the symlink.",
                     "note": "Auto-fix is intentionally not implemented — symlink semantics require operator judgment.",
@@ -195,12 +195,12 @@ mod tests {
     #[test]
     fn detector_flags_unexpected_symlink_with_target() {
         let mut report = ArchiveAnomalyReport::new();
-        report.anomalies.push(ArchiveAnomaly::now(
-            ArchiveAnomalyKind::UnexpectedSymlink {
+        report
+            .anomalies
+            .push(ArchiveAnomaly::now(ArchiveAnomalyKind::UnexpectedSymlink {
                 path: "/var/data/projects/foo/2026-05/bar.md".into(),
                 target: Some("/etc/passwd".into()),
-            },
-        ));
+            }));
         let inputs = DetectInputs {
             storage_root_override: None,
             report_override: Some(report),
@@ -209,7 +209,10 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].entries.len(), 1);
         assert_eq!(
-            findings[0].entries[0].target.as_ref().map(|p| p.to_string_lossy().to_string()),
+            findings[0].entries[0]
+                .target
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("/etc/passwd".to_string())
         );
     }
@@ -217,12 +220,12 @@ mod tests {
     #[test]
     fn detector_flags_unexpected_symlink_without_target() {
         let mut report = ArchiveAnomalyReport::new();
-        report.anomalies.push(ArchiveAnomaly::now(
-            ArchiveAnomalyKind::UnexpectedSymlink {
+        report
+            .anomalies
+            .push(ArchiveAnomaly::now(ArchiveAnomalyKind::UnexpectedSymlink {
                 path: "/var/data/projects/foo/2026-05/dangling.md".into(),
                 target: None,
-            },
-        ));
+            }));
         let inputs = DetectInputs {
             storage_root_override: None,
             report_override: Some(report),
@@ -236,12 +239,12 @@ mod tests {
     fn detector_aggregates_multiple_symlinks_into_one_finding() {
         let mut report = ArchiveAnomalyReport::new();
         for i in 0..3 {
-            report.anomalies.push(ArchiveAnomaly::now(
-                ArchiveAnomalyKind::UnexpectedSymlink {
+            report
+                .anomalies
+                .push(ArchiveAnomaly::now(ArchiveAnomalyKind::UnexpectedSymlink {
                     path: format!("/x/link-{i}.md").into(),
                     target: Some(format!("/y/target-{i}").into()),
-                },
-            ));
+                }));
         }
         let inputs = DetectInputs {
             storage_root_override: None,

@@ -94,7 +94,7 @@ impl MissingOrMalformedProjectJsonFinding {
                     "steps": [
                         "For each Missing entry: inspect `project_dir` to identify the intended project. Create a minimal `project.json` with `slug` (the directory's basename) and `human_key` (the project's canonical filesystem path).",
                         "For each Invalid entry: read the `detail` field for the specific JSON / schema error. Edit `path` to fix the JSON or add the missing required field.",
-                        "Re-run `am doctor --only fm-archive-state-files-missing-or-malformed-project-json` to confirm the anomaly is gone.",
+                        "Re-run `am doctor fix --only fm-archive-state-files-missing-or-malformed-project-json --list` to confirm the anomaly is gone.",
                     ],
                     "note": "Auto-fix is intentionally not implemented — writing a project.json requires operator-supplied truth (the right slug+human_key correspondence).",
                 },

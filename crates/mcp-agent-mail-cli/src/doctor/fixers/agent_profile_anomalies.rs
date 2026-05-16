@@ -95,7 +95,7 @@ impl AgentProfileAnomaliesFinding {
                     "steps": [
                         "For each Orphaned entry: decide whether the missing parent project should be restored from archive history (`git log -- projects/<slug>/`) or the orphan removed. Move orphan dirs into `.doctor/quarantine/orphan-agents/` if removing.",
                         "For each Malformed entry: inspect `detail` for the specific error (missing file, parse error, etc.). Restore from backup or rewrite `profile.json` with the canonical fields (agent_name, project_slug, program, model).",
-                        "Re-run `am doctor --only fm-archive-state-files-agent-profile-anomalies` to confirm the agent surface is clean.",
+                        "Re-run `am doctor fix --only fm-archive-state-files-agent-profile-anomalies --list` to confirm the agent surface is clean.",
                     ],
                     "note": "Auto-fix is intentionally not implemented — both variants require operator judgment about which canonical state to restore.",
                 },

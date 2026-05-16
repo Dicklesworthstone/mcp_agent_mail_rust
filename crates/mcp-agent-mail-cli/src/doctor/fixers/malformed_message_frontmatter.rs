@@ -70,6 +70,7 @@ pub enum FrontmatterProblem {
     },
 }
 
+#[cfg(test)]
 impl FrontmatterProblem {
     fn path(&self) -> &PathBuf {
         match self {
@@ -306,12 +307,12 @@ mod tests {
     #[test]
     fn detector_flags_invalid_message_id() {
         let mut report = ArchiveAnomalyReport::new();
-        report.anomalies.push(ArchiveAnomaly::now(
-            ArchiveAnomalyKind::InvalidMessageId {
+        report
+            .anomalies
+            .push(ArchiveAnomaly::now(ArchiveAnomalyKind::InvalidMessageId {
                 path: "/x.md".into(),
                 detail: "id is zero".to_string(),
-            },
-        ));
+            }));
         let inputs = DetectInputs {
             storage_root_override: None,
             report_override: Some(report),
@@ -359,12 +360,12 @@ mod tests {
                 parse_error: "bad".to_string(),
             },
         ));
-        report.anomalies.push(ArchiveAnomaly::now(
-            ArchiveAnomalyKind::InvalidMessageId {
+        report
+            .anomalies
+            .push(ArchiveAnomaly::now(ArchiveAnomalyKind::InvalidMessageId {
                 path: "/c.md".into(),
                 detail: "negative".to_string(),
-            },
-        ));
+            }));
         report.anomalies.push(ArchiveAnomaly::now(
             ArchiveAnomalyKind::IncompleteFrontmatter {
                 path: "/d.md".into(),
