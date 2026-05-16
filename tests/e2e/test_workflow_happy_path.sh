@@ -12,9 +12,9 @@
 #
 # Target: 30+ assertions
 
-E2E_SUITE="workflow_happy_path"
+export E2E_SUITE="workflow_happy_path"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../../scripts/e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -26,6 +26,8 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 
 WORK="$(e2e_mktemp "e2e_workflow")"
 WF_DB="${WORK}/workflow_test.sqlite3"
+WF_STORAGE="${WORK}/storage"
+mkdir -p "$WF_STORAGE"
 PROJECT_PATH="/tmp/e2e_workflow_project_$$"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-workflow","version":"1.0"}}}'
@@ -34,17 +36,53 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 # Shared helpers (same pattern as test_macros.sh / test_stdio.sh)
 # ---------------------------------------------------------------------------
 
+_SEND_JSONRPC_SESSION_SEQ=0
+
+workflow_response_has_id() {
+    local output_file="$1"
+    local expected_id="$2"
+    [ -s "$output_file" ] || return 1
+    python3 - "$output_file" "$expected_id" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(message.get("id", "")) == expected:
+                raise SystemExit(0)
+except OSError:
+    pass
+raise SystemExit(1)
+PY
+}
+
 send_jsonrpc_session() {
     local db_path="$1"
     shift
     local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
+    _SEND_JSONRPC_SESSION_SEQ=$((_SEND_JSONRPC_SESSION_SEQ + 1))
+    local session_id="${_SEND_JSONRPC_SESSION_SEQ}"
+    local output_file="${WORK}/session_response_${session_id}.txt"
     local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
+    srv_work="$(mktemp -d "${WORK}/srv_${session_id}.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
+    local expected_id=""
+    local last_index=$((${#requests[@]} - 1))
+    if [ "$last_index" -ge 0 ]; then
+        expected_id="$(printf '%s' "${requests[$last_index]}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+    fi
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="${WF_STORAGE}" RUST_LOG=error \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -57,14 +95,21 @@ send_jsonrpc_session() {
     } > "$fifo" &
     local write_pid=$!
 
-    local timeout_s=25
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
+    local timeout_s="${WORKFLOW_SESSION_TIMEOUT_S:-25}"
+    local deadline_ms now_ms
+    deadline_ms=$(($(_e2e_now_ms) + timeout_s * 1000))
+    while true; do
+        if [ -n "$expected_id" ] && workflow_response_has_id "$output_file" "$expected_id"; then
+            break
+        fi
         if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
         fi
+        now_ms="$(_e2e_now_ms)"
+        if [ "$now_ms" -ge "$deadline_ms" ]; then
+            break
+        fi
         sleep 0.5
-        elapsed=$((elapsed + 1))
     done
 
     wait "$write_pid" 2>/dev/null || true
@@ -278,12 +323,13 @@ try:
         subjects = [m.get('subject', '') for m in messages]
         senders = [m.get('from', '') for m in messages]
         bodies = [m.get('body_md', '') for m in messages]
-        has_target = any('Implementation update' in s for s in subjects)
+        target_count = sum(1 for s in subjects if 'Implementation update' in s)
+        has_target = target_count > 0
         has_sender = 'RedFox' in senders
         has_body = any('tests passing' in b for b in bodies)
         thread_ids = [m.get('thread_id', '') for m in messages]
         has_thread = 'FEAT-42' in thread_ids
-        print(f'count={count}|has_target={has_target}|has_sender={has_sender}|has_body={has_body}|has_thread={has_thread}')
+        print(f'count={count}|target_count={target_count}|has_target={has_target}|has_sender={has_sender}|has_body={has_body}|has_thread={has_thread}')
     else:
         print(f'not_list|type={type(messages).__name__}')
 except Exception as e:
@@ -292,7 +338,7 @@ except Exception as e:
 
 e2e_save_artifact "phase3_inbox_parsed.txt" "$INBOX_CHECK"
 
-e2e_assert_contains "inbox has messages" "$INBOX_CHECK" "count=1"
+e2e_assert_contains "inbox includes one target message" "$INBOX_CHECK" "target_count=1"
 e2e_assert_contains "correct subject" "$INBOX_CHECK" "has_target=True"
 e2e_assert_contains "correct sender" "$INBOX_CHECK" "has_sender=True"
 e2e_assert_contains "body preserved" "$INBOX_CHECK" "has_body=True"
@@ -359,8 +405,8 @@ e2e_case_banner "Phase 4: resource://inbox + resource://thread"
 # Read resource://inbox/BluePeak
 PHASE4_RESP="$(send_jsonrpc_session "$WF_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BluePeak?project=${PROJECT_PATH}&limit=10\"}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/FEAT-42?project=${PROJECT_PATH}&include_bodies=true\"}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://inbox/BluePeak?project=${EP_SLUG}&limit=10\"}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://thread/FEAT-42?project=${EP_SLUG}&include_bodies=true\"}}" \
 )"
 e2e_save_artifact "phase4_resources.txt" "$PHASE4_RESP"
 

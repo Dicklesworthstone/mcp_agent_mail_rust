@@ -295,6 +295,10 @@ e2e_case_banner() {
     echo -e "${_e2e_color_blue}── Case: ${case_name} ──${_e2e_color_reset}"
 }
 
+e2e_section() {
+    e2e_case_banner "$@"
+}
+
 e2e_pass() {
     local msg="${1:-}"
     (( _E2E_PASS++ )) || true

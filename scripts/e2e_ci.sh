@@ -13,9 +13,9 @@
 #   9. Decision logic: quick=no-go, full=go
 #  10. Failure handling: format break causes fail
 
-E2E_SUITE="ci"
+export E2E_SUITE="ci"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -29,6 +29,26 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 # Temp workspace for tests
 WORK="$(e2e_mktemp "e2e_ci")"
 mkdir -p "${WORK}"
+
+# `am ci --quick` verifies gate orchestration and report semantics here. The
+# release workflow runs the real cargo gates separately; running them several
+# more times inside this E2E suite makes the full matrix impractically slow.
+REAL_CARGO="$(command -v cargo)"
+STUB_BIN="${WORK}/bin"
+mkdir -p "${STUB_BIN}"
+cat > "${STUB_BIN}/cargo" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+    fmt|clippy|build|test)
+        echo "[e2e cargo shim] cargo \$*" >&2
+        exit 0
+        ;;
+esac
+exec "${REAL_CARGO}" "\$@"
+SH
+chmod +x "${STUB_BIN}/cargo"
+export PATH="${STUB_BIN}:${PATH}"
+e2e_log "cargo shim installed for am ci E2E gate orchestration"
 
 # ===========================================================================
 # Case 1: am ci --help lists expected flags
@@ -62,6 +82,7 @@ CI_RC=$?
 set -e
 
 e2e_save_artifact "case_02_ci_quick.txt" "$CI_OUT"
+e2e_log "am ci --quick exited with code ${CI_RC}"
 
 # Allow non-zero exit if some quick gates fail (e.g., format)
 if [ -f "$REPORT_FILE" ]; then
@@ -147,6 +168,7 @@ PARALLEL_RC=$?
 set -e
 
 e2e_save_artifact "case_06_parallel.txt" "$PARALLEL_OUT"
+e2e_log "am ci --quick --parallel exited with code ${PARALLEL_RC}"
 
 if [ -f "$PARALLEL_REPORT" ]; then
     e2e_pass "parallel report file created"
@@ -204,6 +226,7 @@ set +e
 am ci --quick --report "$CUSTOM_PATH" >/dev/null 2>&1
 CUSTOM_RC=$?
 set -e
+e2e_log "am ci --quick custom report exited with code ${CUSTOM_RC}"
 
 if [ -f "$CUSTOM_PATH" ]; then
     e2e_pass "report written to custom path"

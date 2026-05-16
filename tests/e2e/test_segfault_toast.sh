@@ -14,21 +14,11 @@ e2e_init_artifacts
 e2e_banner "Git Segfault Toast E2E Test Suite"
 
 run_cargo_remote_first() {
-    if [ "${E2E_CARGO_FORCE_LOCAL:-0}" = "1" ]; then
-        cargo "$@"
-        return $?
+    if [ "${E2E_SEGFAULT_TOAST_REMOTE_CARGO:-0}" = "1" ]; then
+        e2e_run_cargo "$@"
+    else
+        E2E_CARGO_FORCE_LOCAL=1 e2e_run_cargo "$@"
     fi
-
-    if command -v rch >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout "${E2E_RCH_TIMEOUT_SECONDS}" rch exec -- cargo "$@"
-        else
-            rch exec -- cargo "$@"
-        fi
-        return $?
-    fi
-
-    e2e_run_cargo "$@"
 }
 
 run_cargo_case() {

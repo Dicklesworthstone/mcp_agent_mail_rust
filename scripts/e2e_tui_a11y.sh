@@ -20,7 +20,7 @@ set -euo pipefail
 
 E2E_SUITE="${E2E_SUITE:-tui_a11y}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 : "${AM_TUI_A11Y_SKIP_CONTRAST:=0}"
@@ -30,6 +30,41 @@ TMP_BASE="${TMP_BASE%/}"
 
 e2e_init_artifacts
 e2e_banner "TUI Accessibility (Keyboard + Contrast) E2E Test Suite"
+
+_TUI_A11Y_ADAPTER_MANIFEST_WRITTEN=0
+write_tui_a11y_adapter_manifest() {
+    if [ -z "${AM_TUI_A11Y_ADAPTER_OUTPUT:-}" ]; then
+        return 0
+    fi
+    if [ "${_TUI_A11Y_ADAPTER_MANIFEST_WRITTEN}" = "1" ]; then
+        return 0
+    fi
+    _TUI_A11Y_ADAPTER_MANIFEST_WRITTEN=1
+
+    local adapter_status="pass"
+    local adapter_exit=0
+    if [ "${_E2E_FAIL:-0}" -gt 0 ]; then
+        adapter_status="fail"
+        adapter_exit=1
+    elif [ "${_E2E_PASS:-0}" -eq 0 ] && [ "${_E2E_SKIP:-0}" -gt 0 ]; then
+        adapter_status="skip"
+    fi
+
+    mkdir -p "$(dirname "${AM_TUI_A11Y_ADAPTER_OUTPUT}")"
+    cat > "${AM_TUI_A11Y_ADAPTER_OUTPUT}" <<ADAPTER_EOF
+{
+  "suite": "${E2E_SUITE}",
+  "timestamp": "$(_e2e_now_rfc3339)",
+  "status": "${adapter_status}",
+  "exit_code": ${adapter_exit},
+  "artifact_dir": "${E2E_ARTIFACT_DIR}",
+  "summary_path": "${E2E_ARTIFACT_DIR}/summary.json",
+  "bundle_path": "${E2E_ARTIFACT_DIR}/bundle.json",
+  "trace_path": "${E2E_ARTIFACT_DIR}/trace/events.jsonl"
+}
+ADAPTER_EOF
+}
+trap write_tui_a11y_adapter_manifest EXIT
 
 is_truthy() {
     case "${1:-0}" in
@@ -371,6 +406,7 @@ RAW2="${E2E_ARTIFACT_DIR}/core_screens.raw"
 # Exercise a mix of jump/tab navigation without asserting an exact PTY-visible
 # route. Exact screen semantics are covered natively; the shell adapter verifies
 # no-crash behavior plus artifact capture.
+# shellcheck disable=SC2016
 EXPECT_SCRIPT_CORE='
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
@@ -476,6 +512,7 @@ mkdir -p "${STORAGE3}"
 PORT3="$(pick_port)"
 RAW3="${E2E_ARTIFACT_DIR}/key_hints_default.raw"
 
+# shellcheck disable=SC2016
 EXPECT_SCRIPT_HINTS_DEFAULT='
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
@@ -541,6 +578,7 @@ mkdir -p "${STORAGE4}"
 PORT4="$(pick_port)"
 RAW4="${E2E_ARTIFACT_DIR}/key_hints.raw"
 
+# shellcheck disable=SC2016
 EXPECT_SCRIPT_HINTS='
 set bin [lindex $argv 0]
 set port [lindex $argv 1]
@@ -588,26 +626,5 @@ fi
 e2e_assert_file_not_contains "key hints hidden" "${RENDERED4}" "j/k  Scroll event log"
 e2e_assert_file_not_contains "key hints disabled binary path valid" "${RENDERED4}" "No such file or directory"
 
-# Write adapter result manifest if requested by the harness.
-if [ -n "${AM_TUI_A11Y_ADAPTER_OUTPUT:-}" ]; then
-    _adapter_status="pass"
-    _adapter_exit=0
-    if [ "${_E2E_FAIL:-0}" -gt 0 ]; then
-        _adapter_status="fail"
-        _adapter_exit=1
-    fi
-    cat > "${AM_TUI_A11Y_ADAPTER_OUTPUT}" <<ADAPTER_EOF
-{
-  "suite": "${E2E_SUITE}",
-  "timestamp": "$(_e2e_now_rfc3339)",
-  "status": "${_adapter_status}",
-  "exit_code": ${_adapter_exit},
-  "artifact_dir": "${E2E_ARTIFACT_DIR}",
-  "summary_path": "${E2E_ARTIFACT_DIR}/summary.json",
-  "bundle_path": "${E2E_ARTIFACT_DIR}/bundle.json",
-  "trace_path": "${E2E_ARTIFACT_DIR}/trace/events.jsonl"
-}
-ADAPTER_EOF
-fi
-
 e2e_summary
+write_tui_a11y_adapter_manifest

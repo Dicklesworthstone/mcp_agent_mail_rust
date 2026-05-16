@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export E2E_SUITE="self_update"
 
-# shellcheck source=e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -83,7 +83,8 @@ reset_install_binaries
 
 CURRENT_VERSION="$("${INSTALL_DIR}/am" --version 2>/dev/null | awk '{print $2}' | sed 's/^v//' | head -1)"
 if [ -z "${CURRENT_VERSION}" ]; then
-    CURRENT_VERSION="$(echo "${CARGO_PKG_VERSION:-}" | sed 's/^v//')"
+    CURRENT_VERSION="${CARGO_PKG_VERSION:-}"
+    CURRENT_VERSION="${CURRENT_VERSION#v}"
 fi
 if [ -z "${CURRENT_VERSION}" ]; then
     CURRENT_VERSION="0.0.0"
@@ -181,6 +182,7 @@ fi
 
 ASSET_SHA="$(e2e_sha256 "${ASSET_PATH}")"
 printf "%s  %s\n" "${ASSET_SHA}" "${ASSET_NAME}" > "${ASSET_PATH}.sha256"
+printf "%s  %s\n" "${ASSET_SHA}" "${ASSET_NAME}" > "${ASSET_DIR}/SHA256SUMS"
 
 if command -v python3 >/dev/null 2>&1; then
     PORT="$(python3 - <<'PY'

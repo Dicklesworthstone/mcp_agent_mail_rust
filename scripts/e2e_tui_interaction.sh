@@ -23,7 +23,7 @@ set -euo pipefail
 
 E2E_SUITE="${E2E_SUITE:-tui_interaction}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -260,7 +260,7 @@ seed_test_data() {
 # Case 1: Tab navigates through screens
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "tab_navigates_through_screens"
-read -r WORK1 DB1 STORAGE1 <<< "$(setup_server_env "tab_nav")"
+read -r _WORK1 DB1 STORAGE1 <<< "$(setup_server_env "tab_nav")"
 PORT1="$(pick_port)"
 
 TRANSCRIPT1="${E2E_ARTIFACT_DIR}/tab_nav_transcript.txt"
@@ -299,7 +299,7 @@ assert_transcript_contains "tab bar: Agents" "${TRANSCRIPT1}" "Agents"
 # Case 2: Number keys switch screens directly
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "number_keys_switch_screens"
-read -r WORK2 DB2 STORAGE2 <<< "$(setup_server_env "num_nav")"
+read -r _WORK2 DB2 STORAGE2 <<< "$(setup_server_env "num_nav")"
 PORT2="$(pick_port)"
 
 TRANSCRIPT2="${E2E_ARTIFACT_DIR}/num_nav_transcript.txt"
@@ -334,7 +334,7 @@ assert_transcript_contains "number 7: System Health" "${TRANSCRIPT2}" "System He
 # Case 3: Help overlay opens and closes
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "help_overlay_toggle"
-read -r WORK3 DB3 STORAGE3 <<< "$(setup_server_env "help")"
+read -r _WORK3 DB3 STORAGE3 <<< "$(setup_server_env "help")"
 PORT3="$(pick_port)"
 
 TRANSCRIPT3="${E2E_ARTIFACT_DIR}/help_transcript.txt"
@@ -360,7 +360,7 @@ run_pty_interaction "help" "${TRANSCRIPT3}" "${KEYS3}" \
 
 # Help overlay should render title plus visible screen-local bindings
 # (global bindings are below the fold at 80x24 and require scrolling).
-assert_transcript_contains "help: shows Keyboard Shortcuts" "${TRANSCRIPT3}" "Keyboard Shortcuts"
+assert_transcript_contains "help: shows Help & Keybindings" "${TRANSCRIPT3}" "Help & Keybindings"
 assert_transcript_contains "help: shows dashboard binding" "${TRANSCRIPT3}" "Scroll event log"
 
 
@@ -368,7 +368,7 @@ assert_transcript_contains "help: shows dashboard binding" "${TRANSCRIPT3}" "Scr
 # Case 4: Command palette opens and navigates
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "command_palette_navigation"
-read -r WORK4 DB4 STORAGE4 <<< "$(setup_server_env "palette")"
+read -r _WORK4 DB4 STORAGE4 <<< "$(setup_server_env "palette")"
 PORT4="$(pick_port)"
 
 TRANSCRIPT4="${E2E_ARTIFACT_DIR}/palette_transcript.txt"
@@ -407,7 +407,7 @@ assert_transcript_contains "palette: navigated to Threads" "${TRANSCRIPT4}" "Thr
 # Case 5: Colon also opens palette
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "colon_opens_palette"
-read -r WORK5 DB5 STORAGE5 <<< "$(setup_server_env "colon")"
+read -r _WORK5 DB5 STORAGE5 <<< "$(setup_server_env "colon")"
 PORT5="$(pick_port)"
 
 TRANSCRIPT5="${E2E_ARTIFACT_DIR}/colon_transcript.txt"
@@ -443,7 +443,7 @@ assert_transcript_contains "colon: navigated to Agents" "${TRANSCRIPT5}" "Agents
 # Case 6: Clean quit with 'q'
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "clean_quit"
-read -r WORK6 DB6 STORAGE6 <<< "$(setup_server_env "quit")"
+read -r _WORK6 DB6 STORAGE6 <<< "$(setup_server_env "quit")"
 PORT6="$(pick_port)"
 
 TRANSCRIPT6="${E2E_ARTIFACT_DIR}/quit_transcript.txt"
@@ -484,7 +484,7 @@ assert_transcript_contains "quit: TUI was running" "${TRANSCRIPT6}" "Dashboard"
 # Case 7: Shift-Tab navigates backward
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "shift_tab_backward_navigation"
-read -r WORK7 DB7 STORAGE7 <<< "$(setup_server_env "backtab")"
+read -r _WORK7 DB7 STORAGE7 <<< "$(setup_server_env "backtab")"
 PORT7="$(pick_port)"
 
 TRANSCRIPT7="${E2E_ARTIFACT_DIR}/backtab_transcript.txt"
@@ -518,7 +518,7 @@ assert_transcript_contains "backtab: Attachments visited" "${TRANSCRIPT7}" "Atta
 # Case 8: Search flow in Messages screen
 # ────────────────────────────────────────────────────────────────────
 e2e_case_banner "search_flow_messages"
-read -r WORK8 DB8 STORAGE8 <<< "$(setup_server_env "search")"
+read -r _WORK8 DB8 STORAGE8 <<< "$(setup_server_env "search")"
 PORT8="$(pick_port)"
 
 TRANSCRIPT8="${E2E_ARTIFACT_DIR}/search_transcript.txt"

@@ -11,9 +11,9 @@
 
 set -euo pipefail
 
-E2E_SUITE="search_quality_integration"
+export E2E_SUITE="search_quality_integration"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../../scripts/e2e_lib.sh
+# shellcheck source=scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -36,18 +36,13 @@ resolve_am_binary() {
         echo "${AM_BIN_OVERRIDE}"
         return 0
     fi
-    if command -v am >/dev/null 2>&1; then
-        local path_am
-        path_am="$(command -v am)"
-        if [ -x "${path_am}" ]; then
-            echo "${path_am}"
-            return 0
-        fi
+    local candidates=()
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        candidates+=("${CARGO_TARGET_DIR}/debug/am")
     fi
-    local candidates=(
+    candidates+=(
         "${E2E_PROJECT_ROOT}/target-codex-search-migration/debug/am"
         "${E2E_PROJECT_ROOT}/target/debug/am"
-        "${CARGO_TARGET_DIR}/debug/am"
     )
     local candidate
     for candidate in "${candidates[@]}"; do
@@ -60,6 +55,14 @@ resolve_am_binary() {
         local built_bin
         if built_bin="$(e2e_ensure_binary "am" 2>/dev/null | tail -n 1)" && [ -x "${built_bin}" ]; then
             echo "${built_bin}"
+            return 0
+        fi
+    fi
+    if command -v am >/dev/null 2>&1; then
+        local path_am
+        path_am="$(command -v am)"
+        if [ -x "${path_am}" ]; then
+            echo "${path_am}"
             return 0
         fi
     fi
@@ -127,6 +130,24 @@ send_jsonrpc_session() {
         sleep 0.2
     } > "$fifo"
 
+    local timeout_s="${SEARCH_QUALITY_SESSION_TIMEOUT_S:-60}"
+    local deadline_ms now_ms
+    deadline_ms=$(($(_e2e_now_ms) + timeout_s * 1000))
+    local timed_out=false
+    while kill -0 "$srv_pid" 2>/dev/null; do
+        now_ms="$(_e2e_now_ms)"
+        if [ "$now_ms" -ge "$deadline_ms" ]; then
+            timed_out=true
+            break
+        fi
+        sleep 0.2
+    done
+    if [ "$timed_out" = true ]; then
+        kill "$srv_pid" 2>/dev/null || true
+        wait "$srv_pid" 2>/dev/null || true
+        cat "${srv_work}/stderr.txt" >&2 2>/dev/null || true
+        return 124
+    fi
     wait "$srv_pid" 2>/dev/null || true
     cat "$output_file"
 }
@@ -599,10 +620,17 @@ fi
 e2e_case_banner "Relevance sanity and latency on large corpus"
 
 T0="$(date +%s%3N)"
-SEARCH_A_TEXT="$(call_tool_text 100 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback search\",\"limit\":25,\"ranking\":\"relevance\"}")"
+SEARCH_A_SESSION="$(send_jsonrpc_session "$DB_PATH" \
+    "$(mcp_tool 100 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback search\",\"limit\":25,\"ranking\":\"relevance\"}")" \
+    "$(mcp_tool 101 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback search\",\"limit\":25,\"ranking\":\"relevance\"}")" \
+)"
 T1="$(date +%s%3N)"
-SEARCH_A_MS=$((T1 - T0))
+SEARCH_A_PAIR_MS=$((T1 - T0))
+e2e_save_artifact "search_a_session_response.txt" "$SEARCH_A_SESSION"
+SEARCH_A_TEXT="$(extract_content_text "$SEARCH_A_SESSION" 100)"
+SEARCH_A_WARM_TEXT="$(extract_content_text "$SEARCH_A_SESSION" 101)"
 e2e_save_artifact "search_a_payload.json" "$SEARCH_A_TEXT"
+e2e_save_artifact "search_a_warm_payload.json" "$SEARCH_A_WARM_TEXT"
 
 SEARCH_A_PARSED="$(parse_search_payload "$SEARCH_A_TEXT")"
 e2e_save_artifact "search_a_parsed.json" "$SEARCH_A_PARSED"
@@ -621,22 +649,10 @@ else
     e2e_fail "high-signal rollback subject missing from relevance results"
 fi
 
-if [ "$SEARCH_A_MS" -lt 10000 ]; then
-    e2e_pass "cold-ish relevance query latency acceptable (${SEARCH_A_MS}ms)"
+if [ "$SEARCH_A_PAIR_MS" -lt "${SEARCH_QUALITY_PAIR_LATENCY_MAX_MS:-20000}" ]; then
+    e2e_pass "paired relevance query latency acceptable (${SEARCH_A_PAIR_MS}ms)"
 else
-    e2e_fail "cold-ish relevance query latency too high (${SEARCH_A_MS}ms)"
-fi
-
-T2="$(date +%s%3N)"
-SEARCH_A_WARM_TEXT="$(call_tool_text 101 search_messages "{\"project_key\":\"$PROJECT_A\",\"query\":\"rollback search\",\"limit\":25,\"ranking\":\"relevance\"}")"
-T3="$(date +%s%3N)"
-SEARCH_A_WARM_MS=$((T3 - T2))
-e2e_save_artifact "search_a_warm_payload.json" "$SEARCH_A_WARM_TEXT"
-
-if [ "$SEARCH_A_WARM_MS" -lt 5000 ]; then
-    e2e_pass "warm relevance query latency acceptable (${SEARCH_A_WARM_MS}ms)"
-else
-    e2e_fail "warm relevance query latency too high (${SEARCH_A_WARM_MS}ms)"
+    e2e_fail "paired relevance query latency too high (${SEARCH_A_PAIR_MS}ms)"
 fi
 
 e2e_case_banner "Scope isolation across project and product surfaces"

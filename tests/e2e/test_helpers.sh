@@ -20,7 +20,7 @@
 #   tests/artifacts/<suite>/<timestamp>/wrapper/
 #     env_at_start.txt      - Environment snapshot at wrapper entry
 #     exit_code.txt         - Delegate script exit code
-#     stderr_capture.txt    - Delegate script stderr (first 10000 lines)
+#     stderr_capture.txt    - Delegate script stderr
 #     timing.txt            - Wall-clock duration in seconds
 #     wrapper_meta.json     - Machine-readable wrapper metadata
 #
@@ -112,19 +112,25 @@ wrapper_exec() {
     _wrapper_log "Delegate: ${script_path}"
     _wrapper_log "Artifacts: ${_WRAPPER_ARTIFACT_DIR}/wrapper/"
 
-    # 2. Run delegate with stderr capture
+    # 2. Run delegate with stderr capture. Avoid process substitution here:
+    # background children can inherit its pipe and keep the native runner's
+    # stderr reader alive after the delegate exits.
     local stderr_file="${_WRAPPER_ARTIFACT_DIR}/wrapper/stderr_capture.txt"
     local start_epoch
     start_epoch="$(date +%s)"
 
     set +e
     if [ $# -gt 0 ]; then
-        bash "$script_path" "$@" 2> >(tee "$stderr_file" >&2)
+        bash "$script_path" "$@" 2>"$stderr_file"
     else
-        bash "$script_path" 2> >(tee "$stderr_file" >&2)
+        bash "$script_path" 2>"$stderr_file"
     fi
     local exit_code=$?
     set -e
+
+    if [ -s "$stderr_file" ]; then
+        cat "$stderr_file" >&2 || true
+    fi
 
     local end_epoch
     end_epoch="$(date +%s)"
