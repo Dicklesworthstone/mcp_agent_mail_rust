@@ -32,6 +32,7 @@ pub mod empty_or_truncated_db;
 pub mod guard_foreign_runner_overwrite;
 pub mod guard_hooks_path_divergence;
 pub mod guard_plugin_not_executable;
+pub mod guard_plugin_symlink_replacement;
 pub mod inbox_stats_divergence;
 pub mod integrity_page_malformed;
 pub mod jwt_enabled_without_keys;
@@ -549,6 +550,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::guard_plugin_not_executable",
         },
         FixerSpec {
+            id: guard_plugin_symlink_replacement::FM_ID,
+            severity: "P1",
+            subsystem: "guard_install",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Agent-mail guard path(s) under the hooks dir are symlinks (installer always writes regular files) — possible filesystem tampering / attacker aliasing; auto-fix via Op::Rename symlink-aside + reinstall deferred",
+            source_module: "doctor::fixers::guard_plugin_symlink_replacement",
+        },
+        FixerSpec {
             id: codex_startup_timeout::FM_ID,
             severity: "P1",
             subsystem: "mcp_config_files",
@@ -1042,6 +1052,16 @@ pub fn dispatch_only(
             outcome.findings.push(f.to_finding());
             // Detect-only — fix is a no-op.
             let result = guard_plugin_not_executable::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == guard_plugin_symlink_replacement::FM_ID {
+        let findings = guard_plugin_symlink_replacement::detect(&inputs.repo_root);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = guard_plugin_symlink_replacement::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1554,6 +1574,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == guard_plugin_not_executable::FM_ID {
         guard_plugin_not_executable::detect(&inputs.repo_root)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == guard_plugin_symlink_replacement::FM_ID {
+        guard_plugin_symlink_replacement::detect(&inputs.repo_root)
             .iter()
             .map(|f| f.to_finding())
             .collect()
