@@ -1,48 +1,48 @@
-── Configuration ──                                                                                                                                  PROBING... 
-Endpoint:                                                                                                                                                       
-Web UI:                                                                                                                                                         
-Auth:      disabled (token: false, len: 0)                                                                                                                      
-Checked:   (never)                                                                                                                                              
-Uptime:    0s                                                                                                                                                   
-                                                                                                                                                                
-── Connection Diagnostics ──                                                                                                                                    
-  [OK] TCP :0  0ms                                                                                                                                              
-                                                                                                                                                                
-r Refresh  v Dashboard                                                                                                                                          
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
+╭ System Health ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                              │
+│ ── Configuration ──                                                        PROBING... ╭ Findings ──────────────────────────────────────────────────────────╮ │
+│ Endpoint:                                                                             │                                                                    │ │
+│ Mail UI:                                                                              │                                                                    │ │
+│ Auth:      disabled (token: false, len: 0)                                            │                                                                    │ │
+│ Checked:   (never)                                                                    │                                                                    │ │
+│ Uptime:    0s                                                                         │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│ ── ATC Operator ──                                                                    │                                                                    │ │
+│ ATC:       disabled ()                                                                │                                                                    │ │
+│ Learning:  kill-switch disabled                                                       │                                                                    │ │
+│ Ticks:     0 ticks  0 decisions  0 deadlocks                                          │                                                                    │ │
+│ Heartbeat: last_tick=1970-01-01T00:00:00+00:00  age=--  stale=false                   │                                                                    │ │
+│ Budget:    tick=0us / 0us  p95≈0us  safe_mode=false  tracked=0                        │                                                                    │ │
+│ Rollup:    count=0  p95=0us  retention=within-policy                                  │                                                                    │ │
+│ Control:   mode=  due=0  probes=0  cache_hit=0%  policy=  fallback=false              │                                                                    │ │
+│ Executor:  mode=  pending=0  overhead=0us  next_due=--                                │                                                                    │ │
+│ Kernel:    scheduled=0  kernel_pending=0  lock_wait=0us  debt=0us  decision_mode=     │                                                                    │ │
+│ Artifacts: bundle=  incumbent=  shadow=false  disagreements=0                         │                                                                    │ │
+│ Liveness:  all tracked agents are alive                                               │    ╭──────────────────────────────────────────────────────────╮    │ │
+│                                                                                       │    │                                                          │    │ │
+│ ── Git ref integrity ──                                                               │    │ ✔  All Checks Passed                                     │    │ │
+│   [OK] Git retry guard  git segfault retries: 0                                       │    │                                                          │    │ │
+│   [WARN] Last boot check  not observed for this process                               │    │ No findings to display.                                  │    │ │
+│   [WARN] Health sweep  enabled=false batch=0 interval=0s scanned=0/0 findings=0 next_c│    │                                                          │    │ │
+│        Rows: no project sweep data yet                                                │    ╰──────────────────────────────────────────────────────────╯    │ │
+│                                                                                       │                                                                    │ │
+│ ── Connection Diagnostics ──                                                          │                                                                    │ │
+│   [OK] TCP :0  0ms                                                                    │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│ r Refresh  v Dashboard  o Open Mail UI  y Copy Mail UI                                │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│                                                                                       ╰────────────────────────────────────────────────────────────────────╯ │
+│                                                                                                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

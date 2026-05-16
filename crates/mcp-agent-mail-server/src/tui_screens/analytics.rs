@@ -3115,7 +3115,8 @@ impl MailScreen for AnalyticsScreen {
             self.last_refresh_tick = Some(tick_count);
             self.pending_refresh = false;
 
-            let raw_count = u64::try_from(self.feed.alerts_processed).unwrap_or(u64::MAX);
+            let source_count = self.feed.alerts_processed.max(self.feed.cards_produced);
+            let raw_count = u64::try_from(source_count).unwrap_or(u64::MAX);
             let rendered_count = u64::try_from(self.feed.cards.len()).unwrap_or(u64::MAX);
             let dropped_count = raw_count.saturating_sub(rendered_count);
             let cfg = state.config_snapshot();

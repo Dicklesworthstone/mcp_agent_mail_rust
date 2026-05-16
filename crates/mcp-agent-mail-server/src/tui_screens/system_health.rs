@@ -1907,7 +1907,7 @@ impl SystemHealthScreen {
         );
 
         let body = format!(
-            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={} canary={} attention={} worst={}",
+            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} attention={} sweep_p95={}us kill={} safe={} open={} canary={} worst={}",
             tick_age,
             tick_p95,
             atc_tick_is_stale(&snap.atc),
@@ -1916,7 +1916,7 @@ impl SystemHealthScreen {
             atc_retention_status(&snap.atc),
             snap.atc.observability.experiences_written_total,
             snap.atc.observability.experiences_resolved_total,
-            strata_summary,
+            snap.agent_attention_count,
             sweep_p95,
             if snap.atc.kill_switch_enabled {
                 "on"
@@ -1924,8 +1924,8 @@ impl SystemHealthScreen {
                 "off"
             },
             if snap.atc.safe_mode { "on" } else { "off" },
+            strata_summary,
             canary_label,
-            snap.agent_attention_count,
             snap.agent_attention_summary,
         );
         Paragraph::new(body)

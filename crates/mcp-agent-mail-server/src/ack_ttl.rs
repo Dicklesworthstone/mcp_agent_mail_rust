@@ -469,6 +469,20 @@ mod tests {
         create_pool(&pool_config).expect("create pool")
     }
 
+    fn ensure_ephemeral_test_project(
+        cx: &Cx,
+        pool: &DbPool,
+        human_key: &str,
+    ) -> mcp_agent_mail_db::ProjectRow {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || match block_on(async { queries::ensure_project(cx, pool, human_key).await }) {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure_project failed: {other:?}"),
+            },
+        )
+    }
+
     fn seed_unacked_message() -> (tempfile::TempDir, DbPool, Cx, queries::UnackedMessageRow) {
         let tmp = tempfile::tempdir().unwrap();
         let pool = make_test_pool(&tmp);
@@ -478,11 +492,7 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project =
-            match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
-                Outcome::Ok(p) => p,
-                other => panic!("ensure_project failed: {other:?}"),
-            };
+        let project = ensure_ephemeral_test_project(&cx, &pool, &human_key);
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
@@ -919,11 +929,7 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project =
-            match block_on(async { queries::ensure_project(&cx, &pool, &human_key).await }) {
-                Outcome::Ok(p) => p,
-                other => panic!("ensure_project failed: {other:?}"),
-            };
+        let project = ensure_ephemeral_test_project(&cx, &pool, &human_key);
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {

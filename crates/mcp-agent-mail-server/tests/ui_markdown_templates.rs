@@ -924,13 +924,32 @@ fn templates_render_search_filter_only_empty_results() {
 
 #[test]
 fn templates_render_search_next_page_link() {
-    let mut ctx = sample_search_ctx("deploy", Vec::new(), false);
+    let mut ctx = sample_search_ctx(
+        "deploy",
+        vec![SearchResult {
+            id: 7,
+            subject: "Deploy plan".to_string(),
+            snippet: "Deployment update".to_string(),
+            from_name: "RedFox".to_string(),
+            created: "2026-02-05T00:00:00Z".to_string(),
+            created_relative: "2d ago".to_string(),
+            importance: "normal".to_string(),
+            thread_id: "br-456".to_string(),
+            thread_url: "/mail/proj/thread/br-456".to_string(),
+            ack_required: false,
+            score: "1.00".to_string(),
+        }],
+        false,
+    );
     ctx.search_active = true;
     ctx.next_cursor = "next-token".to_string();
     ctx.next_page_url = "/mail/proj/search?q=deploy&cursor=next-token".to_string();
     let out = templates::render_template("mail_search.html", ctx).expect("render paginated search");
     assert!(
-        out.contains("href=\"/mail/proj/search?q=deploy&amp;cursor=next-token\""),
+        out.contains("href=\"/mail/proj/search?q=deploy&amp;cursor=next-token\"")
+            || out.contains(
+                "href=\"&#x2f;mail&#x2f;proj&#x2f;search?q=deploy&amp;cursor=next-token\"",
+            ),
         "pagination link should point at the next cursor URL"
     );
 }

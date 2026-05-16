@@ -1,12 +1,10 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                               → Comm • Messages                                
-                                                                                
-▁▂▃▄▅▆ req:0 ok:0 err:0 avg:0ms spark:......                                    
-                                                                                
-                                                                                
-  No messages found.                              Select a message to view deta 
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search               >
+ Search messages... (/ to focus)                                                
+ ● ▁▂▃▄▅▆▇█▁▂  Mouse: click/select, wheel preset/scroll, drag split border  ... 
+ ▁▂▃▄▅▆ req:0 ok:0 err:0 avg:0ms spark:......                                   
                                                                                 
                                                                                 
+  No messages found.                              Select a message to view det  
                                                                                 
                                                                                 
                                                                                 
@@ -21,4 +19,6 @@
                                                                                 
                                                                                 
                                                                                 
- Messages api up:0m00s                                                        ? 
+                                                                                
+                                                                                
+ Messages mcp up:0m00s                                             LIVE [^P] F1 

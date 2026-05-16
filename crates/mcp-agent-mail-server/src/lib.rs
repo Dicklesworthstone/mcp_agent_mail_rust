@@ -563,7 +563,10 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
     // Wire the config flag into the global atomic gate.
     mcp_agent_mail_core::set_shedding_enabled(config.backpressure_shedding_enabled);
 
-    let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"));
+    let shutdown_config = config.clone();
+    let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION")).on_shutdown(move || {
+        shutdown_runtime_services(&shutdown_config);
+    });
 
     let server = add_tool(
         server,
@@ -856,6 +859,42 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         .resource(ViewsAcksStaleResource)
         .resource(ViewsAckOverdueResource)
         .build()
+}
+
+fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
+    tracing::info!("server transport exited; performing graceful shutdown of background services");
+    stop_atc_operator_runtime();
+    integrity_guard::shutdown();
+    disk_monitor::shutdown();
+    maintenance::shutdown();
+    mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
+    cleanup_shutdown_sqlite_sidecars(config);
+}
+
+fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return;
+    }
+
+    let db_path = match (DbPoolConfig {
+        database_url: config.database_url.clone(),
+        ..Default::default()
+    })
+    .sqlite_path()
+    {
+        Ok(path) if path != ":memory:" => PathBuf::from(path),
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "skipping shutdown WAL cleanup because database URL could not be resolved"
+            );
+            return;
+        }
+    };
+
+    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
 }
 
 static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -2080,7 +2119,7 @@ pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Optio
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     let conn =
         open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)?;
-    ensure_base_schema_on_sync_connection(&conn);
+    ensure_base_schema_on_sync_connection(&conn)?;
     Ok(conn)
 }
 
@@ -2091,13 +2130,13 @@ pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result
 /// may not see schema created by a concurrent pool connection.  Running the
 /// idempotent `CREATE TABLE IF NOT EXISTS` DDL guarantees the connection can
 /// execute queries against core tables like `messages`, `agents`, etc.
-fn ensure_base_schema_on_sync_connection(conn: &DbConn) {
+fn ensure_base_schema_on_sync_connection(conn: &DbConn) -> std::io::Result<()> {
     // Quick probe: if the core `messages` table exists we can skip the DDL.
     if conn
         .query_sync("SELECT 1 FROM messages LIMIT 0", &[])
         .is_ok()
     {
-        return;
+        return Ok(());
     }
     let base_ddl = mcp_agent_mail_db::schema::init_schema_sql_base();
     let mut applied = 0usize;
@@ -2109,15 +2148,15 @@ fn ensure_base_schema_on_sync_connection(conn: &DbConn) {
         if let Err(e) = conn.execute_raw(&format!("{stmt};")) {
             // Stop on first failure to avoid a cascade of dependent errors
             // (e.g. read-only filesystem or locked database).
-            tracing::warn!(
-                error = %e,
-                applied,
-                "ensure_base_schema_on_sync_connection: aborting DDL after first failure"
-            );
-            return;
+            return Err(std::io::Error::other(format!(
+                "failed to ensure base schema after {applied} statement(s): {e}"
+            )));
         }
         applied += 1;
     }
+    conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(format!("base schema verification failed: {e}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

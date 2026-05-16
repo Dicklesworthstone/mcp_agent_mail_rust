@@ -1163,7 +1163,7 @@ fn render_help_overlay_title_gradient(frame: &mut Frame<'_>, overlay_area: Rect)
 #[must_use]
 pub fn help_overlay_rect(area: Rect) -> Rect {
     let overlay_width = (u32::from(area.width) * 72 / 100).clamp(40, 90) as u16;
-    let overlay_height = (u32::from(area.height) * 68 / 100).clamp(12, 32) as u16;
+    let overlay_height = (u32::from(area.height) * 68 / 100).clamp(12, 72) as u16;
     let overlay_width = overlay_width.min(area.width.saturating_sub(2));
     let overlay_height = overlay_height.min(area.height.saturating_sub(2));
 

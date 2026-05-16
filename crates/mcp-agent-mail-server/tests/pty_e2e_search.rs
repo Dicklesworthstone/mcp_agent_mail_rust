@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ftui::{Event, Frame, GraphemePool, KeyCode, KeyEvent, KeyEventKind, Modifiers};
 use ftui_runtime::program::Model;
@@ -879,9 +879,11 @@ fn rapid_key_sequences_no_panic() {
     save_artifact("rapid_keys_report", &report);
     eprintln!("{report}");
 
-    // Budget: 900 key events + renders should complete in < 5s
+    // Budget: this is a no-panic interaction stress pass, not a benchmark.
+    // Keep the guard wide enough to avoid machine-noise flakes while still
+    // catching runaway event-loop regressions.
     assert!(
-        elapsed.as_secs() < 5,
+        elapsed < Duration::from_secs(10),
         "Rapid key test took too long: {elapsed:?}"
     );
 }

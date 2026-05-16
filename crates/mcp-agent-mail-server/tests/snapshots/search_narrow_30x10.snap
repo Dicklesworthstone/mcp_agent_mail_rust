@@ -1,10 +1,10 @@
-Search across messages, agents
-Route: /search                
-                              
-                              
-  Scope       No results found
-  [Global]                    
-  Doc Type                    
-  [Messages]                  
-  Importance                  
-  [Any]                       
+╭◐ Search Messages (0 results╮
+│                            │
+│                            │
+╰────────────────────────────╯
+ Facets hidden | type:Message…
+╭Results─────────────────────╮
+│                            │
+│    No results found.       │
+│                            │
+╰────────────────────────────╯

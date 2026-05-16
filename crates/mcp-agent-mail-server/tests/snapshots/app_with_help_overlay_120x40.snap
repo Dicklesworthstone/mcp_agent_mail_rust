@@ -1,40 +1,40 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │ 8:System Health ┃       
-                                                  Agent Mail Dashboard                                                  
-Messages            Ack Pend            Agents              Requests            Avg Lat             Uptime              
-0 ─                 0 ─                 0 ─                 0 ─                 0ms ─               0s ─                
-                                                                                                                        
-                                                                              Awaiting data...                          
-                                                                                                                        
-                                                                                                                        
-                        ╭ Keyboard Shortcuts (j/k to scroll) (Esc to close) ───────────────────╮                        
-                        │ Dashboard                                                            │                        
-                        │  Overview of projects, agents, and live request counters.            │                        
-                        │    j/k        Scroll event log                                       │                        
-                        │    Enter      Timeline at event                                      │                        
-                        │    f          Toggle auto-follow                    Awaiting data... │                        
-                        │    v          Cycle verbosity tier                                   │                        
-                        │    t          Cycle type filter                                      │                        
-                        │    G          Jump to bottom                                         │                        
-                        │    g          Jump to top                                            │                        
-                        │    p          Toggle trend panel                                     │                        
-                        │    l          Toggle console log                                     │                        
-                        │    Mouse      Wheel scroll event log                                 │                        
-                        │ Global (Default)                                                     │                        
-                        │    1-9,0,!,@,#,$ Jump to screen (direct keys for all screens)        │                        
-                        │    Tab        Next screen                                            │                        
-                        │    Shift+Tab  Previous screen                                        │                        
-                        │    m          Toggle MCP/API mode                                    │                        
-                        │    Ctrl+P     Command palette                                        │                        
-                        │    :          Command palette                                        │                        
-No message traffic yet. │e   T          Cycle themeta appears here.                            │                        
-                        │    ?          Toggle help                                            │                        
-                        │                                                                      │                        
-                        ╰──────────────────────────────────────────────────────────────────────╯                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
-                                                                                                                        
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health 
+Messages    Ack Pend    Locks       Agents      Contacts    Projects    Requests    Avg Lat     Error %     Ring Fill   
+Drops                                                       Uptime                                                      
+0 ─                                                         0s ─                                                        
+╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                      │
+│  [1:All]  [2:Ms╭ Help & Keybindings (j/k to scroll) (F1/Esc close) ─────────────────────────────────╮                │
+│ No events yet. │                                                                                    │                │
+│ Waiting for HTT│/t Dashboard                                                                        │                │
+│ Enter opens Tim│linOverview of projects, agents, and live request counters.                         │                │
+│                │   Use this screen for first-pass operational triage before drilling into a narrow  │                │
+│                │                                                                                    │                │
+│                │   Bindings on this screen are rendered live below from the registry, so the overl  │                │
+│                │                                                                                    │                │
+│                │   Robot CLI equivalent: `am robot status --project /abs/path --agent <AgentName>`  │                │
+│                │                                                                                    │                │
+│                │   Related screens: System Health, Timeline, Analytics.                             │                │
+│                │     j/k              Scroll event log                                              │                │
+│                │     Enter            Search (if query) or timeline event                           │                │
+│                │     /                Focus live dashboard search                                   │                │
+│                │     Esc              Dismiss overlay / quit confirm                                │                │
+│                │     f                Toggle auto-follow                                            │                │
+│                │     v                Cycle verbosity tier                                          │                │
+│                │     t                Cycle quick filter                                            │                │
+│                │     1-4              Set filter (All/Msg/Tools/Resv)                               │                │
+│                │     G                Jump to bottom                                                │                │
+│                │     g                Jump to top                                                   │                │
+│                │     p                Toggle trend panel                                            │                │
+│                │     l                Toggle console log                                            │                │
+│                │     Mouse            Wheel scroll event log                                        │                │
+│                │  ────────────────────────────────────────────────────────────────────────────────  │                │
+│                │                                                                                    │                │
+│                ╰────────────────────────────────────────────────────────────────────────────────────╯                │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
  Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                                                          
- Dashboard api up:0m00s             req:0 ok:0 err:0 avg:0ms |  j/k  Scroll event log              [?] Cyberpunk Aurora 
+ Dashboard mcp up:0m00s         req:0 ok:0 err:0 avg:0ms ·  j/k  Scroll event log         LIVE Cyberpunk Aurora [^P] [F1

@@ -6,13 +6,13 @@
 //! change has been introduced and requires explicit approval + migration rationale.
 //!
 //! Contract surface:
-//!   - Default port 8765, default host 0.0.0.0
+//!   - Default port 8765, default host 127.0.0.1
 //!   - Default MCP path `/mcp/` across CLI, setup, and serve
 //!   - Path aliasing: `/api/*` ↔ `/mcp/*` interchangeable
 //!   - Health endpoints bypass auth: `/health/liveness`, `/health/readiness`, `/healthz`
 //!   - OAuth well-known at `/.well-known/oauth-authorization-server`
 //!   - Bearer token auth with exact header match
-//!   - Localhost unauthenticated bypass (default: enabled)
+//!   - Localhost unauthenticated bypass (default: disabled unless explicitly configured)
 //!   - `/mail` web UI coexists with MCP endpoint on same server
 //!   - JSON-RPC 2.0 protocol for MCP `initialize` handshake
 //!   - Error response format: `{"detail": "..."}` for HTTP errors
@@ -36,12 +36,12 @@ fn compat_default_port_is_8765() {
 }
 
 #[test]
-fn compat_default_host_is_wildcard() {
+fn compat_default_host_is_loopback() {
     let config = Config::default();
     assert_eq!(
-        config.http_host, "0.0.0.0",
-        "COMPAT LOCK: Default host MUST be 0.0.0.0. \
-         Operators use the built-in mail UI remotely, so wildcard bind is intentional."
+        config.http_host, "127.0.0.1",
+        "COMPAT LOCK: Default host MUST be 127.0.0.1. \
+         Agent Mail is local-first by default; operators can opt into remote binding with HTTP_HOST."
     );
 }
 
@@ -56,12 +56,12 @@ fn compat_default_config_path_is_mcp() {
 }
 
 #[test]
-fn compat_localhost_unauthenticated_enabled_by_default() {
+fn compat_localhost_unauthenticated_disabled_by_default() {
     let config = Config::default();
     assert!(
-        config.http_allow_localhost_unauthenticated,
-        "COMPAT LOCK: Localhost bypass MUST be enabled by default. \
-         Local MCP clients (Claude Code, Codex) rely on connecting without tokens."
+        !config.http_allow_localhost_unauthenticated,
+        "COMPAT LOCK: Localhost bypass MUST be opt-in. \
+         The default has no bearer token, so local clients still connect without requiring this bypass."
     );
 }
 

@@ -1,7 +1,7 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃ 7:Tool Metrics │     
-                                         → Comm • Messages                                          
-                                                                                                    
-▁▂▃▄▅▆ req:0 ok:0 err:0 avg:0ms spark:......                                                        
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations                 >
+ Search messages... (/ to focus)                                                                    
+ ● ▁▂▃▄▅▆▇█▁▂  Mouse: click/select, wheel preset/scroll, drag split border   Ops: / j k J(toggle... 
+ ▁▂▃▄▅▆ req:0 ok:0 err:0 avg:0ms spark:......                                                       
                                                                                                     
                                                                                                     
   No messages found.                                          Select a message to view details.     
@@ -27,4 +27,4 @@
                                                                                                     
                                                                                                     
                                                                                                     
- Messages api up:0m00s           req:0 ok:0 err:0 avg:0ms |  /  Search           ? Cyberpunk Aurora 
+ Messages mcp up:0m00s      req:0 ok:0 err:0 avg:0ms ·  /  Search       LIVE Cyberpunk Aurora [^P] F

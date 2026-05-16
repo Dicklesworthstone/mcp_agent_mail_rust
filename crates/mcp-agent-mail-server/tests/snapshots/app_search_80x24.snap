@@ -1,24 +1,24 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                                → Comm • Search                                 
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-  Scope           No results found.                     Select a result to view 
-  [Global]                                                                      
-  Doc Type                                                                      
-  [Messages]                                                                    
-  Importance                                                                    
-  [Any]                                                                         
-  Ack Required                                                                  
-  [Any]                                                                         
-  Sort Order                                                                    
-  [Newest]                                                                      
-  Search Field                                                                  
-  [Subject+Body]                                                                
-                                                                                
-                                                                                
-                                                                                
-f:facets  L:que…                                                                
- Search api up:0m00s                                                          ? 
+< 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics       >
+╭◐ Search Messages (0 results, 0 filters) [Right 40%]──────────────────────────╮
+│                                                                              │
+│  Search across messages, agents, projects... (/ to focus)                    │
+│  Route: /search                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭Facets────────╮ ╭Results─────────────────────────────╮ ╭Detail────────────────╮
+│              │ │                                    │ │                      │
+│   Scope      │ │    No results found.               │ │                      │
+│   [Global]   │ │                                    │ │  Select a result t   │
+│   Doc Type   │ │                                    │ │                      │
+│   [Messages] │ │                                    │ │                      │
+│   Search Mo… │ │                                    │ │                      │
+│   [Auto]     │ │                                    │ │                      │
+│   Importance │ │                                    │ │                      │
+│   [Any]      │ │                                    │ │                      │
+│   Ack Requi… │ │                                    │ │                      │
+│   [Any]      │ │                                    │ │                      │
+│   Sort Order │ │                                    │ │                      │
+│   [Newest]   │ │                                    │ │                      │
+│              │ │                                    │ │                      │
+╰──────────────╯ ╰────────────────────────────────────╯ ╰──────────────────────╯
+ Search mcp up:0m00s                                               LIVE [^P] F1 

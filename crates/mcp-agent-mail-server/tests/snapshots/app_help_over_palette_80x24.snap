@@ -1,24 +1,24 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                              Agent Mail Dashboard                              
-Messages        Ack Pend        Agents          Requests        Avg Lat         
-0 ─             0 ─             0 ─             0 ─             0ms ─           
-                ┌────────────── Command Palette ───────────────┐                
-                ╭ Keyboard Shortcuts (j/k to scroll) (Esc to cl╮                
-                │>Dashboardit  Exit AgentMailTUI (requests shu…│                
-                │  Overview of projects, agents, and live reque│                
-                │    j/k        Scroll event logent roster wit…│                
-                │    Enter      Timeline at eventUnified searc…│                
-                │    f          Toggle auto-followck layout to…│                
-                │    v          Cycle verbosity tierrding a ne…│                
-                │    t          Cycle type filter Thread explo…│                
-                │    G          Jump to bottome current dock l…│                
-                │    g          Jump to topLoad dock layout fr…│                
-                │    p          Toggle trend panel Search and …│                
-                │    l          Toggle console lognological ev…│                
-                │    Mouse      Wheel scroll event logbrowser …│                
-                ╰──────────────────────────────────────────────╯                
-                                                                                
-                                                                                
-                                                                                
- Req:0 Avg:0ms 2xx:0 4xx:0 5xx:0   Events:0/10000 (0%) Drops:0                  
- Dashboard api up:0m00s                                                     [?] 
+ 1◈ Dashboard ╎ 2✉ Messages · 3◍ Threads ╎ 4⚙ Agents ╎ 5⌕ Search               >
+Messages   Ack Pend   Locks      Agents     Contacts   Requests   Avg Lat       
+Error %                                                                         
+╭Events (0/0) [FOLLOW] [Verbose] [filter: All]─────────────────────────────────╮
+│          ╭ Help & Keybindings (j/k to scroll) (F1/Esc close) ────╮           │
+│  [1:All] │[2:M│>Type to search...                            │   │           │
+│ No events│ye Dashboard                                           │           │
+│ Waiting f│r HOverview of projects, agents, and live request cou  │           │
+│ Enter ope│s TUse this screen for first-pass operational triage   │           │
+│          │                                                       │           │
+│          │   Bindings on this screen are rendered live below fr  │           │
+│          │                                                       │           │
+│          │   Robot CLI equivalent: `am robot status --project /  │           │
+│          │                                                       │           │
+│          │   Related screens: System Health, Timeline, Analytic  │           │
+│          │     j/k      Scroll event log                         │           │
+│          │     Enter    Search (if query) or timeline event      │           │
+│          │     /        Focus live dashboard search              │           │
+│          │    ╰──────────────────────────────────────────────╯   │           │
+│          ╰───────────────────────────────────────────────────────╯           │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Dashboard mcp up:0m00s                                          LIVE [^P] [F1] 

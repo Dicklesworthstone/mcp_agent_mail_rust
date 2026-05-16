@@ -1701,10 +1701,12 @@ impl AgentRhythm {
             sum_log_ratio += (sorted[i] / threshold_val).ln();
         }
 
-        let tail_index = if sum_log_ratio > 0.0 {
+        let normal_threshold = self.effective_avg() + k * self.std_dev();
+
+        let tail_index = if sum_log_ratio > f64::EPSILON {
             (tail_count as f64) / sum_log_ratio
         } else {
-            2.0
+            return normal_threshold;
         };
 
         // Ensure alpha > 1.0 for valid CVaR
@@ -1720,10 +1722,10 @@ impl AgentRhythm {
             let var = threshold_val * (1.0 - tail_q).powf(-1.0 / alpha);
             var * alpha / (alpha - 1.0)
         } else {
-            self.effective_avg() + k * self.std_dev()
+            normal_threshold
         };
 
-        cvar.max(self.effective_avg() + k * self.std_dev())
+        cvar.max(normal_threshold)
     }
 
     /// How long since the last activity (microseconds).
@@ -2286,29 +2288,21 @@ mod liveness_tests {
         let threshold = rhythm.suspicion_threshold(3.0);
         let avg = rhythm.effective_avg();
 
-        // The first `recent_intervals < 10` branch of `suspicion_threshold`
-        // returns `avg + k*std`, but with 100 observations we're firmly in
-        // the Hill-estimator / CVaR branch. There, a degenerate all-equal
-        // sample yields `sum_log_ratio = 0`, which drops to the fallback
-        // Pareto index (alpha = 2) and produces
-        // `cvar = threshold_val * (1-tail_q)^(-1/alpha) * alpha/(alpha-1)`.
-        // That's intentionally much larger than `avg` — a tail-risk
-        // estimator should stay conservative even when observed variance
-        // collapsed to the EWMA floor. What we *can* verify is (a) the
-        // threshold is finite and strictly above the mean, and (b) the
-        // CVaR branch still clamps above `avg + k*std`, which is the
-        // lower-bound contract in the final `.max(...)` on line 1721.
+        // With a degenerate all-equal sample there is no observed heavy tail
+        // to estimate. The detector should fall back to the normal rhythm
+        // threshold instead of fabricating a Pareto tail that would mask a
+        // genuinely silent agent.
         assert!(
             threshold.is_finite(),
-            "CVaR threshold must stay finite with degenerate variance (std={std})"
+            "threshold must stay finite with degenerate variance (std={std})"
         );
         assert!(
             threshold > avg,
-            "zero-variance threshold ({threshold}) must still exceed avg ({avg}) under the tail-risk model"
+            "zero-variance threshold ({threshold}) must still exceed avg ({avg})"
         );
         assert!(
             threshold >= avg + 3.0 * std,
-            "CVaR output must remain at least as conservative as avg + k*std (threshold={threshold}, avg={avg}, std={std})"
+            "threshold must remain at least as conservative as avg + k*std (threshold={threshold}, avg={avg}, std={std})"
         );
 
         // Silence just above the threshold should trigger suspicion — the
@@ -4895,7 +4889,14 @@ impl AtcEngine {
             );
         }
         if next_review <= now_micros {
-            now_micros.saturating_add((self.config.probe_interval_micros / 2).max(250_000))
+            let recheck_delay = if entry.state == LivenessState::Alive
+                && entry.rhythm.is_suspicious(now_micros, threshold_k)
+            {
+                self.config.probe_interval_micros / 4
+            } else {
+                self.config.probe_interval_micros / 2
+            };
+            now_micros.saturating_add(recheck_delay.max(250_000))
         } else {
             next_review
         }

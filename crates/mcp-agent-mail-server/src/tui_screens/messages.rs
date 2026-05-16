@@ -1516,7 +1516,7 @@ impl MessageBrowserScreen {
     ) -> Result<(), String> {
         let conn = Self::open_live_mutation_db_connection(state)?;
         let project_id = if let Some(project_id) = synthetic_project_id(project_slug) {
-            project_id
+            ensure_synthetic_project_row(&conn, project_id, project_slug)?
         } else {
             let project_sql = "SELECT id FROM projects WHERE slug = ? LIMIT 1";
             conn.query_sync(project_sql, &[Value::Text(project_slug.to_string())])
@@ -4053,6 +4053,60 @@ fn project_id_for_slug(conn: &DbConn, slug: &str) -> Option<i64> {
     .and_then(|row| row.get_named::<i64>("id").ok())
 }
 
+fn ensure_synthetic_project_row(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+) -> Result<i64, String> {
+    let now = unix_epoch_micros_now().unwrap_or(0);
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+        &[
+            Value::BigInt(project_id),
+            Value::Text(project_slug.to_string()),
+            Value::Text(project_slug.to_string()),
+            Value::BigInt(now),
+        ],
+    )
+    .map_err(|e| format!("Failed to ensure placeholder project: {e}"))?;
+
+    let existing_slug = conn
+        .query_sync(
+            "SELECT slug FROM projects WHERE id = ? LIMIT 1",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| format!("Failed to verify placeholder project: {e}"))?
+        .into_iter()
+        .next()
+        .and_then(|row| row.get_named::<String>("slug").ok());
+
+    match existing_slug {
+        Some(existing_slug) if existing_slug == project_slug => Ok(project_id),
+        Some(existing_slug) => Err(format!(
+            "Placeholder project id {project_id} belongs to project '{existing_slug}', not '{project_slug}'"
+        )),
+        None => {
+            let existing_id = conn
+                .query_sync(
+                    "SELECT id FROM projects WHERE slug = ? LIMIT 1",
+                    &[Value::Text(project_slug.to_string())],
+                )
+                .map_err(|e| format!("Failed to verify placeholder project: {e}"))?
+                .into_iter()
+                .next()
+                .and_then(|row| row.get_named::<i64>("id").ok());
+            let Some(existing_id) = existing_id else {
+                return Err(format!(
+                    "Failed to ensure placeholder project '{project_slug}' with id {project_id}"
+                ));
+            };
+            Err(format!(
+                "Placeholder project slug '{project_slug}' belongs to project id {existing_id}, not {project_id}"
+            ))
+        }
+    }
+}
+
 fn project_slugs_by_id(
     conn: &DbConn,
     project_ids: &[i64],
@@ -4109,7 +4163,9 @@ fn recipient_names_by_message(
          FROM message_recipients mr \
          LEFT JOIN agents a ON a.id = mr.agent_id \
          WHERE mr.message_id IN ({placeholders}) \
-         ORDER BY mr.message_id ASC, mr.agent_id ASC"
+         ORDER BY mr.message_id ASC, \
+         CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END ASC, \
+         mr.agent_id ASC"
     );
     let params: Vec<Value> = dedup.into_iter().map(Value::BigInt).collect();
     conn.query_sync(&sql, &params)
@@ -6321,8 +6377,12 @@ first body
             ],
         )
         .expect("insert project");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for orphan fixture");
         conn.execute_raw("DELETE FROM projects WHERE id = 77")
             .expect("delete project row");
+        conn.execute_raw("PRAGMA foreign_keys = ON")
+            .expect("restore foreign keys");
         drop(conn);
 
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config {
@@ -6351,6 +6411,63 @@ first body
             .and_then(|row| row.get_named::<i64>("c").ok())
             .unwrap_or_default();
         assert_eq!(sender_count, 1, "compose sender should be created");
+    }
+
+    #[test]
+    fn ensure_compose_sender_rejects_placeholder_project_id_collision() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("compose-placeholder-collision.db");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(77),
+                Value::Text("real-project".to_string()),
+                Value::Text("/real-project".to_string()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert real project");
+        drop(conn);
+
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            ..Default::default()
+        });
+        let screen = MessageBrowserScreen::new();
+
+        let err = screen
+            .ensure_compose_sender("[unknown-project-77]", Some(&state))
+            .expect_err("placeholder id must not attach to the wrong project");
+        assert_eq!(
+            err,
+            "Placeholder project id 77 belongs to project 'real-project', not '[unknown-project-77]'"
+        );
+
+        let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        let sender_count = live_conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM agents WHERE project_id = ? AND name = ?",
+                &[
+                    Value::BigInt(77),
+                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                ],
+            )
+            .expect("count compose sender")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            sender_count, 0,
+            "compose sender should not be created for a mismatched placeholder"
+        );
     }
 
     fn ctrl_key(code: KeyCode) -> Event {
@@ -7871,8 +7988,12 @@ first body
             ],
         )
         .expect("insert agent");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for orphan fixture");
         conn.execute_raw("DELETE FROM projects WHERE id = 77")
             .expect("delete project row");
+        conn.execute_raw("PRAGMA foreign_keys = ON")
+            .expect("restore foreign keys");
 
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
@@ -7958,8 +8079,12 @@ first body
             ],
         )
         .expect("insert agent");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for orphan fixture");
         conn.execute_raw("DELETE FROM projects WHERE id = 77")
             .expect("delete project row");
+        conn.execute_raw("PRAGMA foreign_keys = ON")
+            .expect("restore foreign keys");
 
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn = Some(conn);
@@ -8872,7 +8997,8 @@ first body
         conn.execute_raw(
             "CREATE TABLE message_recipients (
                 message_id INTEGER NOT NULL,
-                agent_id INTEGER NOT NULL
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'to'
             )",
         )
         .expect("create recipients");
@@ -8888,6 +9014,39 @@ first body
         let to_agents = names.get(&10).expect("message recipients");
         assert!(to_agents.contains("BlueLake"));
         assert!(to_agents.contains("[unknown-agent-99]"));
+    }
+
+    #[test]
+    fn recipient_names_by_message_orders_delivery_kinds_semantically() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'to'
+            )",
+        )
+        .expect("create recipients");
+        conn.execute_raw(
+            "INSERT INTO agents (id, name) VALUES
+                (1, 'BccAgent'),
+                (2, 'CcAgent'),
+                (3, 'ToAgent');
+             INSERT INTO message_recipients (message_id, agent_id, kind) VALUES
+                (10, 1, 'bcc'),
+                (10, 2, 'cc'),
+                (10, 3, 'to')",
+        )
+        .expect("seed recipient kinds");
+
+        let names = recipient_names_by_message(&conn, &[10]);
+
+        assert_eq!(
+            names.get(&10).map(String::as_str),
+            Some("ToAgent, CcAgent, BccAgent")
+        );
     }
 
     #[test]

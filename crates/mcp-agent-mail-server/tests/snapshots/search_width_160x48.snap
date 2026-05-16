@@ -1,48 +1,48 @@
-Search across messages, agents, projects... (/ to focus)                                                                                                        
-Route: /search                                                                                                                                                  
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-  Scope                       No results found.                                                              Select a result to view details.                   
-  [Global]                                                                                                                                                      
-  Doc Type                                                                                                                                                      
-  [Messages]                                                                                                                                                    
-  Importance                                                                                                                                                    
-  [Any]                                                                                                                                                         
-  Ack Required                                                                                                                                                  
-  [Any]                                                                                                                                                         
-  Sort Order                                                                                                                                                    
-  [Newest]                                                                                                                                                      
-  Search Field                                                                                                                                                  
-  [Subject+Body]                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-                                                                                                                                                                
-f:facets  L:query lab  mous…                                                                                                                                    
+╭◐ Search Messages (0 results, 0 filters) [Right 40%]──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                                              │
+│  Search across messages, agents, projects... (/ to focus)                                                                                                    │
+│  Route: /search                                                                                                                                              │
+│                                                                                                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭Facets────────────────────╮ ╭Results──────────────────────────────────────────────────────────────────────╮ ╭Detail───────────────────────────────────────────╮
+│                          │ │                                                                             │ │                                                 │
+│   Scope                  │ │    No results found.                                                        │ │                                                 │
+│   [Global]               │ │                                                                             │ │  Select a result to view details.               │
+│   Doc Type               │ │                                                                             │ │                                                 │
+│   [Messages]             │ │                                                                             │ │                                                 │
+│   Search Mode            │ │                                                                             │ │                                                 │
+│   [Auto]                 │ │                                                                             │ │                                                 │
+│   Importance             │ │                                                                             │ │                                                 │
+│   [Any]                  │ │                                                                             │ │                                                 │
+│   Ack Required           │ │                                                                             │ │                                                 │
+│   [Any]                  │ │                                                                             │ │                                                 │
+│   Sort Order             │ │                                                                             │ │                                                 │
+│   [Newest]               │ │                                                                             │ │                                                 │
+│   Search Field           │ │                                                                             │ │                                                 │
+│   [Subject+Body]         │ │                                                                             │ │                                                 │
+│   Explain                │ │                                                                             │ │                                                 │
+│   [Off]                  │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+│ f:facets  L:query lab  … │ │                                                                             │ │                                                 │
+│                          │ │                                                                             │ │                                                 │
+╰──────────────────────────╯ ╰─────────────────────────────────────────────────────────────────────────────╯ ╰─────────────────────────────────────────────────╯

@@ -7745,10 +7745,10 @@ mod tests {
     }
 
     #[test]
-    fn heatmap_provider_all_11_event_kinds_mapped() {
-        // Verify EVENT_KINDS has all 11 variants
-        assert_eq!(EVENT_KINDS.len(), 11);
-        assert_eq!(EVENT_KIND_LABELS.len(), 11);
+    fn heatmap_provider_all_event_kinds_mapped() {
+        // Verify the fixed mapping arrays stay aligned as event kinds are added.
+        assert_eq!(EVENT_KINDS.len(), EVENT_KIND_COUNT);
+        assert_eq!(EVENT_KIND_LABELS.len(), EVENT_KIND_COUNT);
         // Verify each kind maps to a unique index
         for (i, kind) in EVENT_KINDS.iter().enumerate() {
             assert_eq!(

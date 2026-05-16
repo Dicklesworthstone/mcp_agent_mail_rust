@@ -1,24 +1,24 @@
- 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
-                              → Sys • Tool Metrics                              
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
-                                                                                
- Tool Metrics api up:0m00s                                                    ? 
+ 5⌕ Search ╎ 6⚿ Reservations ╎ 7◴ Tool Metrics · 8♥ System Health ╎ 9◷ Timeline 
+╭ Tool Metrics ────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│  0 tools | 0 calls | 0 errors | avg 0ms | 0 CP | Sort: Calls▼ | v=dashboard  │
+│ Tool Name      │Calls │Errors│Err%  │Avg(ms)│CP  │CI(90%) │Trend             │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Tool Metrics mcp up:0m00s                                         LIVE [^P] F1 

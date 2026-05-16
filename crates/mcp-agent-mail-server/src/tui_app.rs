@@ -5885,34 +5885,42 @@ fn query_palette_db_data(
             .filter(|value| !value.is_empty())
     };
 
-    let agent_metadata = conn
-        .query_sync(
-            &format!(
-                "SELECT a.id AS raw_agent_id, a.project_id AS raw_project_id, \
+    let agent_metadata = match conn.query_sync(
+        &format!(
+            "SELECT a.id AS raw_agent_id, a.project_id AS raw_project_id, \
                         a.name, a.model, p.slug AS project_slug \
                  FROM agents a \
                  LEFT JOIN projects p ON p.id = a.project_id \
                  ORDER BY a.last_active_ts DESC \
                  LIMIT {agent_limit}"
-            ),
-            &[],
-        )
-        .map_err(|error| format!("failed to query command palette agent metadata: {error}"))?
-        .into_iter()
-        .map(|row| {
-            let agent_id = row.get_named::<i64>("raw_agent_id").ok().unwrap_or(0);
-            let project_id = row.get_named::<i64>("raw_project_id").ok().unwrap_or(0);
-            (
-                read_trimmed_text(&row, "name").unwrap_or_else(|| unknown_agent_label(agent_id)),
+        ),
+        &[],
+    ) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                let agent_id = row.get_named::<i64>("raw_agent_id").ok().unwrap_or(0);
+                let project_id = row.get_named::<i64>("raw_project_id").ok().unwrap_or(0);
                 (
-                    read_trimmed_text(&row, "model")
-                        .unwrap_or_else(|| "[unknown-model]".to_string()),
-                    read_trimmed_text(&row, "project_slug")
-                        .unwrap_or_else(|| unknown_project_label(project_id)),
-                ),
-            )
-        })
-        .collect();
+                    read_trimmed_text(&row, "name")
+                        .unwrap_or_else(|| unknown_agent_label(agent_id)),
+                    (
+                        read_trimmed_text(&row, "model")
+                            .unwrap_or_else(|| "[unknown-model]".to_string()),
+                        read_trimmed_text(&row, "project_slug")
+                            .unwrap_or_else(|| unknown_project_label(project_id)),
+                    ),
+                )
+            })
+            .collect(),
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "command palette agent metadata query failed; continuing with recent messages only"
+            );
+            HashMap::new()
+        }
+    };
 
     let messages = conn
         .query_sync(
