@@ -326,7 +326,11 @@ mod tests {
         fs::set_permissions(&pre_push, perms).unwrap();
         let findings = detect(&repo);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].entries.len(), 1, "must NOT flag the regular pre-push");
+        assert_eq!(
+            findings[0].entries.len(),
+            1,
+            "must NOT flag the regular pre-push"
+        );
         assert!(findings[0].entries[0].path.ends_with("pre-commit"));
     }
 

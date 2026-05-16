@@ -177,7 +177,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<SchemaVersionMismatchFinding>
     // Pass-35-review Gemini F1 (P1): URI + immutable=1 so the
     // read-only open cannot create -shm on a WAL-mode DB. See the
     // detailed rationale in text_timestamp_contamination.rs.
-    let uri = format!("file:{}?immutable=1", db_path.to_string_lossy());
+    let uri = super::sqlite_immutable_uri(db_path);
     let mut flags = OpenFlags::read_only();
     flags.uri = true;
     let config = SqliteConfig::file(uri).flags(flags);

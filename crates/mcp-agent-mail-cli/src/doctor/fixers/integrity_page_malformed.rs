@@ -158,7 +158,7 @@ pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<IntegrityPageMalformedFinding> {
 fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding> {
     // URI + immutable=1: read-only, no -shm creation, no
     // locking. Matches the pass-35H pattern.
-    let uri = format!("file:{}?immutable=1", db_path.to_string_lossy());
+    let uri = super::sqlite_immutable_uri(db_path);
     let mut flags = OpenFlags::read_only();
     flags.uri = true;
     let config = SqliteConfig::file(uri).flags(flags);

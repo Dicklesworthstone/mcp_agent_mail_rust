@@ -158,7 +158,7 @@ fn detect_one(db_path: &Path) -> Option<OrphanForeignKeyRowsFinding> {
     if !db_path.exists() {
         return None;
     }
-    let uri = format!("file:{}?immutable=1", db_path.to_string_lossy());
+    let uri = super::sqlite_immutable_uri(db_path);
     let mut flags = OpenFlags::read_only();
     flags.uri = true;
     let config = SqliteConfig::file(uri).flags(flags);
@@ -295,6 +295,34 @@ mod tests {
             assert_eq!(r.child_table, "children");
             assert_eq!(r.parent_table, "parents");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_handles_uri_metacharacters_in_db_path() {
+        let td = TempDir::new().unwrap();
+        let weird_dir = td.path().join("agent mail ?#%");
+        std::fs::create_dir(&weird_dir).unwrap();
+        let db = weird_dir.join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id));
+             INSERT INTO parents (id) VALUES (1);
+             INSERT INTO children (id, parent_id) VALUES (10, 1);
+             PRAGMA foreign_keys = OFF;
+             DELETE FROM parents WHERE id = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let findings = detect(std::slice::from_ref(&db));
+        assert_eq!(
+            findings.len(),
+            1,
+            "URI metacharacters in the DB path must not hide FK findings"
+        );
+        assert_eq!(findings[0].total_orphans, 1);
     }
 
     #[test]

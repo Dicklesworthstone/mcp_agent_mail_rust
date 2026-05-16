@@ -155,15 +155,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFin
     // treats the file as truly immutable: no locking, no -shm
     // creation, no journal/WAL replay. This preserves the pure-
     // detector contract.
-    let uri = format!(
-        "file:{}?immutable=1",
-        // URI percent-encoding for path separators isn't needed
-        // on POSIX (path is already a path-shaped string and
-        // `?immutable=1` after the path terminates the path
-        // component). On Windows callers would need `\` → `/`
-        // normalization, but the doctor surface is Unix-targeted.
-        db_path.to_string_lossy(),
-    );
+    let uri = super::sqlite_immutable_uri(db_path);
     let mut flags = OpenFlags::read_only();
     flags.uri = true;
     let config = SqliteConfig::file(uri).flags(flags);

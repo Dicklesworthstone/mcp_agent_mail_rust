@@ -16271,6 +16271,8 @@ fn git_add_and_commit(
     }
 
     let commit_output = mcp_agent_mail_core::git_cmd::GitCmd::new(repo_root)
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .arg("commit")
         .arg("-m")
         .arg(message)
@@ -18271,9 +18273,7 @@ pub(crate) fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Opti
             return Some(timeout);
         }
 
-        if in_mcp_servers_section
-            && let Some(timeout) = extract_inline_table_timeout(line)
-        {
+        if in_mcp_servers_section && let Some(timeout) = extract_inline_table_timeout(line) {
             return Some(timeout);
         }
     }
@@ -18292,7 +18292,8 @@ pub(crate) fn extract_mcp_agent_mail_toml_startup_timeout(content: &str) -> Opti
 /// key forms or the inline table doesn't have the timeout key.
 fn extract_inline_table_timeout(line: &str) -> Option<u64> {
     // Find `key = {`.
-    let key_match = line.strip_prefix("mcp_agent_mail")
+    let key_match = line
+        .strip_prefix("mcp_agent_mail")
         .or_else(|| line.strip_prefix("\"mcp-agent-mail\""))?;
     let rest = key_match.trim_start();
     let after_eq = rest.strip_prefix('=')?.trim_start();
