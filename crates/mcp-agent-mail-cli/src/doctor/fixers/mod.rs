@@ -29,6 +29,7 @@ pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
 pub mod duplicate_canonical_message_ids;
 pub mod empty_or_truncated_db;
+pub mod guard_foreign_runner_overwrite;
 pub mod guard_hooks_path_divergence;
 pub mod guard_plugin_not_executable;
 pub mod inbox_stats_divergence;
@@ -521,6 +522,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_am_git_binary_cache",
         },
         FixerSpec {
+            id: guard_foreign_runner_overwrite::FM_ID,
+            severity: "P0",
+            subsystem: "guard_install",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Foreign hook manager (husky / lefthook / pre-commit-framework) clobbered the agent-mail chain runner at the active pre-commit — guard is COMPLETELY absent from `git commit`; auto-fix via Op::Rename foreign-aside + re-install deferred",
+            source_module: "doctor::fixers::guard_foreign_runner_overwrite",
+        },
+        FixerSpec {
             id: guard_hooks_path_divergence::FM_ID,
             severity: "P1",
             subsystem: "guard_install",
@@ -1002,6 +1012,16 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = committed_env_file_in_repo::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == guard_foreign_runner_overwrite::FM_ID {
+        let findings = guard_foreign_runner_overwrite::detect(&inputs.repo_root);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = guard_foreign_runner_overwrite::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1519,6 +1539,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == committed_env_file_in_repo::FM_ID {
         committed_env_file_in_repo::detect(&inputs.repo_root)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == guard_foreign_runner_overwrite::FM_ID {
+        guard_foreign_runner_overwrite::detect(&inputs.repo_root)
             .iter()
             .map(|f| f.to_finding())
             .collect()
