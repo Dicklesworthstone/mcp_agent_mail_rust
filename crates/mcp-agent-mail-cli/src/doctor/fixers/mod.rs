@@ -20,6 +20,7 @@
 
 pub mod agent_profile_anomalies;
 pub mod am_git_binary_missing;
+pub mod archive_message_dir_structure_anomalies;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
@@ -194,6 +195,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Agent profile dirs are orphaned (parent project missing/unrecognized) OR have missing/unparseable `profile.json` (manual triage)",
             source_module: "doctor::fixers::agent_profile_anomalies",
+        },
+        FixerSpec {
+            id: archive_message_dir_structure_anomalies::FM_ID,
+            severity: "P2",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Archive `messages/YYYY/MM/` tree has invalid date directories OR non-.md files (breaks FTS V3 + archive replay; manual: rename/quarantine)",
+            source_module: "doctor::fixers::archive_message_dir_structure_anomalies",
         },
         FixerSpec {
             id: duplicate_canonical_message_ids::FM_ID,
@@ -722,6 +732,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == archive_message_dir_structure_anomalies::FM_ID {
+        let amds_inputs = archive_message_dir_structure_anomalies::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        let findings = archive_message_dir_structure_anomalies::detect(&amds_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = archive_message_dir_structure_anomalies::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == duplicate_canonical_message_ids::FM_ID {
         let dc_inputs = duplicate_canonical_message_ids::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
@@ -1210,6 +1233,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             report_override: None,
         };
         agent_profile_anomalies::detect(&ap_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == archive_message_dir_structure_anomalies::FM_ID {
+        let amds_inputs = archive_message_dir_structure_anomalies::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        archive_message_dir_structure_anomalies::detect(&amds_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
