@@ -29,6 +29,7 @@ pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
 pub mod duplicate_canonical_message_ids;
 pub mod empty_or_truncated_db;
+pub mod guard_plugin_not_executable;
 pub mod inbox_stats_divergence;
 pub mod integrity_page_malformed;
 pub mod jwt_enabled_without_keys;
@@ -119,6 +120,41 @@ pub(crate) fn expand_db_candidates_with_sidecars(
         }
     }
     out
+}
+
+/// Build a SQLite URI filename for a read-only immutable probe.
+///
+/// SQLite parses `?` and `#` as URI delimiters when `SQLITE_OPEN_URI`
+/// is set, so candidate DB paths must be percent-encoded before
+/// appending `?immutable=1`. Leaving a raw path here causes doctor DB
+/// detectors to silently skip perfectly valid mailbox roots whose path
+/// contains URI metacharacters.
+pub(crate) fn sqlite_immutable_uri(db_path: &std::path::Path) -> String {
+    let mut uri = String::from("file:");
+    for byte in path_bytes_for_sqlite_uri(db_path) {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' | b':' => {
+                uri.push(byte as char)
+            }
+            other => {
+                use std::fmt::Write as _;
+                write!(&mut uri, "%{other:02X}").expect("writing to String cannot fail");
+            }
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
+#[cfg(unix)]
+fn path_bytes_for_sqlite_uri(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes_for_sqlite_uri(path: &std::path::Path) -> Vec<u8> {
+    path.to_string_lossy().replace('\\', "/").into_bytes()
 }
 
 fn pid_probe_result_is_alive(result: Result<(), nix::errno::Errno>) -> bool {
@@ -482,6 +518,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Cached git binary path/SHA drifted from live disk state (binary swapped after cache validation; manual: restart serve or wait 24h TTL)",
             source_module: "doctor::fixers::stale_am_git_binary_cache",
+        },
+        FixerSpec {
+            id: guard_plugin_not_executable::FM_ID,
+            severity: "P1",
+            subsystem: "guard_install",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Pre-commit / pre-push guard hook(s) lack user-exec bit (POSIX): `git commit` silently bypasses the agent-mail guard. Auto-fix via Op::Chmod deferred — `chmod 755 <path>` per entry (manual)",
+            source_module: "doctor::fixers::guard_plugin_not_executable",
         },
         FixerSpec {
             id: codex_startup_timeout::FM_ID,
@@ -947,6 +992,16 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = committed_env_file_in_repo::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == guard_plugin_not_executable::FM_ID {
+        let findings = guard_plugin_not_executable::detect(&inputs.repo_root);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = guard_plugin_not_executable::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1447,6 +1502,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == guard_plugin_not_executable::FM_ID {
+        guard_plugin_not_executable::detect(&inputs.repo_root)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == known_bad_git_no_override::FM_ID {
         let git_inputs = inputs
             .git_detect
@@ -1728,6 +1788,15 @@ pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchE
 mod tests {
     use super::*;
     use nix::errno::Errno;
+
+    #[test]
+    fn sqlite_immutable_uri_escapes_uri_delimiters_in_paths() {
+        let uri = sqlite_immutable_uri(std::path::Path::new("/tmp/agent mail?#%/storage.sqlite3"));
+        assert_eq!(
+            uri,
+            "file:/tmp/agent%20mail%3F%23%25/storage.sqlite3?immutable=1"
+        );
+    }
 
     #[test]
     fn pid_probe_result_treats_permission_denied_as_alive() {
