@@ -21,6 +21,7 @@
 pub mod agent_profile_anomalies;
 pub mod am_git_binary_missing;
 pub mod archive_db_drift_anomalies;
+pub mod archive_identity_artifact_mismatches;
 pub mod archive_message_artifact_anomalies;
 pub mod archive_message_dir_structure_anomalies;
 pub mod codex_startup_timeout;
@@ -206,6 +207,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Archive-vs-DB drift: archive project identities with no DB row, OR archive message-count diverges from DB count (manual: pick authoritative side; reconstruct DB from archive or restore/rebuild archive from backup/DB evidence)",
             source_module: "doctor::fixers::archive_db_drift_anomalies",
+        },
+        FixerSpec {
+            id: archive_identity_artifact_mismatches::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "DB rows for agent profiles / file reservations reference archive artifacts that are missing or disagree with DB fields (pre-commit guard impact; manual: pick authoritative side; reconstruct DB from archive or restore/rebuild artifacts)",
+            source_module: "doctor::fixers::archive_identity_artifact_mismatches",
         },
         FixerSpec {
             id: archive_message_artifact_anomalies::FM_ID,
@@ -773,6 +783,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == archive_identity_artifact_mismatches::FM_ID {
+        let aiam_inputs = archive_identity_artifact_mismatches::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: db_aware_archive_report(inputs),
+        };
+        let findings = archive_identity_artifact_mismatches::detect(&aiam_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = archive_identity_artifact_mismatches::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == archive_message_artifact_anomalies::FM_ID {
         let ama_inputs = archive_message_artifact_anomalies::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
@@ -1296,6 +1319,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             report_override: db_aware_archive_report(inputs),
         };
         archive_db_drift_anomalies::detect(&ad_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == archive_identity_artifact_mismatches::FM_ID {
+        let aiam_inputs = archive_identity_artifact_mismatches::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: db_aware_archive_report(inputs),
+        };
+        archive_identity_artifact_mismatches::detect(&aiam_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
