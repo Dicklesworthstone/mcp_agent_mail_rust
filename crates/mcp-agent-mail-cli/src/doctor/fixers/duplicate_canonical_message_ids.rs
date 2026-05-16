@@ -79,7 +79,7 @@ impl DuplicateCanonicalMessageIdsFinding {
                 "duplicate_file_count": total_dupes,
                 "manual_remediation": {
                     "steps": [
-                        "For each duplicate: `diff <keep_path> <duplicate_paths[i]>` to confirm they're byte-identical (if so, the duplicate is safe to remove).",
+                        "For each duplicate: `diff <keep_path> <duplicate_paths[i]>` to confirm they're byte-identical (if so, the duplicate is safe to quarantine).",
                         "If the duplicates differ in content (e.g., one has updated frontmatter), pick the canonical version per the project's data governance policy — typically the most-recent-mtime copy.",
                         "Move non-canonical copies into a quarantine dir: `mkdir -p .doctor/quarantine/dup-message-ids && mv <duplicate_path> .doctor/quarantine/dup-message-ids/`.",
                         "Re-run `am doctor fix --only fm-archive-state-files-duplicate-canonical-message-ids --list` to confirm the archive is unique.",

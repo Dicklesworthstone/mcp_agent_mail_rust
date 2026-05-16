@@ -9,8 +9,8 @@
 //! symlink. `am doctor explain`, `am doctor health`, and tooling
 //! that wants to read `report.json` from the last invocation
 //! resolve it. If it points at a `runs/<id>` directory that no
-//! longer exists (because the operator manually pruned the dir,
-//! or `am doctor undo` was followed by an `rm -rf .doctor/runs/<id>`),
+//! longer exists (because the operator manually pruned or moved
+//! the run directory after `am doctor undo`),
 //! the symlink dangles. Tools that resolve it get
 //! `ENOENT` and surface confusing "no recent run" errors even
 //! though other runs may exist.
@@ -41,8 +41,9 @@
 //! byte-for-byte — useful for forensics.
 //!
 //! If no run-dir exists → the fixer returns `actions_skipped: 1`.
-//! Operators who want the symlink gone in that case can manually
-//! remove it (the doctor never deletes per AGENTS.md RULE 1).
+//! Operators who want the symlink out of the way in that case can
+//! move it aside for forensics (the doctor never deletes per
+//! AGENTS.md RULE 1).
 //!
 //! Demonstrates the sixth canonical write-shape at FM level:
 //! - Pass 8/9/10: `Op::Rename` (3 FMs)

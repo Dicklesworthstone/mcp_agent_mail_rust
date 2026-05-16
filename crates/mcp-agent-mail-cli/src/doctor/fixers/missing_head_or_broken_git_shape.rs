@@ -290,7 +290,7 @@ mod tests {
         let repo = td.path().join("a");
         let git_dir = repo.join(".git");
         fs::create_dir_all(&git_dir).unwrap();
-        let findings = detect(&[repo.clone()]);
+        let findings = detect(std::slice::from_ref(&repo));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].broken.len(), 1);
         assert!(matches!(

@@ -21,6 +21,7 @@
 pub mod agent_profile_anomalies;
 pub mod am_git_binary_missing;
 pub mod archive_db_drift_anomalies;
+pub mod archive_message_artifact_anomalies;
 pub mod archive_message_dir_structure_anomalies;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
@@ -203,8 +204,17 @@ pub fn registry() -> Vec<FixerSpec> {
             subsystem: "archive_state_files",
             op_pattern: "detect-only",
             auto_fixable: false,
-            one_line_description: "Archive-vs-DB drift: archive project identities with no DB row, OR archive message-count diverges from DB count (manual: pick authoritative side, then `am doctor reconstruct` or `archive-normalize`)",
+            one_line_description: "Archive-vs-DB drift: archive project identities with no DB row, OR archive message-count diverges from DB count (manual: pick authoritative side; reconstruct DB from archive or restore/rebuild archive from backup/DB evidence)",
             source_module: "doctor::fixers::archive_db_drift_anomalies",
+        },
+        FixerSpec {
+            id: archive_message_artifact_anomalies::FM_ID,
+            severity: "P1",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "DB rows reference canonical message files / per-agent mailbox copies that are missing or out of sync on disk (data-loss signal; manual: pick authoritative side; reconstruct DB from archive or restore/rebuild archive artifacts)",
+            source_module: "doctor::fixers::archive_message_artifact_anomalies",
         },
         FixerSpec {
             id: archive_message_dir_structure_anomalies::FM_ID,
@@ -632,6 +642,14 @@ pub struct DispatchInputs {
     pub stale_seconds_override: Option<u64>,
 }
 
+fn db_aware_archive_report(
+    inputs: &DispatchInputs,
+) -> Option<mcp_agent_mail_db::archive_anomaly::ArchiveAnomalyReport> {
+    let storage_root = inputs.storage_root.as_ref()?;
+    let db_path = inputs.db_file_candidates.first()?;
+    Some(mcp_agent_mail_db::archive_anomaly::scan_archive_anomalies_with_db(storage_root, db_path))
+}
+
 /// Outcome of `dispatch_only`: aggregated counts plus serializable
 /// findings (so callers can embed them in `report.json`).
 #[derive(Debug, Default, Serialize)]
@@ -745,13 +763,26 @@ pub fn dispatch_only(
     } else if fm_id == archive_db_drift_anomalies::FM_ID {
         let ad_inputs = archive_db_drift_anomalies::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
-            report_override: None,
+            report_override: db_aware_archive_report(inputs),
         };
         let findings = archive_db_drift_anomalies::detect(&ad_inputs);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = archive_db_drift_anomalies::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == archive_message_artifact_anomalies::FM_ID {
+        let ama_inputs = archive_message_artifact_anomalies::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: db_aware_archive_report(inputs),
+        };
+        let findings = archive_message_artifact_anomalies::detect(&ama_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = archive_message_artifact_anomalies::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1262,9 +1293,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
     } else if fm_id == archive_db_drift_anomalies::FM_ID {
         let ad_inputs = archive_db_drift_anomalies::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
-            report_override: None,
+            report_override: db_aware_archive_report(inputs),
         };
         archive_db_drift_anomalies::detect(&ad_inputs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == archive_message_artifact_anomalies::FM_ID {
+        let ama_inputs = archive_message_artifact_anomalies::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: db_aware_archive_report(inputs),
+        };
+        archive_message_artifact_anomalies::detect(&ama_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()

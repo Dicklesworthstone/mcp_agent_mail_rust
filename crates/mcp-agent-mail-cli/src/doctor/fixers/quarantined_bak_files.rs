@@ -41,8 +41,9 @@
 //! **Detect-only first cut.** The repair_spec calls for
 //! Op::Rename to a 0o700 quarantine dir; that's substantial
 //! additional plumbing. For now, manual remediation walks the
-//! operator through `chmod 0o600 <file>` (defense-in-depth) or
-//! `rm <file>` after rotating the token.
+//! operator through `chmod 600 <file>` (defense-in-depth) or
+//! moving the backup into a private quarantine after rotating the
+//! token.
 
 #![forbid(unsafe_code)]
 
@@ -130,8 +131,8 @@ impl QuarantinedBakFinding {
                 "matched_pattern": self.matched_pattern,
                 "manual_remediation": {
                     "steps": [
-                        "If the token was rotated since this backup was written, delete it: `shred -u <path>` or `rm <path>` after confirming.",
-                        "If you may need the backup later, chmod it to 0o600 first: `chmod 0o600 <path>`.",
+                        "If the token was rotated since this backup was written, move it into a private quarantine: `mkdir -p .doctor/quarantine/mcp-config-bak && chmod 700 .doctor/quarantine/mcp-config-bak && mv <path> .doctor/quarantine/mcp-config-bak/`.",
+                        "If you may need the backup later, chmod it to owner-only first: `chmod 600 <path>`.",
                         "Auto-fix via Op::Rename-to-quarantine is intentionally deferred in this first cut.",
                     ],
                 },

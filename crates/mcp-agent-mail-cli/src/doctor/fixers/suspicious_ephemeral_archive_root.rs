@@ -73,7 +73,7 @@ impl SuspiciousEphemeralFinding {
                 "ephemerals": self.entries,
                 "manual_remediation": {
                     "steps": [
-                        "Inspect the listed project_dirs. If they are genuinely ephemeral / leftover from test runs, remove them from the archive via `am doctor archive-normalize --dry-run` (preview) then `am doctor archive-normalize --yes`.",
+                        "Inspect the listed project_dirs. If they are genuinely ephemeral / leftover from test runs, quarantine them via `am doctor archive-normalize --dry-run` (preview) then `am doctor archive-normalize --yes`.",
                         "To prevent future occurrences, set `STORAGE_ROOT` to an isolated path for tests / one-shot scripts (avoids polluting the global mailbox).",
                         "If `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE=true` is intentionally set, this FM can be safely ignored.",
                     ],

@@ -31,7 +31,8 @@
 //! 2. If the symlink target is the canonical source, replace the
 //!    symlink with a copy of the target.
 //! 3. If the symlink is unintentional (attacker insertion,
-//!    bad migration), remove it after backing up.
+//!    bad migration), move it to quarantine after preserving
+//!    any target bytes that matter.
 //! 4. Re-run the detector to confirm the archive is clean.
 
 #![forbid(unsafe_code)]
@@ -76,11 +77,11 @@ impl UnexpectedSymlinkFinding {
                 "manual_remediation": {
                     "steps": [
                         "For each path: `ls -la <path>` to inspect the symlink + target.",
-                        "If the target is the canonical source the archive should point at: `rm <path>` then `cp <target> <path>` to convert to a regular file.",
-                        "If the symlink is unintentional (post-migration artifact, attacker insertion): back up the target file content first, then `rm <path>`.",
+                        "If the target is the canonical source the archive should point at: move the symlink into `.doctor/quarantine/archive-symlinks/`, then `cp <target> <path>` to recreate the archive entry as a regular file.",
+                        "If the symlink is unintentional (post-migration artifact, attacker insertion): preserve any target bytes that matter, then move the symlink into `.doctor/quarantine/archive-symlinks/`.",
                         "Re-run `am doctor fix --only fm-archive-state-files-unexpected-symlink-in-archive --list` to confirm the archive is clean.",
                     ],
-                    "warning": "Symlinks in the archive can be a SECURITY signal (attacker aliasing archive files at sensitive system paths). Investigate any target outside `<storage_root>` carefully BEFORE removing the symlink.",
+                    "warning": "Symlinks in the archive can be a SECURITY signal (attacker aliasing archive files at sensitive system paths). Investigate any target outside `<storage_root>` carefully BEFORE quarantining the symlink.",
                     "note": "Auto-fix is intentionally not implemented — symlink semantics require operator judgment.",
                 },
             }),

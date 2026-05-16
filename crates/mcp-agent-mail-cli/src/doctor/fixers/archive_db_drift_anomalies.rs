@@ -24,16 +24,22 @@
 //!
 //! These two variants are bundled into ONE FM because the
 //! remediation playbook is identical: inspect the divergence,
-//! decide which side is the source of truth, then reconcile via
-//! `am doctor reconstruct` (DB-from-archive) or `am doctor
-//! archive-normalize` (archive-from-DB).
+//! decide which side is the source of truth, then use the supported
+//! recovery path for that direction. `am doctor reconstruct` rebuilds
+//! SQLite from the archive. There is intentionally no broad
+//! archive-from-DB rewrite command; when the DB is authoritative, preserve
+//! the DB and restore or manually rebuild the affected archive artifacts.
 //!
 //! ## Detection
 //!
-//! Wraps `mcp_agent_mail_db::archive_anomaly::scan_archive_anomalies(...)`
-//! and filters for `ArchiveAnomalyKind::ArchiveDbProjectMismatch`
-//! and `ArchiveAnomalyKind::ArchiveDbCountDrift`. Mirrors the
-//! FM7/FM12 anomaly-wrapper pattern.
+//! Filters an `ArchiveAnomalyReport` for
+//! `ArchiveAnomalyKind::ArchiveDbProjectMismatch` and
+//! `ArchiveAnomalyKind::ArchiveDbCountDrift`. In the normal doctor
+//! dispatcher this report is produced by
+//! `scan_archive_anomalies_with_db(storage_root, db_path)` so the DB-aware
+//! variants can actually be observed. Direct detector calls with only a
+//! storage root fall back to archive-only scanning and therefore won't emit
+//! this FM.
 //!
 //! ## Fix
 //!
@@ -45,10 +51,13 @@
 //! 1. Run `am doctor archive-scan --json` to dump the full archive
 //!    state.
 //! 2. Decide which side is authoritative.
-//! 3. If DB is authoritative: `am doctor archive-normalize` to
-//!    rewrite the archive from DB state.
-//! 4. If archive is authoritative: `am doctor reconstruct` to
-//!    rebuild the DB from archive state.
+//! 3. If archive is authoritative: `am doctor reconstruct --dry-run --json`
+//!    to preview, then `am doctor reconstruct --yes` after preserving
+//!    forensics/backups.
+//! 4. If DB is authoritative: preserve the DB, restore the archive from a
+//!    known-good backup, or manually rebuild the affected archive artifacts.
+//!    `am doctor archive-normalize --dry-run` only handles safe archive
+//!    hygiene such as project metadata and duplicate canonical files.
 //! 5. Re-run this detector to confirm zero residual drift.
 
 #![forbid(unsafe_code)]
@@ -109,8 +118,9 @@ impl ArchiveDbDriftFinding {
                     "steps": [
                         "Run `am doctor archive-scan --json` to dump full archive state.",
                         "Decide which side is authoritative: is the DB the source of truth, or the on-disk archive?",
-                        "If DB is authoritative: `am doctor archive-normalize` rewrites the archive from DB state.",
-                        "If archive is authoritative: `am doctor reconstruct` rebuilds the DB from archive state.",
+                        "If archive is authoritative: run `am doctor reconstruct --dry-run --json` to preview the DB rebuild, then `am doctor reconstruct --yes` after preserving forensics/backups.",
+                        "If DB is authoritative: preserve the DB and restore the archive from a known-good backup or manually rebuild the affected archive artifacts; there is no broad archive-from-DB rewrite command.",
+                        "`am doctor archive-normalize --dry-run` is only for safe archive hygiene such as project metadata and duplicate canonical files; it is not a DB-to-archive reconciliation tool.",
                         "Re-run `am doctor fix --only fm-archive-state-files-archive-db-drift-anomalies --list` to confirm zero residual drift.",
                     ],
                     "warning": "Auto-fix is intentionally NOT implemented — picking the wrong authoritative side silently destroys data. The doctor requires operator judgment for this class.",
@@ -396,8 +406,9 @@ mod tests {
         assert!(s.contains("warning"));
         assert!(s.contains("common_causes"));
         assert!(s.contains("\"auto_fixable\":false"));
-        assert!(s.contains("am doctor archive-normalize"));
+        assert!(s.contains("am doctor archive-normalize --dry-run"));
         assert!(s.contains("am doctor reconstruct"));
+        assert!(!s.contains("rewrites the archive from DB state"));
     }
 
     #[test]
