@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "asupersync-macros",
  "base64 0.22.1",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "clap",
  "criterion",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4245,6 +4245,7 @@ dependencies = [
  "sha2 0.11.0",
  "similar 3.1.0",
  "sqlmodel-core",
+ "sqlmodel-sqlite",
  "tempfile",
  "thiserror",
  "tracing",
@@ -4257,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4282,7 +4283,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "chrono",
  "criterion",
@@ -4299,6 +4300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.11.0",
+ "sha2 0.11.0",
  "shellexpand",
  "shlex",
  "tempfile",
@@ -4308,7 +4310,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4349,7 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "chrono",
  "git2",
@@ -4365,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "chrono",
  "criterion",
@@ -4394,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4439,7 +4441,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4460,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4488,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "git2",
  "tempfile",
@@ -4497,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.53"
+version = "0.2.54"
 dependencies = [
  "arbitrary",
  "asupersync",
