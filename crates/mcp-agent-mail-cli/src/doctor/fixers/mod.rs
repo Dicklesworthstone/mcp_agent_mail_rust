@@ -22,6 +22,7 @@ pub mod am_git_binary_missing;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
 pub mod dangling_doctor_latest;
+pub mod duplicate_canonical_message_ids;
 pub mod empty_or_truncated_db;
 pub mod inbox_stats_divergence;
 pub mod integrity_page_malformed;
@@ -183,6 +184,15 @@ pub struct FixerSpec {
 ///    automatically.)
 pub fn registry() -> Vec<FixerSpec> {
     vec![
+        FixerSpec {
+            id: duplicate_canonical_message_ids::FM_ID,
+            severity: "P0",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Two or more archive .md files resolve to the same positive message_id — breaks thread reconstruction + ack accounting (manual triage + quarantine)",
+            source_module: "doctor::fixers::duplicate_canonical_message_ids",
+        },
         FixerSpec {
             id: missing_gitignore_entry::FM_ID,
             severity: "P2",
@@ -679,6 +689,19 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == duplicate_canonical_message_ids::FM_ID {
+        let dc_inputs = duplicate_canonical_message_ids::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        let findings = duplicate_canonical_message_ids::detect(&dc_inputs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = duplicate_canonical_message_ids::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == missing_or_malformed_project_json::FM_ID {
         // Same storage_root threading as FM5; reuses
         // scan_archive_anomalies via a different anomaly filter.
@@ -1132,6 +1155,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == missing_head_or_broken_git_shape::FM_ID {
         missing_head_or_broken_git_shape::detect(&inputs.archive_roots)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == duplicate_canonical_message_ids::FM_ID {
+        let dc_inputs = duplicate_canonical_message_ids::DetectInputs {
+            storage_root_override: inputs.storage_root.clone(),
+            report_override: None,
+        };
+        duplicate_canonical_message_ids::detect(&dc_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
