@@ -39,6 +39,7 @@ pub mod malformed_message_frontmatter;
 pub mod missing_gitignore_entry;
 pub mod missing_head_or_broken_git_shape;
 pub mod missing_or_malformed_project_json;
+pub mod orphan_foreign_key_rows;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
@@ -351,6 +352,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "storage.sqlite3 retains legacy FTS5 tables/triggers/views after Search V3 migration (manual DROP sequence; auto-fix deferred)",
             source_module: "doctor::fixers::legacy_fts_residue",
+        },
+        FixerSpec {
+            id: orphan_foreign_key_rows::FM_ID,
+            severity: "P1",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "PRAGMA foreign_key_check reports orphan child rows (FK references a deleted parent; auto-fix via Op::DbExec quarantine deferred — recovery via `am doctor reconstruct`)",
+            source_module: "doctor::fixers::orphan_foreign_key_rows",
         },
         FixerSpec {
             id: retained_autocommit_leak::FM_ID,
@@ -1082,6 +1092,16 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == orphan_foreign_key_rows::FM_ID {
+        let findings = orphan_foreign_key_rows::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = orphan_foreign_key_rows::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == retained_autocommit_leak::FM_ID {
         // Inspects mcp_agent_mail_db::schema constants; no
         // DispatchInputs field needed for production.
@@ -1500,6 +1520,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == legacy_fts_residue::FM_ID {
         legacy_fts_residue::detect(&inputs.db_file_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == orphan_foreign_key_rows::FM_ID {
+        orphan_foreign_key_rows::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()
