@@ -119,14 +119,11 @@ fn scan_messages_dir_max_id(dir: &Path) -> Option<i64> {
 
 fn extract_message_id_from_frontmatter(path: &Path) -> Option<i64> {
     let content = std::fs::read_to_string(path).ok()?;
-    // Frontmatter is fenced by ```json ... ``` at the start of the file
-    // (same convention archive_anomaly::extract_json_frontmatter uses).
-    // We only need the leading JSON object, not the body, so cap the read
-    // window at the first closing fence.
-    let trimmed = content.trim_start();
-    let after_open = trimmed.strip_prefix("```json")?;
-    let json_end = after_open.find("```")?;
-    let json_body = after_open.get(..json_end)?.trim();
+    // The canonical archive frontmatter format is `---json\n{...}\n---\n`
+    // (NOT a markdown ```json``` fence). Reuse the same extractor the
+    // archive_anomaly walker uses so the two scanners always agree on
+    // which files are "in the archive" and what id they carry.
+    let json_body = crate::archive_anomaly::extract_json_frontmatter(&content)?.trim();
     let parsed: serde_json::Value = serde_json::from_str(json_body).ok()?;
     parsed
         .get("id")
@@ -230,8 +227,10 @@ mod tests {
             .join(year)
             .join(month);
         fs::create_dir_all(&dir).unwrap();
+        // Use the canonical archive frontmatter format (---json ... ---),
+        // matching what archive_anomaly and reconstruct read.
         let body =
-            format!("```json\n{{\"id\": {id}, \"subject\": \"x\"}}\n```\n\n# subject\n\nbody");
+            format!("---json\n{{\"id\": {id}, \"subject\": \"x\"}}\n---\n\n# subject\n\nbody");
         fs::write(dir.join(filename), body).unwrap();
     }
 
@@ -264,19 +263,21 @@ mod tests {
             .join("messages")
             .join("notayear");
         fs::create_dir_all(&bogus).unwrap();
-        fs::write(bogus.join("01__99.md"), "```json\n{\"id\":99}\n```\n").unwrap();
+        fs::write(bogus.join("01__99.md"), "---json\n{\"id\":99}\n---\n").unwrap();
         // The malformed year dir should be skipped — nothing else is in the
         // archive — so the scanner returns None.
         assert_eq!(max_message_id_in_archive(root), None);
     }
 
     #[test]
-    fn max_message_id_in_archive_ignores_json_code_block_outside_frontmatter() {
+    fn max_message_id_in_archive_ignores_files_without_canonical_frontmatter() {
         let dir = tempdir().unwrap();
         let path = dir
             .path()
             .join("projects/proj/messages/2026/05/body-only.md");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Body has a JSON-shaped code block but it isn't the canonical
+        // `---json ... ---` frontmatter, so the parser must not pick it up.
         fs::write(
             &path,
             "# subject\n\n```json\n{\"id\": 999, \"subject\": \"not frontmatter\"}\n```\n",

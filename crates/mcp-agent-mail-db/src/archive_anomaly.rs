@@ -901,7 +901,7 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// Extract the JSON frontmatter text from a `---json\n...\n---` block.
-fn extract_json_frontmatter(content: &str) -> Option<&str> {
+pub(crate) fn extract_json_frontmatter(content: &str) -> Option<&str> {
     let start = content.find("---json")?;
     let after_start = &content[start..];
     let json_start = if after_start.starts_with("---json\r\n") {
