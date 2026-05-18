@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    OnceLock,
-    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+    atomic::{AtomicI32, AtomicU64, Ordering},
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -31979,6 +31979,36 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn am_run_artifact_child_has_dedicated_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact_dir = temp.path().join("artifacts");
+        let command_words = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "pid=$$; pgid=$(ps -o pgid= -p \"$pid\" | tr -d ' '); printf '%s %s\\n' \"$pid\" \"$pgid\""
+                .to_string(),
+        ];
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &command_words[2]]);
+
+        let code = run_child_with_artifacts(
+            &mut cmd,
+            &command_words,
+            "verify-process-group",
+            &artifact_dir,
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+        let stdout = std::fs::read_to_string(artifact_dir.join("stdout.log")).unwrap();
+        let mut parts = stdout.split_whitespace();
+        let pid = parts.next().expect("pid");
+        let pgid = parts.next().expect("pgid");
+        assert_eq!(pid, pgid, "child must be the root of its own process group");
+    }
+
     #[test]
     fn clap_rejects_am_run_shared_exclusive_conflict() {
         let err = Cli::try_parse_from([
@@ -52867,6 +52897,185 @@ fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     )
 }
 
+#[derive(Debug)]
+struct ChildCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    termination_signal: Option<i32>,
+}
+
+#[derive(Debug)]
+struct ChildCommandStatus {
+    status: std::process::ExitStatus,
+    termination_signal: Option<i32>,
+}
+
+impl ChildCommandStatus {
+    fn exit_code(&self) -> i32 {
+        self.termination_signal
+            .map_or_else(|| self.status.code().unwrap_or(1), |signal| 128 + signal)
+    }
+}
+
+impl ChildCommandOutput {
+    fn exit_code(&self) -> i32 {
+        ChildCommandStatus {
+            status: self.status,
+            termination_signal: self.termination_signal,
+        }
+        .exit_code()
+    }
+}
+
+#[cfg(unix)]
+struct ChildSignalReaper {
+    received_signal: Arc<AtomicI32>,
+    signal_handle: signal_hook::iterator::Handle,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl ChildSignalReaper {
+    fn spawn(child_pid: u32) -> std::io::Result<Self> {
+        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
+
+        let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
+        let signal_handle = signals.handle();
+        let received_signal = Arc::new(AtomicI32::new(0));
+        let thread_received = Arc::clone(&received_signal);
+
+        let thread = std::thread::spawn(move || {
+            for signal in signals.forever() {
+                thread_received.store(signal, Ordering::SeqCst);
+                terminate_child_process_group(child_pid, signal);
+            }
+        });
+
+        Ok(Self {
+            received_signal,
+            signal_handle,
+            thread: Some(thread),
+        })
+    }
+
+    fn received_signal(&self) -> Option<i32> {
+        match self.received_signal.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildSignalReaper {
+    fn drop(&mut self) {
+        self.signal_handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_child_process_group(child_pid: u32, signal: i32) {
+    let Ok(raw_pid) = i32::try_from(child_pid) else {
+        return;
+    };
+    let Ok(signal) = nix::sys::signal::Signal::try_from(signal) else {
+        return;
+    };
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw_pid), signal);
+}
+
+#[cfg(unix)]
+fn run_child_command_guarded(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<ChildCommandOutput> {
+    use std::os::unix::process::CommandExt;
+
+    // Put the command root in its own process group so Ctrl-C/SIGTERM can
+    // terminate cargo plus the test binaries it spawned, not just the shell.
+    cmd.process_group(0);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let reaper = match ChildSignalReaper::spawn(child.id()) {
+        Ok(reaper) => reaper,
+        Err(error) => {
+            use signal_hook::consts::signal::SIGTERM;
+
+            terminate_child_process_group(child.id(), SIGTERM);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let output = child.wait_with_output()?;
+    let termination_signal = reaper.received_signal();
+    drop(reaper);
+
+    Ok(ChildCommandOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        termination_signal,
+    })
+}
+
+#[cfg(unix)]
+fn run_child_status_guarded(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<ChildCommandStatus> {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+    let reaper = match ChildSignalReaper::spawn(child.id()) {
+        Ok(reaper) => reaper,
+        Err(error) => {
+            use signal_hook::consts::signal::SIGTERM;
+
+            terminate_child_process_group(child.id(), SIGTERM);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let status = child.wait()?;
+    let termination_signal = reaper.received_signal();
+    drop(reaper);
+
+    Ok(ChildCommandStatus {
+        status,
+        termination_signal,
+    })
+}
+
+#[cfg(not(unix))]
+fn run_child_command_guarded(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<ChildCommandOutput> {
+    let output = cmd.output()?;
+    Ok(ChildCommandOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        termination_signal: None,
+    })
+}
+
+#[cfg(not(unix))]
+fn run_child_status_guarded(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<ChildCommandStatus> {
+    let status = cmd.status()?;
+    Ok(ChildCommandStatus {
+        status,
+        termination_signal: None,
+    })
+}
+
 fn run_child_with_artifacts(
     cmd: &mut std::process::Command,
     command_words: &[String],
@@ -52890,7 +53099,7 @@ fn run_child_with_artifacts(
         .map_err(|e| CliError::Format(e.to_string()))?,
     )?;
 
-    let output = match cmd.output() {
+    let output = match run_child_command_guarded(cmd) {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::write(artifact_dir.join("spawn_error.txt"), error.to_string())?;
@@ -52912,7 +53121,7 @@ fn run_child_with_artifacts(
     stdout.write_all(&output.stdout)?;
     stderr.write_all(&output.stderr)?;
 
-    let child_exit_code = output.status.code().unwrap_or(1);
+    let child_exit_code = output.exit_code();
     let rch_proof = classify_rch_remote_proof(command_words, &output.stdout, &output.stderr);
     let proof_exit_code = rch_proof.adjusted_exit_code(child_exit_code);
     let mut context_artifacts = serde_json::Map::new();
@@ -52951,6 +53160,7 @@ fn run_child_with_artifacts(
             "completed_at": Utc::now().to_rfc3339(),
             "exit_code": proof_exit_code,
             "child_exit_code": child_exit_code,
+            "termination_signal": output.termination_signal,
             "rch_proof": rch_proof_json,
             "stdout_log": "stdout.log",
             "stderr_log": "stderr.log",
@@ -53439,9 +53649,8 @@ fn handle_am_run_with(
         if let Some(artifact_dir) = args.artifact_dir.as_ref() {
             run_child_with_artifacts(&mut cmd, &args.cmd, &args.slot, artifact_dir)?
         } else {
-            let status = cmd.status();
-            match status {
-                Ok(s) => s.code().unwrap_or(1),
+            match run_child_status_guarded(&mut cmd) {
+                Ok(status) => status.exit_code(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 127,
                 Err(_) => 1,
             }

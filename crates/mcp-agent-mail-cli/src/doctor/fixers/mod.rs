@@ -22,6 +22,7 @@ pub mod agent_profile_anomalies;
 pub mod am_git_binary_missing;
 pub mod archive_db_drift_anomalies;
 pub mod archive_identity_artifact_mismatches;
+pub mod archive_loose_object_bloat;
 pub mod archive_message_artifact_anomalies;
 pub mod archive_message_dir_structure_anomalies;
 pub mod codex_startup_timeout;
@@ -34,6 +35,7 @@ pub mod guard_foreign_runner_overwrite;
 pub mod guard_hooks_path_divergence;
 pub mod guard_plugin_not_executable;
 pub mod guard_plugin_symlink_replacement;
+pub mod identity_build_slot_lease_expired;
 pub mod inbox_stats_divergence;
 pub mod integrity_page_malformed;
 pub mod jwt_enabled_without_keys;
@@ -41,6 +43,7 @@ pub mod known_bad_git_no_override;
 pub mod legacy_fts_residue;
 pub mod login_shell_path_leak;
 pub mod malformed_message_frontmatter;
+pub mod mcp_duplicate_aliased_server_entries;
 pub mod missing_gitignore_entry;
 pub mod missing_head_or_broken_git_shape;
 pub mod missing_or_malformed_project_json;
@@ -49,7 +52,11 @@ pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
 pub mod retained_autocommit_leak;
+pub mod runtime_pid_hint_symlink_toctou;
 pub mod schema_version_mismatch;
+pub mod share_half_finished_bundle;
+pub mod share_scrub_manifest_mismatch;
+pub mod share_verify_live_failed_deploy;
 pub mod sqlite_sidecar_symlink;
 pub mod stale_am_git_binary_cache;
 pub mod stale_archive_lock;
@@ -227,8 +234,9 @@ pub struct FixerSpec {
 /// fixers in this build. Pass-14 baseline. Adding a new fixer means:
 /// 1. Add its module to `pub mod` declarations above
 /// 2. Add an entry here
-/// 3. (No other wiring needed — `am doctor fixers` picks it up
-///    automatically.)
+/// 3. Add matching `dispatch_only` and `detect_only` branches below so
+///    `am doctor fix --only <fm-id>` and `am doctor fix --list` can
+///    actually run the detector.
 pub fn registry() -> Vec<FixerSpec> {
     vec![
         FixerSpec {
@@ -284,6 +292,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Two or more archive .md files resolve to the same positive message_id — breaks thread reconstruction + ack accounting (manual triage + quarantine)",
             source_module: "doctor::fixers::duplicate_canonical_message_ids",
+        },
+        FixerSpec {
+            id: archive_loose_object_bloat::FM_ID,
+            severity: "P3",
+            subsystem: "archive_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Per-project git archives have excessive loose objects or no pack files (performance/inode pressure; manual: run `am doctor pack-archive`)",
+            source_module: "doctor::fixers::archive_loose_object_bloat",
         },
         FixerSpec {
             id: malformed_message_frontmatter::FM_ID,
@@ -569,6 +586,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::guard_plugin_symlink_replacement",
         },
         FixerSpec {
+            id: identity_build_slot_lease_expired::FM_ID,
+            severity: "P2",
+            subsystem: "identity_contacts_state",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Build-slot lease JSON files are expired but unreleased, leaving ghost occupied slots (manual: confirm dead holder and reclaim through build-slot APIs)",
+            source_module: "doctor::fixers::identity_build_slot_lease_expired",
+        },
+        FixerSpec {
             id: codex_startup_timeout::FM_ID,
             severity: "P1",
             subsystem: "mcp_config_files",
@@ -576,6 +602,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "Codex config.toml missing or too-short startup_timeout_sec (boot races mcp-agent-mail cold start)",
             source_module: "doctor::fixers::codex_startup_timeout",
+        },
+        FixerSpec {
+            id: mcp_duplicate_aliased_server_entries::FM_ID,
+            severity: "P2",
+            subsystem: "mcp_config_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "JSON/JSONC MCP config files contain more than one agent-mail server entry across supported container/alias keys (manual: coalesce to mcpServers.mcp-agent-mail)",
+            source_module: "doctor::fixers::mcp_duplicate_aliased_server_entries",
         },
         FixerSpec {
             id: quarantined_bak_files::FM_ID,
@@ -612,6 +647,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "MCP client JSON config has wrong mcp-agent-mail URL (port/host/scheme/path)",
             source_module: "doctor::fixers::wrong_mcp_url_json",
+        },
+        FixerSpec {
+            id: runtime_pid_hint_symlink_toctou::FM_ID,
+            severity: "P1",
+            subsystem: "runtime_processes",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "listener.pid or its parent directory shape exposes symlink/permission TOCTOU signals (manual security triage)",
+            source_module: "doctor::fixers::runtime_pid_hint_symlink_toctou",
         },
         FixerSpec {
             id: port_bound_by_foreign_process::FM_ID,
@@ -667,13 +711,40 @@ pub fn registry() -> Vec<FixerSpec> {
             one_line_description: "Token-bearing .bak/.tmp/.orig backup with world/group-readable mode (target 0o600)",
             source_module: "doctor::fixers::world_readable_token_bak",
         },
+        FixerSpec {
+            id: share_half_finished_bundle::FM_ID,
+            severity: "P1",
+            subsystem: "share_export_state",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Share-export temp dirs or partial bundles remain after a crash (manual: inspect and move aside; auto-quarantine deferred)",
+            source_module: "doctor::fixers::share_half_finished_bundle",
+        },
+        FixerSpec {
+            id: share_scrub_manifest_mismatch::FM_ID,
+            severity: "P1",
+            subsystem: "share_export_state",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Published share bundle manifest attachment counts disagree with on-disk attachments (manual: re-export, do not patch counts in place)",
+            source_module: "doctor::fixers::share_scrub_manifest_mismatch",
+        },
+        FixerSpec {
+            id: share_verify_live_failed_deploy::FM_ID,
+            severity: "P2",
+            subsystem: "share_export_state",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Share bundle has stale verify-live failure report (manual: re-run verify-live and redeploy or roll back remote target)",
+            source_module: "doctor::fixers::share_verify_live_failed_deploy",
+        },
     ]
 }
 
 /// Inputs to `dispatch_only`. Each FM module pulls only the fields it
 /// needs — `dispatch_only` is a `match` on FM id, not a trait, because
-/// the six concrete fixers have heterogeneous input shapes and a
-/// premature trait would just bury the differences.
+/// the concrete fixers have heterogeneous input shapes and a premature
+/// trait would just bury the differences.
 #[derive(Debug, Clone)]
 pub struct DispatchInputs {
     /// Repository root (used as a default scope-anchor and for default
@@ -930,6 +1001,16 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == archive_loose_object_bloat::FM_ID {
+        let findings =
+            archive_loose_object_bloat::detect(&inputs.archive_roots, &Default::default());
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = archive_loose_object_bloat::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == malformed_message_frontmatter::FM_ID {
         let mf_inputs = malformed_message_frontmatter::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
@@ -1082,6 +1163,18 @@ pub fn dispatch_only(
             outcome.findings.push(f.to_finding());
             // Detect-only — fix is a no-op.
             let result = guard_plugin_symlink_replacement::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == identity_build_slot_lease_expired::FM_ID {
+        let findings = identity_build_slot_lease_expired::detect(
+            inputs.storage_root.as_deref(),
+            &Default::default(),
+        );
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = identity_build_slot_lease_expired::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1263,6 +1356,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == mcp_duplicate_aliased_server_entries::FM_ID {
+        let findings = mcp_duplicate_aliased_server_entries::detect(&inputs.mcp_config_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = mcp_duplicate_aliased_server_entries::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == quarantined_bak_files::FM_ID {
         // Enumerates MCP config dirs via the same default
         // helper; no DispatchInputs field needed for production.
@@ -1360,6 +1462,15 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == runtime_pid_hint_symlink_toctou::FM_ID {
+        let findings = runtime_pid_hint_symlink_toctou::detect(&inputs.pid_hint_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = runtime_pid_hint_symlink_toctou::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == stale_bearer_token_skew::FM_ID {
         let canonical =
             inputs
@@ -1390,6 +1501,35 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = missing_gitignore_entry::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == share_half_finished_bundle::FM_ID {
+        let findings =
+            share_half_finished_bundle::detect(Some(&inputs.repo_root), &Default::default());
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = share_half_finished_bundle::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == share_scrub_manifest_mismatch::FM_ID {
+        let findings = share_scrub_manifest_mismatch::detect(Some(&inputs.repo_root));
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = share_scrub_manifest_mismatch::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == share_verify_live_failed_deploy::FM_ID {
+        let findings =
+            share_verify_live_failed_deploy::detect(Some(&inputs.repo_root), &Default::default());
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = share_verify_live_failed_deploy::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1513,6 +1653,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == archive_loose_object_bloat::FM_ID {
+        archive_loose_object_bloat::detect(&inputs.archive_roots, &Default::default())
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == malformed_message_frontmatter::FM_ID {
         let mf_inputs = malformed_message_frontmatter::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
@@ -1607,6 +1752,14 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == identity_build_slot_lease_expired::FM_ID {
+        identity_build_slot_lease_expired::detect(
+            inputs.storage_root.as_deref(),
+            &Default::default(),
+        )
+        .iter()
+        .map(|f| f.to_finding())
+        .collect()
     } else if fm_id == known_bad_git_no_override::FM_ID {
         let git_inputs = inputs
             .git_detect
@@ -1699,6 +1852,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == mcp_duplicate_aliased_server_entries::FM_ID {
+        mcp_duplicate_aliased_server_entries::detect(&inputs.mcp_config_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == quarantined_bak_files::FM_ID {
         quarantined_bak_files::detect(&quarantined_bak_files::DetectInputs::default())
             .iter()
@@ -1760,6 +1918,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == runtime_pid_hint_symlink_toctou::FM_ID {
+        runtime_pid_hint_symlink_toctou::detect(&inputs.pid_hint_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == stale_bearer_token_skew::FM_ID {
         let canonical =
             inputs
@@ -1782,6 +1945,21 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
                 field: "gitignore_target",
             })?;
         missing_gitignore_entry::detect(gitignore)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == share_half_finished_bundle::FM_ID {
+        share_half_finished_bundle::detect(Some(&inputs.repo_root), &Default::default())
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == share_scrub_manifest_mismatch::FM_ID {
+        share_scrub_manifest_mismatch::detect(Some(&inputs.repo_root))
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == share_verify_live_failed_deploy::FM_ID {
+        share_verify_live_failed_deploy::detect(Some(&inputs.repo_root), &Default::default())
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -1961,6 +2139,76 @@ mod tests {
                 "fixer {} auto_fixable={} but op_pattern={}",
                 spec.id, spec.auto_fixable, spec.op_pattern,
             );
+        }
+    }
+
+    #[test]
+    fn every_registry_entry_has_detect_and_dispatch_arms() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let inputs = DispatchInputs {
+            repo_root: temp.path().to_path_buf(),
+            archive_roots: Vec::new(),
+            storage_root: Some(temp.path().to_path_buf()),
+            pid_hint_candidates: Vec::new(),
+            token_backup_candidates: Vec::new(),
+            mcp_config_candidates: Vec::new(),
+            canonical_mcp_url: None,
+            canonical_bearer_token: None,
+            git_detect: None,
+            am_git_binary_detect: None,
+            jwt_detect: None,
+            port_bind_probe: None,
+            gitignore_target: None,
+            db_file_candidates: Vec::new(),
+            doctor_latest_target: None,
+            stale_seconds_override: None,
+        };
+        let run_dir =
+            crate::doctor::runs::scaffold_run_dir(temp.path(), "test_run").expect("run dir");
+        let actions = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .expect("actions file");
+        let ctx = crate::doctor::mutate::MutateContext {
+            run_id: "test_run".into(),
+            run_dir,
+            capabilities: crate::doctor::mutate::Capabilities {
+                write_scopes: vec![temp.path().to_path_buf()],
+            },
+            actions_file: std::sync::Mutex::new(actions),
+            fixer_id: "registry-arm-test".into(),
+            repo_root: temp.path().to_path_buf(),
+            dry_run: true,
+            start: std::time::Instant::now(),
+            extra_locks: Vec::new(),
+        };
+
+        for spec in registry() {
+            match detect_only(spec.id, &inputs) {
+                Ok(_) | Err(DispatchError::MissingInput { .. }) => {}
+                Err(DispatchError::UnknownFm(id)) => {
+                    panic!("registry id {id} is missing a detect_only branch")
+                }
+                Err(DispatchError::Mutate(err)) => {
+                    panic!(
+                        "detect_only for {} unexpectedly reached mutate: {err}",
+                        spec.id
+                    )
+                }
+            }
+            match dispatch_only(spec.id, &ctx, &inputs) {
+                Ok(_) | Err(DispatchError::MissingInput { .. }) => {}
+                Err(DispatchError::UnknownFm(id)) => {
+                    panic!("registry id {id} is missing a dispatch_only branch")
+                }
+                Err(DispatchError::Mutate(err)) => {
+                    panic!(
+                        "dispatch_only for {} unexpectedly reached mutate: {err}",
+                        spec.id
+                    )
+                }
+            }
         }
     }
 

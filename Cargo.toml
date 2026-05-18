@@ -104,6 +104,7 @@ walkdir = "2"
 tantivy = "0.26.1"
 indexmap = "2"
 nix = "0.31.3"
+signal-hook = "0.4.4"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
 #
@@ -179,6 +180,7 @@ fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
 fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
 
 beads_rust = { path = "../beads_rust" }
+franken-agent-detection = { path = "../franken_agent_detection" }
 # sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
 sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
 sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
@@ -192,6 +194,7 @@ fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 fsqlite-core = { path = "../frankensqlite/crates/fsqlite-core" }
 fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 fsqlite-error = { path = "../frankensqlite/crates/fsqlite-error" }
+fsqlite-observability = { path = "../frankensqlite/crates/fsqlite-observability" }
 fsqlite-vfs = { path = "../frankensqlite/crates/fsqlite-vfs" }
 fsqlite-wal = { path = "../frankensqlite/crates/fsqlite-wal" }
 fsqlite-pager = { path = "../frankensqlite/crates/fsqlite-pager" }
