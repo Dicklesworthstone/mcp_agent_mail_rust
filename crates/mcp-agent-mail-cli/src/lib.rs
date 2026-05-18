@@ -57017,6 +57017,24 @@ fn handle_doctor_repair_with_options(
         ftui_runtime::ftui_println!("  Scoped to project: {slug}");
     }
 
+    // #122: a completed (non-dry-run) repair is the operator's
+    // confirmation that any in-flight WBQ losses have been recovered
+    // from the archive (or accepted as lost), so it's safe to clear
+    // the sticky durability-degraded flag and re-open the API to
+    // writes. Dry-run repair must not clear the flag — it only
+    // reports what *would* be done and has not actually recovered
+    // any lost rows.
+    if !dry_run {
+        let stats_before = mcp_agent_mail_storage::wbq_stats();
+        if stats_before.last_unrecoverable_error_us > 0 {
+            mcp_agent_mail_storage::clear_durability_degraded();
+            ftui_runtime::ftui_println!(
+                "  Durability flag cleared (wbq_unrecoverable_errors_total={} prior to clear).",
+                stats_before.unrecoverable_errors
+            );
+        }
+    }
+
     ftui_runtime::ftui_println!(
         "Repair {}.",
         if dry_run {

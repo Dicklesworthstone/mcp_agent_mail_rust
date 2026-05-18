@@ -1536,6 +1536,33 @@ effective_free_bytes={free}"
         }
     }
 
+    // Durability gate (#122): if the WBQ has reported even one retry-exhausted
+    // op since the last operator clear, the in-memory ID allocator has
+    // already handed out IDs that don't have backing rows. Accepting new
+    // writes in that state would issue more such IDs and produce silent
+    // data loss. Refuse loud and direct the operator at the recovery path.
+    if mcp_agent_mail_storage::durability_degraded() {
+        let stats = mcp_agent_mail_storage::wbq_stats();
+        return Err(legacy_tool_error(
+            "DURABILITY_DEGRADED",
+            format!(
+                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
+                 last failure at us={}); refusing to accept new messages until operator clears the \
+                 durability flag via `am doctor repair` (which will also recover any in-memory \
+                 rows that never persisted)",
+                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
+            ),
+            true,
+            json!({
+                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+                "wbq_errors_total": stats.errors,
+                "wbq_enqueued_total": stats.enqueued,
+                "wbq_drained_total": stats.drained,
+            }),
+        ));
+    }
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -2332,6 +2359,33 @@ effective_free_bytes={free}"
                 }),
             ));
         }
+    }
+
+    // Durability gate (#122): if the WBQ has reported even one retry-exhausted
+    // op since the last operator clear, the in-memory ID allocator has
+    // already handed out IDs that don't have backing rows. Accepting new
+    // writes in that state would issue more such IDs and produce silent
+    // data loss. Refuse loud and direct the operator at the recovery path.
+    if mcp_agent_mail_storage::durability_degraded() {
+        let stats = mcp_agent_mail_storage::wbq_stats();
+        return Err(legacy_tool_error(
+            "DURABILITY_DEGRADED",
+            format!(
+                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
+                 last failure at us={}); refusing to accept new messages until operator clears the \
+                 durability flag via `am doctor repair` (which will also recover any in-memory \
+                 rows that never persisted)",
+                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
+            ),
+            true,
+            json!({
+                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+                "wbq_errors_total": stats.errors,
+                "wbq_enqueued_total": stats.enqueued,
+                "wbq_drained_total": stats.drained,
+            }),
+        ));
     }
 
     let pool = get_db_pool()?;

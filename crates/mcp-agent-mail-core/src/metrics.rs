@@ -501,6 +501,19 @@ pub struct StorageMetrics {
     pub wbq_peak_depth: GaugeU64,
     pub wbq_over_80_since_us: GaugeU64,
     pub wbq_queue_latency_us: Log2Histogram,
+    /// Microsecond timestamp of the most recent WBQ op that failed after
+    /// every retry was exhausted (i.e. the row enqueued via the API never
+    /// reached storage). Zero means "never". This is sticky — a later
+    /// successful drain does NOT clear it, because exhausted-retry means
+    /// a row was already lost and operator attention is required before
+    /// new writes should be accepted. Cleared by `am doctor` repair paths
+    /// only, after the operator confirms recovery. See #122.
+    pub wbq_last_unrecoverable_error_us: GaugeU64,
+    /// Monotonically-increasing count of WBQ ops that exhausted their
+    /// retry budget. Distinct from `wbq_errors_total`, which counts every
+    /// individual op failure (including transient ones that succeed on
+    /// retry). See #122.
+    pub wbq_unrecoverable_errors_total: Counter,
 
     pub commit_enqueued_total: Counter,
     pub commit_drained_total: Counter,
@@ -549,6 +562,8 @@ pub struct StorageMetricsSnapshot {
     pub wbq_peak_depth: u64,
     pub wbq_over_80_since_us: u64,
     pub wbq_queue_latency_us: HistogramSnapshot,
+    pub wbq_last_unrecoverable_error_us: u64,
+    pub wbq_unrecoverable_errors_total: u64,
 
     pub commit_enqueued_total: u64,
     pub commit_drained_total: u64,
@@ -1394,6 +1409,8 @@ impl Default for StorageMetrics {
             wbq_peak_depth: GaugeU64::new(),
             wbq_over_80_since_us: GaugeU64::new(),
             wbq_queue_latency_us: Log2Histogram::new(),
+            wbq_last_unrecoverable_error_us: GaugeU64::new(),
+            wbq_unrecoverable_errors_total: Counter::new(),
 
             commit_enqueued_total: Counter::new(),
             commit_drained_total: Counter::new(),
@@ -1434,6 +1451,8 @@ impl StorageMetrics {
             wbq_peak_depth: self.wbq_peak_depth.load(),
             wbq_over_80_since_us: self.wbq_over_80_since_us.load(),
             wbq_queue_latency_us: self.wbq_queue_latency_us.snapshot(),
+            wbq_last_unrecoverable_error_us: self.wbq_last_unrecoverable_error_us.load(),
+            wbq_unrecoverable_errors_total: self.wbq_unrecoverable_errors_total.load(),
 
             commit_enqueued_total: self.commit_enqueued_total.load(),
             commit_drained_total: self.commit_drained_total.load(),

@@ -218,6 +218,15 @@ pub struct WbqStats {
     pub drained: u64,
     pub errors: u64,
     pub fallbacks: u64,
+    /// Count of ops that exhausted their retry budget — i.e. rows the
+    /// API path enqueued that never reached storage. Non-zero means the
+    /// in-memory ID allocator has handed back IDs that no longer have
+    /// a backing row, and `durability_degraded()` will be true. See #122.
+    pub unrecoverable_errors: u64,
+    /// Microsecond timestamp of the most recent unrecoverable failure.
+    /// Zero means "never". Sticky — operator action (via doctor repair)
+    /// is required to clear it.
+    pub last_unrecoverable_error_us: u64,
 }
 
 enum WbqMsg {
@@ -494,7 +503,39 @@ pub fn wbq_stats() -> WbqStats {
         drained: snap.storage.wbq_drained_total,
         errors: snap.storage.wbq_errors_total,
         fallbacks: snap.storage.wbq_fallbacks_total,
+        unrecoverable_errors: snap.storage.wbq_unrecoverable_errors_total,
+        last_unrecoverable_error_us: snap.storage.wbq_last_unrecoverable_error_us,
     }
+}
+
+/// Returns true when WBQ has experienced at least one retry-exhausted
+/// failure since the last operator clear. While true, the API layer
+/// must refuse new writes — accepting them would issue IDs from the
+/// in-memory allocator that the storage layer has already proven it
+/// can't persist. See #122.
+#[must_use]
+pub fn durability_degraded() -> bool {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_last_unrecoverable_error_us
+        .load()
+        > 0
+}
+
+/// Operator-only: clear the sticky durability-degraded flag.
+///
+/// This should be called by `am doctor` repair paths AFTER the operator
+/// has confirmed (a) the lost rows have been reconstructed from the
+/// archive or accepted as lost, and (b) the underlying cause has been
+/// addressed (e.g. on Windows: the platform fix has shipped, or
+/// `STORAGE_ROOT` has been moved to a path with working durability
+/// semantics). Calling this without those preconditions just re-enables
+/// the bug.
+pub fn clear_durability_degraded() {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_last_unrecoverable_error_us
+        .set(0);
 }
 
 fn wbq_drain_loop(
@@ -577,14 +618,28 @@ fn wbq_drain_loop(
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
             }
             if let Err(error) = result {
+                // Retry budget was already exhausted inside wbq_execute_op /
+                // wbq_execute_message_bundle_batch. Reaching this branch means
+                // the row enqueued via the API was never persisted — that's
+                // a durability failure that must be visible to the API gate
+                // so future send_message calls refuse instead of accepting
+                // writes that will silently disappear. See #122.
+                let unrecoverable = u64::try_from(envelopes.len()).unwrap_or(1);
+                metrics.storage.wbq_unrecoverable_errors_total.add(unrecoverable);
+                metrics
+                    .storage
+                    .wbq_last_unrecoverable_error_us
+                    .set(now_micros_u64());
                 if envelopes.len() > 1 {
-                    tracing::warn!(
-                        "[wbq-drain] batched message-bundle run failed ({} ops): {error}",
+                    tracing::error!(
+                        "[wbq-drain] batched message-bundle run failed after retries ({} ops): {error} — durability degraded, refusing further writes until operator intervention",
                         envelopes.len()
                     );
                     errors += envelopes.len();
                 } else {
-                    tracing::warn!("[wbq-drain] op failed: {error}");
+                    tracing::error!(
+                        "[wbq-drain] op failed after retries: {error} — durability degraded, refusing further writes until operator intervention"
+                    );
                     errors += 1;
                 }
             }
@@ -639,8 +694,19 @@ fn wbq_drain_loop(
                 .unwrap_or(u64::MAX);
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
                 metrics.storage.wbq_drained_total.inc();
-                if r.is_err() {
+                if let Err(error) = r {
+                    // Same exhausted-retry semantics as the main drain
+                    // branch — failures here are also rows the API
+                    // accepted but never persisted. #122.
                     metrics.storage.wbq_errors_total.inc();
+                    metrics.storage.wbq_unrecoverable_errors_total.inc();
+                    metrics
+                        .storage
+                        .wbq_last_unrecoverable_error_us
+                        .set(now_micros_u64());
+                    tracing::error!(
+                        "[wbq-drain post-shutdown] op failed after retries: {error} — row will not persist"
+                    );
                 }
             }
             WbqMsg::Flush(done_tx) => {
