@@ -58070,6 +58070,30 @@ fn handle_doctor_reconstruct_with(
         ))
     })?;
 
+    // mcp_agent_mail#160: after the swap, advance the messages id
+    // allocator to at least the archive's max id. Without this, the
+    // freshly-reconstructed DB still has whatever sqlite_sequence value
+    // the build-into-tmp path produced (max over what we ingested from
+    // canonical files), but operator-triggered reconstructions can run
+    // against an archive that's still being written to by other agents
+    // — making the additional floor advance a safe defensive bump.
+    {
+        let archive_max = mcp_agent_mail_db::id_floor::max_message_id_in_archive(&storage_root);
+        if let Some(max) = archive_max {
+            let conn_result =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string());
+            if let Ok(conn) = conn_result {
+                if let Err(e) =
+                    mcp_agent_mail_db::id_floor::advance_messages_id_floor(&conn, Some(max))
+                {
+                    ftui_runtime::ftui_eprintln!(
+                        "  Warning: post-swap id-floor advance failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+
     if let Some(attempt) = &salvage_attempt {
         match attempt {
             DoctorSalvageAttempt::Failed(detail) => {

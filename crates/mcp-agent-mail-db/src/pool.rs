@@ -2482,6 +2482,43 @@ impl DbPool {
         }
     }
 
+    /// Advance the `messages` table's autoincrement allocator if the
+    /// archive at `self.storage_root` has a higher `id` than the live
+    /// database. Belt-and-suspenders against the failure mode reported
+    /// on mcp_agent_mail#160: when automatic recovery built a
+    /// reconstructed candidate but didn't atomically promote it, the
+    /// live SQLite kept allocating IDs strictly below
+    /// `archive_latest_message_id` and produced duplicate canonical
+    /// files. This method removes that footgun regardless of which
+    /// recovery path was taken.
+    ///
+    /// Returns the new floor when an advance happened, `None` when the
+    /// database was already at or ahead of the archive (and no change
+    /// was made).
+    ///
+    /// Safe to call on every startup. For `:memory:` databases this
+    /// is a no-op because there is no on-disk archive to compare.
+    pub fn advance_message_id_floor_from_archive(&self) -> DbResult<Option<i64>> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(None);
+        }
+        if !Path::new(&self.sqlite_path).exists() {
+            return Ok(None);
+        }
+        let archive_max = crate::id_floor::max_message_id_in_archive(&self.storage_root);
+        if archive_max.is_none() {
+            return Ok(None);
+        }
+
+        let conn = crate::guard_db_conn(
+            open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
+                DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
+            })?,
+            "id_floor floor-advance connection",
+        );
+        crate::id_floor::advance_messages_id_floor(&conn, archive_max)
+    }
+
     /// Run `integrity::quick_check` on `conn` and, on `IntegrityCorruption`,
     /// consult canonical SQLite as a second opinion (mirroring
     /// `sqlite_primary_check_is_ok_with_canonical_fallback` from the runtime

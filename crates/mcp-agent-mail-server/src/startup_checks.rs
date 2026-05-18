@@ -2351,6 +2351,29 @@ fn probe_integrity(config: &Config) -> ProbeResult {
                 );
                 return attempt_probe_recovery(config);
             }
+            // mcp_agent_mail#160 belt-and-suspenders: even when archive
+            // drift didn't trip the recovery path, make sure the messages
+            // ID allocator is at or ahead of the archive's max so no
+            // INSERT can re-use an id the archive already considers
+            // canonical. Failures here are logged but non-fatal — the
+            // alternative (refusing to start) would be worse than the
+            // worst case we're guarding against (duplicate-id allocation,
+            // which already produces a yellow doctor signal).
+            match pool.advance_message_id_floor_from_archive() {
+                Ok(Some(new_floor)) => {
+                    tracing::warn!(
+                        new_floor,
+                        "startup: advanced messages id allocator floor to match archive (mcp_agent_mail#160)"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "startup: id-floor advance check failed; continuing without advance (mcp_agent_mail#160)"
+                    );
+                }
+            }
             ProbeResult::Ok { name: "integrity" }
         }
         Err(ref e) => {

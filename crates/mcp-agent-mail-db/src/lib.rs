@@ -39,6 +39,7 @@ pub mod cache;
 pub mod coalesce;
 pub mod error;
 pub mod forensics;
+pub mod id_floor;
 pub mod integrity;
 pub mod invariants;
 pub mod mail_explorer;
