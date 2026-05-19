@@ -913,12 +913,19 @@ detect_python_binary() {
     fi
   done <<< "$all_am"
 
-  # Also check for python -m mcp_agent_mail availability
-  if command -v python3 >/dev/null 2>&1 && python3 -c "import mcp_agent_mail" 2>/dev/null; then
+  # Also check for python -m mcp_agent_mail availability.
+  #
+  # Run the probe from `/` so CWD-on-sys.path can't let an unrelated directory
+  # (notably the Rust install at $HOME/mcp_agent_mail/) spoof the import via a
+  # PEP 420 implicit namespace package. Also require `__file__` — only real,
+  # initialized packages set it; namespace packages do not. (#128)
+  if command -v python3 >/dev/null 2>&1 && \
+     (cd / && python3 -c "import mcp_agent_mail, sys; sys.exit(0 if getattr(mcp_agent_mail, '__file__', None) else 1)") 2>/dev/null; then
     PYTHON_BINARY_FOUND=1
     PYTHON_BINARY_PATH="python3 -m mcp_agent_mail"
     verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
-  elif command -v python >/dev/null 2>&1 && python -c "import mcp_agent_mail" 2>/dev/null; then
+  elif command -v python >/dev/null 2>&1 && \
+       (cd / && python -c "import mcp_agent_mail, sys; sys.exit(0 if getattr(mcp_agent_mail, '__file__', None) else 1)") 2>/dev/null; then
     PYTHON_BINARY_FOUND=1
     PYTHON_BINARY_PATH="python -m mcp_agent_mail"
     verbose "detect_python_binary:found importable=${PYTHON_BINARY_PATH}"
@@ -2820,6 +2827,11 @@ service_setup_unavailable_failure() {
 }
 
 has_remote_http_client_targets() {
+  if [ "${AM_INSTALL_SKIP_REMOTE_HTTP_READINESS:-0}" = "1" ]; then
+    verbose "remote_http_readiness:skip reason=env_override"
+    return 1
+  fi
+
   if command -v codex >/dev/null 2>&1 || [ -d "${HOME}/.codex" ] || [ -d "${HOME}/.config/codex" ]; then
     return 0
   fi
@@ -6032,12 +6044,16 @@ sqlite_timestamp_fallback_migration() {
     cat >> "$sql_file" <<SQL
 UPDATE ${table}
 SET ${column} =
-  CAST(strftime('%s', ${column}) AS INTEGER) * 1000000
-  + CASE
-      WHEN instr(${column}, '.') > 0
-      THEN CAST(substr(${column} || '000000', instr(${column}, '.') + 1, 6) AS INTEGER)
-      ELSE 0
-    END
+  CASE
+    WHEN trim(${column}) <> '' AND trim(${column}) NOT GLOB '*[^0-9]*'
+    THEN CAST(trim(${column}) AS INTEGER)
+    ELSE CAST(strftime('%s', ${column}) AS INTEGER) * 1000000
+      + CASE
+          WHEN instr(${column}, '.') > 0
+          THEN CAST(substr(${column} || '000000', instr(${column}, '.') + 1, 6) AS INTEGER)
+          ELSE 0
+        END
+  END
 WHERE typeof(${column}) = 'text';
 SQL
     updates=$((updates + 1))
@@ -6071,12 +6087,12 @@ SQL
   local remaining_text_columns
   remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$db_path")
   if [ -n "$remaining_text_columns" ]; then
-    warn "installer fallback left TEXT timestamps in: ${remaining_text_columns}"
-    return 1
+    warn "installer fallback left TEXT-affinity timestamp rows in: ${remaining_text_columns}"
+    warn "Continuing to Rust schema refresh so text-affinity tables can be rebuilt safely."
   fi
 
   verbose "migration:fallback_sqlite ok db=${db_path} update_statements=${updates} backup=${SQLITE_FALLBACK_BACKUP_PATH:-<none>}"
-  ok "Database timestamps normalized (installer fallback)"
+  ok "Database timestamp fallback completed"
   return 0
 }
 
