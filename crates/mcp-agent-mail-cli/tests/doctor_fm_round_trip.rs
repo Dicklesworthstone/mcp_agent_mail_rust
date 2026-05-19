@@ -742,3 +742,102 @@ fn round_trip_quarantined_bak_files_op_chmod() {
     let post_undo = snapshot_tree(td.path(), true);
     assert_byte_identical("quarantined_bak_files", &pre_fix, &post_undo);
 }
+
+/// FM `fm-mcp-config-files-duplicate-aliased-server-entries`
+/// graduated from detect-only to `Op::WriteFile` (partial). Pin
+/// the corrupt → fix → undo → byte-identical-content contract:
+/// plant a `.json` MCP config with canonical
+/// `(mcpServers, mcp-agent-mail)` plus two non-canonical
+/// duplicates, dispatch, verify only canonical remains, undo,
+/// verify all 3 entries are back byte-identical.
+#[test]
+fn round_trip_mcp_duplicate_aliased_server_entries_op_write_file() {
+    let td = TempDir::new().expect("tempdir");
+    let cfg = td.path().join("claude.json");
+    // Three agent-mail registrations: canonical + 2 duplicates.
+    let original = r#"{
+  "mcpServers": {
+    "mcp-agent-mail": {
+      "url": "http://canonical",
+      "args": ["serve"]
+    },
+    "other-server": {
+      "url": "http://other"
+    }
+  },
+  "servers": {
+    "mcp_agent_mail": {
+      "url": "http://stale-1"
+    }
+  },
+  "mcp": {
+    "agent-mail": {
+      "url": "http://stale-2"
+    }
+  }
+}"#;
+    fs::write(&cfg, original).expect("plant config");
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).expect("0o644");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+
+    let run_id = "2026-05-19T00-00-00Z__rt_dup";
+    let fm_id = fixers::mcp_duplicate_aliased_server_entries::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        mcp_config_candidates: vec![cfg.clone()],
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one rewrite expected for the config with canonical+2 duplicates"
+    );
+
+    // Post-fix: canonical entry preserved, both duplicates gone.
+    let post_value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).expect("parse post-fix");
+    assert_eq!(
+        post_value
+            .pointer("/mcpServers/mcp-agent-mail/url")
+            .and_then(|v| v.as_str()),
+        Some("http://canonical"),
+        "canonical entry URL preserved"
+    );
+    assert_eq!(
+        post_value
+            .pointer("/mcpServers/mcp-agent-mail/args/0")
+            .and_then(|v| v.as_str()),
+        Some("serve"),
+        "canonical entry nested args preserved"
+    );
+    assert_eq!(
+        post_value
+            .pointer("/mcpServers/other-server/url")
+            .and_then(|v| v.as_str()),
+        Some("http://other"),
+        "sibling server preserved"
+    );
+    assert!(
+        post_value.pointer("/servers/mcp_agent_mail").is_none(),
+        "non-canonical (servers, mcp_agent_mail) removed"
+    );
+    assert!(
+        post_value.pointer("/mcp/agent-mail").is_none(),
+        "non-canonical (mcp, agent-mail) removed"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("mcp_duplicate_aliased_server_entries", &pre_fix, &post_undo);
+}

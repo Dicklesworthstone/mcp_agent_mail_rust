@@ -607,9 +607,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: mcp_duplicate_aliased_server_entries::FM_ID,
             severity: "P2",
             subsystem: "mcp_config_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "JSON/JSONC MCP config files contain more than one agent-mail server entry across supported container/alias keys (manual: coalesce to mcpServers.mcp-agent-mail)",
+            op_pattern: "Op::WriteFile",
+            auto_fixable: true,
+            one_line_description: "JSON/JSONC MCP config files contain more than one agent-mail server entry across supported container/alias keys — partial auto-fix rewrites strict `.json` configs when canonical `(mcpServers, mcp-agent-mail)` is present; `.jsonc`/`.json5` configs and canonical-missing configs stay manual",
             source_module: "doctor::fixers::mcp_duplicate_aliased_server_entries",
         },
         FixerSpec {
