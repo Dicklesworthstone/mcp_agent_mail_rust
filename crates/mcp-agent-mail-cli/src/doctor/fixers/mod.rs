@@ -333,9 +333,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: missing_or_malformed_project_json::FM_ID,
             severity: "P1",
             subsystem: "archive_state_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Mailbox archive contains projects whose `project.json` is missing OR has malformed JSON / missing required fields (manual: write/repair project.json)",
+            op_pattern: "Op::WriteFile",
+            auto_fixable: true,
+            one_line_description: "Mailbox archive contains projects whose `project.json` is missing OR has malformed JSON / missing required fields — partial auto-fix rewrites Invalid entries when DB-aware scan supplied `canonical_human_key`; Missing entries + Invalid-without-canonical stay manual (operator-supplied truth)",
             source_module: "doctor::fixers::missing_or_malformed_project_json",
         },
         FixerSpec {
@@ -816,6 +816,20 @@ pub struct DispatchInputs {
     /// applied it to ref-lock (canonical 120s) and listener-pid (600s)
     /// alike.
     pub stale_seconds_override: Option<u64>,
+    /// Test-only override for the
+    /// `missing_or_malformed_project_json` FM. `None` (the
+    /// production default) makes the dispatcher build inputs
+    /// from `storage_root` + `db_aware_archive_report`. Tests
+    /// pass `Some(DetectInputs { report_override: Some(synthetic_report), .. })`
+    /// to inject a hand-built `ArchiveAnomalyReport` so the
+    /// round-trip test doesn't need a real DB + archive.
+    ///
+    /// Note: unlike most `Option<DetectInputs>` fields on
+    /// `DispatchInputs`, `None` here does NOT skip the FM — the
+    /// dispatcher falls back to the production-default inputs.
+    /// The override is purely a test-injection hook.
+    pub missing_project_json_detect_override:
+        Option<missing_or_malformed_project_json::DetectInputs>,
 }
 
 fn db_aware_archive_report(
@@ -1025,12 +1039,25 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == missing_or_malformed_project_json::FM_ID {
-        // Same storage_root threading as FM5; reuses
-        // scan_archive_anomalies via a different anomaly filter.
-        let mp_inputs = missing_or_malformed_project_json::DetectInputs {
-            storage_root_override: inputs.storage_root.clone(),
-            report_override: None,
-        };
+        // Use the DB-aware archive scan when both storage_root and
+        // a DB path are available — this populates
+        // `InvalidProjectMetadata::canonical_human_key` from the
+        // DB row, which is the source of truth needed for any
+        // future auto-fix reconstruction of `project.json`. Falls
+        // back to the archive-only scan when no DB is configured
+        // (e.g., an offline mailbox inspection).
+        //
+        // `missing_project_json_detect_override` is the test-only
+        // injection point that lets the round-trip test supply a
+        // synthetic `ArchiveAnomalyReport` without needing a real
+        // DB + archive.
+        let mp_inputs = inputs
+            .missing_project_json_detect_override
+            .clone()
+            .unwrap_or_else(|| missing_or_malformed_project_json::DetectInputs {
+                storage_root_override: inputs.storage_root.clone(),
+                report_override: db_aware_archive_report(inputs),
+            });
         let findings = missing_or_malformed_project_json::detect(&mp_inputs);
         outcome.findings_count = findings.len();
         for f in &findings {
@@ -1668,10 +1695,13 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == missing_or_malformed_project_json::FM_ID {
-        let mp_inputs = missing_or_malformed_project_json::DetectInputs {
-            storage_root_override: inputs.storage_root.clone(),
-            report_override: None,
-        };
+        let mp_inputs = inputs
+            .missing_project_json_detect_override
+            .clone()
+            .unwrap_or_else(|| missing_or_malformed_project_json::DetectInputs {
+                storage_root_override: inputs.storage_root.clone(),
+                report_override: db_aware_archive_report(inputs),
+            });
         missing_or_malformed_project_json::detect(&mp_inputs)
             .iter()
             .map(|f| f.to_finding())
@@ -2162,6 +2192,7 @@ mod tests {
             db_file_candidates: Vec::new(),
             doctor_latest_target: None,
             stale_seconds_override: None,
+            missing_project_json_detect_override: None,
         };
         let run_dir =
             crate::doctor::runs::scaffold_run_dir(temp.path(), "test_run").expect("run dir");

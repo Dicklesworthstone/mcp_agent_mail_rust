@@ -135,6 +135,7 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
         db_file_candidates: Vec::new(),
         doctor_latest_target: None,
         stale_seconds_override: None,
+        missing_project_json_detect_override: None,
     }
 }
 
@@ -403,6 +404,90 @@ fn round_trip_dangling_doctor_latest_op_symlink_atomic() {
 
     let post_undo = snapshot_tree(&isolated, false);
     assert_byte_identical("dangling_doctor_latest", &pre_fix, &post_undo);
+}
+
+/// Pass-35CP+Q: FM `fm-archive-state-files-missing-or-malformed-
+/// project-json` partial-graduated to `Op::WriteFile`. Pin the
+/// corrupt → fix → undo → byte-identical-content contract using
+/// the test-only `missing_project_json_detect_override` hook to
+/// inject a synthetic anomaly report (avoids needing a real DB +
+/// archive for the round-trip).
+#[test]
+fn round_trip_missing_or_malformed_project_json_op_write_file() {
+    use mcp_agent_mail_db::archive_anomaly::{
+        ArchiveAnomaly, ArchiveAnomalyKind, ArchiveAnomalyReport,
+    };
+    let td = TempDir::new().expect("tempdir");
+    let project_json = td.path().join("malformed_project.json");
+    let malformed = r#"{"slug": "demo", "bad-key": "x"#;
+    fs::write(&project_json, malformed).expect("plant malformed project.json");
+    fs::set_permissions(&project_json, fs::Permissions::from_mode(0o644)).expect("0o644");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+
+    // Build a synthetic report with one InvalidProjectMetadata
+    // entry whose `canonical_human_key` is Some(absolute) — the
+    // exact shape that pass-35CP auto-fixes.
+    let mut report = ArchiveAnomalyReport::new();
+    report.anomalies.push(ArchiveAnomaly::now(
+        ArchiveAnomalyKind::InvalidProjectMetadata {
+            path: project_json.clone(),
+            slug: "demo".to_string(),
+            canonical_human_key: Some("/workspaces/demo".to_string()),
+            detail: "unterminated string literal".to_string(),
+        },
+    ));
+
+    let run_id = "2026-05-17T00-00-00Z__rt_project_json";
+    let fm_id = fixers::missing_or_malformed_project_json::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        missing_project_json_detect_override: Some(
+            fixers::missing_or_malformed_project_json::DetectInputs {
+                storage_root_override: Some(td.path().to_path_buf()),
+                report_override: Some(report),
+            },
+        ),
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one rewrite expected for the Invalid-with-canonical entry"
+    );
+
+    // Post-fix: the file is the canonical {slug, human_key} JSON.
+    let post_fix_body = fs::read_to_string(&project_json).expect("read post-fix");
+    let post_value: serde_json::Value =
+        serde_json::from_str(&post_fix_body).expect("parse post-fix");
+    assert_eq!(
+        post_value.get("slug").and_then(|v| v.as_str()),
+        Some("demo")
+    );
+    assert_eq!(
+        post_value.get("human_key").and_then(|v| v.as_str()),
+        Some("/workspaces/demo")
+    );
+    // The malformed `bad-key` entry from the original is GONE
+    // (this is a CLEAN reconstruction — only canonical fields).
+    assert!(
+        post_value.get("bad-key").is_none(),
+        "auto-fix produces clean canonical shape; sibling junk is dropped"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("missing_or_malformed_project_json", &pre_fix, &post_undo);
 }
 
 #[test]
