@@ -589,9 +589,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: identity_build_slot_lease_expired::FM_ID,
             severity: "P2",
             subsystem: "identity_contacts_state",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Build-slot lease JSON files are expired but unreleased, leaving ghost occupied slots (manual: confirm dead holder and reclaim through build-slot APIs)",
+            op_pattern: "Op::WriteFile",
+            auto_fixable: true,
+            one_line_description: "Build-slot lease JSON files are expired but unreleased, leaving ghost occupied slots — auto-fix rewrites `released_ts` to `now_iso` via Op::WriteFile through the chokepoint (UPDATE-only — never deletes; reversible via `am doctor undo`)",
             source_module: "doctor::fixers::identity_build_slot_lease_expired",
         },
         FixerSpec {

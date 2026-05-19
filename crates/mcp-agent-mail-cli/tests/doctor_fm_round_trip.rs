@@ -490,6 +490,82 @@ fn round_trip_missing_or_malformed_project_json_op_write_file() {
     assert_byte_identical("missing_or_malformed_project_json", &pre_fix, &post_undo);
 }
 
+/// Pass-35CL: FM `fm-identity_contacts_state-build-slot-lease-expired`
+/// graduated from detect-only to `Op::WriteFile`. Pin the corrupt
+/// → fix → undo → byte-identical-content contract for ghost-lease
+/// `released_ts` rewrite. UPDATE-only: the file is never deleted
+/// per RULE 1; sibling JSON fields survive verbatim.
+#[test]
+fn round_trip_identity_build_slot_lease_expired_op_write_file() {
+    let td = TempDir::new().expect("tempdir");
+    let storage_root = td.path().join("storage");
+    let lease_dir = storage_root
+        .join("projects")
+        .join("demo")
+        .join("build_slots")
+        .join("build-1");
+    fs::create_dir_all(&lease_dir).expect("mkdir lease dir");
+    let lease_path = lease_dir.join("GhostHolder.json");
+    // Plant a lease that expired in 2020 with non-trivial sibling
+    // fields. The detector's wall-clock `now_iso` will be > 2026,
+    // so it'll flag this regardless of the exact run timestamp.
+    let original_body = r#"{"expires_ts":"2020-01-01T00:00:00Z","released_ts":null,"acquired_ts":"2019-12-31T23:00:00Z","holder":"GhostHolder","slot_metadata":{"label":"build-alpha","priority":7}}"#;
+    fs::write(&lease_path, original_body).expect("plant lease");
+    fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o644)).expect("0o644");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+
+    let run_id = "2026-05-16T00-00-00Z__rt_lease";
+    let fm_id = fixers::identity_build_slot_lease_expired::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        storage_root: Some(storage_root.clone()),
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one rewrite expected for the ghost lease"
+    );
+
+    // Post-fix: released_ts must be non-null, all sibling fields
+    // preserved verbatim.
+    let post_fix_body = fs::read_to_string(&lease_path).expect("read post-fix");
+    let post_value: serde_json::Value =
+        serde_json::from_str(&post_fix_body).expect("parse post-fix");
+    assert!(
+        post_value.get("released_ts").is_some_and(|r| r.is_string()),
+        "released_ts must be a string after fix"
+    );
+    assert_eq!(
+        post_value.get("holder").and_then(|v| v.as_str()),
+        Some("GhostHolder"),
+        "holder sibling field must be preserved verbatim"
+    );
+    assert_eq!(
+        post_value
+            .get("slot_metadata")
+            .and_then(|m| m.get("priority"))
+            .and_then(|v| v.as_u64()),
+        Some(7),
+        "nested sibling field must be preserved verbatim"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("identity_build_slot_lease_expired", &pre_fix, &post_undo);
+}
+
 #[test]
 fn round_trip_missing_gitignore_entry_op_append_file() {
     // Plant a .gitignore lacking `.doctor/` → fix (append) →

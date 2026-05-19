@@ -1,5 +1,5 @@
 //! `fm-identity_contacts_state-build-slot-lease-expired` — P2
-//! detect-only.
+//! auto-fix via `Op::WriteFile`.
 //!
 //! **Subsystem**: identity_contacts_state.
 //!
@@ -36,27 +36,70 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only (first cut).** The repair spec calls for an
-//! `Op::WriteFile` rewrite of each expired lease's `released_ts`
-//! to the current ISO string (UPDATE-only — never delete per
-//! RULE 1). That needs a per-lease round-trip test and careful
-//! preservation of any sibling JSON fields the spec doesn't list.
-//! Deferred. Manual remediation: if the holder is alive, renew
-//! the lease; if the holder is dead, acquire the slot normally
-//! for new work. Do not delete lease files manually — use a
-//! future doctor fixer or a targeted lease rewrite that preserves
-//! all sibling JSON fields.
+//! **Auto-fix via `Op::WriteFile` (UPDATE-only — never delete
+//! per RULE 1):** for each expired-lease entry, re-read the
+//! lease JSON, set `released_ts` to the finding's `now_iso`
+//! (so the operator's evidence and the on-disk record agree),
+//! and rewrite the file through the chokepoint. All sibling
+//! JSON fields are preserved verbatim — `serde_json` is built
+//! with `preserve_order` workspace-wide, so the new bytes differ
+//! from the old only at the `released_ts` value. The chokepoint
+//! backs up the original bytes verbatim, so `am doctor undo
+//! <run-id>` restores byte-identical leases (including
+//! `released_ts: null` or the absent-field shape).
+//!
+//! Mode preservation: the chosen `Op::WriteFile` mode mirrors
+//! the live file's mode at fix-time so the visible permissions
+//! don't shift under operators. (Undo restores to `before_mode`
+//! anyway via the backup, so this is a quality-of-life choice,
+//! not a correctness one.)
+//!
+//! Entries that vanish between detect-time and fix-time count
+//! as `actions_skipped`. Entries that the operator (or another
+//! agent / sibling FM) already released between detect and fix
+//! — i.e. `released_ts` is now non-null — also count as
+//! `actions_skipped` so the fix is idempotent.
+//!
+//! ## Concurrency note (bounded TOCTOU)
+//!
+//! fix() reads the lease content, then calls `mutate()`. Between
+//! those two steps a concurrent server-side `release_build_slot`
+//! call could overwrite the lease. The chokepoint's
+//! `TamperedBeforeMutate` check only fires for changes WITHIN the
+//! chokepoint's hash-then-backup window — not for changes BEFORE
+//! the chokepoint sees the file. Result: a concurrent fresh
+//! release between our read and our write would be silently
+//! overwritten by our `released_ts = now_iso` rewrite.
+//!
+//! This is acceptable because:
+//! - The doctor's premise is operator awareness; running
+//!   `am doctor fix` while the system is live is operator error.
+//! - The cost of overwriting a fresh release is minimal: the
+//!   lease still records a `released_ts` (just `now_iso` instead
+//!   of the writer's chosen ts).
+//! - The race window is microseconds (read → parse → mutate).
+//!
+//! A future hardening pass could re-read the live file inside
+//! the chokepoint right before write, but that requires extending
+//! the `mutate()` API surface (currently overwrite-only).
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{MutateContext, MutateError};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-identity_contacts_state-build-slot-lease-expired";
 const FM_SEVERITY: &str = "P2";
 const FM_SUBSYSTEM: &str = "identity_contacts_state";
+
+/// Fallback mode for `Op::WriteFile` when the live lease file's
+/// own mode can't be read (e.g., a vanished-but-checked race). In
+/// practice fix() will never reach this constant because vanished
+/// paths return early via `actions_skipped`.
+const FALLBACK_LEASE_MODE: u32 = 0o644;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpiredLeaseEntry {
@@ -100,15 +143,19 @@ impl IdentityBuildSlotLeaseExpiredFinding {
             evidence: serde_json::json!({
                 "entries": self.entries,
                 "now_iso": self.now_iso,
+                "auto_fix_summary": format!(
+                    "`am doctor fix --only {FM_ID} --yes` rewrites each lease's `released_ts` to `{}` via Op::WriteFile through the chokepoint, preserving every other JSON field. UPDATE-only: never deletes the lease file (per RULE 1). Reversible via `am doctor undo <run-id>` — the chokepoint backs up the original bytes verbatim.",
+                    self.now_iso,
+                ),
                 "manual_remediation": {
                     "steps": [
-                        "For each entry: confirm the holder is actually dead before clearing the lease. If the holder is alive but past expires_ts, the right fix is to extend the lease (`renew_build_slot`), not release it.",
-                        "If the holder is confirmed dead: current Rust `acquire_build_slot` already ignores expired leases for conflict checks, so new work can acquire the slot normally.",
-                        "To clear the audit/UI ghost itself, rewrite only that lease's `released_ts` through a future doctor fixer or equivalent targeted build-slot maintenance path that preserves all sibling fields.",
+                        "Auto-fix (preferred): `am doctor fix --only fm-identity_contacts_state-build-slot-lease-expired --yes`. The chokepoint rewrites each expired lease's `released_ts` to `now_iso` and records the original bytes so `am doctor undo <run-id>` is byte-identical-reversible.",
+                        "Before invoking auto-fix: confirm the holder is actually dead. If the holder is alive but past `expires_ts`, the right answer is `renew_build_slot`, NOT a `released_ts` rewrite. The auto-fix assumes the holder is gone (which is true for the cases this FM catches: crash, OOM, network partition, SIGTERM mid-lifecycle).",
+                        "Manual alternative: call `acquire_build_slot` for the same project, agent, and slot. Expired leases are ignored by conflict detection and the caller's lease path is rewritten.",
+                        "Per-lease alternative: `am robot reservations --conflicts --expiring 30` shows the same ghost-lease state via the canonical robot CLI; pair with `force_release_file_reservation` for slots that map to a file reservation.",
                         "Re-run `am doctor fix --only fm-identity_contacts_state-build-slot-lease-expired --list` to confirm zero residual ghost leases.",
                     ],
-                    "warning": "Do NOT delete lease files manually — the chokepoint and build-slot tooling rely on lease files as the canonical record. The Rust acquire path ignores expired leases; this FM is about stale audit/UI state, not a forced-release command.",
-                    "safe_fix_deferred": "Auto-fix via `Op::WriteFile` rewriting `released_ts` to `now_iso` (UPDATE-only — never delete per RULE 1) is intentionally deferred in this first cut. Each lease JSON has sibling fields the spec doesn't enumerate; faithful round-trip preservation needs a per-lease test fixture.",
+                    "warning": "Do NOT delete lease files manually — the chokepoint and the build-slot API rely on lease files as the canonical record. Use the auto-fix, the manual API alternatives above, or `acquire_build_slot`/`renew_build_slot`/`release_build_slot` so lease state is written through the API.",
                     "common_causes": [
                         "Agent crashed / OOMed / network-partitioned without calling `release_build_slot`.",
                         "`am serve` SIGTERM'd mid-build-slot lifecycle (the cleanup_pane_identities pass may not have run).",
@@ -118,10 +165,10 @@ impl IdentityBuildSlotLeaseExpiredFinding {
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: false,
-                estimated_actions: 0,
+                auto_fixable: true,
+                estimated_actions: self.entries.len(),
             },
         }
     }
@@ -259,14 +306,101 @@ fn now_iso_string() -> String {
         .to_string()
 }
 
-/// Detect-only FM. `fix()` is a no-op.
+/// Fixer. Routes through `mutate()` with `Op::WriteFile` per
+/// expired-lease entry.
+///
+/// For each entry:
+/// 1. Skip if the lease file has vanished since detect-time
+///    (`actions_skipped += 1`).
+/// 2. Re-read the lease JSON. If parsing fails, skip (the file
+///    was tampered with between detect and fix; safer to not
+///    rewrite than to risk corrupting the operator's evidence).
+/// 3. If `released_ts` is already non-null (a sibling agent or
+///    a manual `release_build_slot` resolved it between probes),
+///    skip — the FM is already moot for this entry.
+/// 4. Set `released_ts` to `finding.now_iso` (preserves the
+///    consistency: the operator's evidence and the on-disk
+///    state agree on when the doctor recorded the release).
+/// 5. Serialize back to JSON. `preserve_order` is enabled
+///    workspace-wide so sibling field ordering is preserved.
+/// 6. Op::WriteFile the new bytes with the live file's existing
+///    mode (no permission-bit surprise for the operator).
+///
+/// All chokepoint guarantees apply: verbatim backup, hash witness,
+/// atomic write-tmp-then-rename, advisory lock, undo restores
+/// byte-identical originals.
 pub fn fix(
-    _ctx: &MutateContext,
-    _finding: &IdentityBuildSlotLeaseExpiredFinding,
+    ctx: &MutateContext,
+    finding: &IdentityBuildSlotLeaseExpiredFinding,
 ) -> Result<FixOutcome, MutateError> {
+    let mut actions_taken = 0;
+    let mut actions_skipped = 0;
+    for entry in &finding.entries {
+        let body = match std::fs::read_to_string(&entry.lease_path) {
+            Ok(b) => b,
+            Err(_) => {
+                actions_skipped += 1;
+                continue;
+            }
+        };
+        let mut value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                actions_skipped += 1;
+                continue;
+            }
+        };
+        let already_released = value.get("released_ts").is_some_and(|r| !r.is_null());
+        if already_released {
+            actions_skipped += 1;
+            continue;
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "released_ts".to_string(),
+                serde_json::Value::String(finding.now_iso.clone()),
+            );
+        } else {
+            // Top-level wasn't a JSON object (e.g., array or
+            // scalar). The detector only emits findings against
+            // object-shaped leases (it reads `released_ts` /
+            // `expires_ts` via `.get(...)`), so this branch is
+            // unreachable in practice. Skip defensively.
+            actions_skipped += 1;
+            continue;
+        }
+        // Match `mcp_agent_mail_tools::build_slots::write_lease_json`
+        // exactly: `to_string_pretty` with NO trailing newline.
+        // Any byte difference vs the server's writer would surface
+        // as operator-visible churn in diff tools.
+        let new_body = match serde_json::to_string_pretty(&value) {
+            Ok(s) => s,
+            Err(_) => {
+                actions_skipped += 1;
+                continue;
+            }
+        };
+        // Mirror the live file's mode so fix() doesn't surprise-
+        // change permissions. If we can't read mode (race), fall
+        // back to a sensible default — though step 1 already
+        // guards the vanished case.
+        let mode = std::fs::symlink_metadata(&entry.lease_path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(FALLBACK_LEASE_MODE);
+        mutate(
+            ctx,
+            &entry.lease_path,
+            Op::WriteFile {
+                content: new_body.into_bytes(),
+                mode,
+            },
+        )?;
+        actions_taken += 1;
+    }
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
+        actions_taken,
+        actions_skipped,
         quarantined_paths: Vec::new(),
     })
 }
@@ -518,24 +652,22 @@ mod tests {
         assert!(s.contains(FM_ID));
         assert!(s.contains("\"now_iso\":\"2026-05-16T00:00:00Z\""));
         assert!(s.contains("acquire_build_slot"));
-        assert!(s.contains("ignores expired leases"));
         assert!(!s.contains("acquire_build_slot --force"));
-        assert!(s.contains("safe_fix_deferred"));
+        assert!(s.contains("auto_fix_summary"));
         assert!(s.contains("common_causes"));
-        assert!(s.contains("\"auto_fixable\":false"));
+        assert!(s.contains("\"auto_fixable\":true"));
+        assert!(s.contains("\"estimated_actions\":1"));
     }
 
-    #[test]
-    fn fixer_is_no_op_returning_skipped() {
-        let td = TempDir::new().unwrap();
-        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), "test_run").unwrap();
+    fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(run_dir.join("actions.jsonl"))
             .unwrap();
-        let ctx = MutateContext {
-            run_id: "test_run".into(),
+        MutateContext {
+            run_id: run_id.into(),
             run_dir,
             capabilities: crate::doctor::mutate::Capabilities {
                 write_scopes: vec![td.path().to_path_buf()],
@@ -546,13 +678,156 @@ mod tests {
             dry_run: false,
             start: std::time::Instant::now(),
             extra_locks: Vec::new(),
-        };
+        }
+    }
+
+    /// **NEGATIVE TEST FIRST**: empty entries → no actions, no
+    /// skips. A degenerate baseline.
+    #[test]
+    fn fixer_with_empty_entries_is_a_no_op() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__lease_empty");
         let finding = IdentityBuildSlotLeaseExpiredFinding {
             entries: Vec::new(),
             now_iso: "2026-05-16T00:00:00Z".to_string(),
         };
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 0);
+    }
+
+    /// **NEGATIVE**: an entry whose lease file vanished between
+    /// detect and fix is skipped, never errors.
+    #[test]
+    fn fixer_skips_vanished_lease() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__lease_vanished");
+        let finding = IdentityBuildSlotLeaseExpiredFinding {
+            entries: vec![ExpiredLeaseEntry {
+                lease_path: td.path().join("ghost-lease.json"),
+                project_slug: "demo".to_string(),
+                slot_name: "build-1".to_string(),
+                acquired_ts: None,
+                expires_ts: "2020-01-01T00:00:00Z".to_string(),
+                holder: None,
+            }],
+            now_iso: "2026-05-16T00:00:00Z".to_string(),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// **NEGATIVE**: a lease that's already non-null
+    /// `released_ts` (sibling resolution race) is skipped — the
+    /// FM is moot for that entry.
+    #[test]
+    fn fixer_skips_already_released_lease() {
+        let td = TempDir::new().unwrap();
+        let root = make_storage_root(&td);
+        let lease = write_lease(
+            &root,
+            "demo",
+            "build-1",
+            "lease",
+            r#"{"expires_ts":"2020-01-01T00:00:00Z","released_ts":"2020-01-02T00:00:00Z"}"#,
+        );
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__lease_already");
+        let finding = IdentityBuildSlotLeaseExpiredFinding {
+            entries: vec![ExpiredLeaseEntry {
+                lease_path: lease.clone(),
+                project_slug: "demo".to_string(),
+                slot_name: "build-1".to_string(),
+                acquired_ts: None,
+                expires_ts: "2020-01-01T00:00:00Z".to_string(),
+                holder: None,
+            }],
+            now_iso: "2026-05-16T00:00:00Z".to_string(),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+        // File content untouched.
+        let post = fs::read_to_string(&lease).unwrap();
+        assert!(post.contains("2020-01-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn fixer_writes_released_ts_to_now_iso_preserving_siblings() {
+        let td = TempDir::new().unwrap();
+        let root = make_storage_root(&td);
+        // Sibling fields (`acquired_ts`, `holder`, custom keys)
+        // must survive the rewrite verbatim.
+        let original = r#"{"expires_ts":"2020-01-01T00:00:00Z","released_ts":null,"acquired_ts":"2019-12-31T00:00:00Z","holder":"GhostHolder","slot_metadata":{"label":"build-alpha","priority":7}}"#;
+        let lease = write_lease(&root, "demo", "build-1", "GhostHolder", original);
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__lease_fix");
+        let now_iso = "2026-05-16T12:34:56Z".to_string();
+        let finding = IdentityBuildSlotLeaseExpiredFinding {
+            entries: vec![ExpiredLeaseEntry {
+                lease_path: lease.clone(),
+                project_slug: "demo".to_string(),
+                slot_name: "build-1".to_string(),
+                acquired_ts: Some("2019-12-31T00:00:00Z".to_string()),
+                expires_ts: "2020-01-01T00:00:00Z".to_string(),
+                holder: Some("GhostHolder".to_string()),
+            }],
+            now_iso: now_iso.clone(),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+
+        let post = fs::read_to_string(&lease).unwrap();
+        let post_value: serde_json::Value = serde_json::from_str(&post).unwrap();
+        assert_eq!(
+            post_value.get("released_ts").and_then(|v| v.as_str()),
+            Some(now_iso.as_str()),
+            "released_ts must be set to finding.now_iso"
+        );
+        // Sibling fields preserved.
+        assert_eq!(
+            post_value.get("expires_ts").and_then(|v| v.as_str()),
+            Some("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            post_value.get("acquired_ts").and_then(|v| v.as_str()),
+            Some("2019-12-31T00:00:00Z")
+        );
+        assert_eq!(
+            post_value.get("holder").and_then(|v| v.as_str()),
+            Some("GhostHolder")
+        );
+        let nested = post_value.get("slot_metadata").unwrap();
+        assert_eq!(
+            nested.get("label").and_then(|v| v.as_str()),
+            Some("build-alpha")
+        );
+        assert_eq!(nested.get("priority").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    /// Tampered / non-JSON lease file is skipped (the chokepoint
+    /// is never invoked on data we can't parse).
+    #[test]
+    fn fixer_skips_malformed_lease_json() {
+        let td = TempDir::new().unwrap();
+        let root = make_storage_root(&td);
+        let lease = write_lease(&root, "demo", "build-1", "lease", "not json {{");
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__lease_malformed");
+        let finding = IdentityBuildSlotLeaseExpiredFinding {
+            entries: vec![ExpiredLeaseEntry {
+                lease_path: lease.clone(),
+                project_slug: "demo".to_string(),
+                slot_name: "build-1".to_string(),
+                acquired_ts: None,
+                expires_ts: "2020-01-01T00:00:00Z".to_string(),
+                holder: None,
+            }],
+            now_iso: "2026-05-16T00:00:00Z".to_string(),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+        let post = fs::read_to_string(&lease).unwrap();
+        assert_eq!(post, "not json {{");
     }
 }
