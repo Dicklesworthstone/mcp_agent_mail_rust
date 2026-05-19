@@ -136,6 +136,7 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
         doctor_latest_target: None,
         stale_seconds_override: None,
         missing_project_json_detect_override: None,
+        quarantined_bak_detect: None,
     }
 }
 
@@ -616,4 +617,128 @@ fn round_trip_missing_gitignore_entry_op_append_file() {
 
     let post_undo = snapshot_tree(td.path(), true);
     assert_byte_identical("missing_gitignore_entry", &pre_fix, &post_undo);
+}
+
+/// Pass-35CJ: FM17 graduated from detect-only to `Op::Chmod`
+/// auto-fix. Pin the corrupt → fix → undo → byte-identical-mode
+/// contract for the guard pre-commit hook chain runner.
+#[test]
+fn round_trip_guard_plugin_not_executable_op_chmod() {
+    // Plant a git repo with the agent-mail pre-commit chain runner
+    // at 0o644 (missing user-exec bit). The detector will flag it;
+    // fix() chmods to 0o755 via the chokepoint; undo() restores
+    // the original 0o644.
+    let td = TempDir::new().expect("tempdir");
+    git2::Repository::init(td.path()).expect("git init");
+    let hooks_dir = td.path().join(".git").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("mkdir .git/hooks");
+
+    let pre_commit = hooks_dir.join("pre-commit");
+    // Body must contain an agent-mail sentinel so the detector
+    // recognizes it as ours (not an unrelated foreign hook).
+    let body = "#!/bin/sh\n# mcp-agent-mail chain-runner (pre-commit)\nexit 0\n";
+    fs::write(&pre_commit, body).expect("plant pre-commit");
+    fs::set_permissions(&pre_commit, fs::Permissions::from_mode(0o644))
+        .expect("set 0o644 on pre-commit");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+    let pre_mode = pre_fix
+        .iter()
+        .find(|(p, _, _)| p.ends_with("hooks/pre-commit"))
+        .map(|(_, _, m)| *m)
+        .expect("pre-fix snapshot must contain pre-commit");
+    assert_eq!(pre_mode, 0o644, "pre-fix mode must be 0o644");
+
+    let run_id = "2026-05-16T00-00-00Z__rt_guard_chmod";
+    let fm_id = fixers::guard_plugin_not_executable::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = empty_inputs(&td);
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one chmod expected for the planted pre-commit"
+    );
+
+    let post_fix_mode = fs::metadata(&pre_commit).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(post_fix_mode, 0o755, "post-fix mode must be 0o755");
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("guard_plugin_not_executable", &pre_fix, &post_undo);
+}
+
+/// Pass-35CK: FM `fm-mcp-config-files-quarantined-bak-files-with-tokens`
+/// graduated from detect-only to `Op::Chmod`. Pin the corrupt →
+/// fix → undo → byte-identical-mode contract on a timestamped
+/// MCP-config backup carrying token-shape content.
+#[test]
+fn round_trip_quarantined_bak_files_op_chmod() {
+    // Plant a timestamped MCP-config backup (`config.json.<ts>.bak`)
+    // with token-shape content at mode 0o644. The detector will
+    // flag it; fix() chmods to 0o600 via the chokepoint; undo()
+    // restores the original 0o644.
+    let td = TempDir::new().expect("tempdir");
+    let config_dir = td.path().join("Claude");
+    fs::create_dir_all(&config_dir).expect("mkdir Claude config dir");
+    let bak = config_dir.join("claude_desktop_config.json.20260101_120000.bak");
+    fs::write(&bak, r#"{"authorization":"Bearer secret-pass35ck"}"#).expect("plant bak");
+    fs::set_permissions(&bak, fs::Permissions::from_mode(0o644)).expect("set 0o644");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+    let pre_mode = pre_fix
+        .iter()
+        .find(|(p, _, _)| p.ends_with("claude_desktop_config.json.20260101_120000.bak"))
+        .map(|(_, _, m)| *m)
+        .expect("pre-fix snapshot must contain the bak");
+    assert_eq!(pre_mode, 0o644, "pre-fix mode must be 0o644");
+
+    let run_id = "2026-05-16T00-00-00Z__rt_qbak";
+    let fm_id = fixers::quarantined_bak_files::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        quarantined_bak_detect: Some(fixers::quarantined_bak_files::DetectInputs {
+            dir_overrides: Some(vec![config_dir.clone()]),
+        }),
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one chmod expected for the planted bak"
+    );
+
+    let post_fix_mode = fs::metadata(&bak).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(post_fix_mode, 0o600, "post-fix mode must be 0o600");
+
+    // The file content must be untouched (chmod, not rename or
+    // rewrite). Snapshot diff after undo proves byte-identity.
+    let mid_fix_content = fs::read_to_string(&bak).unwrap();
+    assert!(
+        mid_fix_content.contains("secret-pass35ck"),
+        "fix must not modify file content"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("quarantined_bak_files", &pre_fix, &post_undo);
 }

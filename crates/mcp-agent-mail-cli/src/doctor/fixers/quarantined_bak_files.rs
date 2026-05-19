@@ -1,5 +1,5 @@
 //! `fm-mcp-config-files-quarantined-bak-files-with-tokens` — P1
-//! detect-only.
+//! auto-fix via `Op::Chmod`.
 //!
 //! **Subsystem**: mcp_config_files.
 //!
@@ -38,16 +38,25 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only first cut.** The repair_spec calls for
-//! Op::Rename to a 0o700 quarantine dir; that's substantial
-//! additional plumbing. For now, manual remediation walks the
-//! operator through `chmod 600 <file>` (defense-in-depth) or
-//! moving the backup into a private quarantine after rotating the
-//! token.
+//! **Auto-fix (defense-in-depth):** each flagged backup is
+//! chmodded to `0o600` via the chokepoint (`Op::Chmod`). The
+//! prior mode is recorded in `actions.jsonl`, so
+//! `am doctor undo <run-id>` restores byte-identical mode bits.
+//! Entries that vanish between detect-time and fix-time count as
+//! `actions_skipped`. The file content is NOT moved or modified —
+//! the auto-fix only narrows POSIX permissions to owner-only,
+//! matching the canonical mode the writer SHOULD have used.
+//!
+//! The stronger remediation (move into `.doctor/quarantine/mcp-
+//! config-bak/`) remains documented for manual application when
+//! the operator has rotated the token and wants the backup out of
+//! the config dir entirely; that needs the chokepoint's
+//! Op::Rename quarantine path plus token-rotation coordination.
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use regex::Regex;
 use serde::Serialize;
 use std::fs;
@@ -58,6 +67,11 @@ use std::sync::OnceLock;
 pub const FM_ID: &str = "fm-mcp-config-files-quarantined-bak-files-with-tokens";
 const FM_SEVERITY: &str = "P1";
 const FM_SUBSYSTEM: &str = "mcp_config_files";
+
+/// Canonical owner-only mode the chokepoint chmods flagged backups
+/// to. Matches the canonical mode the writer should have used and
+/// the `world_readable_token_bak` FM's `SAFE_MODE`.
+pub const SAFE_MODE: u32 = 0o600;
 
 /// Bytes scanned for token-shape content. 64 KiB matches the
 /// repair_spec.
@@ -128,20 +142,25 @@ impl QuarantinedBakFinding {
             evidence: serde_json::json!({
                 "path": self.path.to_string_lossy(),
                 "current_mode_octal": mode_str,
+                "target_mode_octal": format!("0o{:o}", SAFE_MODE),
                 "matched_pattern": self.matched_pattern,
+                "auto_fix_summary": format!(
+                    "`am doctor fix --only fm-mcp-config-files-quarantined-bak-files-with-tokens --yes` chmods this backup to 0o{:o} via the chokepoint. Reversible via `am doctor undo <run-id>` (the prior mode is recorded in actions.jsonl). The backup file CONTENT is not moved or modified.",
+                    SAFE_MODE,
+                ),
                 "manual_remediation": {
                     "steps": [
-                        "If the token was rotated since this backup was written, move it into a private quarantine: `mkdir -p .doctor/quarantine/mcp-config-bak && chmod 700 .doctor/quarantine/mcp-config-bak && mv <path> .doctor/quarantine/mcp-config-bak/`.",
-                        "If you may need the backup later, chmod it to owner-only first: `chmod 600 <path>`.",
-                        "Auto-fix via Op::Rename-to-quarantine is intentionally deferred in this first cut.",
+                        "Auto-fix (preferred): `am doctor fix --only fm-mcp-config-files-quarantined-bak-files-with-tokens --yes`. The chokepoint chmods each flagged backup to 0o600 and records the prior mode so `am doctor undo <run-id>` is byte-identical-reversible.",
+                        "Manual alternative: `chmod 600 <path>` per entry — same canonical defense-in-depth mode.",
+                        "If the token was already rotated and you want the backup out of the config dir entirely, move it into a private quarantine: `mkdir -p .doctor/quarantine/mcp-config-bak && chmod 700 .doctor/quarantine/mcp-config-bak && mv <path> .doctor/quarantine/mcp-config-bak/`. This is a stronger remediation than the auto-fix and remains manual.",
                     ],
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: false,
-                estimated_actions: 0,
+                auto_fixable: true,
+                estimated_actions: 1,
             },
         }
     }
@@ -223,13 +242,30 @@ fn token_pattern_in_head(path: &Path) -> Option<String> {
     None
 }
 
+/// Fixer. Routes through `mutate()` with `Op::Chmod { mode: SAFE_MODE }`.
+///
+/// One finding represents one file (the detector emits one per
+/// matched backup). If the file has vanished between detect-time
+/// and fix-time, count as `actions_skipped` and return Ok. The
+/// chokepoint already refuses symlinks (the detector pre-filters
+/// them out as well) and opens the chmod target via O_NOFOLLOW,
+/// so a symlink-swap attack between detect and fix cannot redirect
+/// the chmod to an out-of-scope file.
 pub fn fix(
-    _ctx: &crate::doctor::mutate::MutateContext,
-    _finding: &QuarantinedBakFinding,
-) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    ctx: &MutateContext,
+    finding: &QuarantinedBakFinding,
+) -> Result<FixOutcome, MutateError> {
+    if !finding.path.exists() {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    }
+    mutate(ctx, &finding.path, Op::Chmod { mode: SAFE_MODE })?;
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
+        actions_taken: 1,
+        actions_skipped: 0,
         quarantined_paths: Vec::new(),
     })
 }
@@ -369,7 +405,10 @@ mod tests {
         // assert on the unquoted `authorization` substring to
         // stay agnostic about the JSON encoding shape.
         assert!(s.contains("authorization"));
-        assert!(s.contains("\"auto_fixable\":false"));
+        assert!(s.contains("auto_fix_summary"));
+        assert!(s.contains("\"auto_fixable\":true"));
+        assert!(s.contains("\"estimated_actions\":1"));
+        assert!(s.contains("\"target_mode_octal\":\"0o600\""));
     }
 
     #[test]
@@ -407,17 +446,15 @@ mod tests {
         assert!(!re.is_match("config.json.2026٠١٠١_120000.bak"));
     }
 
-    #[test]
-    fn fixer_is_no_op_returning_skipped() {
-        let td = TempDir::new().unwrap();
-        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), "test_run").unwrap();
+    fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(run_dir.join("actions.jsonl"))
             .unwrap();
-        let ctx = crate::doctor::mutate::MutateContext {
-            run_id: "test_run".into(),
+        MutateContext {
+            run_id: run_id.into(),
             run_dir,
             capabilities: crate::doctor::mutate::Capabilities {
                 write_scopes: vec![td.path().to_path_buf()],
@@ -428,14 +465,72 @@ mod tests {
             dry_run: false,
             start: std::time::Instant::now(),
             extra_locks: Vec::new(),
-        };
+        }
+    }
+
+    /// **NEGATIVE TEST FIRST**: a vanished path (the file was
+    /// rotated between detect and fix) counts as
+    /// `actions_skipped` and never errors.
+    #[test]
+    fn fixer_skips_vanished_path() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__qbak_vanished");
         let finding = QuarantinedBakFinding {
-            path: "/x".into(),
+            path: td.path().join("ghost.20260101_120000.bak"),
             current_mode: 0o100644,
             matched_pattern: Some("token=".to_string()),
         };
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    #[test]
+    fn fixer_chmods_world_readable_backup_to_0o600() {
+        let td = TempDir::new().unwrap();
+        let f = td.path().join("config.json.20260101_120000.bak");
+        write_with_mode(&f, r#"{"authorization":"Bearer abc"}"#, 0o644);
+
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__qbak_chmod");
+        let finding = QuarantinedBakFinding {
+            path: f.clone(),
+            current_mode: 0o100644,
+            matched_pattern: Some("\"authorization\"".to_string()),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "post-fix mode must be exactly 0o600 (defense-in-depth)"
+        );
+
+        // Sanity: the file CONTENT is untouched.
+        let content = fs::read_to_string(&f).unwrap();
+        assert_eq!(content, r#"{"authorization":"Bearer abc"}"#);
+    }
+
+    /// Idempotence: re-running on an already-0o600 file is a no-op
+    /// (mutate returns Ok; mode is unchanged). The detector wouldn't
+    /// enqueue a 0o600 entry, but the fixer must tolerate it if a
+    /// caller hand-builds the finding.
+    #[test]
+    fn fixer_is_idempotent_on_already_safe_mode() {
+        let td = TempDir::new().unwrap();
+        let f = td.path().join("config.json.20260101_120000.bak");
+        write_with_mode(&f, "HTTP_BEARER_TOKEN=keep-me", 0o600);
+
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__qbak_idem");
+        let finding = QuarantinedBakFinding {
+            path: f.clone(),
+            current_mode: 0o100600,
+            matched_pattern: Some("HTTP_BEARER_TOKEN".to_string()),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
     }
 }

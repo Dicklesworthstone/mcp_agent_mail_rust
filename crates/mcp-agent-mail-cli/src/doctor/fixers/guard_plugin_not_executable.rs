@@ -1,4 +1,4 @@
-//! `fm-guard_install-plugin-not-executable` — P1 detect-only first cut.
+//! `fm-guard_install-plugin-not-executable` — P1 auto-fix via `Op::Chmod`.
 //!
 //! **Subsystem**: guard_install.
 //!
@@ -46,17 +46,17 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only (first cut).** The repair_spec calls for an
-//! `Op::Chmod { mode: 0o755 }` per affected path through the
-//! chokepoint, which is straightforward once a per-FM round-trip
-//! test is wired (corrupt → fix → undo → byte-identical-mode).
-//! That's deferred to a follow-up pass. Manual remediation:
-//! `chmod 755 <path>` per affected entry.
+//! **Auto-fix.** Each non-executable entry is routed through the
+//! chokepoint as `Op::Chmod { mode: 0o755 }`. The chokepoint records
+//! the prior mode in `<run-dir>/actions.jsonl`, so `am doctor undo
+//! <run-id>` restores byte-identical mode bits. Entries that vanish
+//! between detect-time and fix-time count as `actions_skipped`.
+//! Idempotent: re-running on an already-0o755 file is a no-op.
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{MutateContext, MutateError};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -64,9 +64,11 @@ pub const FM_ID: &str = "fm-guard_install-plugin-not-executable";
 const FM_SEVERITY: &str = "P1";
 const FM_SUBSYSTEM: &str = "guard_install";
 
-/// Target mode for the future auto-fix. Surfaced in the finding
-/// so operators running `chmod` manually know the canonical
-/// value without consulting docs.
+/// Canonical mode the installer writes for guard hook entries.
+/// The fixer routes `Op::Chmod { mode: EXPECTED_MODE }` through
+/// the chokepoint for each flagged entry. Surfaced in the finding
+/// so operators running `chmod` manually know the value without
+/// consulting docs.
 const EXPECTED_MODE: u32 = 0o755;
 
 /// Canonical filename of the agent-mail plugin under
@@ -118,14 +120,18 @@ impl GuardPluginNotExecutableFinding {
                 "hooks_dir": self.hooks_dir.to_string_lossy(),
                 "entries": entries_json,
                 "expected_mode_octal": format!("0o{:o}", self.expected_mode),
+                "auto_fix_summary": format!(
+                    "`am doctor fix --only fm-guard_install-plugin-not-executable --yes` chmods each entry to 0o{:o} via the chokepoint. Reversible via `am doctor undo <run-id>` (the prior mode is recorded in actions.jsonl).",
+                    self.expected_mode,
+                ),
                 "manual_remediation": {
                     "steps": [
-                        "For each entry, restore the user-exec bit: `chmod 755 <path>` (the canonical mode the installer writes).",
-                        "Re-run `am doctor fix --only fm-guard_install-plugin-not-executable --list` to confirm zero residual hooks.",
+                        "Auto-fix (preferred): `am doctor fix --only fm-guard_install-plugin-not-executable --yes`. The chokepoint chmods each entry to 0o755 and records the prior mode so `am doctor undo <run-id>` is byte-identical-reversible.",
+                        "Manual alternative: `chmod 755 <path>` per entry. Confirms the same canonical mode the installer writes.",
                         "Confirm `git commit` triggers the agent-mail guard end-to-end: `git commit --allow-empty -m smoke` should report the guard's banner on stderr.",
+                        "Re-run `am doctor fix --only fm-guard_install-plugin-not-executable --list` to confirm zero residual hooks.",
                     ],
                     "warning": "When the user-exec bit is missing, `git commit` silently bypasses the guard — reservation violations land in the repo without any error. Treat as P1.",
-                    "safe_fix_deferred": "Auto-fix via Op::Chmod { mode: 0o755 } is straightforward but intentionally deferred in this first cut. The chokepoint already implements Op::Chmod (see `world_readable_storage_db` and `world_readable_token_bak`); a follow-up pass wires it for these hook paths with a round-trip test (corrupt → fix → undo → byte-identical-mode).",
                     "common_causes": [
                         "Manual `chmod -x` (or `chmod 644`) on a hook path.",
                         "`git checkout` from a worktree filesystem that strips mode bits.",
@@ -135,10 +141,10 @@ impl GuardPluginNotExecutableFinding {
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: false,
-                estimated_actions: 0,
+                auto_fixable: true,
+                estimated_actions: self.entries.len(),
             },
         }
     }
@@ -199,14 +205,46 @@ pub fn detect(repo_root: &Path) -> Vec<GuardPluginNotExecutableFinding> {
     }]
 }
 
-/// Detect-only FM. `fix()` is a no-op.
+/// Fixer. For each non-executable entry in the finding, routes a
+/// `Op::Chmod { mode: EXPECTED_MODE }` (0o755) through the chokepoint.
+///
+/// The mode bits the chokepoint actually applies depend on file type:
+/// regular files get 0o755 (rwx for owner, rx for group/other), which
+/// is the canonical mode the installer writes. The chokepoint refuses
+/// to chmod symlinks (defeats the symlink-swap attack); since the
+/// detector already filters out symlinks (delegating to
+/// `guard_plugin_symlink_replacement`), this refusal is unreachable
+/// in practice.
+///
+/// Entries whose paths have vanished between detect-time and fix-time
+/// count as `actions_skipped`. Idempotent: re-running on an already-
+/// 0o755 file is a no-op (mutate returns Ok with no diff). Per
+/// AGENTS.md RULE 1, this never deletes; chmod is fully reversible
+/// via `am doctor undo <run-id>` which restores the prior mode from
+/// `<run-dir>/actions.jsonl`.
 pub fn fix(
-    _ctx: &MutateContext,
-    _finding: &GuardPluginNotExecutableFinding,
+    ctx: &MutateContext,
+    finding: &GuardPluginNotExecutableFinding,
 ) -> Result<FixOutcome, MutateError> {
+    let mut actions_taken = 0;
+    let mut actions_skipped = 0;
+    for entry in &finding.entries {
+        if !entry.path.exists() {
+            actions_skipped += 1;
+            continue;
+        }
+        mutate(
+            ctx,
+            &entry.path,
+            Op::Chmod {
+                mode: EXPECTED_MODE,
+            },
+        )?;
+        actions_taken += 1;
+    }
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
+        actions_taken,
+        actions_skipped,
         quarantined_paths: Vec::new(),
     })
 }
@@ -357,23 +395,22 @@ mod tests {
         assert!(s.contains(FM_ID));
         assert!(s.contains("\"current_mode_octal\":\"0o644\""));
         assert!(s.contains("\"expected_mode_octal\":\"0o755\""));
-        assert!(s.contains("safe_fix_deferred"));
+        assert!(s.contains("auto_fix_summary"));
         assert!(s.contains("common_causes"));
-        assert!(s.contains("\"auto_fixable\":false"));
+        assert!(s.contains("\"auto_fixable\":true"));
+        assert!(s.contains("\"estimated_actions\":1"));
         assert!(s.contains("chmod 755"));
     }
 
-    #[test]
-    fn fixer_is_no_op_returning_skipped() {
-        let td = TempDir::new().unwrap();
-        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), "test_run").unwrap();
+    fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(run_dir.join("actions.jsonl"))
             .unwrap();
-        let ctx = MutateContext {
-            run_id: "test_run".into(),
+        MutateContext {
+            run_id: run_id.into(),
             run_dir,
             capabilities: crate::doctor::mutate::Capabilities {
                 write_scopes: vec![td.path().to_path_buf()],
@@ -384,7 +421,16 @@ mod tests {
             dry_run: false,
             start: std::time::Instant::now(),
             extra_locks: Vec::new(),
-        };
+        }
+    }
+
+    /// **NEGATIVE TEST FIRST**: an empty-entries finding is a
+    /// degenerate baseline — neither chmods nor skips anything.
+    #[cfg(unix)]
+    #[test]
+    fn fixer_with_empty_entries_takes_no_actions() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__empty");
         let finding = GuardPluginNotExecutableFinding {
             hooks_dir: td.path().to_path_buf(),
             entries: Vec::new(),
@@ -392,6 +438,87 @@ mod tests {
         };
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 0);
+    }
+
+    /// **NEGATIVE**: an entry whose path vanished between detect-
+    /// and fix-time counts as `actions_skipped`, never errors.
+    #[cfg(unix)]
+    #[test]
+    fn fixer_skips_vanished_path() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__vanished");
+        let finding = GuardPluginNotExecutableFinding {
+            hooks_dir: td.path().to_path_buf(),
+            entries: vec![NonExecutableEntry {
+                path: td.path().join("ghost-pre-commit"),
+                current_mode: 0o644,
+            }],
+            expected_mode: EXPECTED_MODE,
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixer_chmods_non_executable_entry_to_0o755() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let hooks_dir = td.path().join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let p = hooks_dir.join("pre-commit");
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__chmod");
+        let finding = GuardPluginNotExecutableFinding {
+            hooks_dir: hooks_dir.clone(),
+            entries: vec![NonExecutableEntry {
+                path: p.clone(),
+                current_mode: 0o644,
+            }],
+            expected_mode: EXPECTED_MODE,
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+
+        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o755,
+            "post-fix mode must be exactly 0o755 (the canonical installer mode)"
+        );
+    }
+
+    /// Idempotence: re-running on an already-0o755 file is a no-op
+    /// (mutate returns Ok; mode is unchanged). The detector
+    /// wouldn't enqueue a 0o755 entry, but the fixer must tolerate
+    /// it if a caller hand-builds the finding.
+    #[cfg(unix)]
+    #[test]
+    fn fixer_is_idempotent_on_already_executable_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = TempDir::new().unwrap();
+        let hooks_dir = td.path().join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let p = hooks_dir.join("pre-commit");
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ctx = ctx_for(&td, "2026-05-16T00-00-00Z__idem");
+        let finding = GuardPluginNotExecutableFinding {
+            hooks_dir: hooks_dir.clone(),
+            entries: vec![NonExecutableEntry {
+                path: p.clone(),
+                current_mode: 0o755,
+            }],
+            expected_mode: EXPECTED_MODE,
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
     }
 }

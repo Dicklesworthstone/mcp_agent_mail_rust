@@ -409,6 +409,9 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
         missing_project_json_detect_override: None,
+        // Production: Some(default) invokes the canonical
+        // MCP-config-dir walk so the quarantined-bak FM is reachable.
+        quarantined_bak_detect: Some(fixers::quarantined_bak_files::DetectInputs::default()),
     };
 
     let run_id = format!(
@@ -630,6 +633,9 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         // None → each FM falls back to its own canonical DEFAULT_STALE_SECONDS.
         stale_seconds_override: None,
         missing_project_json_detect_override: None,
+        // Production: Some(default) invokes the canonical
+        // MCP-config-dir walk so the quarantined-bak FM is reachable.
+        quarantined_bak_detect: Some(fixers::quarantined_bak_files::DetectInputs::default()),
     };
 
     let outcome = match fixers::detect_only(fm_id, &inputs) {
@@ -718,6 +724,9 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         doctor_latest_target: Some(runs::doctor_root(&repo_root).join("latest")),
         stale_seconds_override: None,
         missing_project_json_detect_override: None,
+        // Production: Some(default) invokes the canonical
+        // MCP-config-dir walk so the quarantined-bak FM is reachable.
+        quarantined_bak_detect: Some(fixers::quarantined_bak_files::DetectInputs::default()),
     };
 
     let outcome = match fixers::detect_all(&inputs) {

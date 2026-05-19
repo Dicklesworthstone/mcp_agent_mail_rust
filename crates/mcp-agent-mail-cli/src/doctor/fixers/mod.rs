@@ -571,9 +571,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: guard_plugin_not_executable::FM_ID,
             severity: "P1",
             subsystem: "guard_install",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Pre-commit / pre-push guard hook(s) lack user-exec bit (POSIX): `git commit` silently bypasses the agent-mail guard. Auto-fix via Op::Chmod deferred — `chmod 755 <path>` per entry (manual)",
+            op_pattern: "Op::Chmod",
+            auto_fixable: true,
+            one_line_description: "Pre-commit / pre-push guard hook(s) lack user-exec bit (POSIX): `git commit` silently bypasses the agent-mail guard. Auto-fix chmods each entry to 0o755 via the chokepoint; reversible via `am doctor undo`",
             source_module: "doctor::fixers::guard_plugin_not_executable",
         },
         FixerSpec {
@@ -616,9 +616,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: quarantined_bak_files::FM_ID,
             severity: "P1",
             subsystem: "mcp_config_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Timestamped MCP config backups (`*.<YYYYMMDD>_<HHMMSS>.bak`) with token-shape content + world/group-readable mode (auto-fix via Op::Rename quarantine deferred)",
+            op_pattern: "Op::Chmod",
+            auto_fixable: true,
+            one_line_description: "Timestamped MCP config backups (`*.<YYYYMMDD>_<HHMMSS>.bak`) with token-shape content + world/group-readable mode — auto-fix chmods each to 0o600 via the chokepoint (defense-in-depth; reversible via `am doctor undo`)",
             source_module: "doctor::fixers::quarantined_bak_files",
         },
         FixerSpec {
@@ -830,6 +830,15 @@ pub struct DispatchInputs {
     /// The override is purely a test-injection hook.
     pub missing_project_json_detect_override:
         Option<missing_or_malformed_project_json::DetectInputs>,
+    /// Inputs for the quarantined-bak-files FM
+    /// (`quarantined_bak_files`). `None` skips the FM
+    /// (`MissingInput`). Production callers pass
+    /// `Some(DetectInputs::default())` to invoke the canonical
+    /// MCP-config-dir walk via
+    /// `mcp_config::detect_mcp_config_locations_default()`. Tests
+    /// pass `Some(DetectInputs { dir_overrides: Some(...) })` to
+    /// scope the walk to a tempdir.
+    pub quarantined_bak_detect: Option<quarantined_bak_files::DetectInputs>,
 }
 
 fn db_aware_archive_report(
@@ -1393,10 +1402,20 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == quarantined_bak_files::FM_ID {
-        // Enumerates MCP config dirs via the same default
-        // helper; no DispatchInputs field needed for production.
-        let qb_inputs = quarantined_bak_files::DetectInputs::default();
-        let findings = quarantined_bak_files::detect(&qb_inputs);
+        // `None` skips the FM via `MissingInput`. Production
+        // callers pass `Some(DetectInputs::default())` to invoke
+        // the canonical MCP-config-dir walk; tests inject
+        // `Some(DetectInputs { dir_overrides: Some(...) })` to
+        // scope the walk to a tempdir.
+        let qb_inputs =
+            inputs
+                .quarantined_bak_detect
+                .as_ref()
+                .ok_or(DispatchError::MissingInput {
+                    fm_id: quarantined_bak_files::FM_ID,
+                    field: "quarantined_bak_detect",
+                })?;
+        let findings = quarantined_bak_files::detect(qb_inputs);
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -1888,7 +1907,15 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == quarantined_bak_files::FM_ID {
-        quarantined_bak_files::detect(&quarantined_bak_files::DetectInputs::default())
+        let qb_inputs =
+            inputs
+                .quarantined_bak_detect
+                .as_ref()
+                .ok_or(DispatchError::MissingInput {
+                    fm_id: quarantined_bak_files::FM_ID,
+                    field: "quarantined_bak_detect",
+                })?;
+        quarantined_bak_files::detect(qb_inputs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
@@ -2193,6 +2220,7 @@ mod tests {
             doctor_latest_target: None,
             stale_seconds_override: None,
             missing_project_json_detect_override: None,
+            quarantined_bak_detect: None,
         };
         let run_dir =
             crate::doctor::runs::scaffold_run_dir(temp.path(), "test_run").expect("run dir");
