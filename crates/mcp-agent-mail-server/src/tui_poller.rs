@@ -3782,17 +3782,14 @@ mod tests {
         create_empty_mail_schema(&conn);
         drop(conn);
 
-        let tempdir_name = dir
-            .path()
-            .file_name()
-            .expect("tempdir basename")
+        let relative_path = absolute_db
             .to_string_lossy()
-            .into_owned();
-        let relative_path = format!("tmp/{tempdir_name}/poller_fallback.sqlite3");
-        let shadow_root = std::env::current_dir()
-            .expect("cwd")
-            .join("tmp")
-            .join(&tempdir_name);
+            .trim_start_matches('/')
+            .to_string();
+        let relative_parent = std::path::Path::new(&relative_path)
+            .parent()
+            .expect("relative db parent");
+        let shadow_root = std::env::current_dir().expect("cwd").join(relative_parent);
         struct ShadowRootCleanup(std::path::PathBuf);
         impl Drop for ShadowRootCleanup {
             fn drop(&mut self) {
