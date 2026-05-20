@@ -243,6 +243,18 @@ fn sha256_for_path_before_op(path: &Path, op: &Op) -> std::io::Result<String> {
 }
 
 fn sha256_of_path(path: &Path) -> std::io::Result<String> {
+    // Directories hash via a deterministic tree digest (used by
+    // directory `Op::Rename` quarantine). symlink_metadata avoids
+    // following a symlink-to-dir — only a real directory dispatches
+    // here; a symlink falls through to the regular-file path (which
+    // O_NOFOLLOW rejects, matching the symlink-refused contract).
+    if matches!(fs::symlink_metadata(path), Ok(meta) if meta.file_type().is_dir()) {
+        return sha256_of_dir_tree(path);
+    }
+    sha256_of_regular_file(path)
+}
+
+fn sha256_of_regular_file(path: &Path) -> std::io::Result<String> {
     let mut f = match open_regular_file_no_follow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -258,6 +270,69 @@ fn sha256_of_path(path: &Path) -> std::io::Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Deterministic content+structure digest of a directory tree.
+///
+/// Used so directory `Op::Rename` (quarantine) is hash-witnessed
+/// and undo can verify the quarantined tree still matches the
+/// mutation result before moving it back. The digest is:
+/// - **order-independent**: entries are sorted by relative path
+///   before hashing, so readdir order doesn't affect the result.
+/// - **structure + content sensitive**: each entry contributes its
+///   relative path, type, mode bits, and either its file-content
+///   hash (regular file), symlink target (symlink), or a `dir`
+///   marker (directory). A changed byte, mode, added/removed file,
+///   or retargeted symlink changes the digest.
+///
+/// Two callers compute this independently (the chokepoint on the
+/// source dir before rename; undo on the quarantined dir before
+/// restore) and MUST agree — keep the serialization stable.
+pub(crate) fn sha256_of_dir_tree(root: &Path) -> std::io::Result<String> {
+    fn walk(base: &Path, cur: &Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+        let mut children: Vec<fs::DirEntry> =
+            fs::read_dir(cur)?.collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in children {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)?;
+            let ft = meta.file_type();
+            let mode = meta.permissions().mode() & 0o7777;
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            if ft.is_dir() {
+                out.push((rel.clone(), format!("dir:{mode:o}")));
+                walk(base, &path, out)?;
+            } else if ft.is_symlink() {
+                let target = fs::read_link(&path)?;
+                out.push((
+                    rel,
+                    format!("symlink:{mode:o}:{}", target.to_string_lossy()),
+                ));
+            } else if ft.is_file() {
+                let content = sha256_of_regular_file(&path)?;
+                out.push((rel, format!("file:{mode:o}:{content}")));
+            }
+            // FIFOs / sockets / devices are intentionally skipped:
+            // they don't belong in a mailbox archive and can't be
+            // meaningfully content-hashed.
+        }
+        Ok(())
+    }
+    let mut entries: Vec<(String, String)> = Vec::new();
+    walk(root, root, &mut entries)?;
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for (rel, digest) in &entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
     }
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
@@ -732,27 +807,50 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // in actions.jsonl preserves the original path semantics for undo.
     let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
+    let path_is_dir = matches!(fs::symlink_metadata(path), Ok(meta) if meta.file_type().is_dir());
     if !ctx.dry_run && fs::symlink_metadata(path).is_ok() {
-        if matches!(op, Op::SymlinkAtomic { .. })
-            && matches!(
-                fs::symlink_metadata(path),
-                Ok(meta) if meta.file_type().is_symlink()
-            )
-        {
-            copy_symlink_target(path, &backup_path)?;
-            cmp_symlink_target(path, &backup_path)
-                .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
+        if path_is_dir {
+            // Directory: the ONLY supported op is `Op::Rename`
+            // (quarantine). We skip the verbatim file-copy backup —
+            // `fs::rename` preserves the entire tree intact at the
+            // destination `to`, which IS the backup; undo reverses
+            // by renaming it back. A recursive copy here would be
+            // redundant and risk partial-copy failure modes.
+            if !matches!(op, Op::Rename { .. }) {
+                let _ = FileExt::unlock(&lock_file);
+                return Err(MutateError::Unsupported(
+                    "only Op::Rename is supported for directory paths",
+                ));
+            }
+            // Still enforce the tamper defense: re-hash the tree and
+            // refuse if a concurrent writer changed it in our window.
+            let post_backup_hash = sha256_for_path_before_op(path, &op)?;
+            if post_backup_hash != before_hash {
+                let _ = FileExt::unlock(&lock_file);
+                return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
+            }
         } else {
-            copy_verbatim_with_perms(path, &backup_path)?;
-            cmp_strict(path, &backup_path)
-                .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
-        }
-        // Re-hash the live file; if it changed since step 4, someone else
-        // is writing, so refuse to proceed.
-        let post_backup_hash = sha256_for_path_before_op(path, &op)?;
-        if post_backup_hash != before_hash {
-            let _ = FileExt::unlock(&lock_file);
-            return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
+            if matches!(op, Op::SymlinkAtomic { .. })
+                && matches!(
+                    fs::symlink_metadata(path),
+                    Ok(meta) if meta.file_type().is_symlink()
+                )
+            {
+                copy_symlink_target(path, &backup_path)?;
+                cmp_symlink_target(path, &backup_path)
+                    .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
+            } else {
+                copy_verbatim_with_perms(path, &backup_path)?;
+                cmp_strict(path, &backup_path)
+                    .map_err(|_| MutateError::BackupVerify(path.to_path_buf()))?;
+            }
+            // Re-hash the live file; if it changed since step 4, someone else
+            // is writing, so refuse to proceed.
+            let post_backup_hash = sha256_for_path_before_op(path, &op)?;
+            if post_backup_hash != before_hash {
+                let _ = FileExt::unlock(&lock_file);
+                return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
+            }
         }
     }
 
@@ -1388,6 +1486,77 @@ mod tests {
         assert!(!target.exists(), "source removed by rename");
         assert!(quarantine.exists(), "destination has the data");
         assert_eq!(fs::read_to_string(&quarantine).unwrap(), "data\n");
+    }
+
+    #[test]
+    fn dir_rename_quarantines_whole_tree_via_op_rename() {
+        let td = TempDir::new().unwrap();
+        // Plant a debris directory tree with nested files.
+        let debris = td.path().join("debris-bundle");
+        fs::create_dir_all(debris.join("nested")).unwrap();
+        fs::write(debris.join("manifest.json"), b"{\"partial\":true}").unwrap();
+        fs::write(debris.join("nested").join("payload.bin"), b"\x00\x01\x02").unwrap();
+
+        let quarantine = td
+            .path()
+            .join(".doctor")
+            .join("quarantine")
+            .join("debris-bundle");
+        let ctx = make_ctx(&td, "2026-05-20T00-00-00Z__dir");
+        let result = mutate(
+            &ctx,
+            &debris,
+            Op::Rename {
+                to: quarantine.clone(),
+            },
+        )
+        .unwrap();
+        assert!(result.ok, "dir rename should succeed");
+        assert!(!debris.exists(), "source dir removed by rename");
+        assert!(quarantine.is_dir(), "destination is the moved dir tree");
+        assert_eq!(
+            fs::read(quarantine.join("nested").join("payload.bin")).unwrap(),
+            b"\x00\x01\x02",
+            "nested file content preserved by rename"
+        );
+        // before_hash == after_hash for a rename, and both are the
+        // deterministic dir-tree digest (non-empty).
+        assert!(result.before_hash.starts_with("sha256:"));
+        assert_eq!(result.before_hash, result.after_hash);
+    }
+
+    #[test]
+    fn dir_tree_hash_is_order_independent_and_content_sensitive() {
+        let td = TempDir::new().unwrap();
+        let a = td.path().join("a");
+        fs::create_dir_all(a.join("sub")).unwrap();
+        fs::write(a.join("z.txt"), b"zz").unwrap();
+        fs::write(a.join("sub").join("y.txt"), b"yy").unwrap();
+        let h1 = sha256_of_dir_tree(&a).unwrap();
+        // Identical tree built in a different creation order → same hash.
+        let b = td.path().join("b");
+        fs::create_dir_all(b.join("sub")).unwrap();
+        fs::write(b.join("sub").join("y.txt"), b"yy").unwrap();
+        fs::write(b.join("z.txt"), b"zz").unwrap();
+        let h2 = sha256_of_dir_tree(&b).unwrap();
+        assert_eq!(h1, h2, "tree hash must be order-independent");
+        // Change one byte → different hash.
+        fs::write(b.join("z.txt"), b"zX").unwrap();
+        let h3 = sha256_of_dir_tree(&b).unwrap();
+        assert_ne!(h1, h3, "tree hash must be content-sensitive");
+    }
+
+    #[test]
+    fn non_rename_op_on_directory_is_unsupported() {
+        let td = TempDir::new().unwrap();
+        let dir = td.path().join("somedir");
+        fs::create_dir_all(&dir).unwrap();
+        let ctx = make_ctx(&td, "2026-05-20T00-00-00Z__dirchmod");
+        let err = mutate(&ctx, &dir, Op::Chmod { mode: 0o700 }).unwrap_err();
+        assert!(
+            matches!(err, MutateError::Unsupported(_)),
+            "Chmod on a directory must be rejected as Unsupported, got {err:?}"
+        );
     }
 
     #[test]

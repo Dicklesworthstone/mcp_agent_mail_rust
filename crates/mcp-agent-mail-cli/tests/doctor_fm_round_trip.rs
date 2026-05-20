@@ -927,3 +927,75 @@ fn round_trip_legacy_fts_residue_op_db_exec() {
         "residue must reappear after undo restores the DB"
     );
 }
+
+/// FM `fm-share_export_state-half-finished-bundle-after-crash`
+/// graduated from detect-only to directory `Op::Rename`. This is
+/// the FIRST round-trip exercising the chokepoint's directory
+/// quarantine path — pins that a whole debris DIRECTORY TREE is
+/// moved (never deleted), then restored byte-identical by undo.
+///
+/// Plant a partial bundle (`manifest.json` present, no
+/// `mailbox.sqlite3`) under `<repo>/archived_mailbox_states/`,
+/// dispatch → fix quarantines the dir tree into the run-dir →
+/// undo renames it back → assert byte-identical (the bundle dir +
+/// its nested files reappear at the original path).
+#[test]
+fn round_trip_share_half_finished_bundle_op_rename_dir() {
+    let td = TempDir::new().expect("tempdir");
+    // Partial bundle: manifest.json with no mailbox.sqlite3 payload.
+    // Name must NOT match an `am-share-*` temp prefix (those are the
+    // stale-temp-dir family, gated on mtime).
+    let bundle = td
+        .path()
+        .join("archived_mailbox_states")
+        .join("export-2026-05-20");
+    fs::create_dir_all(bundle.join("attachments")).expect("mkdir bundle");
+    fs::write(bundle.join("manifest.json"), b"{\"attachments\":1}").expect("manifest");
+    fs::write(
+        bundle.join("attachments").join("a.bin"),
+        b"\xde\xad\xbe\xef",
+    )
+    .expect("attachment");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+
+    let run_id = "2026-05-20T00-00-00Z__rt_share";
+    let fm_id = fixers::share_half_finished_bundle::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    // The dispatcher reads project_root from inputs.repo_root, which
+    // build_ctx/empty_inputs both set to td.path().
+    let inputs = empty_inputs(&td);
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one partial-bundle dir quarantined"
+    );
+
+    // Post-fix: the bundle dir is moved out of archived_mailbox_states.
+    assert!(
+        !bundle.exists(),
+        "partial bundle dir should have been quarantined (moved)"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    // Bundle dir + nested attachment restored byte-identical.
+    assert!(bundle.is_dir(), "bundle dir restored by undo");
+    assert_eq!(
+        fs::read(bundle.join("attachments").join("a.bin")).unwrap(),
+        b"\xde\xad\xbe\xef",
+        "nested attachment restored byte-identical"
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("share_half_finished_bundle", &pre_fix, &post_undo);
+}

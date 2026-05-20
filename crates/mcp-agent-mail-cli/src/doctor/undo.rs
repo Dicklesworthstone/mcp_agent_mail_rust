@@ -1263,7 +1263,20 @@ pub fn run_undo_with_scopes(
                 // displace operator hook files. Mirrors the
                 // WriteFile/DbExec user-edit defense.
                 if !action.after_hash.is_empty() {
-                    match sha256_stream_no_follow(&from_after) {
+                    // Directory renames (quarantined dir trees) are
+                    // hash-witnessed via the same deterministic
+                    // tree digest the chokepoint used; a regular
+                    // file uses the streaming file hash.
+                    let from_after_is_dir = matches!(
+                        fs::symlink_metadata(&from_after),
+                        Ok(meta) if meta.file_type().is_dir()
+                    );
+                    let hash_result = if from_after_is_dir {
+                        crate::doctor::mutate::sha256_of_dir_tree(&from_after)
+                    } else {
+                        sha256_stream_no_follow(&from_after)
+                    };
+                    match hash_result {
                         Ok(cur_hash) => {
                             if cur_hash != action.after_hash {
                                 let msg = format!(

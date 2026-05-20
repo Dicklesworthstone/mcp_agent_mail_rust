@@ -52,18 +52,30 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only.** The repair spec calls for Op::Rename of
-//! every debris entry into `<run-dir>/quarantine/share-debris/`.
-//! Multi-step with operator-visible side effects; deferred.
-//! Manual remediation: move each entry into a private archive
-//! after inspecting — debris contains in-progress export bytes
-//! and may include user data that the operator wants to
-//! preserve for forensics.
+//! **Auto-fix via directory `Op::Rename` (quarantine).** Each
+//! debris entry — both stale temp dirs and partial bundle dirs —
+//! is moved into `<run-dir>/quarantine/share-debris/<basename>.<ns>`
+//! through the chokepoint. Per AGENTS.md RULE 1 this is NEVER a
+//! delete: the entire directory tree is preserved intact under
+//! quarantine (operators can inspect the in-progress export bytes
+//! there), and `am doctor undo <run-id>` renames each tree back to
+//! its original path. The chokepoint hash-witnesses the tree with
+//! a deterministic dir digest, so undo verifies the quarantined
+//! tree still matches before restoring.
+//!
+//! Entries that vanish between detect and fix (a writer cleaned up,
+//! or a previous fix already quarantined them) count as
+//! `actions_skipped` — the fix is idempotent.
+//!
+//! Note: directory `Op::Rename` is the chokepoint's only
+//! directory-aware operation; it skips the verbatim file-copy
+//! backup because the rename itself preserves the tree at the
+//! quarantine destination (see `mutate.rs` directory-rename path).
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{MutateContext, MutateError};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -153,16 +165,20 @@ impl ShareHalfFinishedBundleFinding {
                 "stale_threshold_secs": self.stale_threshold_secs,
                 "stale_temp_dirs": self.stale_temp_dirs,
                 "partial_bundles": self.partial_bundles,
+                "auto_fix_summary": format!(
+                    "`am doctor fix --only {FM_ID} --yes` quarantines all {} debris entr(ies) (stale temp dirs + partial bundles) via directory Op::Rename into `<run-dir>/quarantine/share-debris/`. NEVER deletes — the tree is preserved for forensics and `am doctor undo <run-id>` renames each back to its original path.",
+                    self.total_entries(),
+                ),
                 "manual_remediation": {
                     "steps": [
-                        "Confirm no live `am share` / `am doctor pack-archive` is in progress (their temp dirs are short-lived and should not appear in this finding).",
-                        "For each stale temp dir: `mkdir -p .doctor/quarantine/share-debris && mv <stale_path> .doctor/quarantine/share-debris/` (preserves the in-progress bytes for forensics).",
-                        "For each partial bundle: inspect the parent bundle dir (`ls -la <bundle_dir>`); a missing `mailbox.sqlite3` payload OR a `.partial` zip without a final `.zip` means the export was aborted. Move the entire bundle dir into the quarantine subtree — there's no safe way to finish it from outside the export pipeline.",
+                        "Auto-fix (preferred): `am doctor fix --only fm-share_export_state-half-finished-bundle-after-crash --yes`. Quarantines each debris dir into `<run-dir>/quarantine/share-debris/` via directory Op::Rename; reversible byte-identically via `am doctor undo <run-id>`.",
+                        "Before auto-fixing: confirm no live `am share` / `am doctor pack-archive` is in progress (their temp dirs are short-lived and should not appear in this finding — the mtime gate already filters them, but double-check under heavy load).",
+                        "Manual alternative for a stale temp dir: `mkdir -p .doctor/quarantine/share-debris && mv <stale_path> .doctor/quarantine/share-debris/` (preserves the in-progress bytes for forensics).",
+                        "Manual alternative for a partial bundle: inspect the parent bundle dir (`ls -la <bundle_dir>`); a missing `mailbox.sqlite3` payload OR a `.partial` zip without a final `.zip` means the export was aborted. Move the entire bundle dir into the quarantine subtree — there's no safe way to finish it from outside the export pipeline.",
                         "If many debris entries accumulated, the share-export pipeline may be crashing on a specific input. Check `am robot status` and recent `tracing` logs for the underlying error before re-running `am share`.",
                         "Re-run `am doctor fix --only fm-share_export_state-half-finished-bundle-after-crash --list` to confirm zero residual debris.",
                     ],
                     "warning": "Partial bundles can be exposed through the share-export API as if they were valid (the API does not currently re-verify completeness on read). Move them aside as a P1 before the next consumer reads them.",
-                    "safe_fix_deferred": "Auto-fix via Op::Rename to `<run-dir>/quarantine/share-debris/` is intentionally deferred in this first cut. The chokepoint already implements Op::Rename (see `stale_archive_lock` and `stale_head_or_ref_lock`); a follow-up pass wires per-entry quarantine plus a round-trip test (corrupt → fix → undo → debris reappears at the original path).",
                     "common_causes": [
                         "Kernel reboot or OOM kill during a long `am share` export.",
                         "Signal-terminated `mcp-agent-mail` server with an export-in-progress.",
@@ -172,10 +188,10 @@ impl ShareHalfFinishedBundleFinding {
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: false,
-                estimated_actions: 0,
+                auto_fixable: self.total_entries() > 0,
+                estimated_actions: self.total_entries(),
             },
         }
     }
@@ -355,15 +371,73 @@ fn collect_partial_bundles(archive_root: &Path) -> Vec<PartialBundleEntry> {
     out
 }
 
-/// Detect-only FM. `fix()` is a no-op.
+/// Quarantine destination for a debris entry: a per-entry path
+/// under `<run-dir>/quarantine/share-debris/`. The basename is
+/// suffixed with a nanosecond stamp so two debris entries that
+/// share a basename (e.g. two `am-share-stage-*` dirs in different
+/// subtrees) don't collide at the destination — the chokepoint
+/// refuses to clobber an existing quarantine target.
+fn quarantine_dest(ctx: &MutateContext, debris: &Path, now_ns: u128) -> PathBuf {
+    let basename = debris
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "debris".to_string());
+    ctx.run_dir
+        .join("quarantine")
+        .join("share-debris")
+        .join(format!("{basename}.{now_ns}"))
+}
+
+/// Fixer. Quarantines every debris entry (stale temp dirs +
+/// partial bundle dirs) via directory `Op::Rename`. Vanished
+/// entries count as `actions_skipped` (idempotent).
 pub fn fix(
-    _ctx: &MutateContext,
-    _finding: &ShareHalfFinishedBundleFinding,
+    ctx: &MutateContext,
+    finding: &ShareHalfFinishedBundleFinding,
 ) -> Result<FixOutcome, MutateError> {
+    let mut actions_taken = 0;
+    let mut actions_skipped = 0;
+    let mut quarantined_paths = Vec::new();
+
+    // A single nanosecond base keeps the per-entry suffixes stable
+    // within one fix() call; an incrementing index disambiguates
+    // same-basename collisions deterministically.
+    let base_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    // Collect every debris path (temp dirs first, then partial
+    // bundles) into one list so the quarantine loop is uniform.
+    let debris_paths: Vec<&Path> = finding
+        .stale_temp_dirs
+        .iter()
+        .map(|e| e.path.as_path())
+        .chain(
+            finding
+                .partial_bundles
+                .iter()
+                .map(|e| e.bundle_dir.as_path()),
+        )
+        .collect();
+
+    for (idx, debris) in debris_paths.iter().enumerate() {
+        if !debris.exists() {
+            // Vanished between detect and fix (writer cleaned up, or
+            // a prior fix already quarantined it). Idempotent skip.
+            actions_skipped += 1;
+            continue;
+        }
+        let dest = quarantine_dest(ctx, debris, base_ns + idx as u128);
+        mutate(ctx, debris, Op::Rename { to: dest.clone() })?;
+        actions_taken += 1;
+        quarantined_paths.push(dest);
+    }
+
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
-        quarantined_paths: Vec::new(),
+        actions_taken,
+        actions_skipped,
+        quarantined_paths,
     })
 }
 
@@ -594,23 +668,24 @@ mod tests {
         assert!(s.contains(FM_ID));
         assert!(s.contains("\"missing_database\""));
         assert!(s.contains("\"stale_threshold_secs\":3600"));
-        assert!(s.contains("safe_fix_deferred"));
+        assert!(s.contains("auto_fix_summary"));
         assert!(s.contains("common_causes"));
-        assert!(s.contains("\"auto_fixable\":false"));
+        assert!(s.contains("\"auto_fixable\":true"));
+        // 1 stale temp dir + 1 partial bundle = 2 estimated actions.
+        assert!(s.contains("\"estimated_actions\":2"));
+        // explain_command is still present even when auto-fixable.
         assert!(s.contains("am doctor explain"));
     }
 
-    #[test]
-    fn fixer_is_no_op_returning_skipped() {
-        let td = TempDir::new().unwrap();
-        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), "test_run").unwrap();
+    fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(run_dir.join("actions.jsonl"))
             .unwrap();
-        let ctx = MutateContext {
-            run_id: "test_run".into(),
+        MutateContext {
+            run_id: run_id.into(),
             run_dir,
             capabilities: crate::doctor::mutate::Capabilities {
                 write_scopes: vec![td.path().to_path_buf()],
@@ -621,7 +696,15 @@ mod tests {
             dry_run: false,
             start: std::time::Instant::now(),
             extra_locks: Vec::new(),
-        };
+        }
+    }
+
+    /// **NEGATIVE TEST FIRST**: empty finding → no-op (no actions,
+    /// no skips).
+    #[test]
+    fn fixer_with_no_debris_is_a_no_op() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__share_empty");
         let finding = ShareHalfFinishedBundleFinding {
             archive_root: td.path().to_path_buf(),
             stale_threshold_secs: 3600,
@@ -630,6 +713,80 @@ mod tests {
         };
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 0);
+    }
+
+    /// **NEGATIVE**: a debris entry whose dir vanished between
+    /// detect and fix is skipped, never errors.
+    #[test]
+    fn fixer_skips_vanished_debris() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__share_vanished");
+        let finding = ShareHalfFinishedBundleFinding {
+            archive_root: td.path().to_path_buf(),
+            stale_threshold_secs: 3600,
+            stale_temp_dirs: vec![StaleTempDirEntry {
+                path: td.path().join("ghost-am-share-stage-1"),
+                age_secs: 7200,
+                matched_prefix: "am-share-stage-".to_string(),
+            }],
+            partial_bundles: Vec::new(),
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// Positive: a stale temp dir AND a partial bundle dir are both
+    /// quarantined (moved, not deleted) into the run-dir; the trees
+    /// are preserved verbatim under quarantine.
+    #[test]
+    fn fixer_quarantines_debris_dirs_via_rename() {
+        let td = TempDir::new().unwrap();
+        // Stale temp dir with a nested file.
+        let stale = td.path().join("am-share-stage-abc");
+        fs::create_dir_all(stale.join("inner")).unwrap();
+        fs::write(stale.join("inner").join("scratch.bin"), b"scratch").unwrap();
+        // Partial bundle dir with a manifest but no payload.
+        let bundle = td.path().join("bundle-xyz");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("manifest.json"), b"{\"v\":1}").unwrap();
+
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__share_fix");
+        let finding = ShareHalfFinishedBundleFinding {
+            archive_root: td.path().to_path_buf(),
+            stale_threshold_secs: 3600,
+            stale_temp_dirs: vec![StaleTempDirEntry {
+                path: stale.clone(),
+                age_secs: 7200,
+                matched_prefix: "am-share-stage-".to_string(),
+            }],
+            partial_bundles: vec![PartialBundleEntry {
+                bundle_dir: bundle.clone(),
+                reason: PartialBundleReason::MissingDatabase,
+            }],
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 2);
+        assert_eq!(outcome.actions_skipped, 0);
+        assert_eq!(outcome.quarantined_paths.len(), 2);
+
+        // Originals moved away.
+        assert!(!stale.exists(), "stale temp dir moved to quarantine");
+        assert!(!bundle.exists(), "partial bundle moved to quarantine");
+
+        // Quarantined trees preserve content verbatim.
+        let q_stale = &outcome.quarantined_paths[0];
+        assert!(q_stale.is_dir());
+        assert_eq!(
+            fs::read(q_stale.join("inner").join("scratch.bin")).unwrap(),
+            b"scratch",
+            "nested debris file preserved under quarantine"
+        );
+        let q_bundle = &outcome.quarantined_paths[1];
+        assert_eq!(
+            fs::read(q_bundle.join("manifest.json")).unwrap(),
+            b"{\"v\":1}",
+        );
     }
 }

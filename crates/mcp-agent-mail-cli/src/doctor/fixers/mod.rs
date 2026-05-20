@@ -715,9 +715,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: share_half_finished_bundle::FM_ID,
             severity: "P1",
             subsystem: "share_export_state",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Share-export temp dirs or partial bundles remain after a crash (manual: inspect and move aside; auto-quarantine deferred)",
+            op_pattern: "Op::Rename",
+            auto_fixable: true,
+            one_line_description: "Share-export temp dirs or partial bundles remain after a crash — auto-fix quarantines each debris directory via directory Op::Rename into `<run-dir>/quarantine/share-debris/` (never deletes; reversible via `am doctor undo`)",
             source_module: "doctor::fixers::share_half_finished_bundle",
         },
         FixerSpec {
