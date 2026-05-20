@@ -10,9 +10,10 @@
 //! scrubber's output in two places that MUST agree with the
 //! actual on-disk artifact set:
 //!
-//! - `manifest.json` — under `attachments.stats.copied` for the
-//!   current bundle schema, with a legacy fallback to
-//!   `scrub_summary.counts.attachments_kept`.
+//! - `manifest.json` — under unique
+//!   `attachments.items[].bundle_path` values for the current
+//!   bundle schema, with fallbacks to `attachments.stats.copied`
+//!   and legacy `scrub_summary.counts.attachments_kept`.
 //! - `viewer_data.json` — under `attachments_total` for older
 //!   bundle shapes that wrote a separate viewer-data file.
 //!
@@ -50,10 +51,13 @@
 //!    manifest is a different FM concern.
 //! 3. Count files recursively under `<bundle>/attachments/`
 //!    (0 if the dir is absent).
-//! 4. Read `attachments.stats.copied` from the manifest
-//!    (legacy fallback: `scrub_summary.counts.attachments_kept`).
-//!    If present and doesn't equal the recursive count, record
-//!    an `AttachmentCountMismatch`.
+//! 4. Read the manifest's claimed on-disk attachment file count.
+//!    Current bundles use unique `attachments.items[].bundle_path`
+//!    values because duplicate attachments are content-deduped on
+//!    disk. Fallbacks: `attachments.stats.copied`, then legacy
+//!    `scrub_summary.counts.attachments_kept`. If present and it
+//!    doesn't equal the recursive count, record an
+//!    `AttachmentCountMismatch`.
 //! 5. If `viewer_data.json` exists, parse it and read
 //!    `attachments_total`. If present and doesn't equal the
 //!    recursive count, record a `ViewerCountMismatch`.
@@ -96,8 +100,8 @@ const LEGACY_SKIP_PREFIXES: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriftKind {
-    /// `manifest.attachments.stats.copied` (or legacy
-    /// `manifest.scrub_summary.counts.attachments_kept`) ≠ disk count.
+    /// Unique `manifest.attachments.items[].bundle_path` values (or
+    /// current/legacy count fallbacks) != disk count.
     AttachmentCountMismatch,
     /// `viewer_data.attachments_total` ≠ disk count.
     ViewerCountMismatch,
@@ -135,7 +139,7 @@ impl ShareScrubManifestMismatchFinding {
                 "entries": self.entries,
                 "manual_remediation": {
                     "steps": [
-                        "For each entry: inspect both sides. `jq '.attachments.stats, .scrub_summary.counts' <bundle>/manifest.json` shows the manifest's claim; `find <bundle>/attachments -type f | wc -l` shows the disk truth.",
+                        "For each entry: inspect both sides. `jq '.attachments.items[].bundle_path, .attachments.stats, .scrub_summary.counts' <bundle>/manifest.json` shows the manifest's claim; `find <bundle>/attachments -type f | wc -l` shows the disk truth.",
                         "Decide which side is authoritative. If the disk is correct, the manifest is stale — re-export via `am share` to regenerate a fresh manifest + viewer_data + signature.",
                         "If the manifest is correct, the disk has drifted — preserve forensics (`mv <bundle> .doctor/quarantine/scrub-drift/`) and re-export rather than patching files in place.",
                         "Re-run `am doctor fix --only fm-share_export_state-scrub-marker-manifest-mismatch --list` to confirm zero residual drift.",
@@ -248,18 +252,48 @@ fn check_bundle(bundle_dir: &Path, out: &mut Vec<DriftEntry>) {
 }
 
 fn manifest_claimed_attachment_files(manifest: &serde_json::Value) -> Option<u64> {
+    if let Some(items) = manifest
+        .get("attachments")
+        .and_then(|a| a.get("items"))
+        .and_then(|v| v.as_array())
+    {
+        let unique_bundle_paths: std::collections::BTreeSet<&str> = items
+            .iter()
+            .filter_map(|item| {
+                let mode = item.get("mode").and_then(|v| v.as_str());
+                let bundle_path = item.get("bundle_path").and_then(|v| v.as_str());
+                match (mode, bundle_path) {
+                    (Some("file"), Some(path)) | (None, Some(path)) => Some(path),
+                    _ => None,
+                }
+            })
+            .collect();
+        if !unique_bundle_paths.is_empty() {
+            return Some(unique_bundle_paths.len() as u64);
+        }
+        if let Some(copied) = manifest_current_stats_copied(manifest)
+            && copied > 0
+        {
+            return Some(copied);
+        }
+        return Some(0);
+    }
+
+    manifest_current_stats_copied(manifest).or_else(|| {
+        manifest
+            .get("scrub_summary")
+            .and_then(|s| s.get("counts"))
+            .and_then(|c| c.get("attachments_kept"))
+            .and_then(|v| v.as_u64())
+    })
+}
+
+fn manifest_current_stats_copied(manifest: &serde_json::Value) -> Option<u64> {
     manifest
         .get("attachments")
         .and_then(|a| a.get("stats"))
         .and_then(|s| s.get("copied"))
         .and_then(|v| v.as_u64())
-        .or_else(|| {
-            manifest
-                .get("scrub_summary")
-                .and_then(|s| s.get("counts"))
-                .and_then(|c| c.get("attachments_kept"))
-                .and_then(|v| v.as_u64())
-        })
 }
 
 fn count_files_recursive(dir: &Path) -> u64 {
@@ -312,6 +346,24 @@ mod tests {
     fn write_current_manifest(bundle: &Path, copied: u64) {
         let body = format!(r#"{{"attachments":{{"stats":{{"copied":{copied}}}}}}}"#);
         fs::write(bundle.join("manifest.json"), body).unwrap();
+    }
+
+    fn write_current_manifest_with_items(bundle: &Path, copied: u64, bundle_paths: &[&str]) {
+        let items = bundle_paths
+            .iter()
+            .map(|path| serde_json::json!({"mode": "file", "bundle_path": path}))
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "attachments": {
+                "stats": {"copied": copied},
+                "items": items,
+            },
+        });
+        fs::write(
+            bundle.join("manifest.json"),
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
     }
 
     fn write_viewer(bundle: &Path, attachments_total: u64) {
@@ -452,6 +504,71 @@ mod tests {
         );
         assert_eq!(findings[0].entries[0].claimed, 4);
         assert_eq!(findings[0].entries[0].actual, 2);
+    }
+
+    #[test]
+    fn detector_counts_current_manifest_unique_bundle_paths_to_allow_dedup() {
+        let td = TempDir::new().unwrap();
+        let arch = make_archive(&td);
+        let bundle = arch.join("bundle-1");
+        fs::create_dir_all(bundle.join("attachments/ab")).unwrap();
+        fs::write(bundle.join("attachments/ab/digest.txt"), b"x").unwrap();
+        write_current_manifest_with_items(
+            &bundle,
+            2,
+            &["attachments/ab/digest.txt", "attachments/ab/digest.txt"],
+        );
+
+        let findings = detect(Some(td.path()));
+        assert!(
+            findings.is_empty(),
+            "deduped attachment references should not look like on-disk drift: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn detector_flags_current_manifest_unique_bundle_path_missing_on_disk() {
+        let td = TempDir::new().unwrap();
+        let arch = make_archive(&td);
+        let bundle = arch.join("bundle-1");
+        fs::create_dir_all(&bundle).unwrap();
+        write_current_manifest_with_items(&bundle, 1, &["attachments/ab/missing.txt"]);
+
+        let findings = detect(Some(td.path()));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].entries[0].kind,
+            DriftKind::AttachmentCountMismatch
+        );
+        assert_eq!(findings[0].entries[0].claimed, 1);
+        assert_eq!(findings[0].entries[0].actual, 0);
+    }
+
+    #[test]
+    fn detector_falls_back_to_stats_when_items_have_no_bundle_paths() {
+        let td = TempDir::new().unwrap();
+        let arch = make_archive(&td);
+        let bundle = arch.join("bundle-1");
+        fs::create_dir_all(&bundle).unwrap();
+        let manifest = serde_json::json!({
+            "attachments": {
+                "stats": {"copied": 2},
+                "items": [
+                    {"mode": "file"},
+                    {"mode": "external", "original_path": "/tmp/large.bin"}
+                ],
+            },
+        });
+        fs::write(
+            bundle.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let findings = detect(Some(td.path()));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].entries[0].claimed, 2);
+        assert_eq!(findings[0].entries[0].actual, 0);
     }
 
     #[test]
