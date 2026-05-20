@@ -217,7 +217,6 @@ fn classify_override(
     override_path: Option<&str>,
     override_version: Option<&str>,
 ) -> Option<OverrideStatus> {
-    use std::os::unix::fs::PermissionsExt;
     let Some(path_str) = override_path else {
         return Some(OverrideStatus::Unset);
     };
@@ -226,9 +225,12 @@ fn classify_override(
         Ok(m) => m,
         Err(_) => return Some(OverrideStatus::PathMissing),
     };
-    let mode = meta.permissions().mode();
-    // Any execute bit set is sufficient.
-    if mode & 0o111 == 0 {
+    // The execute-bit check is a POSIX mode-bit concept. On Windows
+    // executability is governed by file extension (.exe/.cmd/…) rather than
+    // mode bits, so we don't flag a present override as "NotExecutable"
+    // there (mirrors `path_order_shadows_am::is_executable`'s
+    // `#[cfg(not(unix))]` no-op).
+    if !meta_is_executable(&meta) {
         return Some(OverrideStatus::NotExecutable);
     }
     if override_version
@@ -239,6 +241,20 @@ fn classify_override(
         return Some(OverrideStatus::StillBad);
     }
     None
+}
+
+/// Whether the override binary is executable. Unix: any execute bit set.
+/// Windows: there are no POSIX execute bits — executability is governed by
+/// file extension — so a present file is treated as executable.
+#[cfg(unix)]
+fn meta_is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn meta_is_executable(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Fix is intentionally NOT implemented — this is a detect-only FM.

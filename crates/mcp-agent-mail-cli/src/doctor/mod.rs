@@ -19,6 +19,7 @@
 pub mod capabilities;
 pub mod fixers;
 pub mod mutate;
+pub(crate) mod platform;
 pub mod robot_docs;
 pub mod runs;
 pub mod undo;
@@ -1075,7 +1076,6 @@ fn short_run_suffix(fm_id: &str) -> String {
 /// Exit 0 on pass, 1 on fail. For operators after install/upgrade.
 pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -1149,11 +1149,31 @@ pub fn handle_selftest(format: Option<CliOutputFormat>) -> CliResult<()> {
     checks.push(serde_json::json!({"name": "append_file_mutation", "ok": ok2}));
 
     // Step 3: Chmod mutation.
+    //
+    // On Unix the chokepoint applies real POSIX mode bits, so we verify the
+    // exact `0o600`. On Windows there are no POSIX modes — `Op::Chmod` maps
+    // the owner-write bit to the read-only attribute via
+    // `platform::set_permission_mode` — so the meaningful check is that the
+    // mutation succeeded and the synthesized mode reflects writability
+    // (`0o600` carries the owner-write bit ⇒ not read-only ⇒ `permission_mode`
+    // reports `0o644`).
     let r3 = mutate::mutate(&ctx, &target_a, mutate::Op::Chmod { mode: 0o600 });
-    let ok3 = r3.is_ok()
-        && fs::metadata(&target_a)
-            .map(|m| m.permissions().mode() & 0o777 == 0o600)
-            .unwrap_or(false);
+    let chmod_applied = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&target_a)
+                .map(|m| m.permissions().mode() & 0o777 == 0o600)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::metadata(&target_a)
+                .map(|m| crate::doctor::platform::permission_mode(&m) == 0o644)
+                .unwrap_or(false)
+        }
+    };
+    let ok3 = r3.is_ok() && chmod_applied;
     all_ok &= ok3;
     checks.push(serde_json::json!({"name": "chmod_mutation", "ok": ok3}));
 

@@ -79,10 +79,10 @@
 
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{Op, mutate};
+use crate::doctor::platform;
 use mcp_agent_mail_core::git_cmd::GitCmd;
 use serde::Serialize;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-secrets-env-state-committed-env-file-in-repo";
@@ -267,13 +267,33 @@ fn list_tracked_files(project_root: &Path) -> Option<Vec<PathBuf>> {
         .stdout
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| PathBuf::from(std::ffi::OsStr::from_bytes(s)))
+        .map(path_from_git_zsep_bytes)
         .collect();
     Some(entries)
 }
 
-// Linux/macOS: bytes ↔ OsStr conversion is from std::os::unix.
-use std::os::unix::ffi::OsStrExt;
+/// Decode one NUL-separated `git ls-files -z` path entry into a `PathBuf`.
+///
+/// Unix: git emits raw path bytes; reconstruct losslessly via
+/// `OsStr::from_bytes`.
+///
+/// Windows: git emits UTF-8 path bytes; reconstruct via `String::from_utf8`
+/// (paths from `ls-files` are UTF-8). On the rare non-UTF-8 byte, fall back
+/// to a lossy decode so the entry still participates in the env-file probe
+/// rather than being silently dropped.
+#[cfg(unix)]
+fn path_from_git_zsep_bytes(s: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(s))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_zsep_bytes(s: &[u8]) -> PathBuf {
+    match std::str::from_utf8(s) {
+        Ok(text) => PathBuf::from(text),
+        Err(_) => PathBuf::from(String::from_utf8_lossy(s).into_owned()),
+    }
+}
 
 /// Detector. PURE.
 ///
@@ -313,7 +333,7 @@ pub fn detect(project_root: &Path) -> Vec<CommittedEnvFileFinding> {
             out.push(CommittedEnvFileFinding {
                 path: abs,
                 tracked_by_git: true,
-                current_mode: meta.permissions().mode(),
+                current_mode: platform::permission_mode(&meta),
                 matched_pattern: pattern,
             });
         }
@@ -340,7 +360,7 @@ pub fn detect(project_root: &Path) -> Vec<CommittedEnvFileFinding> {
         if !meta.file_type().is_file() {
             continue;
         }
-        let mode = meta.permissions().mode();
+        let mode = platform::permission_mode(&meta);
         if mode & 0o077 == 0 {
             // Already owner-only or stricter; chmod would not improve
             // the situation. Skip silently — re-running detect after
@@ -384,7 +404,7 @@ pub fn fix(
     // exact permission-widening bug the pass-35S detector gate
     // tried to prevent (pass-35T review F3, both models).
     let live_mode = match fs::symlink_metadata(&finding.path) {
-        Ok(m) if m.file_type().is_file() => m.permissions().mode(),
+        Ok(m) if m.file_type().is_file() => platform::permission_mode(&m),
         Ok(_) => {
             // Symlink or other non-regular file at the target. Refuse
             // to follow — same defense as the detector.

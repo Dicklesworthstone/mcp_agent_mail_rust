@@ -23,9 +23,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::fs::{self, File, OpenOptions, Permissions};
+use super::platform;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -223,7 +223,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn sha256_path_bytes(path: &Path) -> String {
-    sha256_bytes(path.as_os_str().as_bytes())
+    sha256_bytes(&platform::os_str_bytes(path.as_os_str()))
 }
 
 fn sha256_for_path_before_op(path: &Path, op: &Op) -> std::io::Result<String> {
@@ -299,7 +299,7 @@ pub(crate) fn sha256_of_dir_tree(root: &Path) -> std::io::Result<String> {
             let path = entry.path();
             let meta = fs::symlink_metadata(&path)?;
             let ft = meta.file_type();
-            let mode = meta.permissions().mode() & 0o7777;
+            let mode = platform::permission_mode(&meta);
             let rel = path
                 .strip_prefix(base)
                 .unwrap_or(&path)
@@ -338,23 +338,33 @@ pub(crate) fn sha256_of_dir_tree(root: &Path) -> std::io::Result<String> {
 }
 
 fn open_regular_file_no_follow(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
+    // Round-7 Gemini F2 (P1): O_NONBLOCK mirrors the undo helper —
+    // defeats the FIFO-blocks-open DoS in the chokepoint's hash/backup
+    // paths. No-op for regular files. The Unix `O_NOFOLLOW | O_NONBLOCK`
+    // open + post-open regular-file check (and the Windows
+    // reparse-point-refusal equivalent) live in `platform`.
+    platform::open_regular_file_no_follow(path)
+}
 
-    let f = OpenOptions::new()
-        .read(true)
-        // Round-7 Gemini F2 (P1): O_NONBLOCK mirrors the undo
-        // helper — defeats the FIFO-blocks-open DoS in the
-        // chokepoint's hash/backup paths. No-op for regular files.
-        .custom_flags(libc_consts::O_NOFOLLOW | libc_consts::O_NONBLOCK)
-        .open(path)?;
-    let meta = f.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    Ok(f)
+/// The recorded `before_mode` value for the action log.
+///
+/// Unix: the *raw* `Metadata::mode()` (file-type bits included, NOT masked
+/// to `0o7777`) — `before_mode`/`after_mode` are recorded and round-tripped
+/// verbatim, and undo's `restore_mode` feeds it back through
+/// `from_mode`/`set_permission_mode` (which ignores the high bits). Keeping
+/// the raw value preserves the existing action-log contract byte-for-byte.
+///
+/// Windows: synthesize from the read-only attribute, matching
+/// `platform::permission_mode`.
+#[cfg(unix)]
+fn recorded_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn recorded_mode(meta: &std::fs::Metadata) -> u32 {
+    platform::permission_mode(meta)
 }
 
 fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -476,7 +486,7 @@ fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
         let mut dst_file = tmp.as_file();
         std::io::copy(&mut src_file, &mut dst_file)?;
         dst_file.sync_data()?;
-        dst_file.set_permissions(Permissions::from_mode(meta.permissions().mode()))?;
+        platform::set_permission_mode(dst_file, platform::permission_mode(&meta))?;
     }
     tmp.persist(dst).map_err(|e| e.error)?;
     let _ = OpenOptions::new()
@@ -488,13 +498,13 @@ fn copy_verbatim_with_perms(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn copy_symlink_target(src: &Path, dst: &Path) -> std::io::Result<()> {
     let target = fs::read_link(src)?;
-    atomic_write_file(dst, target.as_os_str().as_bytes(), 0o600)
+    atomic_write_file(dst, &platform::os_str_bytes(target.as_os_str()), 0o600)
 }
 
 fn cmp_symlink_target(src: &Path, dst: &Path) -> std::io::Result<()> {
     let target = fs::read_link(src)?;
     let backup = read_or_empty(dst)?;
-    if target.as_os_str().as_bytes() == backup {
+    if platform::os_str_bytes(target.as_os_str()) == backup {
         Ok(())
     } else {
         Err(std::io::Error::other(
@@ -552,7 +562,7 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8], mode: u32) -> std::
         f.write_all(content)?;
         f.sync_data()?;
         // Chmod via fd before persist so a path swap cannot redirect it.
-        f.set_permissions(Permissions::from_mode(mode))?;
+        platform::set_permission_mode(f, mode)?;
     }
     tmp.persist(path).map_err(|e| e.error)?;
     let _ = OpenOptions::new()
@@ -625,7 +635,7 @@ pub(crate) fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> 
             ),
         ));
     }
-    std::os::unix::fs::symlink(target, &tmp_path)?;
+    platform::create_symlink(target, &tmp_path)?;
     fs::rename(&tmp_path, path)?;
     Ok(())
 }
@@ -636,6 +646,7 @@ pub(crate) fn atomic_symlink(path: &Path, target: &Path) -> std::io::Result<()> 
 /// symlink between the hash check and this open cannot redirect the append to
 /// an out-of-scope file. On a symlink, open returns `ELOOP`, which maps to
 /// `MutateError::Io`.
+#[cfg(unix)]
 fn append_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -650,7 +661,46 @@ fn append_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Windows equivalent of the Unix `O_NOFOLLOW` append: open the link itself
+/// (refusing reparse points) so a symlink/junction-swap attacker cannot
+/// redirect the append to an out-of-scope file, then append.
+#[cfg(not(unix))]
+fn append_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    // FILE_FLAG_OPEN_REPARSE_POINT opens the link itself instead of
+    // following it; we then reject any reparse point (symlink / junction /
+    // mount point), mirroring the Unix O_NOFOLLOW append.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if f.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a reparse point (symlink/junction); refusing append",
+                path.display()
+            ),
+        ));
+    }
+    f.write_all(content)?;
+    f.sync_data()?;
+    Ok(())
+}
+
 /// `O_NOFOLLOW` value as a const so we don't need a libc dep.
+///
+/// Only the Unix `append_file`/`chmod_via_fd` paths reference these; the
+/// Windows equivalents use the reparse-point flags inline. The shared
+/// `open_regular_file_no_follow` (hash/backup paths, where the FIFO-blocks-
+/// open DoS also mattered and `O_NONBLOCK` was needed) now lives in
+/// `super::platform`, so `O_NONBLOCK` is no longer referenced here.
+#[cfg(unix)]
 mod libc_consts {
     /// Linux/macOS/BSD: O_NOFOLLOW = 0x20000 on Linux x86_64, 0x100 on macOS.
     /// Rust stdlib's std::fs doesn't expose this. Use cfg-target.
@@ -666,26 +716,6 @@ mod libc_consts {
         target_os = "freebsd"
     )))]
     pub const O_NOFOLLOW: i32 = 0;
-
-    /// `O_NONBLOCK` value. Round-7 Gemini F2 (P1): the same FIFO
-    /// DoS that motivated `O_NONBLOCK` on undo's helper applies to
-    /// the chokepoint's `open_regular_file_no_follow` — without
-    /// it, `open(2)` on a FIFO with no writer blocks indefinitely.
-    /// `O_NONBLOCK` is a no-op for regular files (and the
-    /// post-open `is_file()` check rejects the FIFO/socket case
-    /// before any I/O).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub const O_NONBLOCK: i32 = 0o4000;
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    pub const O_NONBLOCK: i32 = 0x0004;
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd"
-    )))]
-    pub const O_NONBLOCK: i32 = 0;
 }
 
 /// Set permissions on `path` via the file descriptor.
@@ -693,13 +723,24 @@ mod libc_consts {
 /// Opens the file with `O_NOFOLLOW` first so a symlink-swap attacker
 /// cannot redirect the chmod to an arbitrary file. Returns `ELOOP` if
 /// `path` is now a symlink.
+#[cfg(unix)]
 fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc_consts::O_NOFOLLOW)
         .open(path)?;
-    f.set_permissions(Permissions::from_mode(mode))?;
+    platform::set_permission_mode(&f, mode)?;
+    Ok(())
+}
+
+/// Windows equivalent of the Unix `O_NOFOLLOW` chmod: open the link itself
+/// (refusing reparse points) so a symlink/junction-swap attacker cannot
+/// redirect the chmod, then map the mode onto the read-only attribute.
+#[cfg(not(unix))]
+fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
+    let f = platform::open_regular_file_no_follow(path)?;
+    platform::set_permission_mode(&f, mode)?;
     Ok(())
 }
 
@@ -794,7 +835,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         ) {
         None
     } else {
-        fs::metadata(path).ok().map(|m| m.permissions().mode())
+        fs::metadata(path).ok().map(|m| recorded_mode(&m))
     };
 
     // 5. Verbatim backup (only if file exists). Also re-verifies that the

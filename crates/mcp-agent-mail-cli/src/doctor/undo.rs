@@ -21,12 +21,12 @@
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::platform;
 use super::runs::doctor_root;
 
 const EMPTY_FILE_SHA256: &str =
@@ -37,15 +37,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_path_bytes(path: &Path) -> String {
-    sha256_hex(path.as_os_str().as_bytes())
+    sha256_hex(&platform::os_str_bytes(path.as_os_str()))
 }
 
 fn symlink_target_hash(path: &Path) -> std::io::Result<String> {
     Ok(sha256_path_bytes(&fs::read_link(path)?))
 }
 
+/// Reconstruct a path from the raw bytes a symlink-target backup stored.
+///
+/// This is the exact inverse of `platform::os_str_bytes` (used by the
+/// chokepoint's `copy_symlink_target`):
+///
+/// Unix: the bytes are the raw `OsStr` bytes → `OsString::from_vec`.
+///
+/// Windows: the bytes are little-endian UTF-16 code units → decode pairs
+/// back into u16s and `OsString::from_wide`. A trailing odd byte (which a
+/// well-formed backup never has) is dropped.
+#[cfg(unix)]
 fn path_from_raw_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
     PathBuf::from(OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+fn path_from_raw_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    PathBuf::from(OsString::from_wide(&units))
 }
 
 /// Read a regular file into memory with O_NOFOLLOW + post-open

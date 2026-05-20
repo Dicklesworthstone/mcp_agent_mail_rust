@@ -60,7 +60,6 @@ use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use regex::Regex;
 use serde::Serialize;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -207,9 +206,14 @@ pub fn detect(inputs: &DetectInputs) -> Vec<QuarantinedBakFinding> {
                 // Symlinks and dirs are out of scope here.
                 continue;
             }
-            let mode = meta.permissions().mode();
+            // The "wider than owner-only" gate is a POSIX mode-bit concept.
+            // On Windows there are no group/other permission bits, so this
+            // FM is N/A and never fires (mirrors the `#[cfg(not(unix))]`
+            // no-op pattern in `path_order_shadows_am`/`empty_or_truncated_db`).
+            let Some((mode, world_or_group)) = mode_and_world_or_group(&meta) else {
+                continue;
+            };
             let pattern = token_pattern_in_head(&path);
-            let world_or_group = mode & 0o077 != 0;
             // Emit if: (a) has token-shape AND wider than owner-only, OR
             // (b) has token-shape regardless of mode (hygiene — backup
             // shouldn't be left lying around). For now we ONLY emit
@@ -225,6 +229,21 @@ pub fn detect(inputs: &DetectInputs) -> Vec<QuarantinedBakFinding> {
         }
     }
     out
+}
+
+/// `Some((mode, world_or_group))` on Unix where `mode` is the POSIX mode and
+/// `world_or_group` is `mode & 0o077 != 0`. `None` on Windows, where there
+/// are no group/other permission bits and the FM is inapplicable.
+#[cfg(unix)]
+fn mode_and_world_or_group(meta: &std::fs::Metadata) -> Option<(u32, bool)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode();
+    Some((mode, mode & 0o077 != 0))
+}
+
+#[cfg(not(unix))]
+fn mode_and_world_or_group(_meta: &std::fs::Metadata) -> Option<(u32, bool)> {
+    None
 }
 
 fn token_pattern_in_head(path: &Path) -> Option<String> {

@@ -91,8 +91,8 @@
 
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
+use crate::doctor::platform;
 use serde::Serialize;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-mcp-config-files-duplicate-aliased-server-entries";
@@ -363,7 +363,7 @@ pub fn fix(
         // change permissions.
         let mode = std::fs::symlink_metadata(&entry.config_path)
             .ok()
-            .map(|m| m.permissions().mode() & 0o7777)
+            .map(|m| platform::permission_mode(&m))
             .unwrap_or(FALLBACK_CONFIG_MODE);
         mutate(
             ctx,

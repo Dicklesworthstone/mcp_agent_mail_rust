@@ -86,6 +86,7 @@ use serde::Serialize;
 /// process group on POSIX, so PID 0 is rejected before probing. Tests
 /// that want a guaranteed-dead PID should use `999_999_999` (above all
 /// known `pid_max` values on Linux/macOS/BSD).
+#[cfg(unix)]
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
     use nix::unistd::Pid;
 
@@ -97,6 +98,28 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     }
 
     pid_probe_result_is_alive(nix::sys::signal::kill(Pid::from_raw(pid), None))
+}
+
+/// Windows PID-liveness probe.
+///
+/// The real Win32 probe — `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+/// …)` + `GetExitCodeProcess` (alive iff exit code == `STILL_ACTIVE`) —
+/// requires `unsafe` FFI. This crate is built under a crate-root
+/// `#![forbid(unsafe_code)]`, which an inner `#[allow(unsafe_code)]`
+/// cannot downgrade (`E0453`), so we cannot call those Win32 entry points
+/// here.
+///
+/// We therefore fall back to a *conservative* answer: assume the PID is
+/// alive. Every caller uses `is_pid_alive` to decide whether a recorded
+/// PID still owns a lock / pid-hint before reclaiming it; answering `true`
+/// means the doctor will NEVER reclaim a lock out from under a process it
+/// cannot positively confirm is dead. The cost is that a genuinely-stale
+/// lock left by a crashed Windows process won't be auto-cleaned by these
+/// FMs — strictly the safe direction (no data loss, no live-process
+/// disruption). PID 0 is still rejected to match the Unix guard.
+#[cfg(not(unix))]
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
+    pid != 0
 }
 
 /// Canonical Rust-binary path used by the `stale_python_launcher_entry`
@@ -168,6 +191,7 @@ fn path_bytes_for_sqlite_uri(path: &std::path::Path) -> Vec<u8> {
     path.to_string_lossy().replace('\\', "/").into_bytes()
 }
 
+#[cfg(unix)]
 fn pid_probe_result_is_alive(result: Result<(), nix::errno::Errno>) -> bool {
     use nix::errno::Errno;
 
@@ -634,9 +658,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: stale_python_launcher_entry::FM_ID,
             severity: "P0",
             subsystem: "mcp_config_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "MCP client config still uses Python launcher for mcp_agent_mail (rust binary or HTTP URL is canonical)",
+            op_pattern: "Op::WriteFile",
+            auto_fixable: true,
+            one_line_description: "MCP client config still uses Python launcher for mcp_agent_mail — auto-fix swaps the launcher command to the canonical Rust binary (stdio preserved) in `.json`/`.toml` configs; `.jsonc`/`.json5` stay manual",
             source_module: "doctor::fixers::stale_python_launcher_entry",
         },
         FixerSpec {

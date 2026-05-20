@@ -56,7 +56,6 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{Op, mutate};
 use serde::Serialize;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-world-readable-storage-db";
@@ -117,17 +116,35 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WorldReadableStorageDbFinding>
         if !meta.file_type().is_file() {
             continue; // symlink-attack defense
         }
-        let mode = meta.permissions().mode();
-        if mode & 0o077 == 0 {
-            // Already safe (0o600 or stricter — 0o400 / 0o700 / etc.).
+        // "World/group-readable" is a POSIX mode-bit concept. On Windows
+        // there are no group/other permission bits, so this FM is N/A and
+        // never produces a finding (mirrors the `#[cfg(not(unix))]` no-op
+        // pattern in `path_order_shadows_am`/`empty_or_truncated_db`).
+        let Some(mode) = world_or_group_accessible_mode(&meta) else {
             continue;
-        }
+        };
         out.push(WorldReadableStorageDbFinding {
             path: path.clone(),
             current_mode: mode,
         });
     }
     out
+}
+
+/// `Some(mode)` iff the file is group/other-accessible (a finding); `None`
+/// when already owner-only or stricter. Windows has no POSIX mode bits, so
+/// it always returns `None` (the FM is inapplicable there).
+#[cfg(unix)]
+fn world_or_group_accessible_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode();
+    // Already safe (0o600 or stricter — 0o400 / 0o700 / etc.).
+    if mode & 0o077 == 0 { None } else { Some(mode) }
+}
+
+#[cfg(not(unix))]
+fn world_or_group_accessible_mode(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 /// Fixer. Routes through `mutate()` with `Op::Chmod`.

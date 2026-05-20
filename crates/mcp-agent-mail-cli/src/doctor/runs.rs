@@ -212,6 +212,7 @@ fn open_append_no_follow(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
+#[cfg(unix)]
 mod libc_consts {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const O_NOFOLLOW: i32 = 0o400000;
@@ -356,7 +357,7 @@ pub fn update_latest_symlink(target: &Path, run_id: &str) -> std::io::Result<()>
             ),
         ));
     }
-    std::os::unix::fs::symlink(&target_relative, &tmp)?;
+    crate::doctor::platform::create_symlink(&target_relative, &tmp)?;
     fs::rename(&tmp, &latest)?;
     Ok(())
 }
