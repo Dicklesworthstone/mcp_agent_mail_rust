@@ -10,6 +10,17 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+---
+
+## [v0.3.0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.0) — 2026-05-20 **[Release]**
+
+First minor-version release. Consolidates all development since v0.2.46 (the prior CHANGELOG-versioned release) and supersedes the unpublished in-tree 0.2.47–0.2.54 version bumps. Headline changes:
+
+- **`am doctor` world-class self-healing surface** matured through the pass-35 series: dozens of new failure-mode (FM) detectors graduated from detect-only to reversible, hash-witnessed mutations (`Op::WriteFile` / `Op::Chmod` / `Op::Rename`) routed through the single `mutate()` chokepoint — covering archive-state, db-state, mcp-config, guard-install, secrets/env, identity/contacts, and runtime-process failure modes. See the per-FM dispatcher detail below.
+- **Search V3 refactor + v24 migration** dropping the recipient-cascade trigger, with search-dialect rollout and `git_binary` hardening.
+- **Write-behind-queue durability hardening**: storage refuses new writes after the WBQ exhausts its retries, recoverable via `am doctor repair`; the messages id allocator now advances past the archive at startup and post-reconstruct.
+- **Installer hardening** against PEP 420 namespace spoofing in Python detection.
+
 ### `am doctor` — per-FM dispatcher surface (passes 14-32)
 
 The world-class doctor surface (added in commit `641990d8`, hardened in passes 1-13) gained a registry-backed per-FM dispatcher across passes 14-32. Every entry below is reachable from the CLI via `am doctor ...` or the library API in `crates/mcp-agent-mail-cli/src/doctor/`.
