@@ -87,8 +87,8 @@
 
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
+use crate::doctor::platform;
 use serde::Serialize;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-identity_contacts_state-build-slot-lease-expired";
@@ -386,7 +386,7 @@ pub fn fix(
         // guards the vanished case.
         let mode = std::fs::symlink_metadata(&entry.lease_path)
             .ok()
-            .map(|m| m.permissions().mode() & 0o7777)
+            .map(|m| platform::permission_mode(&m))
             .unwrap_or(FALLBACK_LEASE_MODE);
         mutate(
             ctx,
