@@ -196,6 +196,34 @@ fn identify_lock_holder_via_proc(db_path: &std::path::Path) -> Option<LockHolder
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    pids_holding_file_filtered(path, |_| true)
+}
+
+/// Internal variant of [`pids_holding_file`] that lets callers prune candidate
+/// PIDs *before* the expensive per-FD scan. Used by
+/// [`agent_mail_pids_holding_file`] so we don't open every FD of every process
+/// on the host just to discard non-Agent-Mail PIDs at the end.
+///
+/// Performance notes:
+/// - The previous implementation called `read_link` + `metadata(&link_target)`
+///   for every FD of every process — two syscalls per FD, plus a wasted
+///   `stat()` for socket/pipe/anon_inode FDs whose target string can never
+///   exist on the filesystem. With ~1k processes × ~50 FDs each, that was
+///   ≥100k syscalls per call.
+/// - This implementation calls `metadata(fd_entry.path())` directly, which
+///   resolves the symlink atomically via the kernel's `stat(2)`. One syscall
+///   per FD, and non-file FDs (sockets, pipes, eventpolls) return a stat
+///   for the anonymous inode that simply won't match the target's
+///   `(dev, ino)` — no special-casing needed.
+/// - The `pre_filter` callback runs after parsing the PID but before opening
+///   `/proc/<pid>/fd`, so a callback that rejects ~99% of host PIDs
+///   (e.g. `pid_is_agent_mail`) collapses the cost to O(matched PIDs × FDs).
+#[cfg(target_os = "linux")]
+#[must_use]
+fn pids_holding_file_filtered<F: Fn(u32) -> bool>(
+    path: &std::path::Path,
+    pre_filter: F,
+) -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(target_meta) = std::fs::metadata(path) else {
@@ -221,17 +249,19 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
         if pid == my_pid {
             continue;
         }
+        if !pre_filter(pid) {
+            continue;
+        }
         let fd_dir = format!("/proc/{pid}/fd");
         let Ok(fds) = std::fs::read_dir(&fd_dir) else {
             continue;
         };
         for fd_entry in fds.flatten() {
-            // readlink on /proc/<pid>/fd/<N> gives the target path.
-            let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
-                continue;
-            };
-            // Compare by inode+device to handle symlinks and bind mounts.
-            if let Ok(link_meta) = std::fs::metadata(&link_target) {
+            // `metadata` follows the /proc/<pid>/fd/<N> symlink in one syscall
+            // and yields the target's inode/dev. Anonymous-inode FDs (sockets,
+            // pipes, eventpolls, signalfds, ...) get a stat for the anon
+            // inode whose (dev, ino) cannot match a regular file.
+            if let Ok(link_meta) = std::fs::metadata(fd_entry.path()) {
                 if link_meta.ino() == target_ino && link_meta.dev() == target_dev {
                     holders.push(pid);
                     break; // One match per PID is enough
@@ -271,8 +301,24 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
 
 /// Find Agent Mail PIDs that have the given database file open.
 ///
-/// Filters `pids_holding_file` results to only include processes whose
-/// executable or command line matches the Agent Mail signature.
+/// Filters by the Agent Mail binary signature *before* walking each
+/// candidate PID's `/proc/<pid>/fd/` directory — `pid_is_agent_mail` only
+/// has to read `/proc/<pid>/cmdline` and `/proc/<pid>/exe`, while the FD
+/// scan can do ~100 syscalls per process. On a typical host this drops
+/// the call from O(host PIDs × FDs per PID) to O(am PIDs × FDs per PID),
+/// usually a 50–500× reduction.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn agent_mail_pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    pids_holding_file_filtered(path, pid_is_agent_mail)
+}
+
+/// Find Agent Mail PIDs that have the given database file open (macOS).
+///
+/// macOS has no `/proc`, so this stays on the original two-step path:
+/// shell out to `lsof` (which is already filtered to the target file) and
+/// then drop any returned PIDs that are not Agent Mail processes.
+#[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn agent_mail_pids_holding_file(path: &std::path::Path) -> Vec<u32> {
     pids_holding_file(path)
