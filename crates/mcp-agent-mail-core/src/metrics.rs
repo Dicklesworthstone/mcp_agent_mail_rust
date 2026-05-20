@@ -422,6 +422,14 @@ pub struct DbMetrics {
     pub pool_peak_active_connections: GaugeU64,
     pub pool_over_80_since_us: GaugeU64,
     pub integrity_failures_total: Counter,
+    /// Count of runtime corruption triggers where file-level health probes
+    /// (canonical `SQLite` `quick_check` + `integrity_check`) report healthy.
+    /// These are bespoke-parser-only rejections: typically a record or page
+    /// shape the frankensqlite parser refuses but canonical `SQLite` accepts.
+    /// Each tick corresponds to a recovery attempt that was *skipped* (rather
+    /// than re-spinning the futile recovery loop) so the caller surfaces a
+    /// terminal error instead.
+    pub bespoke_parser_only_rejections_total: Counter,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -437,6 +445,7 @@ pub struct DbMetricsSnapshot {
     pub pool_utilization_pct: u64,
     pub pool_over_80_since_us: u64,
     pub integrity_failures_total: u64,
+    pub bespoke_parser_only_rejections_total: u64,
 }
 
 impl Default for DbMetrics {
@@ -452,6 +461,7 @@ impl Default for DbMetrics {
             pool_peak_active_connections: GaugeU64::new(),
             pool_over_80_since_us: GaugeU64::new(),
             integrity_failures_total: Counter::new(),
+            bespoke_parser_only_rejections_total: Counter::new(),
         }
     }
 }
@@ -476,6 +486,7 @@ impl DbMetrics {
             pool_utilization_pct,
             pool_over_80_since_us: self.pool_over_80_since_us.load(),
             integrity_failures_total: self.integrity_failures_total.load(),
+            bespoke_parser_only_rejections_total: self.bespoke_parser_only_rejections_total.load(),
         }
     }
 }

@@ -625,7 +625,10 @@ fn wbq_drain_loop(
                 // so future send_message calls refuse instead of accepting
                 // writes that will silently disappear. See #122.
                 let unrecoverable = u64::try_from(envelopes.len()).unwrap_or(1);
-                metrics.storage.wbq_unrecoverable_errors_total.add(unrecoverable);
+                metrics
+                    .storage
+                    .wbq_unrecoverable_errors_total
+                    .add(unrecoverable);
                 metrics
                     .storage
                     .wbq_last_unrecoverable_error_us

@@ -3009,10 +3009,38 @@ impl DbPool {
         let primary_path = Path::new(&self.sqlite_path);
         let on_disk_healthy = match sqlite_file_is_healthy(primary_path) {
             Ok(true) => {
-                tracing::warn!(
+                // The query that triggered this recovery failed with a
+                // corruption-class error, but file-level health probes
+                // (including the canonical-SQLite fallback in
+                // `sqlite_primary_check_is_ok_with_canonical_fallback`) say
+                // the file is healthy. That means the trigger came from a
+                // bespoke-parser rejection of a record / page / index shape
+                // that canonical SQLite accepts — for example, SQLite
+                // serial types 10 and 11 which canonical reads as
+                // zero-length NULLs but a stricter parser may reject.
+                //
+                // Archive reconciliation is still valuable in this state
+                // (an archive-only message may be missing from the DB), so
+                // we let `recover_sqlite_file_with_storage_root` run below.
+                // What changes is the RETURN VALUE: we count this in a
+                // dedicated metric and convert the post-reconciliation
+                // success path to a TERMINAL Err so the caller does not
+                // retry the same parser-only-rejected query.
+                //
+                // Pre-fix, this branch returned `on_disk_healthy = true`
+                // and the success arm of `recover_sqlite_file_with_storage_root`
+                // returned `Ok(true)` — the caller retried the same query,
+                // the bespoke parser rejected the same record, and we
+                // re-entered this function forever at 100% CPU.
+                let metrics = mcp_agent_mail_core::global_metrics();
+                metrics.db.bespoke_parser_only_rejections_total.inc();
+                tracing::error!(
                     path = %self.sqlite_path,
                     trigger = %trigger_error,
-                    "runtime corruption trigger received while file-level health probes pass; forcing archive-aware reconciliation and pool refresh"
+                    "bespoke parser rejected a record that canonical SQLite accepts; \
+                     archive reconciliation will run but the caller will receive a \
+                     terminal error so it does not spin. File this against \
+                     frankensqlite with the trigger text."
                 );
                 true
             }
@@ -3035,9 +3063,39 @@ impl DbPool {
             }
         };
 
+        // True iff file-level probes passed (canonical SQLite said healthy)
+        // while the bespoke parser produced the trigger error. After
+        // reconciliation we convert the success path to Err so the caller
+        // does not retry the same parser-only-rejected query.
+        let bespoke_parser_only_trigger = on_disk_healthy;
+
         match recover_sqlite_file_with_storage_root(primary_path, &self.storage_root) {
             Ok(()) => {
                 self.retire_runtime_state_after_recovery(trigger_error);
+                if bespoke_parser_only_trigger {
+                    tracing::warn!(
+                        path = %self.sqlite_path,
+                        "archive reconciliation completed after bespoke-parser-only rejection; \
+                         returning terminal error so the caller does not retry the failing query"
+                    );
+                    return Err(DbError::IntegrityCorruption {
+                        message: format!(
+                            "Bespoke SQLite parser rejected a record that canonical SQLite \
+                             accepts on {path}: {trigger}. Archive reconciliation completed \
+                             but the underlying parser rejection will persist on retry; \
+                             returning terminal error to prevent an infinite retry loop. \
+                             This is a frankensqlite bug, not on-disk corruption.",
+                            path = self.sqlite_path,
+                            trigger = trigger_error,
+                        ),
+                        details: vec![
+                            format!("trigger: {trigger_error}"),
+                            "file_health_probe: canonical SQLite reports healthy".to_string(),
+                            "archive_reconciliation: completed".to_string(),
+                            "caller_action: do not retry the offending query".to_string(),
+                        ],
+                    });
+                }
                 tracing::warn!(
                     path = %self.sqlite_path,
                     on_disk_healthy,
@@ -9241,13 +9299,51 @@ mod tests {
             );
         }
 
-        assert!(
-            pool.try_recover_from_corruption("database disk image is malformed")
-                .expect("runtime recovery should succeed for healthy db")
-        );
+        // A healthy on-disk DB with a corruption-class trigger error means
+        // the bespoke parser rejected a record canonical SQLite accepts.
+        // `try_recover_from_corruption` must run archive reconciliation
+        // (covered by the sibling test) AND return a terminal Err so the
+        // caller does not retry the same parser-only-rejected query.
+        // It must still retire the cached pool / init gate so a fresh
+        // pool is initialized on the next acquire.
+        //
+        // Snapshot the bespoke-parser-only metric before the call so we can
+        // verify *this* invocation contributed the increment. Bare `>= 1`
+        // would false-pass if a sibling test in the same binary had already
+        // incremented the global counter.
+        let metric_before = mcp_agent_mail_core::global_metrics()
+            .db
+            .snapshot()
+            .bespoke_parser_only_rejections_total;
+        let rec_err = pool
+            .try_recover_from_corruption("database disk image is malformed")
+            .expect_err(
+                "healthy on-disk DB must return a terminal Err for bespoke-parser-only \
+                 rejections; returning Ok(true) here is the pre-fix spin-loop bug",
+            );
+        match &rec_err {
+            DbError::IntegrityCorruption { details, .. } => {
+                assert!(
+                    details
+                        .iter()
+                        .any(|d| d.contains("canonical SQLite reports healthy")),
+                    "terminal Err must explain that the file is healthy per canonical; got {details:?}"
+                );
+            }
+            other => panic!("expected IntegrityCorruption, got {other:?}"),
+        }
         assert!(
             pool.pool.is_closed(),
             "runtime recovery should close the old pool so stale connections cannot return"
+        );
+        let metric_after = mcp_agent_mail_core::global_metrics()
+            .db
+            .snapshot()
+            .bespoke_parser_only_rejections_total;
+        assert!(
+            metric_after > metric_before,
+            "bespoke_parser_only_rejections_total must increment on the healthy-DB recovery path; \
+             before={metric_before}, after={metric_after}",
         );
 
         {
@@ -9332,9 +9428,23 @@ mod tests {
         )
         .unwrap();
 
+        // Archive reconciliation MUST run even when the trigger is a
+        // bespoke-parser-only rejection (the file passes file-level
+        // probes via canonical SQLite). The function ALSO MUST return a
+        // terminal Err so the caller does not retry the same parser-only-
+        // rejected query (the pre-fix Ok(true) caused an infinite retry
+        // loop). The post-reconciliation row count below verifies the
+        // archive merge happened despite the terminal Err signal.
+        let rec_err = pool
+            .try_recover_from_corruption("database disk image is malformed")
+            .expect_err(
+                "healthy on-disk DB with a bespoke-parser-only trigger must return a \
+                 terminal Err to break the retry loop, while still performing archive \
+                 reconciliation",
+            );
         assert!(
-            pool.try_recover_from_corruption("database disk image is malformed")
-                .expect("runtime recovery should succeed")
+            matches!(rec_err, DbError::IntegrityCorruption { .. }),
+            "expected IntegrityCorruption terminal error, got {rec_err:?}",
         );
 
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();

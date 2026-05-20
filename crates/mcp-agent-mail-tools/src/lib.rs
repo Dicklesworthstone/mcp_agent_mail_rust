@@ -223,18 +223,6 @@ pub mod tool_util {
             | DbError::Pool(ref message)
                 if e.is_corruption() =>
             {
-                // Attempt automatic recovery before reporting error.
-                if let Ok(pool) = get_db_pool()
-                    && matches!(pool.try_recover_from_corruption(message), Ok(true))
-                {
-                    return legacy_tool_error(
-                        "DATABASE_RECOVERED",
-                        "Database corruption was detected and the runtime was automatically recovered. \
-                         Please retry your operation.",
-                        true,
-                        json!({ "error_detail": message, "recovered": true }),
-                    );
-                }
                 let message = message.clone();
                 legacy_tool_error(
                     "DATABASE_CORRUPTION",
@@ -1303,6 +1291,32 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_corruption_mapping_is_pure_with_live_pool() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let db_path = temp.path().join("live.sqlite3");
+            let database_url = format!("sqlite:///{}", db_path.display());
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("DATABASE_URL", database_url.as_str())],
+                || {
+                    Config::reset_cached();
+                    let _pool = get_db_pool().expect("live pool");
+
+                    let err = db_error_to_mcp_error(DbError::Schema(
+                        "database disk image is malformed".into(),
+                    ));
+                    let data = err.data.expect("expected data payload");
+                    assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
+                    assert_eq!(data["error"]["recoverable"], false);
+                },
+            );
         }
 
         #[test]

@@ -946,6 +946,7 @@ mod tests {
                 pool_utilization_pct: 0,
                 pool_over_80_since_us: 0,
                 integrity_failures_total: 0,
+                bespoke_parser_only_rejections_total: 0,
             },
             storage: StorageMetricsSnapshot {
                 wbq_enqueued_total: 0,
@@ -965,6 +966,8 @@ mod tests {
                     p95: 0,
                     p99: 0,
                 },
+                wbq_last_unrecoverable_error_us: 0,
+                wbq_unrecoverable_errors_total: 0,
                 commit_enqueued_total: 0,
                 commit_drained_total: 0,
                 commit_errors_total: 0,

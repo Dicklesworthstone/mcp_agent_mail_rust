@@ -1694,6 +1694,7 @@ mod tests {
                 pool_utilization_pct: 50,
                 pool_over_80_since_us: 0,
                 integrity_failures_total: 0,
+                bespoke_parser_only_rejections_total: 0,
             },
             storage: StorageMetricsSnapshot {
                 wbq_enqueued_total: tool_calls,
@@ -1705,6 +1706,8 @@ mod tests {
                 wbq_peak_depth: 50,
                 wbq_over_80_since_us: 0,
                 wbq_queue_latency_us: make_histogram(100, 500, 1000),
+                wbq_last_unrecoverable_error_us: 0,
+                wbq_unrecoverable_errors_total: 0,
 
                 commit_enqueued_total: commit_drained + 5,
                 commit_drained_total: commit_drained,
