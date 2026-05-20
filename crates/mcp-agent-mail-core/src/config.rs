@@ -1459,7 +1459,24 @@ impl Default for Config {
 /// Module-level shared config cache (used by `Config::get` and `Config::reset_cached`).
 static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
 
+#[cfg(test)]
+fn test_config_env_overrides_active() -> bool {
+    let process_overrides_empty = process_env_overrides()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty();
+    if !process_overrides_empty {
+        return true;
+    }
+    TEST_ENV_OVERRIDES.with(|cell| !cell.borrow().is_empty())
+}
+
 fn global_config_cache_get() -> Config {
+    #[cfg(test)]
+    if test_config_env_overrides_active() {
+        return Config::from_env();
+    }
+
     // Fast path: read lock, return clone if present
     {
         let guard = CONFIG_CACHE
@@ -3631,6 +3648,33 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("AM_ATC_WRITE_MODE", "shadow")]);
         let config = Config::from_env();
         assert!(config.atc_write_mode.is_shadow());
+    }
+
+    #[test]
+    fn test_config_get_bypasses_stale_cache_when_process_override_active() {
+        Config::reset_cached();
+        {
+            let stale = Config {
+                atc_write_mode: AtcWriteMode::Off,
+                ..Config::default()
+            };
+            let mut guard = CONFIG_CACHE
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(stale);
+        }
+
+        with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("ATC_LEARNING_DISABLED", "0"),
+            ],
+            || {
+                assert!(Config::get().atc_write_mode.is_live());
+            },
+        );
+
+        Config::reset_cached();
     }
 
     #[test]
