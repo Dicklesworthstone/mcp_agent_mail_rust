@@ -17,6 +17,7 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
@@ -51,6 +52,7 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
@@ -107,6 +109,7 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
