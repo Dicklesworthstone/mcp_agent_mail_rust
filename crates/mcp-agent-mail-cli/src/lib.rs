@@ -5037,6 +5037,33 @@ fn run_startup_doctor_repair_subprocess(
     storage_root: &Path,
     backup_dir: &Path,
 ) -> CliResult<()> {
+    // Issue #127: the spawned `am doctor repair` subprocess crashes with
+    // "WAL file too small for header during rebuild" when a header-only or
+    // truncated WAL sidecar is still attached, which surfaces as a non-zero
+    // exit and traps `serve-http` in a systemd restart loop. The startup-checks
+    // path already quarantines such a WAL, but this subprocess entry point did
+    // not, so the symmetry gap let the crash through. Quarantine it here too
+    // before spawning — a header-only WAL has no committed frames, so detaching
+    // it is non-destructive (and forensics-preserving via quarantine).
+    if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        if let Ok(meta) = std::fs::metadata(&wal_path)
+            && mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len())
+            && let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
+                &wal_path,
+                "header-only/truncated WAL before startup doctor repair",
+            )?
+        {
+            eprintln!(
+                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; <= {} byte WAL header) before startup doctor repair",
+                wal_path.display(),
+                quarantined.display(),
+                meta.len(),
+                mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
+            );
+        }
+    }
+
     let exe = std::env::current_exe().map_err(|error| {
         CliError::Other(format!(
             "failed to resolve current executable for startup database repair: {error}"
