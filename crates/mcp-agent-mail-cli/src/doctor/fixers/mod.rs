@@ -598,9 +598,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: codex_startup_timeout::FM_ID,
             severity: "P1",
             subsystem: "mcp_config_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Codex config.toml missing or too-short startup_timeout_sec (boot races mcp-agent-mail cold start)",
+            op_pattern: "Op::WriteFile",
+            auto_fixable: true,
+            one_line_description: "Codex config.toml missing or too-short startup_timeout_sec (boot races mcp-agent-mail cold start) — auto-fix sets startup_timeout_sec on the existing mcp_agent_mail entry via format-preserving toml_edit; entry-absent stays manual (am setup)",
             source_module: "doctor::fixers::codex_startup_timeout",
         },
         FixerSpec {

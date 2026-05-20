@@ -35,18 +35,35 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only.** A safe auto-fix requires TOML byte-exact
-//! preservation (comments, key ordering, trailing whitespace),
-//! which is a substantial engineering surface and out of scope
-//! for this commit. The manual remediation envelope gives the
-//! operator the exact line to add / change.
+//! **Auto-fix via `Op::WriteFile`** (format-preserving). The
+//! config is parsed with `toml_edit::DocumentMut`, which keeps
+//! comments, key ordering, and whitespace intact. Only the
+//! `startup_timeout_sec` scalar under the existing
+//! `mcp_agent_mail` server entry is touched — set to the
+//! canonical `CODEX_STARTUP_TIMEOUT_SECS` (30). This handles both
+//! the `TooShort` state (replace the small value) and the
+//! `Missing` state where the entry exists but lacks the key
+//! (insert it). The chokepoint backs up the original bytes
+//! verbatim, so `am doctor undo <run-id>` restores them
+//! byte-identically.
+//!
+//! Skip (operator-supplied truth required):
+//! - The `mcp_agent_mail` server entry doesn't exist at all
+//!   (`[mcp_servers]` absent, or no `mcp_agent_mail` /
+//!   `"mcp-agent-mail"` key): adding the whole server entry is
+//!   `am setup`'s job and requires choosing stdio vs HTTP.
+//! - The TOML is malformed (a different FM / the operator owns
+//!   broken configs).
+//! - The value is already ≥ the minimum (idempotent / a writer
+//!   fixed it between detect and fix).
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{MutateContext, MutateError};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use crate::{CODEX_STARTUP_TIMEOUT_SECS, extract_mcp_agent_mail_toml_startup_timeout};
 use mcp_agent_mail_core::mcp_config::{McpConfigLocation, McpConfigTool};
+use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -115,24 +132,31 @@ impl CodexStartupTimeoutFinding {
                 "tool": "codex",
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                // Detect-only — TOML in-place edit is a separate
-                // surface (filed as follow-up).
-                auto_fixable: false,
-                estimated_actions: 0,
+                // Auto-fix sets startup_timeout_sec on the existing
+                // mcp_agent_mail entry via format-preserving
+                // toml_edit. Skipped (counted in actions_skipped)
+                // when the entry doesn't exist at all.
+                auto_fixable: true,
+                estimated_actions: 1,
             },
         }
     }
 
     pub fn manual_remediation_text(&self) -> String {
         format!(
-            "Edit {} and ensure the [mcp_servers.mcp_agent_mail] section contains \
-             `startup_timeout_sec = {}` (or quoted variant `[mcp_servers.\"mcp-agent-mail\"]`). \
-             Codex cold-boots mcp-agent-mail in ~10s under normal conditions; a smaller \
-             timeout produces flaky 'MCP server didn't respond' errors. Auto-fix is \
-             detect-only because TOML byte-exact in-place editing is out of scope for this \
-             FM revision.",
+            "Auto-fix (preferred): `am doctor fix --only {} --yes` sets \
+             `startup_timeout_sec = {}` on the existing mcp_agent_mail entry in {} via \
+             format-preserving toml_edit (comments / key order / whitespace untouched), \
+             reversible via `am doctor undo`. Manual alternative: edit the file and ensure \
+             the [mcp_servers.mcp_agent_mail] section contains `startup_timeout_sec = {}` \
+             (or quoted variant `[mcp_servers.\"mcp-agent-mail\"]`). Codex cold-boots \
+             mcp-agent-mail in ~10s under normal conditions; a smaller timeout produces \
+             flaky 'MCP server didn't respond' errors. If the mcp_agent_mail entry doesn't \
+             exist at all, run `am setup` first — the auto-fix won't create the server entry.",
+            FM_ID,
+            self.min_required_secs,
             self.config_path.display(),
             self.min_required_secs,
         )
@@ -172,14 +196,96 @@ pub fn detect(locations: &[McpConfigLocation]) -> Vec<CodexStartupTimeoutFinding
     out
 }
 
-/// Detect-only FM. `fix()` is a no-op.
+/// Candidate keys for the agent-mail server entry under
+/// `[mcp_servers]`. Codex configs use the snake_case form
+/// canonically; the quoted kebab form is also accepted by the
+/// detector, so the fixer handles both.
+const AGENT_MAIL_KEYS: &[&str] = &["mcp_agent_mail", "mcp-agent-mail"];
+
+/// Set `startup_timeout_sec` on the existing `mcp_agent_mail`
+/// entry in a parsed TOML document, preserving all formatting.
+///
+/// Returns `true` if a value was written, `false` if there was
+/// nothing safe to do (entry absent, or already ≥ min). Never
+/// creates the server entry itself — that's `am setup`'s job.
+fn set_startup_timeout(doc: &mut toml_edit::DocumentMut, min_secs: u64) -> bool {
+    let Some(servers) = doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return false;
+    };
+    let Some(key) = AGENT_MAIL_KEYS
+        .iter()
+        .find(|k| servers.contains_key(k))
+        .copied()
+    else {
+        return false;
+    };
+    let Some(entry) = servers
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        // Entry exists but isn't a table/inline-table (e.g. a
+        // bare string) — not a shape we can safely edit.
+        return false;
+    };
+    // Idempotence / race guard: if already ≥ min, do nothing.
+    if let Some(cur) = entry
+        .get("startup_timeout_sec")
+        .and_then(toml_edit::Item::as_integer)
+        && cur >= 0
+        && (cur as u64) >= min_secs
+    {
+        return false;
+    }
+    entry.insert(
+        "startup_timeout_sec",
+        toml_edit::value(i64::try_from(min_secs).unwrap_or(i64::MAX)),
+    );
+    true
+}
+
+/// Fixer. Format-preserving TOML edit via `Op::WriteFile`.
 pub fn fix(
-    _ctx: &MutateContext,
-    _finding: &CodexStartupTimeoutFinding,
+    ctx: &MutateContext,
+    finding: &CodexStartupTimeoutFinding,
 ) -> Result<FixOutcome, MutateError> {
+    let skip = || {
+        Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        })
+    };
+    let content = match std::fs::read_to_string(&finding.config_path) {
+        Ok(c) => c,
+        Err(_) => return skip(), // vanished between detect and fix
+    };
+    let mut doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return skip(), // malformed TOML — operator owns it
+    };
+    if !set_startup_timeout(&mut doc, finding.min_required_secs) {
+        // Entry absent, wrong shape, or already healthy.
+        return skip();
+    }
+    let new_content = doc.to_string();
+    let mode = std::fs::symlink_metadata(&finding.config_path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o644);
+    mutate(
+        ctx,
+        &finding.config_path,
+        Op::WriteFile {
+            content: new_content.into_bytes(),
+            mode,
+        },
+    )?;
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
+        actions_taken: 1,
+        actions_skipped: 0,
         quarantined_paths: Vec::new(),
     })
 }
