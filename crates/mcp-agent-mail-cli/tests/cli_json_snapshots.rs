@@ -133,13 +133,24 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
         );
         for root in [search_index_root, "/tmp/mcp-agent-mail-search-index"] {
             if let Some(rest) = normalized.strip_prefix(root)
-                && (rest.starts_with('/') || rest.starts_with('\\'))
-                && rest[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+                && search_index_hash_suffix(rest).is_some()
             {
                 return "<SEARCH_INDEX_ROOT>/<HASH>".to_string();
             }
         }
         normalized
+    }
+
+    fn search_index_hash_suffix(rest: &str) -> Option<&str> {
+        let sep = rest
+            .char_indices()
+            .find_map(|(idx, ch)| matches!(ch, '/' | '\\').then_some(idx))?;
+        let (scope, hash_with_sep) = rest.split_at(sep);
+        let hash = &hash_with_sep[1..];
+        if hash.is_empty() || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+        (scope.is_empty() || scope.starts_with('-')).then_some(hash)
     }
 
     fn walk(v: Value, tmp: &str, tmp_slug: Option<&str>, search_index_root: &str) -> Value {
@@ -238,6 +249,30 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
         tmp_slug.as_deref(),
         &search_index_root,
     )
+}
+
+#[test]
+fn normalize_json_redacts_user_scoped_search_index_roots() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let value = serde_json::json!({
+        "old": "/tmp/mcp-agent-mail-search-index/abcdef",
+        "scoped": "/tmp/mcp-agent-mail-search-index-880489/abcdef",
+        "not_hash": "/tmp/mcp-agent-mail-search-index-880489/not-a-hash",
+    });
+
+    let normalized = normalize_json(value, tmp.path());
+    assert_eq!(
+        normalized["old"],
+        Value::String("<SEARCH_INDEX_ROOT>/<HASH>".to_string())
+    );
+    assert_eq!(
+        normalized["scoped"],
+        Value::String("<SEARCH_INDEX_ROOT>/<HASH>".to_string())
+    );
+    assert_eq!(
+        normalized["not_hash"],
+        Value::String("/tmp/mcp-agent-mail-search-index-880489/not-a-hash".to_string())
+    );
 }
 
 #[derive(Debug)]

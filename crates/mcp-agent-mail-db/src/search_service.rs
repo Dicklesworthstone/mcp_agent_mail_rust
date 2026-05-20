@@ -897,9 +897,30 @@ fn stable_direct_surface_index_dir(pool: &DbPool) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(pool.sqlite_identity_key().as_bytes());
     let digest = hex::encode(hasher.finalize());
-    std::env::temp_dir()
-        .join("mcp-agent-mail-search-index")
-        .join(digest)
+    stable_direct_surface_index_root().join(digest)
+}
+
+fn stable_direct_surface_index_root() -> PathBuf {
+    let owner = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .map(|value| sanitize_search_index_owner(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::process::id().to_string());
+    std::env::temp_dir().join(format!("mcp-agent-mail-search-index-{owner}"))
+}
+
+fn sanitize_search_index_owner(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn direct_surface_index_dir(pool: &DbPool) -> PathBuf {
@@ -4636,8 +4657,19 @@ mod tests {
 
         let chosen = direct_surface_index_dir(&pool);
         assert_ne!(chosen, root.path().join("search_index"));
-        assert!(chosen.starts_with(std::env::temp_dir().join("mcp-agent-mail-search-index")));
+        assert!(chosen.starts_with(stable_direct_surface_index_root()));
         assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
+    }
+
+    #[test]
+    fn stable_direct_surface_index_root_is_user_scoped() {
+        let root = stable_direct_surface_index_root();
+        let name = root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("search index root name");
+        assert!(name.starts_with("mcp-agent-mail-search-index-"));
+        assert_ne!(name, "mcp-agent-mail-search-index");
     }
 
     fn write_backfill_health_state(
