@@ -94,7 +94,7 @@ echo "new content" > "${REPO}/test.py"
 git -C "$REPO" add test.py
 
 set +e
-git -C "$REPO" commit -qm "add test.py" 2>"${WORK}/commit_clean_stderr.txt"
+AGENT_NAME=TestAgent git -C "$REPO" commit -qm "add test.py" 2>"${WORK}/commit_clean_stderr.txt"
 commit_rc=$?
 set -e
 
@@ -106,7 +106,8 @@ e2e_save_artifact "case3_commit_clean_stderr.txt" "$(cat "${WORK}/commit_clean_s
 # ---------------------------------------------------------------------------
 e2e_case_banner "Pre-commit blocks commit when exclusive reservation conflicts"
 
-# Create a minimal sqlite DB for the guard plugin to query.
+# Create a minimal SQLite DB for older guard lookup paths plus the archive JSON
+# consumed by the installed hook.
 GUARD_DB="$GUARD_DB" PROJECT_KEY="$REPO" python3 - <<'PY'
 import os
 import sqlite3
@@ -149,6 +150,17 @@ conn.commit()
 conn.close()
 PY
 
+cat > "${REPO}/file_reservations/res_precommit.json" << EOJSON
+{
+    "id": 1,
+    "path_pattern": "app/api/*.py",
+    "agent_name": "OtherAgent",
+    "exclusive": true,
+    "expires_ts": "${FUTURE_TS}",
+    "released_ts": null
+}
+EOJSON
+
 # Stage a conflicting change and attempt commit (should be blocked by pre-commit)
 echo "# changed" >> "$REPO/app/api/views.py"
 git -C "$REPO" add app/api/views.py
@@ -184,6 +196,19 @@ now_micros = int(time.time() * 1_000_000)
 cur.execute("UPDATE file_reservations SET released_ts = ? WHERE id = 1", (now_micros,))
 conn.commit()
 conn.close()
+PY
+
+python3 - "${REPO}/file_reservations/res_precommit.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+payload["released_ts"] = "2025-01-01T00:00:00Z"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=4)
+    handle.write("\n")
 PY
 
 set +e

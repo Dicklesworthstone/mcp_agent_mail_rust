@@ -417,7 +417,7 @@ run_robot_capture "${OUTPUT_DIR}/snapshots/threads_view.md"        thread "${THR
 run_robot_capture "${OUTPUT_DIR}/snapshots/message_detail.json"    message "${MESSAGE_ID}" --format json
 run_robot_capture "${OUTPUT_DIR}/snapshots/search_results.json"    search "truth-fixture" --format json
 run_robot_capture "${OUTPUT_DIR}/snapshots/search_results_since.json" search "truth-fixture" --since "1970-01-01T00:00:00Z" --format json
-run_robot_capture "${OUTPUT_DIR}/snapshots/search_results_kind_message.json" search "truth-fixture" --kind message --format json
+run_robot_capture "${OUTPUT_DIR}/snapshots/search_results_kind_to.json" search "truth-fixture" --kind to --format json
 
 # Track 3b: Navigation (resource:// URI resolution)
 run_robot_capture "${OUTPUT_DIR}/snapshots/navigate.json"           navigate "resource://agents/${PROJECT_SLUG}" --format json
@@ -798,7 +798,7 @@ threads_snap = safe_load(os.path.join(snap_dir, "threads_view.json"))
 threads_limit3_snap = safe_load(os.path.join(snap_dir, "threads_view_limit3.json"))
 search_snap = safe_load(os.path.join(snap_dir, "search_results.json"))
 search_since_snap = safe_load(os.path.join(snap_dir, "search_results_since.json"))
-search_kind_message_snap = safe_load(os.path.join(snap_dir, "search_results_kind_message.json"))
+search_kind_to_snap = safe_load(os.path.join(snap_dir, "search_results_kind_to.json"))
 overview_snap = safe_load(os.path.join(snap_dir, "overview.json"))
 attachments_snap = safe_load(os.path.join(snap_dir, "attachments.json"))
 inbox_limit5_snap = safe_load(os.path.join(snap_dir, "messages_inbox_limit5.json"))
@@ -815,7 +815,7 @@ required_snapshots = {
     "threads_view_limit3.json": threads_limit3_snap,
     "search_results.json": search_snap,
     "search_results_since.json": search_since_snap,
-    "search_results_kind_message.json": search_kind_message_snap,
+    "search_results_kind_to.json": search_kind_to_snap,
     "overview.json": overview_snap,
     "attachments.json": attachments_snap,
     "system_health.json": health_snap,
@@ -1099,23 +1099,23 @@ if search_since_snap:
         note=search_since_note,
     ))
 
-if search_kind_message_snap:
+if search_kind_to_snap:
     search_kind_note = None
     search_kind_value = None
-    if has_capture_error(search_kind_message_snap):
-        search_kind_note = "search_results_kind_message snapshot capture_error"
+    if has_capture_error(search_kind_to_snap):
+        search_kind_note = "search_results_kind_to snapshot capture_error"
     else:
         search_kind_value = first_int(
-            search_kind_message_snap.get("total_results"),
-            search_kind_message_snap.get("count"),
+            search_kind_to_snap.get("total_results"),
+            search_kind_to_snap.get("count"),
         )
     record_check(build_check(
         surface_id="robot.search_params",
-        metric="search_kind_message.lte_baseline",
+        metric="search_kind_to.lte_baseline",
         comparator="lte",
         db_truth=base_search_count,
         surface_value=search_kind_value,
-        snapshot="search_results_kind_message.json",
+        snapshot="search_results_kind_to.json",
         note=search_kind_note,
     ))
 

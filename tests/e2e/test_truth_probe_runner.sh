@@ -86,7 +86,7 @@ assert_h3_parameter_sweeps() {
         and has_check("robot.thread_params:limit3.lte_baseline")
         and has_check("robot.thread_params:limit3.lte_3")
         and has_check("robot.search_params:since.lte_baseline")
-        and has_check("robot.search_params:kind_message.lte_baseline")
+        and has_check("robot.search_params:kind_to.lte_baseline")
     ' "${report_path}" >/dev/null 2>&1; then
         e2e_pass "${label}: H3 param-sweep checks are present"
     else

@@ -103,14 +103,16 @@ e2e_log "Pre-v10 DB created with 3 case-duplicate agents"
 AGENT_COUNT_BEFORE=$(sqlite3 "${DB_CASE}" "SELECT COUNT(*) FROM agents WHERE project_id = 1")
 e2e_assert_eq "3 case-duplicate agents before fix" "3" "$AGENT_COUNT_BEFORE"
 
-# Run am with this DB — should trigger v10a/v10b migrations
+# Run the explicit migration command with this DB.  Doctor check is
+# intentionally non-mutating, so it must not be used as a migration trigger.
 export DATABASE_URL="${DB_URL}"
 export STORAGE_ROOT="${STORAGE_ROOT}"
 export AM_INTERFACE_MODE="cli"
 
-OUTPUT=$(am doctor check --json 2>&1) || true
-e2e_save_artifact "case_dup_doctor_check.txt" "$OUTPUT"
-e2e_log "Doctor check triggered v10a/v10b migrations"
+OUTPUT=$(am migrate 2>&1) || true
+e2e_save_artifact "case_dup_migrate.txt" "$OUTPUT"
+e2e_assert_contains "migration completes" "$OUTPUT" "Database schema"
+e2e_log "Explicit migrate triggered v10a/v10b migrations"
 
 # After migrations run, verify dedup:
 AGENT_COUNT_AFTER=$(sqlite3 "${DB_CASE}" "SELECT COUNT(*) FROM agents WHERE project_id = 1")
@@ -145,8 +147,8 @@ export DATABASE_URL="${DB_REPAIR_URL}"
 am doctor check --json >/dev/null 2>&1 || true
 e2e_log "Repair test DB initialized"
 
-# Run doctor repair with explicit backup dir
-REPAIR_OUTPUT=$(am doctor repair --backup-dir "${BACKUP_DIR}" 2>&1) || true
+# Run doctor repair with explicit backup dir and explicit non-interactive consent
+REPAIR_OUTPUT=$(am doctor repair --backup-dir "${BACKUP_DIR}" --yes 2>&1) || true
 e2e_save_artifact "repair_output.txt" "$REPAIR_OUTPUT"
 e2e_assert_contains "repair completes" "$REPAIR_OUTPUT" "Repair complete"
 

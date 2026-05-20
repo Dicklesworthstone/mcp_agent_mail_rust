@@ -31,7 +31,9 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_force_release")"
 FR_DB="${WORK}/force_release_test.sqlite3"
+TEST_STORAGE_ROOT="${WORK}/storage"
 PROJECT_PATH="/tmp/e2e_force_release_$$"
+mkdir -p "$TEST_STORAGE_ROOT"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-force-release","version":"1.0"}}}'
 
@@ -42,13 +44,14 @@ INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 send_jsonrpc_session() {
     local db_path="$1"; shift
     local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
+    local output_file
+    output_file="$(mktemp "${WORK}/session_response.XXXXXX")"
     local srv_work
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="$TEST_STORAGE_ROOT" RUST_LOG=error \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -61,9 +64,15 @@ send_jsonrpc_session() {
     } > "$fifo" &
     local write_pid=$!
 
-    local timeout_s=30
+    local max_ticks=200
     local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
+    local expected_responses="${#requests[@]}"
+    local response_count=0
+    while [ "$elapsed" -lt "$max_ticks" ]; do
+        response_count="$(grep -c '^{' "$output_file" 2>/dev/null || true)"
+        if [ "$response_count" -ge "$expected_responses" ]; then
+            break
+        fi
         if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
         sleep 0.5
         elapsed=$((elapsed + 1))
@@ -79,7 +88,7 @@ send_jsonrpc_session() {
 extract_result() {
     local response="$1"
     local req_id="$2"
-    echo "$response" | python3 -c "
+    python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -93,13 +102,13 @@ for line in sys.stdin:
                 sys.exit(0)
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
-" 2>/dev/null
+" <<< "$response" 2>/dev/null
 }
 
 is_error_result() {
     local response="$1"
     local req_id="$2"
-    echo "$response" | python3 -c "
+    python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -116,7 +125,7 @@ for line in sys.stdin:
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
 print('false')
-" 2>/dev/null
+" <<< "$response" 2>/dev/null
 }
 
 parse_json_field() {
@@ -147,7 +156,7 @@ assert_ok() {
     local id="$3"
 
     local check
-    check="$(echo "$resp" | python3 -c "
+    check="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -166,7 +175,7 @@ for line in sys.stdin:
                 sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+" <<< "$resp" 2>/dev/null)"
 
     case "$check" in
         OK) e2e_pass "$label" ;;
@@ -176,32 +185,36 @@ print('NO_MATCH')
 }
 
 # ===========================================================================
-# Setup: Create project and agents (StaleBot, ActiveBot, ReleaserBot)
+# Setup: Create project and agents.
 # ===========================================================================
-e2e_case_banner "Setup: project + agents (StaleBot, ActiveBot, ReleaserBot)"
+STALE_AGENT="SilverPine"
+ACTIVE_AGENT="BlueLake"
+RELEASER_AGENT="RedStone"
+
+e2e_case_banner "Setup: project + agents (${STALE_AGENT}, ${ACTIVE_AGENT}, ${RELEASER_AGENT})"
 
 SETUP_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"StaleBot\",\"task_description\":\"force-release E2E (will become stale)\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"ActiveBot\",\"task_description\":\"force-release E2E (stays active)\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"ReleaserBot\",\"task_description\":\"force-release E2E (requests force-release)\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${STALE_AGENT}\",\"task_description\":\"force-release E2E (will become stale)\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${ACTIVE_AGENT}\",\"task_description\":\"force-release E2E (stays active)\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"program\":\"e2e-test\",\"model\":\"test-model\",\"name\":\"${RELEASER_AGENT}\",\"task_description\":\"force-release E2E (requests force-release)\"}}}" \
 )"
 e2e_save_artifact "case_00_setup.txt" "$SETUP_RESP"
 
 assert_ok "ensure_project" "$SETUP_RESP" 10
-assert_ok "register StaleBot" "$SETUP_RESP" 11
-assert_ok "register ActiveBot" "$SETUP_RESP" 12
-assert_ok "register ReleaserBot" "$SETUP_RESP" 13
+assert_ok "register ${STALE_AGENT}" "$SETUP_RESP" 11
+assert_ok "register ${ACTIVE_AGENT}" "$SETUP_RESP" 12
+assert_ok "register ${RELEASER_AGENT}" "$SETUP_RESP" 13
 
 # ===========================================================================
-# Case 1: StaleBot creates a reservation
+# Case 1: stale agent creates a reservation
 # ===========================================================================
-e2e_case_banner "StaleBot creates a reservation"
+e2e_case_banner "${STALE_AGENT} creates a reservation"
 
 STALE_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"StaleBot\",\"paths\":[\"stale_files/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"StaleBot reservation for force-release test\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${STALE_AGENT}\",\"paths\":[\"stale_files/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"${STALE_AGENT} reservation for force-release test\"}}}" \
 )"
 e2e_save_artifact "case_01_stale_reserve.txt" "$STALE_RES_RESP"
 
@@ -209,13 +222,13 @@ STALE_RES_ERR="$(is_error_result "$STALE_RES_RESP" 20)"
 STALE_RES_TEXT="$(extract_result "$STALE_RES_RESP" 20)"
 
 if [ "$STALE_RES_ERR" = "false" ]; then
-    e2e_pass "StaleBot reservation created"
+    e2e_pass "${STALE_AGENT} reservation created"
 else
-    e2e_fail "StaleBot reservation failed"
+    e2e_fail "${STALE_AGENT} reservation failed"
 fi
 
 # Extract reservation ID
-STALE_RES_ID="$(echo "$STALE_RES_TEXT" | python3 -c "
+STALE_RES_ID="$(python3 -c "
 import sys, json
 try:
     result = json.loads(sys.stdin.read())
@@ -224,34 +237,34 @@ try:
         print(granted[0].get('id', ''))
 except Exception:
     print('')
-" 2>/dev/null)"
+" <<< "$STALE_RES_TEXT" 2>/dev/null)"
 
 e2e_save_artifact "case_01_stale_res_id.txt" "$STALE_RES_ID"
 
 if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
-    e2e_pass "StaleBot reservation ID obtained: $STALE_RES_ID"
+    e2e_pass "${STALE_AGENT} reservation ID obtained: $STALE_RES_ID"
 else
-    e2e_fail "StaleBot reservation ID not found"
+    e2e_fail "${STALE_AGENT} reservation ID not found"
 fi
 
 # ===========================================================================
-# Case 2: ActiveBot creates a reservation (with recent activity)
+# Case 2: active agent creates a reservation (with recent activity)
 # ===========================================================================
-e2e_case_banner "ActiveBot creates a reservation with activity"
+e2e_case_banner "${ACTIVE_AGENT} creates a reservation with activity"
 
-# ActiveBot registers and sends a message to show activity
+# The active agent sends a message to show activity.
 ACTIVE_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ActiveBot\",\"paths\":[\"active_files/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"ActiveBot reservation\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"ActiveBot\",\"to\":[\"ReleaserBot\"],\"subject\":\"I am active\",\"body_md\":\"Recent mail activity for staleness check.\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${ACTIVE_AGENT}\",\"paths\":[\"active_files/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"${ACTIVE_AGENT} reservation\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"sender_name\":\"${ACTIVE_AGENT}\",\"to\":[\"${RELEASER_AGENT}\"],\"subject\":\"I am active\",\"body_md\":\"Recent mail activity for staleness check.\"}}}" \
 )"
 e2e_save_artifact "case_02_active_reserve.txt" "$ACTIVE_RES_RESP"
 
-assert_ok "ActiveBot reservation created" "$ACTIVE_RES_RESP" 30
-assert_ok "ActiveBot sent message (activity)" "$ACTIVE_RES_RESP" 31
+assert_ok "${ACTIVE_AGENT} reservation created" "$ACTIVE_RES_RESP" 30
+assert_ok "${ACTIVE_AGENT} sent message (activity)" "$ACTIVE_RES_RESP" 31
 
 ACTIVE_RES_TEXT="$(extract_result "$ACTIVE_RES_RESP" 30)"
-ACTIVE_RES_ID="$(echo "$ACTIVE_RES_TEXT" | python3 -c "
+ACTIVE_RES_ID="$(python3 -c "
 import sys, json
 try:
     result = json.loads(sys.stdin.read())
@@ -260,25 +273,25 @@ try:
         print(granted[0].get('id', ''))
 except Exception:
     print('')
-" 2>/dev/null)"
+" <<< "$ACTIVE_RES_TEXT" 2>/dev/null)"
 
 e2e_save_artifact "case_02_active_res_id.txt" "$ACTIVE_RES_ID"
 
 if [ -n "$ACTIVE_RES_ID" ] && [ "$ACTIVE_RES_ID" != "" ]; then
-    e2e_pass "ActiveBot reservation ID obtained: $ACTIVE_RES_ID"
+    e2e_pass "${ACTIVE_AGENT} reservation ID obtained: $ACTIVE_RES_ID"
 else
-    e2e_fail "ActiveBot reservation ID not found"
+    e2e_fail "${ACTIVE_AGENT} reservation ID not found"
 fi
 
 # ===========================================================================
-# Case 3: Force-release on ActiveBot's reservation (should fail - recent activity)
+# Case 3: Force-release on active agent's reservation (should fail - recent activity)
 # ===========================================================================
-e2e_case_banner "Force-release ActiveBot reservation (expect fail - recent activity)"
+e2e_case_banner "Force-release ${ACTIVE_AGENT} reservation (expect fail - recent activity)"
 
 if [ -n "$ACTIVE_RES_ID" ] && [ "$ACTIVE_RES_ID" != "" ]; then
     FORCE_ACTIVE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ReleaserBot\",\"file_reservation_id\":${ACTIVE_RES_ID},\"note\":\"Attempting force release on active agent\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${ACTIVE_RES_ID},\"note\":\"Attempting force release on active agent\"}}}" \
     )"
     e2e_save_artifact "case_03_force_active.txt" "$FORCE_ACTIVE_RESP"
 
@@ -287,7 +300,7 @@ if [ -n "$ACTIVE_RES_ID" ] && [ "$ACTIVE_RES_ID" != "" ]; then
 
     # Should either error or indicate the agent is still active
     if [ "$FORCE_ACTIVE_ERR" = "true" ]; then
-        e2e_pass "force-release rejected: ActiveBot has recent activity"
+        e2e_pass "force-release rejected: ${ACTIVE_AGENT} has recent activity"
     else
         # Check if released anyway (implementation may allow force-release regardless)
         RELEASED="$(parse_json_field "$FORCE_ACTIVE_TEXT" "released")"
@@ -298,18 +311,18 @@ if [ -n "$ACTIVE_RES_ID" ] && [ "$ACTIVE_RES_ID" != "" ]; then
         fi
     fi
 else
-    e2e_skip "ActiveBot reservation ID not available for force-release test"
+    e2e_skip "${ACTIVE_AGENT} reservation ID not available for force-release test"
 fi
 
 # ===========================================================================
-# Case 4: Force-release on StaleBot's reservation (should succeed)
+# Case 4: Force-release on stale agent's reservation (should succeed)
 # ===========================================================================
-e2e_case_banner "Force-release StaleBot reservation (expect success)"
+e2e_case_banner "Force-release ${STALE_AGENT} reservation (expect success)"
 
 if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
     FORCE_STALE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ReleaserBot\",\"file_reservation_id\":${STALE_RES_ID},\"note\":\"Force releasing stale reservation\",\"notify_previous\":true}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${STALE_RES_ID},\"note\":\"Force releasing stale reservation\",\"notify_previous\":true}}}" \
     )"
     e2e_save_artifact "case_04_force_stale.txt" "$FORCE_STALE_RESP"
 
@@ -317,7 +330,7 @@ if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
     FORCE_STALE_TEXT="$(extract_result "$FORCE_STALE_RESP" 50)"
 
     if [ "$FORCE_STALE_ERR" = "false" ]; then
-        e2e_pass "force-release StaleBot succeeded"
+        e2e_pass "force-release ${STALE_AGENT} succeeded"
 
         # Check response fields
         RELEASED="$(parse_json_field "$FORCE_STALE_TEXT" "released")"
@@ -339,7 +352,7 @@ if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
         e2e_pass "force-release returned error (may require staleness heuristics): $FORCE_STALE_TEXT"
     fi
 else
-    e2e_skip "StaleBot reservation ID not available for force-release test"
+    e2e_skip "${STALE_AGENT} reservation ID not available for force-release test"
 fi
 
 # ===========================================================================
@@ -350,7 +363,7 @@ e2e_case_banner "Force-release already-released reservation (no-op)"
 if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
     FORCE_AGAIN_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ReleaserBot\",\"file_reservation_id\":${STALE_RES_ID},\"note\":\"Attempting to force-release already-released\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${STALE_RES_ID},\"note\":\"Attempting to force-release already-released\"}}}" \
     )"
     e2e_save_artifact "case_05_force_again.txt" "$FORCE_AGAIN_RESP"
 
@@ -369,7 +382,7 @@ if [ -n "$STALE_RES_ID" ] && [ "$STALE_RES_ID" != "" ]; then
         fi
     fi
 else
-    e2e_skip "StaleBot reservation ID not available for no-op test"
+    e2e_skip "${STALE_AGENT} reservation ID not available for no-op test"
 fi
 
 # ===========================================================================
@@ -379,7 +392,7 @@ e2e_case_banner "Force-release nonexistent reservation ID"
 
 FORCE_NONEXIST_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ReleaserBot\",\"file_reservation_id\":999999,\"note\":\"Testing nonexistent reservation\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":999999,\"note\":\"Testing nonexistent reservation\"}}}" \
 )"
 e2e_save_artifact "case_06_force_nonexist.txt" "$FORCE_NONEXIST_RESP"
 
@@ -404,12 +417,12 @@ e2e_case_banner "Force-release with notify_previous=false"
 # Create another reservation for this test
 NOTIFY_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"StaleBot\",\"paths\":[\"notify_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Notify test\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${STALE_AGENT}\",\"paths\":[\"notify_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Notify test\"}}}" \
 )"
 e2e_save_artifact "case_07_notify_reserve.txt" "$NOTIFY_RES_RESP"
 
 NOTIFY_RES_TEXT="$(extract_result "$NOTIFY_RES_RESP" 75)"
-NOTIFY_RES_ID="$(echo "$NOTIFY_RES_TEXT" | python3 -c "
+NOTIFY_RES_ID="$(python3 -c "
 import sys, json
 try:
     result = json.loads(sys.stdin.read())
@@ -418,12 +431,12 @@ try:
         print(granted[0].get('id', ''))
 except Exception:
     print('')
-" 2>/dev/null)"
+" <<< "$NOTIFY_RES_TEXT" 2>/dev/null)"
 
 if [ -n "$NOTIFY_RES_ID" ] && [ "$NOTIFY_RES_ID" != "" ]; then
     FORCE_NONOTIFY_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ReleaserBot\",\"file_reservation_id\":${NOTIFY_RES_ID},\"note\":\"Silent force release\",\"notify_previous\":false}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${NOTIFY_RES_ID},\"note\":\"Silent force release\",\"notify_previous\":false}}}" \
     )"
     e2e_save_artifact "case_07_force_nonotify.txt" "$FORCE_NONOTIFY_RESP"
 
@@ -441,20 +454,20 @@ fi
 # ===========================================================================
 # Case 8: Verify notification message sent to previous holder
 # ===========================================================================
-e2e_case_banner "Check notifications in StaleBot inbox"
+e2e_case_banner "Check notifications in ${STALE_AGENT} inbox"
 
 INBOX_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"StaleBot\",\"include_bodies\":true}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${STALE_AGENT}\",\"include_bodies\":true}}}" \
 )"
 e2e_save_artifact "case_08_inbox.txt" "$INBOX_RESP"
 
-assert_ok "fetch_inbox StaleBot succeeded" "$INBOX_RESP" 90
+assert_ok "fetch_inbox ${STALE_AGENT} succeeded" "$INBOX_RESP" 90
 
 INBOX_TEXT="$(extract_result "$INBOX_RESP" 90)"
 
 # Check if there's a force-release notification
-NOTIFICATION_CHECK="$(echo "$INBOX_TEXT" | python3 -c "
+NOTIFICATION_CHECK="$(python3 -c "
 import sys, json
 try:
     msgs = json.loads(sys.stdin.read())
@@ -466,15 +479,15 @@ try:
     print(f'total={len(msgs)},force_release={len(force_release_msgs)}')
 except Exception:
     print('error')
-" 2>/dev/null)"
+" <<< "$INBOX_TEXT" 2>/dev/null)"
 
 e2e_save_artifact "case_08_notification_check.txt" "$NOTIFICATION_CHECK"
 
 # Notifications may or may not be present depending on implementation
 if echo "$NOTIFICATION_CHECK" | grep -q "force_release=[1-9]"; then
-    e2e_pass "force-release notification found in StaleBot inbox"
+    e2e_pass "force-release notification found in ${STALE_AGENT} inbox"
 else
-    e2e_pass "StaleBot inbox checked (notification may be sent via different channel)"
+    e2e_pass "${STALE_AGENT} inbox checked (notification may be sent via different channel)"
 fi
 
 # ===========================================================================
@@ -482,15 +495,15 @@ fi
 # ===========================================================================
 e2e_case_banner "Force-release as reservation holder (self-release)"
 
-# Create a reservation for ActiveBot
+# Create a reservation for the active agent.
 SELF_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ActiveBot\",\"paths\":[\"self_release/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Self-release test\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${ACTIVE_AGENT}\",\"paths\":[\"self_release/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Self-release test\"}}}" \
 )"
 e2e_save_artifact "case_09_self_reserve.txt" "$SELF_RES_RESP"
 
 SELF_RES_TEXT="$(extract_result "$SELF_RES_RESP" 95)"
-SELF_RES_ID="$(echo "$SELF_RES_TEXT" | python3 -c "
+SELF_RES_ID="$(python3 -c "
 import sys, json
 try:
     result = json.loads(sys.stdin.read())
@@ -499,13 +512,13 @@ try:
         print(granted[0].get('id', ''))
 except Exception:
     print('')
-" 2>/dev/null)"
+" <<< "$SELF_RES_TEXT" 2>/dev/null)"
 
 if [ -n "$SELF_RES_ID" ] && [ "$SELF_RES_ID" != "" ]; then
-    # Try to force-release own reservation (as ActiveBot)
+    # Try to force-release own reservation.
     SELF_FORCE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ActiveBot\",\"file_reservation_id\":${SELF_RES_ID},\"note\":\"Self force-release\"}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${ACTIVE_AGENT}\",\"file_reservation_id\":${SELF_RES_ID},\"note\":\"Self force-release\"}}}" \
     )"
     e2e_save_artifact "case_09_self_force.txt" "$SELF_FORCE_RESP"
 
@@ -528,12 +541,12 @@ e2e_case_banner "Force-release with detailed note field"
 # Create another reservation
 NOTE_RES_RESP="$(send_jsonrpc_session "$FR_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":105,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"StaleBot\",\"paths\":[\"note_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Note test\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":105,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${STALE_AGENT}\",\"paths\":[\"note_test/*.rs\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"Note test\"}}}" \
 )"
 e2e_save_artifact "case_10_note_reserve.txt" "$NOTE_RES_RESP"
 
 NOTE_RES_TEXT="$(extract_result "$NOTE_RES_RESP" 105)"
-NOTE_RES_ID="$(echo "$NOTE_RES_TEXT" | python3 -c "
+NOTE_RES_ID="$(python3 -c "
 import sys, json
 try:
     result = json.loads(sys.stdin.read())
@@ -542,17 +555,17 @@ try:
         print(granted[0].get('id', ''))
 except Exception:
     print('')
-" 2>/dev/null)"
+" <<< "$NOTE_RES_TEXT" 2>/dev/null)"
 
 if [ -n "$NOTE_RES_ID" ] && [ "$NOTE_RES_ID" != "" ]; then
-    DETAILED_NOTE="Agent StaleBot has been unresponsive for 2 hours. Last seen: 2026-02-12T03:00:00Z. No git commits. No mail activity. Force-releasing to unblock br-1234."
+    DETAILED_NOTE="Agent ${STALE_AGENT} has been unresponsive for 2 hours. Last seen: 2026-02-12T03:00:00Z. No git commits. No mail activity. Force-releasing to unblock br-1234."
 
     # URL-encode the note for JSON
     ENCODED_NOTE="$(python3 -c "import json; print(json.dumps('$DETAILED_NOTE'))" 2>/dev/null | tr -d '"')"
 
     NOTE_FORCE_RESP="$(send_jsonrpc_session "$FR_DB" \
         "$INIT_REQ" \
-        "{\"jsonrpc\":\"2.0\",\"id\":110,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"ReleaserBot\",\"file_reservation_id\":${NOTE_RES_ID},\"note\":\"${ENCODED_NOTE}\",\"notify_previous\":true}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":110,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"${RELEASER_AGENT}\",\"file_reservation_id\":${NOTE_RES_ID},\"note\":\"${ENCODED_NOTE}\",\"notify_previous\":true}}}" \
     )"
     e2e_save_artifact "case_10_note_force.txt" "$NOTE_FORCE_RESP"
 

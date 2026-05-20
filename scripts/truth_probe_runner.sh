@@ -579,7 +579,7 @@ for mode_meta in mode_runs:
     threads_view_limit3 = safe_load(os.path.join(snap_dir, "threads_view_limit3.json"))
     search_results = safe_load(os.path.join(snap_dir, "search_results.json"))
     search_results_since = safe_load(os.path.join(snap_dir, "search_results_since.json"))
-    search_results_kind_message = safe_load(os.path.join(snap_dir, "search_results_kind_message.json"))
+    search_results_kind_to = safe_load(os.path.join(snap_dir, "search_results_kind_to.json"))
     reservations_view = safe_load(os.path.join(snap_dir, "reservations.json"))
     metrics_view = safe_load(os.path.join(snap_dir, "metrics.json"))
     system_health = safe_load(os.path.join(snap_dir, "system_health.json"))
@@ -610,7 +610,7 @@ for mode_meta in mode_runs:
         "threads_view_limit3.json": threads_view_limit3,
         "search_results.json": search_results,
         "search_results_since.json": search_results_since,
-        "search_results_kind_message.json": search_results_kind_message,
+        "search_results_kind_to.json": search_results_kind_to,
         "message_detail.json": message_detail,
         "navigate.json": navigate_view,
         "reservations.json": reservations_view,
@@ -1343,21 +1343,21 @@ for mode_meta in mode_runs:
 
                 search_kind_value = None
                 search_kind_note = None
-                if search_results_kind_message is None:
-                    search_kind_note = "search_results_kind_message snapshot missing"
-                elif has_capture_error(search_results_kind_message):
-                    search_kind_note = "search_results_kind_message snapshot capture_error"
+                if search_results_kind_to is None:
+                    search_kind_note = "search_results_kind_to snapshot missing"
+                elif has_capture_error(search_results_kind_to):
+                    search_kind_note = "search_results_kind_to snapshot capture_error"
                 else:
-                    search_kind_value = search_total(search_results_kind_message)
+                    search_kind_value = search_total(search_results_kind_to)
                 checks.append(
                     build_check(
                         mode_meta=mode_meta,
                         surface_id="robot.search_params",
-                        metric="kind_message.lte_baseline",
+                        metric="kind_to.lte_baseline",
                         db_truth=baseline_search_total,
                         surface_value=search_kind_value,
                         comparator="lte",
-                        snapshot="search_results_kind_message.json",
+                        snapshot="search_results_kind_to.json",
                         note=search_kind_note,
                     )
                 )

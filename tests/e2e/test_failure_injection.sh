@@ -33,6 +33,8 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_failure_inj")"
+TEST_STORAGE_ROOT="${WORK}/storage"
+mkdir -p "${TEST_STORAGE_ROOT}"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-failure","version":"1.0"}}}'
 
@@ -48,7 +50,7 @@ send_session() {
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="${TEST_STORAGE_ROOT}" RUST_LOG=error WORKTREES_ENABLED=true \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -62,9 +64,15 @@ send_session() {
     } > "$fifo" &
     local write_pid=$!
 
-    local timeout_s=25
+    local max_ticks=120
+    local expected_responses="${#requests[@]}"
     local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
+    while [ "$elapsed" -lt "$max_ticks" ]; do
+        local response_count
+        response_count=$(grep -c '^{' "$output_file" 2>/dev/null || true)
+        if [ "$response_count" -ge "$expected_responses" ]; then
+            break
+        fi
         if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
         fi
@@ -121,9 +129,11 @@ for line in sys.stdin:
             if d.get('result', {}).get('isError', False):
                 print('ERROR')
                 sys.exit(0)
+            print('OK')
+            sys.exit(0)
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
-print('OK')
+print('MISSING')
 " "$req_id" 2>/dev/null
 }
 
@@ -357,10 +367,12 @@ e2e_step_start "force_release_active"
 if [ "$FR_STATUS" = "ERROR" ]; then
     e2e_pass "force-release on active reservation returns error"
     e2e_log "Error: ${FR_TEXT:0:200}"
-else
+elif [ "$FR_STATUS" = "OK" ]; then
     # May succeed but should indicate non-stale context
     e2e_pass "force-release on active reservation returned result (may have inactivity check)"
     e2e_log "Result: ${FR_TEXT:0:200}"
+else
+    e2e_fail "force-release on active reservation returned no response"
 fi
 e2e_step_end "force_release_active"
 
@@ -388,8 +400,10 @@ RESP_BAD2=$(send_session "$DB7" \
 STATUS_BAD2=$(is_error "$RESP_BAD2" 71)
 if [ "$STATUS_BAD2" = "ERROR" ]; then
     e2e_pass "string-where-int-expected returns error"
-else
+elif [ "$STATUS_BAD2" = "OK" ]; then
     e2e_pass "string-where-int-expected gracefully coerced (lenient)"
+else
+    e2e_fail "string-where-int-expected returned no response"
 fi
 
 # Nonexistent tool name
@@ -434,8 +448,10 @@ RESP_EMPTY_SUBJ=$(send_session "$DB8" \
 STATUS_EMPTY=$(is_error "$RESP_EMPTY_SUBJ" 83)
 if [ "$STATUS_EMPTY" = "ERROR" ]; then
     e2e_pass "empty subject returns error (strict)"
-else
+elif [ "$STATUS_EMPTY" = "OK" ]; then
     e2e_pass "empty subject accepted (lenient)"
+else
+    e2e_fail "empty subject returned no response"
 fi
 e2e_step_end "empty_subject"
 
@@ -450,9 +466,11 @@ RESP_LONG=$(send_session "$DB8" \
 STATUS_LONG=$(is_error "$RESP_LONG" 85)
 if [ "$STATUS_LONG" = "ERROR" ]; then
     e2e_pass "very long subject (500 chars) returns error (strict, truncation required)"
-else
+elif [ "$STATUS_LONG" = "OK" ]; then
     LONG_RESULT=$(extract_tool_result "$RESP_LONG" 85)
     e2e_pass "very long subject accepted (may be truncated)"
+else
+    e2e_fail "very long subject returned no response"
 fi
 e2e_step_end "very_long_subject"
 
@@ -477,8 +495,10 @@ RESP_ZERO=$(send_session "$DB8" \
 STATUS_ZERO=$(is_error "$RESP_ZERO" 89)
 if [ "$STATUS_ZERO" = "ERROR" ]; then
     e2e_pass "fetch_inbox with limit=0 returns error"
-else
+elif [ "$STATUS_ZERO" = "OK" ]; then
     e2e_pass "fetch_inbox with limit=0 returns empty result"
+else
+    e2e_fail "fetch_inbox with limit=0 returned no response"
 fi
 e2e_step_end "zero_limit_inbox"
 

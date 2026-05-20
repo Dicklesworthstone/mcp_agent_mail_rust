@@ -30,6 +30,8 @@ export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
 
 WORK="$(e2e_mktemp "e2e_fault_injection")"
 FI_DB="${WORK}/fault_inject.sqlite3"
+TEST_STORAGE_ROOT="${WORK}/storage"
+mkdir -p "$TEST_STORAGE_ROOT"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-fault-injection","version":"1.0"}}}'
 
@@ -37,13 +39,14 @@ send_jsonrpc_session() {
     local db_path="$1"
     shift
     local requests=("$@")
-    local output_file="${WORK}/session_response_$$.txt"
+    local output_file
+    output_file="$(mktemp "${WORK}/session_response.XXXXXX")"
     local srv_work
     srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="$TEST_STORAGE_ROOT" RUST_LOG=error \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -56,9 +59,15 @@ send_jsonrpc_session() {
     } > "$fifo" &
     local write_pid=$!
 
-    local timeout_s=20
+    local max_ticks=200
     local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
+    local expected_responses="${#requests[@]}"
+    local response_count=0
+    while [ "$elapsed" -lt "$max_ticks" ]; do
+        response_count="$(grep -c '^{' "$output_file" 2>/dev/null || true)"
+        if [ "$response_count" -ge "$expected_responses" ]; then
+            break
+        fi
         if ! kill -0 "$srv_pid" 2>/dev/null; then
             break
         fi
@@ -78,7 +87,7 @@ send_jsonrpc_session() {
 assert_ok() {
     local label="$1" resp="$2" id="$3"
     local check
-    check="$(echo "$resp" | python3 -c "
+    check="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -97,7 +106,7 @@ for line in sys.stdin:
                 sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+" <<< "$resp" 2>/dev/null)"
     case "$check" in
         OK) e2e_pass "$label" ;;
         JSON_RPC_ERROR|MCP_ERROR) e2e_fail "$label -> error: $check" ;;
@@ -108,7 +117,7 @@ print('NO_MATCH')
 assert_error() {
     local label="$1" resp="$2" id="$3"
     local check
-    check="$(echo "$resp" | python3 -c "
+    check="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -127,7 +136,7 @@ for line in sys.stdin:
                 sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+" <<< "$resp" 2>/dev/null)"
     case "$check" in
         JSON_RPC_ERROR|MCP_ERROR) e2e_pass "$label" ;;
         OK) e2e_fail "$label -> expected error, got OK" ;;
@@ -139,7 +148,7 @@ print('NO_MATCH')
 assert_any_response() {
     local label="$1" resp="$2" id="$3"
     local check
-    check="$(echo "$resp" | python3 -c "
+    check="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -151,7 +160,7 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+" <<< "$resp" 2>/dev/null)"
     case "$check" in
         RESPONDED) e2e_pass "$label" ;;
         NO_MATCH) e2e_fail "$label -> no response for id=$id" ;;
@@ -160,7 +169,7 @@ print('NO_MATCH')
 
 extract_result_text() {
     local resp="$1" id="$2"
-    echo "$resp" | python3 -c "
+    python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -173,7 +182,7 @@ for line in sys.stdin:
                 print(r['content'][0].get('text', ''))
             sys.exit(0)
     except Exception: pass
-" 2>/dev/null
+" <<< "$resp" 2>/dev/null
 }
 
 # ===========================================================================
@@ -230,7 +239,7 @@ assert_ok "stress msg 20" "$RESP" 220
 assert_ok "fetch inbox after stress" "$RESP" 299
 
 # Verify inbox has at least 20 messages
-INBOX_COUNT="$(echo "$RESP" | python3 -c "
+INBOX_COUNT="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -243,7 +252,7 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print(-1)
-" 2>/dev/null)"
+" <<< "$RESP" 2>/dev/null)"
 
 if [ "$INBOX_COUNT" -ge 20 ]; then
     e2e_pass "inbox has >= 20 messages after stress"
@@ -322,7 +331,7 @@ e2e_save_artifact "case_07_glob_conflict.txt" "$RESP"
 assert_ok "RedFox reserves src/*.rs" "$RESP" 700
 
 # BlueLake's src/main.rs should conflict with RedFox's src/*.rs glob
-GLOB_CHECK="$(echo "$RESP" | python3 -c "
+GLOB_CHECK="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -337,7 +346,7 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print('PARSE_FAIL')
-" 2>/dev/null)"
+" <<< "$RESP" 2>/dev/null)"
 e2e_assert_contains "glob conflict detected" "$GLOB_CHECK" "conflicts=1"
 
 # ===========================================================================
@@ -383,7 +392,7 @@ e2e_save_artifact "case_09_contention.txt" "$RESP"
 assert_ok "RedFox gets contested.rs" "$RESP" 900
 
 # Count total conflicts (BlueLake and GoldPeak should both have conflicts)
-CONTEST_BLUE="$(echo "$RESP" | python3 -c "
+CONTEST_BLUE="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -397,9 +406,9 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print(-1)
-" 2>/dev/null)"
+" <<< "$RESP" 2>/dev/null)"
 
-CONTEST_GOLD="$(echo "$RESP" | python3 -c "
+CONTEST_GOLD="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -413,7 +422,7 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print(-1)
-" 2>/dev/null)"
+" <<< "$RESP" 2>/dev/null)"
 
 e2e_assert_eq "BlueLake gets conflict" "1" "$CONTEST_BLUE"
 e2e_assert_eq "GoldPeak gets conflict" "1" "$CONTEST_GOLD"
@@ -487,7 +496,7 @@ RESP="$(send_jsonrpc_session "$FI_DB" \
 e2e_save_artifact "case_14_force_release.txt" "$RESP"
 
 # Force-release should fail because the holder is still active
-FORCE_CHECK="$(echo "$RESP" | python3 -c "
+FORCE_CHECK="$(python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -509,7 +518,7 @@ for line in sys.stdin:
             sys.exit(0)
     except Exception: pass
 print('NO_MATCH')
-" 2>/dev/null)"
+" <<< "$RESP" 2>/dev/null)"
 
 case "$FORCE_CHECK" in
     REJECTED) e2e_pass "force-release rejected for active reservation" ;;
