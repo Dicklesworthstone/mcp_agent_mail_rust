@@ -10,8 +10,10 @@ use std::path::Path;
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
-use asupersync::{Budget, Cx};
+use asupersync::Cx;
+use asupersync::time::wall_now;
 // Tests run outside the HTTP server's async runtime, so `fastmcp_core::block_on`
 // is safe there. Production code uses `spin_block_on` instead (see below).
 #[cfg(test)]
@@ -26,6 +28,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::markdown;
 use crate::templates;
+
+/// Mail UI request budget helper.
+///
+/// `asupersync::Budget::with_deadline_secs` stores an absolute timestamp in
+/// asupersync's process-relative clock. Request handlers need a fresh relative
+/// deadline for every request, so keep the conversion at this boundary.
+struct Budget;
+
+impl Budget {
+    fn with_deadline_secs(secs: u64) -> asupersync::Budget {
+        let deadline = wall_now() + Duration::from_secs(secs);
+        asupersync::Budget::new().with_deadline(deadline)
+    }
+}
 
 /// Dispatch a mail UI request to the correct handler.
 ///
@@ -122,6 +138,22 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
         ..DbPoolConfig::default()
     };
     get_or_create_pool(&cfg).expect("test pool should initialize")
+}
+
+#[cfg(test)]
+mod request_budget_tests {
+    use super::*;
+
+    #[test]
+    fn mail_ui_request_budget_deadline_is_relative_to_now() {
+        let budget = Budget::with_deadline_secs(30);
+        let now = wall_now();
+
+        assert!(
+            !budget.is_past_deadline(now),
+            "mail UI request deadlines must be relative to the current asupersync clock"
+        );
+    }
 }
 
 #[cfg(test)]
