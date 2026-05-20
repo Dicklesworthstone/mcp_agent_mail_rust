@@ -464,7 +464,7 @@ startup_timeout_sec = 5
     }
 
     #[test]
-    fn finding_severity_is_p1_detect_only() {
+    fn finding_severity_is_p1_auto_fixable() {
         let f = CodexStartupTimeoutFinding {
             config_path: PathBuf::from("/x/config.toml"),
             state: TimeoutState::Missing,
@@ -472,7 +472,8 @@ startup_timeout_sec = 5
         };
         let g = f.to_finding();
         assert_eq!(g.severity, "P1");
-        assert!(!g.remediation.auto_fixable);
+        assert!(g.remediation.auto_fixable);
+        assert_eq!(g.remediation.estimated_actions, 1);
     }
 
     #[test]
@@ -485,5 +486,162 @@ startup_timeout_sec = 5
         let text = f.manual_remediation_text();
         assert!(text.contains("/home/op/.codex/config.toml"));
         assert!(text.contains("startup_timeout_sec = 30"));
+    }
+
+    fn ctx_for(td: &TempDir, run_id: &str) -> MutateContext {
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
+        let actions = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        MutateContext {
+            run_id: run_id.into(),
+            run_dir,
+            capabilities: crate::doctor::mutate::Capabilities {
+                write_scopes: vec![td.path().to_path_buf()],
+            },
+            actions_file: std::sync::Mutex::new(actions),
+            fixer_id: FM_ID.into(),
+            repo_root: td.path().to_path_buf(),
+            dry_run: false,
+            start: std::time::Instant::now(),
+            extra_locks: Vec::new(),
+        }
+    }
+
+    fn finding_for(path: PathBuf, state: TimeoutState) -> CodexStartupTimeoutFinding {
+        CodexStartupTimeoutFinding {
+            config_path: path,
+            state,
+            min_required_secs: CODEX_STARTUP_TIMEOUT_SECS,
+        }
+    }
+
+    /// **NEGATIVE**: config vanished between detect and fix → skip.
+    #[test]
+    fn fixer_skips_vanished_config() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_vanished");
+        let finding = finding_for(td.path().join("absent.toml"), TimeoutState::Missing);
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// **NEGATIVE**: the mcp_agent_mail server entry doesn't exist
+    /// at all → skip (am setup territory; never create the entry).
+    #[test]
+    fn fixer_skips_when_entry_absent() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(&p, "[mcp_servers.some_other_server]\ncommand = \"x\"\n").unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_absent");
+        let finding = finding_for(p.clone(), TimeoutState::Missing);
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+        // File untouched.
+        assert!(!fs::read_to_string(&p).unwrap().contains("startup_timeout_sec"));
+    }
+
+    /// **NEGATIVE**: malformed TOML → skip (operator owns it).
+    #[test]
+    fn fixer_skips_malformed_toml() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(&p, "[mcp_servers.mcp_agent_mail\nbroken = ").unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_malformed");
+        let finding = finding_for(p.clone(), TimeoutState::Missing);
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// Positive: TooShort → bump to 30, preserving a comment and a
+    /// sibling key in the same section.
+    #[test]
+    fn fixer_bumps_too_short_preserving_format() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        let original = "# my codex config\n\
+                        [mcp_servers.mcp_agent_mail]\n\
+                        command = \"mcp-agent-mail\"  # the rust binary\n\
+                        startup_timeout_sec = 5\n";
+        fs::write(&p, original).unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_short");
+        let finding = finding_for(p.clone(), TimeoutState::TooShort { observed_secs: 5 });
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+        let post = fs::read_to_string(&p).unwrap();
+        assert!(post.contains("startup_timeout_sec = 30"));
+        assert!(!post.contains("startup_timeout_sec = 5"));
+        // Comments + sibling key preserved.
+        assert!(post.contains("# my codex config"));
+        assert!(post.contains("# the rust binary"));
+        assert!(post.contains("command = \"mcp-agent-mail\""));
+        // Detector now sees a healthy value.
+        assert_eq!(
+            extract_mcp_agent_mail_toml_startup_timeout(&post),
+            Some(CODEX_STARTUP_TIMEOUT_SECS)
+        );
+    }
+
+    /// Positive: Missing key on an EXISTING entry → insert it.
+    #[test]
+    fn fixer_inserts_missing_key_on_existing_entry() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(
+            &p,
+            "[mcp_servers.mcp_agent_mail]\ncommand = \"mcp-agent-mail\"\n",
+        )
+        .unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_missing");
+        let finding = finding_for(p.clone(), TimeoutState::Missing);
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(
+            extract_mcp_agent_mail_toml_startup_timeout(&fs::read_to_string(&p).unwrap()),
+            Some(CODEX_STARTUP_TIMEOUT_SECS)
+        );
+    }
+
+    /// Positive: quoted kebab key form `"mcp-agent-mail"` is handled.
+    #[test]
+    fn fixer_handles_quoted_kebab_key() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(
+            &p,
+            "[mcp_servers.\"mcp-agent-mail\"]\nstartup_timeout_sec = 3\n",
+        )
+        .unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_kebab");
+        let finding = finding_for(p.clone(), TimeoutState::TooShort { observed_secs: 3 });
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert!(fs::read_to_string(&p).unwrap().contains("startup_timeout_sec = 30"));
+    }
+
+    /// Idempotence: an already-healthy value is left alone.
+    #[test]
+    fn fixer_skips_when_already_healthy() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("config.toml");
+        fs::write(
+            &p,
+            "[mcp_servers.mcp_agent_mail]\nstartup_timeout_sec = 60\n",
+        )
+        .unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__codex_healthy");
+        // (The detector wouldn't emit this, but fix() must tolerate
+        // a stale finding pointing at an already-fixed file.)
+        let finding = finding_for(p.clone(), TimeoutState::TooShort { observed_secs: 5 });
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+        assert!(fs::read_to_string(&p).unwrap().contains("startup_timeout_sec = 60"));
     }
 }
