@@ -1160,6 +1160,18 @@ first body
             ),
             "{html}"
         );
+        // Regression for #129: the helpers must be DEFINED (in base.html), not merely
+        // referenced. The previous tests only asserted call sites, which passed even
+        // though `window.agentMailAppendAuth`/`agentMailNavigate` were undefined,
+        // leaving every `:href` binding inert.
+        assert!(
+            html.contains("window.agentMailAppendAuth = function"),
+            "base.html must DEFINE window.agentMailAppendAuth, not just reference it: {html}"
+        );
+        assert!(
+            html.contains("window.agentMailNavigate = function"),
+            "base.html must DEFINE window.agentMailNavigate, not just reference it: {html}"
+        );
     }
 }
 

@@ -173,6 +173,32 @@
           return date.toLocaleString();
         }
       };
+
+      // Propagate the web-UI bearer token (`?token=…`) onto client-built links and
+      // fetch URLs.
+      //
+      // When the server runs with HTTP_BEARER_TOKEN, browser routes are gated on a
+      // `?token=<expected>` query parameter (server side: `has_expected_query_token`).
+      // The server renders that token into the initial page URL, but Alpine `:href`
+      // bindings and client-side `fetch()` calls construct their own URLs and must
+      // carry the token forward — otherwise every in-app link and action 401s. This
+      // helper was referenced throughout the inbox / unified-inbox / search templates
+      // but never defined (#129), so those `:href` bindings threw a TypeError and the
+      // anchors rendered inert. Mirrors the `withToken` helper used by the TUI web
+      // dashboard. Reads the token fresh on each call so it stays correct across
+      // history.replaceState navigation.
+      window.agentMailAppendAuth = function (path) {
+        const url = path === null || path === undefined ? '' : String(path);
+        const token = new URLSearchParams(window.location.search).get('token');
+        if (!token) return url;
+        return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+      };
+
+      // Navigate to an in-app route while preserving the auth token. Also previously
+      // referenced (command palette, keyboard shortcuts) without a definition (#129).
+      window.agentMailNavigate = function (path) {
+        window.location.href = window.agentMailAppendAuth(path);
+      };
     </script>
 
     <!-- Tippy.js for beautiful tooltips -->
