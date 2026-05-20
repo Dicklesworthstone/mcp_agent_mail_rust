@@ -1149,7 +1149,13 @@ pub async fn register_agent(
         Some(n) => {
             let n = n.trim();
             if n.is_empty() {
-                generate_agent_name()
+                return Err(legacy_tool_error(
+                    "EMPTY_AGENT_NAME",
+                    "name cannot be empty. Omit the `name` parameter to auto-generate a valid \
+                     adjective+noun agent name.",
+                    true,
+                    json!({ "provided": n }),
+                ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(n) {
                 normalized
             } else {
@@ -1424,7 +1430,13 @@ pub async fn create_agent_identity(
         Some(hint) => {
             let hint = hint.trim();
             if hint.is_empty() {
-                generate_agent_name()
+                return Err(legacy_tool_error(
+                    "EMPTY_AGENT_NAME",
+                    "name_hint cannot be empty. Omit the `name_hint` parameter to auto-generate \
+                     a valid adjective+noun agent name.",
+                    true,
+                    json!({ "provided": hint }),
+                ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(hint)
             {
                 normalized
