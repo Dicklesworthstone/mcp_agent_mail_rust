@@ -51,9 +51,9 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use crate::{McpAgentMailEntryKind, classify_mcp_agent_mail_config};
+use crate::doctor::platform;
 use mcp_agent_mail_core::mcp_config::{McpConfigLocation, McpConfigTool};
 use serde::Serialize;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-mcp-config-files-stale-python-launcher-entry";
@@ -332,7 +332,7 @@ pub fn fix(
         };
         let mode = std::fs::symlink_metadata(path)
             .ok()
-            .map(|m| m.permissions().mode() & 0o7777)
+            .map(|m| platform::permission_mode(&m))
             .unwrap_or(0o644);
         mutate(
             ctx,

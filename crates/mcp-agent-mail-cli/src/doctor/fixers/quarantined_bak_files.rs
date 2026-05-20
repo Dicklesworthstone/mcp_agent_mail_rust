@@ -292,6 +292,10 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Production code no longer imports PermissionsExt at module scope
+    // (Windows has no POSIX modes); the tests exercise Unix mode semantics
+    // and only run on the host, so the import lives here.
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn write_with_mode(path: &Path, content: &str, mode: u32) {

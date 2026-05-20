@@ -393,9 +393,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: unexpected_symlink_in_archive::FM_ID,
             severity: "P1",
             subsystem: "archive_state_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "Mailbox archive contains unexpected symlinks (possible filesystem tampering / migration artifact; manual review — could be SECURITY signal if target is outside storage_root)",
+            op_pattern: "Op::Rename",
+            auto_fixable: true,
+            one_line_description: "Mailbox archive contains unexpected symlinks (possible filesystem tampering / migration artifact) — auto-fix quarantines each via symlink-aware Op::Rename (moved, never dereferenced; removes exfil vector, preserves link for forensics; reversible via `am doctor undo`)",
             source_module: "doctor::fixers::unexpected_symlink_in_archive",
         },
         FixerSpec {

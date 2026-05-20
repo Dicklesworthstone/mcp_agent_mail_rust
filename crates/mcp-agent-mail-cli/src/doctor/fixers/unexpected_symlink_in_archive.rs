@@ -1,5 +1,5 @@
 //! `fm-archive-state-files-unexpected-symlink-in-archive` — P1
-//! detect-only.
+//! auto-fix via symlink-aware `Op::Rename` (quarantine).
 //!
 //! **Subsystem**: archive_state_files.
 //!
@@ -21,23 +21,33 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only.** The doctor cannot safely remove a symlink
-//! without operator confirmation — the target may be data the
-//! operator intentionally aliased, and the chokepoint's
-//! Op::Rename quarantine path is gated on regular-file
-//! semantics. Manual remediation walks operators through:
+//! **Auto-fix via symlink-aware `Op::Rename` (quarantine).** Each
+//! unexpected symlink is MOVED — never dereferenced — into
+//! `<run-dir>/quarantine/archive-symlinks/<basename>.<ns>` through
+//! the chokepoint. This immediately removes the symlink from the
+//! live archive serving path (neutralizing any exfil vector — e.g.
+//! a link aliasing `<storage>/.../foo.md` at `/etc/shadow` that
+//! `am robot thread` would otherwise read through), while
+//! PRESERVING the link itself in quarantine for forensics. The
+//! chokepoint hash-witnesses the link by its target STRING (it is
+//! never followed), so `am doctor undo <run-id>` renames the
+//! symlink back byte-identically if the operator decides it was
+//! legitimate.
 //!
-//! 1. Inspect each `path` to identify the intended content.
-//! 2. If the symlink target is the canonical source, replace the
-//!    symlink with a copy of the target.
-//! 3. If the symlink is unintentional (attacker insertion,
-//!    bad migration), move it to quarantine after preserving
-//!    any target bytes that matter.
-//! 4. Re-run the detector to confirm the archive is clean.
+//! Per AGENTS.md RULE 1 this is NEVER a delete: the symlink tree
+//! entry is preserved under quarantine. Vanished entries (the
+//! symlink was already removed) count as `actions_skipped`
+//! (idempotent).
+//!
+//! Quarantining-then-undo is strictly safer than leaving a live
+//! symlink in the archive pending manual operator action: the
+//! exfil vector is gone immediately, the evidence is preserved,
+//! and the move is fully reversible.
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use mcp_agent_mail_db::archive_anomaly::{
     ArchiveAnomalyKind, ArchiveAnomalyReport, scan_archive_anomalies,
 };
@@ -74,22 +84,25 @@ impl UnexpectedSymlinkFinding {
             evidence: serde_json::json!({
                 "symlinks": self.entries,
                 "count": self.entries.len(),
+                "auto_fix_summary": format!(
+                    "`am doctor fix --only {FM_ID} --yes` quarantines all {} unexpected symlink(s) via symlink-aware Op::Rename into `<run-dir>/quarantine/archive-symlinks/` — the link is MOVED (never dereferenced), removing the exfil vector from the live archive while preserving the link for forensics. Reversible via `am doctor undo <run-id>`.",
+                    self.entries.len(),
+                ),
                 "manual_remediation": {
                     "steps": [
-                        "For each path: `ls -la <path>` to inspect the symlink + target.",
-                        "If the target is the canonical source the archive should point at: move the symlink into `.doctor/quarantine/archive-symlinks/`, then `cp <target> <path>` to recreate the archive entry as a regular file.",
-                        "If the symlink is unintentional (post-migration artifact, attacker insertion): preserve any target bytes that matter, then move the symlink into `.doctor/quarantine/archive-symlinks/`.",
+                        "Auto-fix (preferred): `am doctor fix --only fm-archive-state-files-unexpected-symlink-in-archive --yes`. Quarantines each symlink (moved, not dereferenced) into `<run-dir>/quarantine/archive-symlinks/`; reversible via `am doctor undo <run-id>`.",
+                        "Before/after auto-fixing, INVESTIGATE each target: `ls -la <path>` to inspect the symlink + target. A target outside `<storage_root>` (e.g. `/etc/shadow`) is a strong tampering signal.",
+                        "If the symlink was a legitimate alias the archive needs as content: `am doctor undo <run-id>` to restore it, then `cp <target> <path>` to recreate the archive entry as a regular file.",
                         "Re-run `am doctor fix --only fm-archive-state-files-unexpected-symlink-in-archive --list` to confirm the archive is clean.",
                     ],
-                    "warning": "Symlinks in the archive can be a SECURITY signal (attacker aliasing archive files at sensitive system paths). Investigate any target outside `<storage_root>` carefully BEFORE quarantining the symlink.",
-                    "note": "Auto-fix is intentionally not implemented — symlink semantics require operator judgment.",
+                    "warning": "Symlinks in the archive can be a SECURITY signal (attacker aliasing archive files at sensitive system paths). The auto-fix removes the live exfil vector immediately and preserves the link in quarantine — investigate the quarantined target before deciding it was legitimate.",
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: false,
-                estimated_actions: 0,
+                auto_fixable: !self.entries.is_empty(),
+                estimated_actions: self.entries.len(),
             },
         }
     }
@@ -133,14 +146,47 @@ pub fn detect(inputs: &DetectInputs) -> Vec<UnexpectedSymlinkFinding> {
     vec![UnexpectedSymlinkFinding { entries }]
 }
 
+/// Fixer. Quarantines each unexpected symlink via symlink-aware
+/// `Op::Rename` (the chokepoint moves the link, never follows it).
+/// Vanished entries count as `actions_skipped` (idempotent).
 pub fn fix(
-    _ctx: &crate::doctor::mutate::MutateContext,
-    _finding: &UnexpectedSymlinkFinding,
-) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    ctx: &MutateContext,
+    finding: &UnexpectedSymlinkFinding,
+) -> Result<FixOutcome, MutateError> {
+    let mut actions_taken = 0;
+    let mut actions_skipped = 0;
+    let mut quarantined_paths = Vec::new();
+    // One nanosecond base + per-entry index disambiguates
+    // same-basename symlinks at the quarantine destination.
+    let base_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for (idx, entry) in finding.entries.iter().enumerate() {
+        // `symlink_metadata` does not follow the link — we only
+        // check that the symlink still exists, never read its target.
+        if std::fs::symlink_metadata(&entry.path).is_err() {
+            actions_skipped += 1;
+            continue;
+        }
+        let basename = entry
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "symlink".to_string());
+        let dest = ctx
+            .run_dir
+            .join("quarantine")
+            .join("archive-symlinks")
+            .join(format!("{basename}.{}", base_ns + idx as u128));
+        mutate(ctx, &entry.path, Op::Rename { to: dest.clone() })?;
+        actions_taken += 1;
+        quarantined_paths.push(dest);
+    }
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
-        quarantined_paths: Vec::new(),
+        actions_taken,
+        actions_skipped,
+        quarantined_paths,
     })
 }
 
@@ -269,23 +315,23 @@ mod tests {
         assert!(s.contains(FM_ID));
         assert!(s.contains("\"count\":1"));
         assert!(s.contains("warning"));
-        assert!(s.contains("\"auto_fixable\":false"));
+        assert!(s.contains("\"auto_fixable\":true"));
+        assert!(s.contains("\"estimated_actions\":1"));
+        assert!(s.contains("auto_fix_summary"));
         // Target path appears in evidence (for operator visibility).
         assert!(s.contains("shadow"));
     }
 
-    #[test]
-    fn fixer_is_no_op_returning_skipped() {
+    fn ctx_for(td: &tempfile::TempDir, run_id: &str) -> crate::doctor::mutate::MutateContext {
         use std::fs;
-        let td = tempfile::TempDir::new().unwrap();
-        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), "test_run").unwrap();
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(run_dir.join("actions.jsonl"))
             .unwrap();
-        let ctx = crate::doctor::mutate::MutateContext {
-            run_id: "test_run".into(),
+        crate::doctor::mutate::MutateContext {
+            run_id: run_id.into(),
             run_dir,
             capabilities: crate::doctor::mutate::Capabilities {
                 write_scopes: vec![td.path().to_path_buf()],
@@ -296,10 +342,120 @@ mod tests {
             dry_run: false,
             start: std::time::Instant::now(),
             extra_locks: Vec::new(),
-        };
+        }
+    }
+
+    /// **NEGATIVE TEST FIRST**: empty finding → no-op (no actions,
+    /// no skips).
+    #[test]
+    fn fixer_with_no_entries_is_a_no_op() {
+        let td = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__sym_empty");
         let finding = UnexpectedSymlinkFinding { entries: vec![] };
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 0);
+    }
+
+    /// **NEGATIVE**: a symlink that vanished between detect and fix
+    /// is skipped, never errors.
+    #[cfg(unix)]
+    #[test]
+    fn fixer_skips_vanished_symlink() {
+        let td = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__sym_vanished");
+        let finding = UnexpectedSymlinkFinding {
+            entries: vec![UnexpectedSymlinkEntry {
+                path: td.path().join("ghost-link.md"),
+                target: Some("/some/target".into()),
+            }],
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// Positive: an unexpected symlink (pointing at a sensitive
+    /// target outside the archive) is quarantined — MOVED, never
+    /// dereferenced. The target's bytes are never read.
+    #[cfg(unix)]
+    #[test]
+    fn fixer_quarantines_symlink_without_dereferencing() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        // A "sensitive" target outside any archive path.
+        let secret = td.path().join("secret.txt");
+        fs::write(&secret, b"top-secret").unwrap();
+        // The archive symlink aliasing it.
+        let archive_dir = td.path().join("projects").join("demo");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let link = archive_dir.join("aliased.md");
+        symlink(&secret, &link).unwrap();
+
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__sym_fix");
+        let finding = UnexpectedSymlinkFinding {
+            entries: vec![UnexpectedSymlinkEntry {
+                path: link.clone(),
+                target: Some(secret.clone()),
+            }],
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+        assert_eq!(outcome.quarantined_paths.len(), 1);
+
+        // Live archive link gone (exfil vector removed).
+        assert!(fs::symlink_metadata(&link).is_err());
+        // Quarantined as a symlink, target preserved, NOT a copy.
+        let q = &outcome.quarantined_paths[0];
+        let q_meta = fs::symlink_metadata(q).unwrap();
+        assert!(q_meta.file_type().is_symlink());
+        assert_eq!(fs::read_link(q).unwrap(), secret);
+        // Secret target never touched.
+        assert_eq!(fs::read(&secret).unwrap(), b"top-secret");
+    }
+
+    /// Round-trip: quarantine → undo → the symlink reappears at its
+    /// original archive path, byte-identical (same target).
+    #[cfg(unix)]
+    #[test]
+    fn round_trip_quarantine_then_undo_restores_symlink() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let td = tempfile::TempDir::new().unwrap();
+        let target = td.path().join("target.bin");
+        fs::write(&target, b"x").unwrap();
+        let link = td.path().join("projects").join("demo").join("aliased.md");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+        let original_target = fs::read_link(&link).unwrap();
+
+        let run_id = "2026-05-20T00-00-00Z__sym_rt";
+        let ctx = ctx_for(&td, run_id);
+        let finding = UnexpectedSymlinkFinding {
+            entries: vec![UnexpectedSymlinkEntry {
+                path: link.clone(),
+                target: Some(target.clone()),
+            }],
+        };
+        assert_eq!(fix(&ctx, &finding).expect("fix").actions_taken, 1);
+        assert!(fs::symlink_metadata(&link).is_err(), "link quarantined");
+
+        drop(ctx);
+        let summary = crate::doctor::undo::run_undo_with_scopes(
+            td.path(),
+            run_id,
+            false,
+            true,
+            &[td.path().to_path_buf()],
+        )
+        .expect("run_undo");
+        assert!(summary.failures.is_empty(), "undo failures: {:?}", summary.failures);
+
+        // Symlink restored at original path, same target.
+        let restored = fs::symlink_metadata(&link).unwrap();
+        assert!(restored.file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), original_target);
     }
 }

@@ -62,9 +62,9 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use crate::{CODEX_STARTUP_TIMEOUT_SECS, extract_mcp_agent_mail_toml_startup_timeout};
+use crate::doctor::platform;
 use mcp_agent_mail_core::mcp_config::{McpConfigLocation, McpConfigTool};
 use serde::Serialize;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-mcp-config-files-codex-startup-timeout-too-short";
@@ -273,7 +273,7 @@ pub fn fix(
     let new_content = doc.to_string();
     let mode = std::fs::symlink_metadata(&finding.config_path)
         .ok()
-        .map(|m| m.permissions().mode() & 0o7777)
+        .map(|m| platform::permission_mode(&m))
         .unwrap_or(0o644);
     mutate(
         ctx,

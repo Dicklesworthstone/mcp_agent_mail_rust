@@ -227,7 +227,12 @@ fn sha256_path_bytes(path: &Path) -> String {
 }
 
 fn sha256_for_path_before_op(path: &Path, op: &Op) -> std::io::Result<String> {
-    if matches!(op, Op::SymlinkAtomic { .. }) {
+    // For ops that legitimately operate on a symlink WITHOUT
+    // dereferencing it — `Op::SymlinkAtomic` (replace a symlink) and
+    // `Op::Rename` (quarantine a symlink, moving the link itself) —
+    // hash the link's target string rather than trying to read it
+    // as a regular file (which O_NOFOLLOW would reject).
+    if matches!(op, Op::SymlinkAtomic { .. } | Op::Rename { .. }) {
         match fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Ok(sha256_path_bytes(&fs::read_link(path)?));
@@ -272,6 +277,15 @@ fn sha256_of_regular_file(path: &Path) -> std::io::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+/// Digest of a symlink's target string, identical to the
+/// chokepoint's `before_hash` for a symlink `Op::Rename`
+/// (`sha256_for_path_before_op`). Lets undo verify a quarantined
+/// symlink still matches the recorded mutation result before
+/// renaming it back — without ever dereferencing the link.
+pub(crate) fn sha256_of_symlink_target(path: &Path) -> std::io::Result<String> {
+    Ok(sha256_path_bytes(&fs::read_link(path)?))
 }
 
 /// Deterministic content+structure digest of a directory tree.
@@ -383,6 +397,22 @@ fn read_or_empty(path: &Path) -> std::io::Result<Vec<u8>> {
 /// "no such file or directory" when the path is a target we're about to
 /// CREATE.
 pub(crate) fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
+    // If the FINAL component is a symlink, canonicalize its PARENT
+    // and append the link's own name — NEVER follow the link. Scope
+    // checks must anchor to where the link SITS, not where it
+    // points. Without this, quarantining an unexpected symlink whose
+    // target is out of scope (e.g. an archive entry aliasing
+    // `/etc/shadow`) would canonicalize to the target and be
+    // false-refused as `OutOfScope` — defeating the very fix. (Uses
+    // `symlink_metadata`, which does not traverse the link.)
+    if matches!(fs::symlink_metadata(path), Ok(meta) if meta.file_type().is_symlink()) {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent_canon = canonicalize_existing_or_parent(parent)?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "symlink path has no file name")
+        })?;
+        return Ok(parent_canon.join(name));
+    }
     if path.exists() {
         return path.canonicalize();
     }
@@ -442,7 +472,14 @@ pub(crate) fn ensure_in_scope(caps: &Capabilities, path: &Path) -> Result<(), Mu
 }
 
 fn reject_unexpected_symlink(path: &Path, op: &Op) -> Result<(), MutateError> {
-    if matches!(op, Op::SymlinkAtomic { .. }) {
+    // `Op::SymlinkAtomic` creates/replaces a symlink; `Op::Rename`
+    // MOVES the path (quarantine) via `fs::rename`, which operates
+    // on the link itself and never dereferences it. Both are safe
+    // on a symlink source — no write is ever directed THROUGH the
+    // link to its target. Every other op (WriteFile / AppendFile /
+    // Chmod / DbExec) would follow the link and write to an
+    // out-of-scope target, so they stay refused.
+    if matches!(op, Op::SymlinkAtomic { .. } | Op::Rename { .. }) {
         return Ok(());
     }
     match fs::symlink_metadata(path) {
@@ -848,23 +885,33 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // in actions.jsonl preserves the original path semantics for undo.
     let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
-    let path_is_dir = matches!(fs::symlink_metadata(path), Ok(meta) if meta.file_type().is_dir());
+    let path_meta_kind = fs::symlink_metadata(path);
+    let path_is_dir = matches!(&path_meta_kind, Ok(meta) if meta.file_type().is_dir());
+    let path_is_symlink = matches!(&path_meta_kind, Ok(meta) if meta.file_type().is_symlink());
     if !ctx.dry_run && fs::symlink_metadata(path).is_ok() {
-        if path_is_dir {
-            // Directory: the ONLY supported op is `Op::Rename`
-            // (quarantine). We skip the verbatim file-copy backup —
-            // `fs::rename` preserves the entire tree intact at the
-            // destination `to`, which IS the backup; undo reverses
-            // by renaming it back. A recursive copy here would be
-            // redundant and risk partial-copy failure modes.
-            if !matches!(op, Op::Rename { .. }) {
+        if path_is_dir || (path_is_symlink && matches!(op, Op::Rename { .. })) {
+            // Non-regular-file quarantine via `Op::Rename`: a
+            // directory tree OR a symlink. `fs::rename` preserves
+            // the tree / the link itself intact at the destination
+            // `to` — that IS the backup, and undo reverses by
+            // renaming it back. We skip the verbatim file-copy
+            // (a recursive dir copy would be redundant + risk
+            // partial-copy failures; a symlink isn't a regular file
+            // so the copy path can't read it anyway). A symlink is
+            // moved as the link — never dereferenced.
+            //
+            // For a directory, `Op::Rename` is the ONLY supported
+            // op (every other op would need to follow into the
+            // tree); reject anything else.
+            if path_is_dir && !matches!(op, Op::Rename { .. }) {
                 let _ = FileExt::unlock(&lock_file);
                 return Err(MutateError::Unsupported(
                     "only Op::Rename is supported for directory paths",
                 ));
             }
-            // Still enforce the tamper defense: re-hash the tree and
-            // refuse if a concurrent writer changed it in our window.
+            // Still enforce the tamper defense: re-hash (dir-tree
+            // digest, or the symlink target string) and refuse if a
+            // concurrent writer changed it in our window.
             let post_backup_hash = sha256_for_path_before_op(path, &op)?;
             if post_backup_hash != before_hash {
                 let _ = FileExt::unlock(&lock_file);
@@ -1151,6 +1198,13 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    // The chokepoint's production code no longer imports these at module
+    // scope (Windows has no POSIX modes), but the tests exercise Unix mode
+    // semantics directly and run only on the host. The test module is never
+    // compiled for Windows (`cargo check` skips `#[cfg(test)]`), so these
+    // Unix-only imports are safe here.
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
 
     fn make_ctx(td: &TempDir, run_id: &str) -> MutateContext {
         let run_dir = td.path().join(".doctor").join("runs").join(run_id);
@@ -1600,6 +1654,80 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlink_rename_quarantines_link_without_dereferencing() {
+        use std::os::unix::fs::symlink;
+        let td = TempDir::new().unwrap();
+        // The symlink points at a "sensitive" target OUTSIDE the
+        // archive. Quarantine must move the LINK without ever
+        // reading the target (no dereference / exfil).
+        let secret = td.path().join("secret.txt");
+        fs::write(&secret, b"do-not-read-me").unwrap();
+        let link = td.path().join("sneaky.md");
+        symlink(&secret, &link).unwrap();
+
+        let quarantine = td
+            .path()
+            .join(".doctor")
+            .join("quarantine")
+            .join("sneaky.md");
+        let ctx = make_ctx(&td, "2026-05-20T00-00-00Z__symq");
+        let result = mutate(
+            &ctx,
+            &link,
+            Op::Rename {
+                to: quarantine.clone(),
+            },
+        )
+        .unwrap();
+        assert!(result.ok, "symlink rename should succeed");
+        // Source link gone; quarantine holds the symlink (still a
+        // symlink, still pointing at the original target — NOT a
+        // copy of the target's bytes).
+        assert!(fs::symlink_metadata(&link).is_err(), "source link moved");
+        let q_meta = fs::symlink_metadata(&quarantine).unwrap();
+        assert!(q_meta.file_type().is_symlink(), "quarantined as a symlink");
+        assert_eq!(fs::read_link(&quarantine).unwrap(), secret, "target preserved");
+        // The secret target was never touched.
+        assert_eq!(fs::read(&secret).unwrap(), b"do-not-read-me");
+        // before==after hash (the target-string digest), non-empty.
+        assert!(result.before_hash.starts_with("sha256:"));
+        assert_eq!(result.before_hash, result.after_hash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_rename_round_trips_via_undo() {
+        use crate::doctor::undo::run_undo_with_scopes;
+        use std::os::unix::fs::symlink;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("target.bin");
+        fs::write(&target, b"x").unwrap();
+        let link = td.path().join("link.md");
+        symlink(&target, &link).unwrap();
+        let original_target = fs::read_link(&link).unwrap();
+
+        let run_id = "2026-05-20T00-00-00Z__symq_rt";
+        let quarantine = td
+            .path()
+            .join(".doctor")
+            .join("quarantine")
+            .join("link.md");
+        let ctx = make_ctx(&td, run_id);
+        mutate(&ctx, &link, Op::Rename { to: quarantine }).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err(), "link quarantined");
+
+        let summary =
+            run_undo_with_scopes(td.path(), run_id, false, true, &[td.path().to_path_buf()])
+                .unwrap();
+        assert!(summary.failures.is_empty(), "undo failures: {:?}", summary.failures);
+        // Link restored, still a symlink, same target.
+        let restored = fs::symlink_metadata(&link).unwrap();
+        assert!(restored.file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), original_target);
+    }
+
     #[test]
     fn dry_run_does_not_write() {
         let td = TempDir::new().unwrap();
@@ -1904,7 +2032,6 @@ mod tests {
     fn g4_atomic_write_chmod_via_fd_before_persist() {
         // Permissions are set via fd before persist, not via path after.
         // This checks the requested mode is applied through that path.
-        use std::os::unix::fs::PermissionsExt;
         let td = TempDir::new().unwrap();
         let target = td.path().join("hook.sh");
         let ctx = make_ctx(&td, "2026-05-09T16-30-15Z__g4");

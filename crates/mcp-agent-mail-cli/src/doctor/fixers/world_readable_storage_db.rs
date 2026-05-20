@@ -172,6 +172,10 @@ mod tests {
     use super::*;
     use crate::doctor::mutate::{Capabilities, MutateContext};
     use crate::doctor::runs::scaffold_run_dir;
+    // Production code no longer imports PermissionsExt at module scope
+    // (Windows has no POSIX modes); the tests exercise Unix mode semantics
+    // and only run on the host, so the import lives here.
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::Instant;
     use tempfile::TempDir;
