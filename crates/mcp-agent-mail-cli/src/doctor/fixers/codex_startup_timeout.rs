@@ -63,8 +63,8 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use crate::{CODEX_STARTUP_TIMEOUT_SECS, extract_mcp_agent_mail_toml_startup_timeout};
 use mcp_agent_mail_core::mcp_config::{McpConfigLocation, McpConfigTool};
-use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-mcp-config-files-codex-startup-timeout-too-short";
@@ -542,7 +542,11 @@ startup_timeout_sec = 5
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
         // File untouched.
-        assert!(!fs::read_to_string(&p).unwrap().contains("startup_timeout_sec"));
+        assert!(
+            !fs::read_to_string(&p)
+                .unwrap()
+                .contains("startup_timeout_sec")
+        );
     }
 
     /// **NEGATIVE**: malformed TOML → skip (operator owns it).
@@ -622,7 +626,11 @@ startup_timeout_sec = 5
         let finding = finding_for(p.clone(), TimeoutState::TooShort { observed_secs: 3 });
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 1);
-        assert!(fs::read_to_string(&p).unwrap().contains("startup_timeout_sec = 30"));
+        assert!(
+            fs::read_to_string(&p)
+                .unwrap()
+                .contains("startup_timeout_sec = 30")
+        );
     }
 
     /// Idempotence: an already-healthy value is left alone.
@@ -642,6 +650,10 @@ startup_timeout_sec = 5
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
-        assert!(fs::read_to_string(&p).unwrap().contains("startup_timeout_sec = 60"));
+        assert!(
+            fs::read_to_string(&p)
+                .unwrap()
+                .contains("startup_timeout_sec = 60")
+        );
     }
 }

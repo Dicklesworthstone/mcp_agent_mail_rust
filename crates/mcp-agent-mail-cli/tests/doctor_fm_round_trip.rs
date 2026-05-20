@@ -999,3 +999,62 @@ fn round_trip_share_half_finished_bundle_op_rename_dir() {
     let post_undo = snapshot_tree(td.path(), true);
     assert_byte_identical("share_half_finished_bundle", &pre_fix, &post_undo);
 }
+
+/// FM `fm-mcp-config-files-codex-startup-timeout-too-short`
+/// graduated from detect-only to `Op::WriteFile` (format-preserving
+/// toml_edit). Unlike the other round-trips this drives `fix()`
+/// directly rather than `dispatch_only`, because the codex
+/// dispatcher reads global config locations
+/// (`detect_mcp_config_locations_default` → home dir + CWD) and
+/// has no per-test injection point. The property under test is the
+/// same: corrupt → fix → undo → byte-identical, here proving the
+/// chokepoint reverses a toml_edit-produced rewrite (comments and
+/// all) byte-for-byte.
+#[test]
+fn round_trip_codex_startup_timeout_op_write_file() {
+    let td = TempDir::new().expect("tempdir");
+    let cfg = td.path().join("config.toml");
+    let original = "# codex config (operator comment)\n\
+                    [mcp_servers.mcp_agent_mail]\n\
+                    command = \"mcp-agent-mail\"  # rust binary\n\
+                    startup_timeout_sec = 5\n";
+    fs::write(&cfg, original).expect("plant config.toml");
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o644)).expect("0o644");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+
+    let run_id = "2026-05-20T00-00-00Z__rt_codex";
+    let fm_id = fixers::codex_startup_timeout::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let finding = fixers::codex_startup_timeout::CodexStartupTimeoutFinding {
+        config_path: cfg.clone(),
+        state: fixers::codex_startup_timeout::TimeoutState::TooShort { observed_secs: 5 },
+        min_required_secs: 30,
+    };
+    let outcome = fixers::codex_startup_timeout::fix(&ctx, &finding).expect("fix");
+    assert_eq!(outcome.actions_taken, 1, "the too-short timeout is bumped");
+
+    // Post-fix: timeout bumped, comments preserved.
+    let post_fix = fs::read_to_string(&cfg).unwrap();
+    assert!(post_fix.contains("startup_timeout_sec = 30"));
+    assert!(post_fix.contains("# codex config (operator comment)"));
+    assert!(post_fix.contains("# rust binary"));
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    // Undo restores the original byte-for-byte (timeout back to 5,
+    // comments intact).
+    let post_undo_body = fs::read_to_string(&cfg).unwrap();
+    assert_eq!(post_undo_body, original, "undo restores original bytes");
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("codex_startup_timeout", &pre_fix, &post_undo);
+}
