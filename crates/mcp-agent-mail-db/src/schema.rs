@@ -499,10 +499,14 @@ pub fn schema_migrations() -> Vec<Migration> {
     // The conversion: strftime('%s', text) * 1000000 + fractional_micros
     let ts_conversion = |col: &str| -> String {
         format!(
-            "CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
-             CASE WHEN instr({col}, '.') > 0 \
-                  THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
-                  ELSE 0 \
+            "CASE \
+                 WHEN trim({col}) <> '' AND trim({col}) NOT GLOB '*[^0-9]*' \
+                 THEN CAST(trim({col}) AS INTEGER) \
+                 ELSE CAST(strftime('%s', {col}) AS INTEGER) * 1000000 + \
+                      CASE WHEN instr({col}, '.') > 0 \
+                           THEN CAST(substr({col} || '000000', instr({col}, '.') + 1, 6) AS INTEGER) \
+                           ELSE 0 \
+                      END \
              END"
         )
     };
@@ -515,6 +519,13 @@ pub fn schema_migrations() -> Vec<Migration> {
             "UPDATE projects SET created_at = ({}) WHERE typeof(created_at) = 'text'",
             ts_conversion("created_at")
         ),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v3b_rebuild_projects_created_at_integer_affinity".to_string(),
+        "rebuild legacy projects table when created_at has TEXT affinity".to_string(),
+        "-- handled by the migration runner".to_string(),
         String::new(),
     ));
 
@@ -2780,6 +2791,63 @@ async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     Outcome::Ok(())
 }
 
+async fn execute_v3b_rebuild_projects_created_at_integer_affinity<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    const REBUILD_SQL: [&str; 7] = [
+        "DROP TABLE IF EXISTS projects_v3b_rebuild",
+        "CREATE TABLE projects_v3b_rebuild (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            slug TEXT NOT NULL UNIQUE,\
+            human_key TEXT NOT NULL,\
+            created_at INTEGER NOT NULL\
+        )",
+        "INSERT INTO projects_v3b_rebuild (id, slug, human_key, created_at) \
+         SELECT id, slug, human_key, \
+                CASE \
+                    WHEN typeof(created_at) = 'integer' THEN created_at \
+                    WHEN typeof(created_at) = 'real' THEN CAST(created_at AS INTEGER) \
+                    WHEN typeof(created_at) = 'text' AND trim(created_at) <> '' \
+                         AND trim(created_at) NOT GLOB '*[^0-9]*' \
+                    THEN CAST(trim(created_at) AS INTEGER) \
+                    ELSE CAST(strftime('%s', created_at) AS INTEGER) * 1000000 + \
+                         CASE WHEN instr(created_at, '.') > 0 \
+                              THEN CAST(substr(created_at || '000000', instr(created_at, '.') + 1, 6) AS INTEGER) \
+                              ELSE 0 \
+                         END \
+                END \
+         FROM projects",
+        "DROP TABLE projects",
+        "ALTER TABLE projects_v3b_rebuild RENAME TO projects",
+        "CREATE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_human_key ON projects(human_key)",
+    ];
+
+    for sql in REBUILD_SQL {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    match conn
+        .execute(
+            cx,
+            "CREATE INDEX IF NOT EXISTS idx_projects_created_id_desc ON projects(created_at DESC, id DESC)",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(err) => Outcome::Err(err),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 async fn cleanup_legacy_message_fts_artifacts<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -2876,16 +2944,19 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 "migration preflight found schema already satisfies migration; recording migration without executing DDL"
             );
         } else {
-            let statement_result = if migration.id == "v15_add_recipients_json_to_messages" {
-                execute_v15_add_recipients_json_to_messages(cx, conn).await
-            } else {
-                match conn.execute(cx, &migration.up, &[]).await {
-                    Outcome::Ok(_) => Outcome::Ok(()),
-                    Outcome::Err(err) => Outcome::Err(err),
-                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-                    Outcome::Panicked(payload) => Outcome::Panicked(payload),
-                }
-            };
+            let statement_result =
+                if migration.id == "v3b_rebuild_projects_created_at_integer_affinity" {
+                    execute_v3b_rebuild_projects_created_at_integer_affinity(cx, conn).await
+                } else if migration.id == "v15_add_recipients_json_to_messages" {
+                    execute_v15_add_recipients_json_to_messages(cx, conn).await
+                } else {
+                    match conn.execute(cx, &migration.up, &[]).await {
+                        Outcome::Ok(_) => Outcome::Ok(()),
+                        Outcome::Err(err) => Outcome::Err(err),
+                        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+                    }
+                };
 
             match statement_result {
                 Outcome::Ok(()) => {}
@@ -4448,6 +4519,60 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
                 .get_named::<String>("t")
                 .expect("projects.created_at type"),
             "integer"
+        );
+    }
+
+    #[test]
+    fn v3_migration_accepts_stringified_microseconds_in_text_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("stringified_micros.sqlite3");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        conn.execute_raw(
+            "\
+            CREATE TABLE IF NOT EXISTS projects (\
+                id INTEGER PRIMARY KEY,\
+                slug TEXT NOT NULL,\
+                human_key TEXT NOT NULL,\
+                created_at TEXT NOT NULL\
+            )",
+        )
+        .expect("create legacy projects table");
+        conn.execute_raw(
+            "\
+            INSERT INTO projects (id, slug, human_key, created_at) \
+            VALUES (1, 'legacy-stringified-micros', '/tmp/legacy', '1772368496123456')",
+        )
+        .expect("insert stringified micros project");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) AS t, created_at FROM projects WHERE id = 1",
+                &[],
+            )
+            .expect("query migrated project");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("t")
+                .expect("projects.created_at type"),
+            "integer"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<i64>("created_at")
+                .expect("projects.created_at value"),
+            1_772_368_496_123_456
         );
     }
 

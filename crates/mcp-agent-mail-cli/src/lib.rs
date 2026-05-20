@@ -12924,6 +12924,68 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
 
     match outcome {
         asupersync::Outcome::Ok(_) => {
+            let migrate_cfg = mcp_agent_mail_db::DbPoolConfig {
+                database_url: database_url.to_string(),
+                ..Default::default()
+            };
+            let path = migrate_cfg
+                .sqlite_path()
+                .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+            if path == ":memory:" {
+                match rt.block_on(async {
+                    schema::migrate_runtime_canonical_followup(&cx, &conn).await
+                }) {
+                    asupersync::Outcome::Ok(_) => {}
+                    asupersync::Outcome::Err(e) => {
+                        return Err(CliError::Other(format!(
+                            "runtime canonical follow-up migration failed: {e}"
+                        )));
+                    }
+                    asupersync::Outcome::Cancelled(r) => {
+                        return Err(CliError::Other(format!(
+                            "runtime canonical follow-up migration cancelled: {r:?}"
+                        )));
+                    }
+                    asupersync::Outcome::Panicked(p) => {
+                        return Err(CliError::Other(format!(
+                            "runtime canonical follow-up migration panicked: {p}"
+                        )));
+                    }
+                }
+            } else {
+                let resolved_path = resolve_sqlite_path_with_absolute_candidate(&path);
+                let canonical_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&resolved_path)
+                    .map_err(|e| {
+                        CliError::Other(format!(
+                            "failed to open DB for runtime canonical follow-up migrations: {e}"
+                        ))
+                    })?;
+                canonical_conn
+                    .execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+                    .map_err(|e| {
+                        CliError::Other(format!("failed to apply canonical follow-up PRAGMAs: {e}"))
+                    })?;
+                match rt.block_on(async {
+                    schema::migrate_runtime_canonical_followup(&cx, &canonical_conn).await
+                }) {
+                    asupersync::Outcome::Ok(_) => {}
+                    asupersync::Outcome::Err(e) => {
+                        return Err(CliError::Other(format!(
+                            "runtime canonical follow-up migration failed: {e}"
+                        )));
+                    }
+                    asupersync::Outcome::Cancelled(r) => {
+                        return Err(CliError::Other(format!(
+                            "runtime canonical follow-up migration cancelled: {r:?}"
+                        )));
+                    }
+                    asupersync::Outcome::Panicked(p) => {
+                        return Err(CliError::Other(format!(
+                            "runtime canonical follow-up migration panicked: {p}"
+                        )));
+                    }
+                }
+            }
             schema::enforce_runtime_fts_cleanup(&conn)
                 .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
             conn.execute_raw(&schema::schema_user_version_sql())
@@ -12998,6 +13060,9 @@ fn handle_migrate_cmd(
     let mut resolved_path = resolve_sqlite_path_with_absolute_candidate(&path);
     let mut db_path = PathBuf::from(&resolved_path);
     if !db_path.exists() {
+        if !check {
+            return handle_migrate_with_database_url(&cfg.database_url);
+        }
         ftui_runtime::ftui_println!("Database file does not exist: {resolved_path}");
         ftui_runtime::ftui_println!("Run the server once to create it, then migrate.");
         return Ok(());
@@ -34712,6 +34777,38 @@ http_headers = { Authorization = "Bearer secret" }
                         "table {expected} should exist after migration"
                     );
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn migrate_cmd_bootstraps_missing_database_file() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing-command.db");
+        let storage_root = dir.path().join("storage-root");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(false, false, false, None).expect("migrate missing db");
+                assert!(db_path.exists(), "migrate should create the database file");
+
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                    .expect("reopen migrated db");
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS project_count FROM projects", &[])
+                    .expect("projects table should exist");
+                let project_count = rows[0].get_named::<i64>("project_count").unwrap_or(-1);
+                assert_eq!(project_count, 0);
             },
         );
     }
@@ -58109,14 +58206,11 @@ fn handle_doctor_reconstruct_with(
         if let Some(max) = archive_max {
             let conn_result =
                 mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string());
-            if let Ok(conn) = conn_result {
-                if let Err(e) =
+            if let Ok(conn) = conn_result
+                && let Err(e) =
                     mcp_agent_mail_db::id_floor::advance_messages_id_floor(&conn, Some(max))
-                {
-                    ftui_runtime::ftui_eprintln!(
-                        "  Warning: post-swap id-floor advance failed: {e}"
-                    );
-                }
+            {
+                ftui_runtime::ftui_eprintln!("  Warning: post-swap id-floor advance failed: {e}");
             }
         }
     }
