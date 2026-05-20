@@ -24,7 +24,6 @@ ftui.workspace = true
 ftui-extras.workspace = true
 ftui-render.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
-ftui-tty.workspace = true
 ftui-widgets.workspace = true
 fastmcp.workspace = true
 fastmcp-core.workspace = true
@@ -37,12 +36,22 @@ glob.workspace = true
 walkdir.workspace = true
 sha2.workspace = true
 fs2.workspace = true
-nix = { workspace = true, features = ["fs"] }
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
 mcp-agent-mail-db = { path = "../mcp-agent-mail-db", default-features = false }
 mcp-agent-mail-share = { path = "../mcp-agent-mail-share", default-features = false }
 mcp-agent-mail-storage = { path = "../mcp-agent-mail-storage", default-features = false }
 mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools", default-features = false }
+
+# Unix-only deps: the native ftui-tty TUI backend and nix syscalls. Gating them
+# here keeps them out of the Windows build, which uses the crossterm-compat
+# backend (Program::with_config) instead.
+[target.'cfg(unix)'.dependencies]
+ftui-runtime = { workspace = true, features = ["native-backend"] }
+ftui-tty.workspace = true
+nix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(not(unix))'.dependencies]
+ftui-runtime = { workspace = true, features = ["crossterm-compat"] }
 
 [features]
 default = [

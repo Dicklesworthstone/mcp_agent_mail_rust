@@ -45,7 +45,7 @@ sqlmodel-frankensqlite = "0.2.2"
 sqlmodel-sqlite = "0.2.2"
 
 ftui = "0.4.0"
-ftui-runtime = { version = "0.4.0", features = ["native-backend"] }
+ftui-runtime = { version = "0.4.0" }
 ftui-extras = { version = "0.4.0", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
 ftui-widgets = { version = "0.4.0", features = ["debug-overlay", "regex-search"] }
 ftui-tty = "0.4.0"

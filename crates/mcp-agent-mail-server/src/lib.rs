@@ -4133,7 +4133,14 @@ fn run_tui_main_thread(
         .with_resize_behavior(ftui_runtime::program::ResizeBehavior::Throttled)
         .with_resize_coalescer(resize_coalescer);
 
+    // frankentui's native ftui-tty backend (`with_native_backend`) is `#[cfg(unix)]`.
+    // On non-Unix targets (Windows) use the crossterm-compat backend instead —
+    // frankentui's documented cross-platform path — gated by the `crossterm-compat`
+    // feature on ftui-runtime. `Program::run()` and `ProgramConfig` are shared.
+    #[cfg(unix)]
     let mut program = Program::with_native_backend(model, tui_config)?;
+    #[cfg(not(unix))]
+    let mut program = Program::with_config(model, tui_config)?;
     program.run()
 }
 
@@ -7601,6 +7608,16 @@ impl StartupDashboard {
         }
     }
 
+    /// Non-Unix (Windows): the console-layout raw-input thread relies on the
+    /// Unix-only `ftui-tty` backend. On Windows the primary interface is the
+    /// crossterm-backed TUI (`Program::with_config`), whose own event loop
+    /// handles input, so this secondary console-input worker is a no-op.
+    #[cfg(not(unix))]
+    fn spawn_console_input_worker(self: &Arc<Self>) {
+        let _ = self;
+    }
+
+    #[cfg(unix)]
     #[allow(clippy::too_many_lines)]
     fn spawn_console_input_worker(self: &Arc<Self>) {
         const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -7620,14 +7637,13 @@ impl StartupDashboard {
             .name("mcp-agent-mail-dashboard-input".to_string())
             .spawn(move || {
                 use ftui_runtime::BackendEventSource;
-                #[cfg(unix)]
+                // This worker is `#[cfg(unix)]`-only (see the fn above), so the
+                // native ftui-tty backend is always available here.
                 let backend_result = ftui_tty::TtyBackend::open(
                     0,
                     0,
                     ftui_tty::TtySessionOptions::default(),
                 );
-                #[cfg(not(unix))]
-                let backend_result = Ok::<_, std::io::Error>(ftui_tty::TtyBackend::new(0, 0));
                 let Ok(mut backend) = backend_result else {
                     this.log_line("Console interactive mode: failed to enter raw mode");
                     return;
@@ -7749,6 +7765,10 @@ impl StartupDashboard {
 
         // Ensure Ctrl+C still terminates the process even if raw-mode disables ISIG.
         if key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Char('c')) {
+            // Unix raw-mode terminal restore before the hard exit. The Unix-only
+            // ftui-tty backend owns this escape-sequence cleanup; on Windows the
+            // crossterm backend manages its own terminal state, so we just flush.
+            #[cfg(unix)]
             let _ = ftui_tty::write_cleanup_sequence(
                 &ftui_runtime::BackendFeatures::default(),
                 false,
