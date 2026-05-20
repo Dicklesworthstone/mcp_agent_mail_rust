@@ -841,3 +841,89 @@ fn round_trip_mcp_duplicate_aliased_server_entries_op_write_file() {
     let post_undo = snapshot_tree(td.path(), true);
     assert_byte_identical("mcp_duplicate_aliased_server_entries", &pre_fix, &post_undo);
 }
+
+/// FM `fm-db-state-files-legacy-fts-residue` graduated from
+/// detect-only to `Op::DbExec`. FIRST Op::DbExec round-trip in
+/// the suite — pins that the chokepoint's whole-DB-file backup
+/// reverses a `DROP` sequence byte-identically.
+///
+/// Plant a delete-journal-mode SQLite DB with a legacy
+/// `fts_messages` table + `fts_messages_ai` trigger plus the
+/// Search-V3 `.managed.json` marker. Dispatch → fix drops the
+/// residue via Op::DbExec → detector confirms clean → undo
+/// restores the DB byte-identical (and leaves no stray
+/// `-wal`/`-journal` sidecars in the snapshot).
+#[test]
+fn round_trip_legacy_fts_residue_op_db_exec() {
+    use sqlmodel_sqlite::SqliteConnection;
+
+    let td = TempDir::new().expect("tempdir");
+    let db_path = td.path().join("storage.sqlite3");
+    {
+        let conn = SqliteConnection::open_file(db_path.to_string_lossy().into_owned())
+            .expect("open new sqlite db");
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT);")
+            .expect("create main table");
+        // Legacy FTS5 residue: a table + trigger matching the
+        // canonical fts_messages prefix. (Regular table stands in
+        // for the FTS5 virtual table — the detector matches by
+        // name, and in-process SQLite test builds may lack FTS5.)
+        conn.execute_raw("CREATE TABLE fts_messages (rowid INTEGER, content TEXT);")
+            .expect("create fts_messages");
+        conn.execute_raw(
+            "CREATE TRIGGER fts_messages_ai AFTER INSERT ON messages BEGIN \
+             INSERT INTO fts_messages(rowid, content) VALUES (NEW.id, NEW.body); END;",
+        )
+        .expect("create fts trigger");
+        // conn drops here → DB closed cleanly, delete-journal mode
+        // leaves no sidecar.
+    }
+    // Search V3 marker → detector treats fts_* as residue.
+    let marker_dir = td.path().join("search_index");
+    fs::create_dir_all(&marker_dir).expect("mkdir search_index");
+    fs::write(marker_dir.join(".managed.json"), b"{}").expect("write marker");
+
+    let pre_fix = snapshot_tree(td.path(), true);
+
+    let run_id = "2026-05-20T00-00-00Z__rt_fts";
+    let fm_id = fixers::legacy_fts_residue::FM_ID;
+    let ctx = build_ctx(&td, run_id, fm_id);
+
+    let inputs = DispatchInputs {
+        db_file_candidates: vec![db_path.clone()],
+        ..empty_inputs(&td)
+    };
+
+    let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
+    assert_eq!(
+        outcome.actions_taken, 1,
+        "exactly one Op::DbExec drop sequence expected"
+    );
+
+    // Post-fix: detector finds zero residue.
+    let post = fixers::legacy_fts_residue::detect(std::slice::from_ref(&db_path));
+    assert!(
+        post.is_empty(),
+        "detector must find zero residue after fix: {post:?}"
+    );
+
+    drop(ctx);
+
+    let summary = run_undo(td.path(), run_id, false, true).expect("run_undo");
+    assert!(
+        summary.failures.is_empty(),
+        "undo failures: {:?}",
+        summary.failures
+    );
+
+    let post_undo = snapshot_tree(td.path(), true);
+    assert_byte_identical("legacy_fts_residue", &pre_fix, &post_undo);
+
+    // And the residue is back after undo (the DROP was reversed).
+    let post_undo_detect = fixers::legacy_fts_residue::detect(std::slice::from_ref(&db_path));
+    assert_eq!(
+        post_undo_detect.len(),
+        1,
+        "residue must reappear after undo restores the DB"
+    );
+}

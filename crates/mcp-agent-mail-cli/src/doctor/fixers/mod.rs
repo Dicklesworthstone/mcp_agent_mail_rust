@@ -405,9 +405,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: legacy_fts_residue::FM_ID,
             severity: "P2",
             subsystem: "db_state_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "storage.sqlite3 retains legacy FTS5 tables/triggers/views after Search V3 migration (manual DROP sequence; auto-fix deferred)",
+            op_pattern: "Op::DbExec",
+            auto_fixable: true,
+            one_line_description: "storage.sqlite3 retains legacy FTS5 tables/triggers/views after Search V3 migration — auto-fix drops them via Op::DbExec in dependency order (TRIGGER → VIEW → TABLE); reversible via `am doctor undo` (whole-DB-file backup)",
             source_module: "doctor::fixers::legacy_fts_residue",
         },
         FixerSpec {
@@ -1351,7 +1351,9 @@ pub fn dispatch_only(
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            // Detect-only — fix is a no-op.
+            // Auto-fix via Op::DbExec: dependency-ordered DROP of
+            // the residual fts_* objects. Reversible via the
+            // chokepoint's whole-DB-file backup.
             let result = legacy_fts_residue::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;

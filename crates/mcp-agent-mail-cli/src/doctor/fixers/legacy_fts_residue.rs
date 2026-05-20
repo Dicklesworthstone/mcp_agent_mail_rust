@@ -30,18 +30,31 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only in this first cut.** The repair_spec's full
-//! Op::DbExec drop sequence (TRIGGER → VIEW → TABLE) is correct
-//! per AGENTS.md's frankensqlite notes ("DROP TRIGGER is fully
-//! functional"), but the dependency-ordered drop loop plus
-//! `sqlite3 .dump`-style backup of the master rows requires
-//! more chokepoint plumbing than fits this commit. Manual
-//! remediation envelope points operators at running the
-//! documented sequence by hand.
+//! **Auto-fix via `Op::DbExec`.** The residual objects are
+//! dropped in dependency order — TRIGGER first, then VIEW, then
+//! TABLE — as a single `Op::DbExec` carrying the ordered
+//! `DROP ... IF EXISTS` sequence. The chokepoint byte-copies the
+//! whole DB file to its backup BEFORE executing, so
+//! `am doctor undo <run-id>` restores the pre-fix DB
+//! byte-identically (the DROP is reversed wholesale by the
+//! file-level restore — no row-level replay needed).
+//!
+//! Each `DROP ... IF EXISTS` is individually idempotent: running
+//! the fix twice (or on an already-clean DB) drops nothing on the
+//! second pass.
+//!
+//! WAL caveat: the chokepoint backs up the main DB file but not
+//! `-wal` / `-shm` sidecars. For the pooled production DB an
+//! operator should `PRAGMA wal_checkpoint(TRUNCATE)` and quiesce
+//! writers before running `am doctor fix`; the doctor's premise
+//! is operator-supervised remediation, not live mutation. The DB
+//! created by tests uses the default delete-journal mode, so no
+//! sidecars persist past the drop.
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
+use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -118,21 +131,25 @@ impl LegacyFtsResidueFinding {
                 "v3_marker_path": self.v3_marker_path.to_string_lossy(),
                 "residual_count": count,
                 "residual_objects": self.residual_objects,
+                "auto_fix_summary": format!(
+                    "`am doctor fix --only {FM_ID} --yes` drops the {count} residual object(s) via Op::DbExec in dependency order (TRIGGER → VIEW → TABLE). The chokepoint backs up the whole DB file first, so `am doctor undo <run-id>` restores the pre-fix DB byte-identically."
+                ),
+                "drop_sequence": build_drop_sql(&self.residual_objects),
                 "manual_remediation": {
                     "steps": [
-                        "Take a `sqlite3 storage.sqlite3 .dump` backup of the fts_% rows BEFORE dropping them (so an undo is possible).",
-                        "Drop triggers first (DROP TRIGGER IF EXISTS <name>;), then views (DROP VIEW IF EXISTS <name>;), then virtual tables (DROP TABLE IF EXISTS <name>;) — order matters for FK / dependency reasons.",
+                        "Auto-fix (preferred): `am doctor fix --only fm-db-state-files-legacy-fts-residue --yes`. Drops the residual fts_* objects in dependency order via Op::DbExec; the chokepoint's DB-file backup makes `am doctor undo <run-id>` reverse it wholesale.",
+                        "Before invoking on the live pooled DB: `PRAGMA wal_checkpoint(TRUNCATE);` and quiesce writers so the main DB file (not the -wal sidecar) carries the change and the backup is complete.",
+                        "Manual alternative: drop triggers first (DROP TRIGGER IF EXISTS <name>;), then views (DROP VIEW IF EXISTS <name>;), then tables (DROP TABLE IF EXISTS <name>;) — order matters for dependency reasons.",
                         "Re-run `am doctor fix --only fm-db-state-files-legacy-fts-residue --list` to confirm sqlite_master is clean.",
                     ],
-                    "note": "Auto-fix via Op::DbExec is intentionally deferred in this first cut — the dependency-ordered drop sequence + backup of dropped rows needs additional chokepoint plumbing.",
                     "residue_summary": object_summary,
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor explain {FM_ID}"),
+                command: format!("am doctor fix --only {FM_ID}"),
                 explain_command: format!("am doctor explain {FM_ID}"),
-                auto_fixable: false,
-                estimated_actions: 0,
+                auto_fixable: true,
+                estimated_actions: count,
             },
         }
     }
@@ -213,15 +230,84 @@ fn read_fts_residue(conn: &sqlmodel_sqlite::SqliteConnection) -> Option<Vec<Resi
     Some(out)
 }
 
-/// Fixer. Detect-only — returns `actions_skipped: 1`. The full
-/// repair_spec Op::DbExec drop sequence is deferred.
+/// Quote a SQLite identifier: wrap in double-quotes and double any
+/// embedded double-quote. Defends against names from sqlite_master
+/// that contain special characters (FTS5 names are simple in
+/// practice, but never interpolate an unquoted identifier into DDL).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build the dependency-ordered DROP sequence: TRIGGER first, then
+/// VIEW, then TABLE. Each statement is `DROP <KIND> IF EXISTS
+/// "<name>";` so the sequence is idempotent (re-running drops
+/// nothing on the second pass). Objects with an unrecognized kind
+/// are skipped (defensive — the detector only emits table / trigger
+/// / view).
+fn build_drop_sql(objects: &[ResidualObject]) -> String {
+    // Drop priority by kind: lower number → dropped first.
+    fn priority(kind: &str) -> Option<u8> {
+        match kind {
+            "trigger" => Some(0),
+            "view" => Some(1),
+            "table" => Some(2),
+            _ => None,
+        }
+    }
+    let mut ordered: Vec<&ResidualObject> = objects
+        .iter()
+        .filter(|o| priority(&o.kind).is_some())
+        .collect();
+    ordered.sort_by_key(|o| priority(&o.kind).unwrap_or(u8::MAX));
+    let mut sql = String::new();
+    for obj in ordered {
+        let keyword = match obj.kind.as_str() {
+            "trigger" => "TRIGGER",
+            "view" => "VIEW",
+            "table" => "TABLE",
+            _ => continue,
+        };
+        sql.push_str(&format!(
+            "DROP {keyword} IF EXISTS {};\n",
+            quote_ident(&obj.name)
+        ));
+    }
+    sql
+}
+
+/// Fixer. Routes through `mutate()` with a single `Op::DbExec`
+/// carrying the dependency-ordered DROP sequence.
+///
+/// Skip semantics:
+/// - DB path vanished between detect and fix → `actions_skipped`.
+/// - No droppable objects (all had unrecognized kinds, or the
+///   finding was empty) → `actions_skipped`.
+///
+/// Reversibility: the chokepoint backs up the whole DB file before
+/// executing, so `am doctor undo <run-id>` restores it byte-identical.
 pub fn fix(
-    _ctx: &crate::doctor::mutate::MutateContext,
-    _finding: &LegacyFtsResidueFinding,
-) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
+    ctx: &MutateContext,
+    finding: &LegacyFtsResidueFinding,
+) -> Result<FixOutcome, MutateError> {
+    if !finding.db_path.exists() {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    }
+    let sql = build_drop_sql(&finding.residual_objects);
+    if sql.trim().is_empty() {
+        return Ok(FixOutcome {
+            actions_taken: 0,
+            actions_skipped: 1,
+            quarantined_paths: Vec::new(),
+        });
+    }
+    mutate(ctx, &finding.db_path, Op::DbExec { sql })?;
     Ok(FixOutcome {
-        actions_taken: 0,
-        actions_skipped: 1,
+        actions_taken: 1,
+        actions_skipped: 0,
         quarantined_paths: Vec::new(),
     })
 }
@@ -397,8 +483,22 @@ mod tests {
         assert!(s.contains("\"residual_count\":2"));
         assert!(s.contains("fts_messages"));
         assert!(s.contains("manual_remediation"));
-        assert!(s.contains("\"auto_fixable\":false"));
+        assert!(s.contains("\"auto_fixable\":true"));
+        assert!(s.contains("\"estimated_actions\":2"));
+        assert!(s.contains("auto_fix_summary"));
         assert!(s.contains("DROP TRIGGER"));
+        // The drop_sequence must order TRIGGER before TABLE.
+        let drop_seq = g
+            .evidence
+            .get("drop_sequence")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let trigger_pos = drop_seq.find("DROP TRIGGER").unwrap();
+        let table_pos = drop_seq.find("DROP TABLE").unwrap();
+        assert!(
+            trigger_pos < table_pos,
+            "trigger must be dropped before table: {drop_seq}"
+        );
     }
 
     #[test]
@@ -415,17 +515,15 @@ mod tests {
         assert!(g.title.contains("retains 1 legacy FTS5 object"));
     }
 
-    #[test]
-    fn fixer_is_no_op_returning_skipped() {
-        let td = TempDir::new().unwrap();
-        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), "test_run").unwrap();
+    fn ctx_for(td: &TempDir, run_id: &str) -> crate::doctor::mutate::MutateContext {
+        let run_dir = crate::doctor::runs::scaffold_run_dir(td.path(), run_id).unwrap();
         let actions = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(run_dir.join("actions.jsonl"))
             .unwrap();
-        let ctx = crate::doctor::mutate::MutateContext {
-            run_id: "test_run".into(),
+        crate::doctor::mutate::MutateContext {
+            run_id: run_id.into(),
             run_dir,
             capabilities: crate::doctor::mutate::Capabilities {
                 write_scopes: vec![td.path().to_path_buf()],
@@ -436,9 +534,59 @@ mod tests {
             dry_run: false,
             start: std::time::Instant::now(),
             extra_locks: Vec::new(),
-        };
+        }
+    }
+
+    /// `quote_ident` doubles embedded double-quotes.
+    #[test]
+    fn quote_ident_escapes_embedded_quotes() {
+        assert_eq!(quote_ident("fts_messages"), "\"fts_messages\"");
+        assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    /// `build_drop_sql` orders TRIGGER → VIEW → TABLE regardless of
+    /// input order, and skips unrecognized kinds.
+    #[test]
+    fn build_drop_sql_orders_by_dependency() {
+        let objects = vec![
+            ResidualObject {
+                kind: "table".into(),
+                name: "fts_messages".into(),
+            },
+            ResidualObject {
+                kind: "view".into(),
+                name: "fts_agents_v".into(),
+            },
+            ResidualObject {
+                kind: "trigger".into(),
+                name: "fts_messages_ai".into(),
+            },
+            ResidualObject {
+                kind: "index".into(), // unrecognized → skipped
+                name: "fts_messages_idx".into(),
+            },
+        ];
+        let sql = build_drop_sql(&objects);
+        let trigger = sql.find("DROP TRIGGER").unwrap();
+        let view = sql.find("DROP VIEW").unwrap();
+        let table = sql.find("DROP TABLE").unwrap();
+        assert!(trigger < view, "trigger before view");
+        assert!(view < table, "view before table");
+        assert!(
+            !sql.contains("fts_messages_idx"),
+            "unrecognized kind (index) must be skipped"
+        );
+        assert!(sql.contains("DROP TRIGGER IF EXISTS \"fts_messages_ai\";"));
+    }
+
+    /// **NEGATIVE**: DB path vanished between detect and fix →
+    /// skipped, never errors.
+    #[test]
+    fn fixer_skips_when_db_path_vanished() {
+        let td = TempDir::new().unwrap();
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__fts_vanished");
         let finding = LegacyFtsResidueFinding {
-            db_path: td.path().join("storage.sqlite3"),
+            db_path: td.path().join("nonexistent.sqlite3"),
             v3_marker_path: td.path().join("search_index").join(V3_MANAGED_MARKER),
             residual_objects: vec![ResidualObject {
                 kind: "table".into(),
@@ -448,6 +596,75 @@ mod tests {
         let outcome = fix(&ctx, &finding).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
-        assert!(outcome.quarantined_paths.is_empty());
+    }
+
+    /// **NEGATIVE**: a finding whose objects all have unrecognized
+    /// kinds yields an empty DROP sequence → skipped.
+    #[test]
+    fn fixer_skips_when_drop_sequence_empty() {
+        let td = TempDir::new().unwrap();
+        let (db_path, _marker) = setup_db(&td, true, true);
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__fts_empty_seq");
+        let finding = LegacyFtsResidueFinding {
+            db_path,
+            v3_marker_path: td.path().join("search_index").join(V3_MANAGED_MARKER),
+            residual_objects: vec![ResidualObject {
+                kind: "index".into(), // unrecognized
+                name: "fts_messages_idx".into(),
+            }],
+        };
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 0);
+        assert_eq!(outcome.actions_skipped, 1);
+    }
+
+    /// Positive: fix() drops the residual objects from a real DB.
+    /// Detector confirms zero residue afterward.
+    #[test]
+    fn fixer_drops_residue_via_db_exec() {
+        let td = TempDir::new().unwrap();
+        let (db_path, _marker) = setup_db(&td, true, true);
+
+        // Pre-fix: detector finds residue.
+        let pre = detect(std::slice::from_ref(&db_path));
+        assert_eq!(pre.len(), 1, "detector must find residue pre-fix");
+        let finding = pre.into_iter().next().unwrap();
+        assert!(!finding.residual_objects.is_empty());
+
+        let ctx = ctx_for(&td, "2026-05-20T00-00-00Z__fts_drop");
+        let outcome = fix(&ctx, &finding).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+        assert_eq!(outcome.actions_skipped, 0);
+
+        // Post-fix: detector finds nothing.
+        let post = detect(std::slice::from_ref(&db_path));
+        assert!(
+            post.is_empty(),
+            "detector must find zero residue after fix: {post:?}"
+        );
+    }
+
+    /// Idempotence: re-running on an already-clean DB drops nothing
+    /// (DROP ... IF EXISTS is a no-op) and doesn't error.
+    #[test]
+    fn fixer_is_idempotent_on_clean_db() {
+        let td = TempDir::new().unwrap();
+        let (db_path, _marker) = setup_db(&td, true, true);
+        let finding = detect(std::slice::from_ref(&db_path))
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let ctx1 = ctx_for(&td, "2026-05-20T00-00-00Z__fts_idem_1");
+        assert_eq!(fix(&ctx1, &finding).expect("fix 1").actions_taken, 1);
+
+        // Second run with the SAME finding (stale residual list):
+        // every DROP ... IF EXISTS is now a no-op. fix() still
+        // reports actions_taken: 1 because it issued the Op::DbExec,
+        // but the DB is unchanged and the detector stays clean.
+        let ctx2 = ctx_for(&td, "2026-05-20T00-00-00Z__fts_idem_2");
+        let outcome2 = fix(&ctx2, &finding).expect("fix 2");
+        assert_eq!(outcome2.actions_taken, 1);
+        assert!(detect(std::slice::from_ref(&db_path)).is_empty());
     }
 }
