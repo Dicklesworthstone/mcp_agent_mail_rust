@@ -61,8 +61,8 @@
 
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
-use crate::{CODEX_STARTUP_TIMEOUT_SECS, extract_mcp_agent_mail_toml_startup_timeout};
 use crate::doctor::platform;
+use crate::{CODEX_STARTUP_TIMEOUT_SECS, extract_mcp_agent_mail_toml_startup_timeout};
 use mcp_agent_mail_core::mcp_config::{McpConfigLocation, McpConfigTool};
 use serde::Serialize;
 use std::path::PathBuf;

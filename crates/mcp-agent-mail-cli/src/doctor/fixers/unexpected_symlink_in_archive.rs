@@ -451,7 +451,11 @@ mod tests {
             &[td.path().to_path_buf()],
         )
         .expect("run_undo");
-        assert!(summary.failures.is_empty(), "undo failures: {:?}", summary.failures);
+        assert!(
+            summary.failures.is_empty(),
+            "undo failures: {:?}",
+            summary.failures
+        );
 
         // Symlink restored at original path, same target.
         let restored = fs::symlink_metadata(&link).unwrap();

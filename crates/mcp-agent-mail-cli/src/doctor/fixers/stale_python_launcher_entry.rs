@@ -50,8 +50,8 @@
 
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
-use crate::{McpAgentMailEntryKind, classify_mcp_agent_mail_config};
 use crate::doctor::platform;
+use crate::{McpAgentMailEntryKind, classify_mcp_agent_mail_config};
 use mcp_agent_mail_core::mcp_config::{McpConfigLocation, McpConfigTool};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -600,7 +600,11 @@ args = ["-m", "mcp_agent_mail"]
         let outcome = fix(&ctx, &finding_for(p.clone(), "claude")).expect("fix");
         assert_eq!(outcome.actions_taken, 0);
         assert_eq!(outcome.actions_skipped, 1);
-        assert!(fs::read_to_string(&p).unwrap().contains("http://127.0.0.1:8765/mcp/"));
+        assert!(
+            fs::read_to_string(&p)
+                .unwrap()
+                .contains("http://127.0.0.1:8765/mcp/")
+        );
     }
 
     /// Positive (JSON): a uvx Python launcher is swapped to the
@@ -640,11 +644,8 @@ args = ["-m", "mcp_agent_mail"]
             Some("bar")
         );
         // Classifier now sees a Rust entry → detector would clear.
-        let kind = classify_mcp_agent_mail_config(
-            &p,
-            &fs::read_to_string(&p).unwrap(),
-            &rust_binary(),
-        );
+        let kind =
+            classify_mcp_agent_mail_config(&p, &fs::read_to_string(&p).unwrap(), &rust_binary());
         assert_eq!(kind, Some(McpAgentMailEntryKind::Rust));
     }
 
@@ -713,7 +714,11 @@ args = ["-m", "mcp_agent_mail"]
             &[td.path().to_path_buf()],
         )
         .expect("run_undo");
-        assert!(summary.failures.is_empty(), "undo failures: {:?}", summary.failures);
+        assert!(
+            summary.failures.is_empty(),
+            "undo failures: {:?}",
+            summary.failures
+        );
 
         // Undo restores the python launcher bytes exactly.
         assert_eq!(fs::read_to_string(&p).unwrap(), original);

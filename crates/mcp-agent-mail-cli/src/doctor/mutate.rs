@@ -409,7 +409,10 @@ pub(crate) fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<Pa
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let parent_canon = canonicalize_existing_or_parent(parent)?;
         let name = path.file_name().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "symlink path has no file name")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "symlink path has no file name",
+            )
         })?;
         return Ok(parent_canon.join(name));
     }
@@ -1688,7 +1691,11 @@ mod tests {
         assert!(fs::symlink_metadata(&link).is_err(), "source link moved");
         let q_meta = fs::symlink_metadata(&quarantine).unwrap();
         assert!(q_meta.file_type().is_symlink(), "quarantined as a symlink");
-        assert_eq!(fs::read_link(&quarantine).unwrap(), secret, "target preserved");
+        assert_eq!(
+            fs::read_link(&quarantine).unwrap(),
+            secret,
+            "target preserved"
+        );
         // The secret target was never touched.
         assert_eq!(fs::read(&secret).unwrap(), b"do-not-read-me");
         // before==after hash (the target-string digest), non-empty.
@@ -1709,11 +1716,7 @@ mod tests {
         let original_target = fs::read_link(&link).unwrap();
 
         let run_id = "2026-05-20T00-00-00Z__symq_rt";
-        let quarantine = td
-            .path()
-            .join(".doctor")
-            .join("quarantine")
-            .join("link.md");
+        let quarantine = td.path().join(".doctor").join("quarantine").join("link.md");
         let ctx = make_ctx(&td, run_id);
         mutate(&ctx, &link, Op::Rename { to: quarantine }).unwrap();
         assert!(fs::symlink_metadata(&link).is_err(), "link quarantined");
@@ -1721,7 +1724,11 @@ mod tests {
         let summary =
             run_undo_with_scopes(td.path(), run_id, false, true, &[td.path().to_path_buf()])
                 .unwrap();
-        assert!(summary.failures.is_empty(), "undo failures: {:?}", summary.failures);
+        assert!(
+            summary.failures.is_empty(),
+            "undo failures: {:?}",
+            summary.failures
+        );
         // Link restored, still a symlink, same target.
         let restored = fs::symlink_metadata(&link).unwrap();
         assert!(restored.file_type().is_symlink());
