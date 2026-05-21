@@ -285,23 +285,36 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
 
-### Per-FM registry (9 FMs as of pass-28)
+### Per-FM registry
 
-`am doctor fixers --format json` enumerates the registry. Current entries:
+**The registry is the source of truth — these counts drift fast.**
+`am doctor fixers --format json` enumerates the live registry; for an
+exact current count run a quick scan of `op_pattern` / `auto_fixable`
+over `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`. As of
+2026-05-21 the registry holds **55 FMs, of which 22 are auto-fixable**
+(33 remain detect-only by design — they need operator-supplied truth,
+an authoritative-side policy decision, or a source fix).
+
+Illustrative auto-fix entries (one per Op variant):
 
 | FM id | Severity | Op | Subsystem |
 |-------|----------|----|-----------|
 | `fm-archive-state-files-missing-doctor-gitignore-entry` | P2 | `Op::AppendFile` | archive_state_files |
 | `fm-archive-state-files-stale-archive-lock-from-dead-pid` | P1 | `Op::Rename` | archive_state_files |
-| `fm-archive-state-files-stale-head-or-ref-update-lock` | P2 | `Op::Rename` | archive_state_files |
+| `fm-archive-state-files-unexpected-symlink-in-archive` | P1 | `Op::Rename` (symlink quarantine) | archive_state_files |
 | `fm-db-state-files-world-readable-storage-db` | P0 | `Op::Chmod` | db_state_files |
+| `fm-db-state-files-legacy-fts-residue` | P2 | `Op::DbExec` | db_state_files |
 | `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
-| `fm-environment_toolchain-known-bad-git-no-override` | P0 | detect-only | environment_toolchain |
 | `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
-| `fm-runtime-processes-stale-listener-pid-hint` | P1 | `Op::Rename` | runtime_processes |
-| `fm-secrets_env_state-bak-tokens-readable` | P1 | `Op::Chmod` | secrets_env_state |
 
-Op coverage at FM level: **6 of 7** canonical Ops (Rename×3, Chmod×2, WriteFile×1, AppendFile×1, SymlinkAtomic×1, detect-only×1). `Op::DbExec`/`Op::DbMigrate` remain stubbed in the chokepoint pending `DbConn` plumbing.
+Op coverage across the 22 auto-fix FMs (2026-05-21): `Op::WriteFile`×7,
+`Op::Chmod`×5, `Op::Rename`×5 (incl. directory-tree and symlink
+quarantine), `Op::DbExec`×3, `Op::AppendFile`×1, `Op::SymlinkAtomic`×1.
+`Op::DbExec` is live (e.g. dependency-ordered DROP of legacy FTS
+residue); `Op::DbMigrate` remains a bookkeeping marker (migration SQL
+runs via paired `Op::DbExec`). `Op::Rename` now quarantines whole
+directory trees and individual symlinks (the link is moved, never
+dereferenced), both hash-witnessed and `undo`-reversible.
 
 ### When to run `am doctor`
 
@@ -414,17 +427,23 @@ am doctor health || {
 }
 ```
 
-### Workspace artifacts (decision support)
+### Decision support
 
-The full inventory of 82 failure modes (P0×24/P1×39/P2×16/P3×3) lives at `/data/projects/mcp_agent_mail_rust__doctor_workspace/`:
+The standalone `mcp_agent_mail_rust__doctor_workspace/` planning
+directory (taxonomy / dependency-graph / repair-specs that drove the
+original FM scaffolding) no longer exists. The live registry is now
+self-describing — derive everything from the code + the doctor's own
+reflection surface:
 
-- `analysis/taxonomy.md` — FMs by severity + subsystem
-- `analysis/dependency_graph.json` — execution-order DAG (82 nodes, 142 edges, validated)
-- `analysis/conflict_matrix.md` — 60+ never-co-run pairs
-- `analysis/safety_envelope.md` — write/read scopes, locks, exit codes
-- `analysis/repair_specs/fm-*.md` — per-FM detector + fixer + fixture spec
-- `playbook.md` — operator-facing 3-chapter playbook
-- `HANDOFF.md` — pass-2/pass-3 priority list
+- `am doctor fixers --format json` — the live FM registry (id,
+  severity, op_pattern, auto_fixable, one_line_description).
+- `am doctor capabilities --json` — write/read scopes, exit codes,
+  the canonical `Op` set, contract version.
+- `am doctor explain <fm-id>` — per-FM detector + fixer + remediation
+  envelope (the in-code successor to the old `repair_specs/fm-*.md`).
+- `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs` — the
+  `registry()` table (severity / subsystem / op_pattern) plus the
+  `dispatch_only` + `detect_only` wiring each FM needs.
 
 ---
 
