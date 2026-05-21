@@ -5830,8 +5830,24 @@ fn apply_http_config_overrides(
         config.http_path = normalize_http_path(&path);
     }
     if no_auth {
-        // Disable bearer token authentication for this run
+        // Disable bearer token authentication for this run. `--no-auth` is the
+        // documented "for local development" contract: no auth required for ANY
+        // operation, reads and writes alike. Clearing the bearer token only
+        // disables the bearer/JWT gate; the RBAC layer (enabled by default with
+        // a read-only `reader` default role) still 403s every write tool unless
+        // the request is classified `is_local_ok`. Since 89b8a3e0 flipped the
+        // `http_allow_localhost_unauthenticated` default from true to false,
+        // localhost requests stopped being `is_local_ok`, so `--no-auth` writes
+        // started returning 403 (regression first shipped in v0.3.0, breaking
+        // every ntm-spawned `am serve-http --no-auth` session). Re-enabling the
+        // localhost-unauthenticated bypass for this run restores the v0.2.x
+        // contract without weakening the default posture for authenticated
+        // serve-http runs. `allow_local_unauthenticated` still requires an
+        // actual local peer address and rejects forwarded headers, so remote
+        // callers remain unauthenticated-denied even under `--no-auth`.
+        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/131
         config.http_bearer_token = None;
+        config.http_allow_localhost_unauthenticated = true;
         eprintln!("[info] --no-auth: Bearer token authentication disabled for this run");
     }
     config
@@ -30813,6 +30829,36 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             config_no_auth.http_bearer_token.is_none(),
             "--no-auth should clear bearer token"
+        );
+    }
+
+    #[test]
+    fn serve_http_no_auth_enables_localhost_unauthenticated() {
+        // Regression guard for #131: clearing the bearer token alone is not
+        // enough — the RBAC layer (default `reader` role) 403s every write tool
+        // for requests that are not `is_local_ok`. `--no-auth` must also enable
+        // the localhost-unauthenticated bypass so localhost writes succeed,
+        // matching the documented "for local development" contract and the
+        // v0.2.x behavior.
+        let base = Config {
+            http_allow_localhost_unauthenticated: false,
+            ..Config::default()
+        };
+        let with_no_auth = apply_http_config_overrides(base, None, None, None, true);
+        assert!(
+            with_no_auth.http_allow_localhost_unauthenticated,
+            "--no-auth should enable localhost-unauthenticated access for writes"
+        );
+
+        // Without --no-auth, the override must not silently relax the posture.
+        let base_off = Config {
+            http_allow_localhost_unauthenticated: false,
+            ..Config::default()
+        };
+        let without_no_auth = apply_http_config_overrides(base_off, None, None, None, false);
+        assert!(
+            !without_no_auth.http_allow_localhost_unauthenticated,
+            "without --no-auth the localhost-unauthenticated default must be preserved"
         );
     }
 
