@@ -12,6 +12,17 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.2) — 2026-05-21 **[Release]**
+
+**Fixes the `--no-auth` write regression that broke ntm-spawned sessions** ([#131](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/131)).
+
+`am serve-http --no-auth` is documented as "Disable bearer token authentication for this run (for local development)" — the v0.2.x contract being no auth required for *any* operation, reads and writes alike. v0.3.0/v0.3.1 regressed this: every mutating MCP tool call (`ensure_project`, `register_agent`, `send_message`, …) returned HTTP 403 Forbidden while read tools returned 200, breaking every ntm-spawned session that hardcodes `am serve-http --no-tui --no-auth` (including ntm's own startup `ensure_project`).
+
+- **Root cause**: `--no-auth` cleared only the bearer token, which disables the bearer/JWT gate but not the RBAC layer (`http_rbac_enabled` defaults true, default role `reader` is read-only). A change between v0.2.51 and v0.3.0 incidentally flipped the `http_allow_localhost_unauthenticated` default from `true` to `false`, so localhost requests stopped being classified `is_local_ok` and RBAC began 403-ing every write tool.
+- **Fix**: `--no-auth` now also enables `http_allow_localhost_unauthenticated` for that run, restoring the documented v0.2.x semantics. The global default stays `false`, so authenticated `serve-http` runs are unaffected, and `allow_local_unauthenticated` still requires an actual local peer address and rejects forwarded headers — remote callers remain unauthenticated-denied even under `--no-auth`.
+
+---
+
 ## [v0.3.1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.1) — 2026-05-20 **[Release]**
 
 **Windows is now a fully-built platform** (`x86_64-pc-windows-msvc`), restoring 5-platform coverage. v0.3.0 shipped 4 platforms because the TUI and the `am doctor` subsystem didn't compile for Windows; this release ports both:
