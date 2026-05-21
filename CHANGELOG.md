@@ -12,6 +12,18 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.1](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.1) — 2026-05-20 **[Release]**
+
+**Windows is now a fully-built platform** (`x86_64-pc-windows-msvc`), restoring 5-platform coverage. v0.3.0 shipped 4 platforms because the TUI and the `am doctor` subsystem didn't compile for Windows; this release ports both:
+
+- **TUI**: `mcp-agent-mail-server` now selects frankentui's crossterm-compat backend (`Program::with_config`) on non-Unix targets, since the native `ftui-tty` backend is `#[cfg(unix)]`. `ftui-tty`/`nix`/`native-backend` are gated to `[target.'cfg(unix)']`; `crossterm-compat` is used on Windows.
+- **`am doctor`**: new `doctor::platform` module centralizes the cross-platform mutation/backup primitives. The Unix paths are byte-identical; the Windows equivalents preserve the doctor's hardened guarantees — reparse-point refusal (the `O_NOFOLLOW` symlink-swap defense), fd-based permission setting, deterministic UTF-16 path hashing, and NTFS symlinks. All 45 Unix-only doctor sites now route through it or are cfg-gated.
+- **PID liveness on Windows** uses a conservative "assume alive unless positively dead" fallback (no `unsafe`/FFI, honoring the workspace `#![forbid(unsafe_code)]`), so the doctor never reclaims a lock from a process it cannot confirm dead.
+
+No Unix behavior changes. Same code, now cross-platform.
+
+---
+
 ## [v0.3.0](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.0) — 2026-05-20 **[Release]**
 
 First minor-version release. Consolidates all development since v0.2.46 (the prior CHANGELOG-versioned release) and supersedes the unpublished in-tree 0.2.47–0.2.54 version bumps. Headline changes:
