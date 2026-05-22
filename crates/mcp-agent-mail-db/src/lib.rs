@@ -241,6 +241,7 @@ pub use pool::{
     MailboxSidecarState,
     MutatingSurface,
     OverloadPolicy,
+    ReadOnlyIntentGuard,
     RecoveryAction,
     RecoveryAdmissionStatus,
     RecoveryApproval,

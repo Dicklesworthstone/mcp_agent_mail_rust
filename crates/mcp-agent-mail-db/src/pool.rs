@@ -3793,6 +3793,16 @@ fn reconcile_archive_state_before_init(
         return Ok(false);
     }
 
+    // #126(a): A read-only caller must not trigger an archive-driven
+    // reconstruction (reconstruction is a mutation that contends with the
+    // owning daemon's WAL). When the primary file is missing under read
+    // intent, defer to the caller to surface a "route through the daemon"
+    // error (the larger #126(b) daemon-proxy work) — short-circuit here so
+    // the open path can proceed for a present-and-healthy primary.
+    if read_only_intent_is_active() {
+        return Ok(false);
+    }
+
     refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
 
     if !primary_path.exists() {
@@ -5728,6 +5738,15 @@ fn refuse_mutating_mailbox_when_owned(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
+    // #126(a): A read-only caller never mutates; suppress the write-ownership
+    // refusal so `am <read-subcommand>` is not blocked while a `serve-http`
+    // daemon owns the mailbox. Reconcile/archive-rebuild are mutations, so the
+    // callers wrap the rebuild branches in their own intent check and only
+    // skip the rebuild for read intent; this function intentionally returns
+    // Ok(()) early so the no-rebuild fast path can proceed.
+    if read_only_intent_is_active() {
+        return Ok(());
+    }
     let ownership = inspect_mailbox_ownership(primary_path, storage_root);
     if !ownership.blocks_mutation() {
         return Ok(());
@@ -5744,6 +5763,64 @@ fn refuse_mutating_mailbox_when_owned(
         ownership.detail,
         remediation
     )))
+}
+
+// ── Read-only intent (#126 part a) ──────────────────────────────────────
+//
+// Per-thread flag set by the CLI dispatcher before opening the pool for a
+// classified read-only subcommand. The DB-init path consults
+// `read_only_intent_is_active()` to suppress two write-only behaviours that
+// would otherwise reject a read:
+//
+// 1. The mailbox-ownership guard (`refuse_mutating_mailbox_when_owned`)
+//    short-circuits — a read never mutates, so a write-owner is irrelevant.
+// 2. The archive-reconcile path (`reconcile_archive_state_before_init`)
+//    skips reconstruction — reconstruction *is* a mutation, and a healthy
+//    primary file is sufficient for a read.
+//
+// If the primary file is missing AND read intent is set, the open will still
+// fail (no DB to read from); this is the expected behaviour and the larger
+// daemon-proxy/attach work (#126 part b) is what would let those reads
+// succeed by routing through the live daemon's snapshot.
+
+thread_local! {
+    static READ_ONLY_INTENT_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+#[must_use]
+pub fn read_only_intent_is_active() -> bool {
+    READ_ONLY_INTENT_DEPTH.with(|cell| cell.get() > 0)
+}
+
+/// RAII guard that marks the current thread as executing a read-only DB
+/// operation. While at least one guard is alive the mailbox-ownership refusal
+/// and the archive-reconcile reconstruction path are bypassed in
+/// `ensure_sqlite_file_healthy_with_archive` and
+/// `reconcile_archive_state_before_init`.
+///
+/// Guards nest: an inner guard increments the depth and the outer guard's
+/// drop will not clear the flag until the outermost guard goes out of scope.
+pub struct ReadOnlyIntentGuard {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ReadOnlyIntentGuard {
+    #[must_use]
+    pub fn enter() -> Self {
+        READ_ONLY_INTENT_DEPTH.with(|cell| cell.set(cell.get().saturating_add(1)));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ReadOnlyIntentGuard {
+    fn drop(&mut self) {
+        READ_ONLY_INTENT_DEPTH.with(|cell| {
+            let next = cell.get().saturating_sub(1);
+            cell.set(next);
+        });
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -10844,6 +10921,104 @@ mod tests {
         let row = rows.first().unwrap();
         assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 1);
         assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 7);
+    }
+
+    // ── #126 part (a): read-only intent guard ───────────────────────────
+
+    #[test]
+    fn read_only_intent_guard_nests_and_drops() {
+        // Sanity: starts inactive.
+        assert!(!read_only_intent_is_active());
+
+        let outer = ReadOnlyIntentGuard::enter();
+        assert!(read_only_intent_is_active());
+
+        {
+            let _inner = ReadOnlyIntentGuard::enter();
+            assert!(read_only_intent_is_active());
+        }
+        // After inner drops, outer keeps it active.
+        assert!(read_only_intent_is_active());
+
+        drop(outer);
+        assert!(!read_only_intent_is_active());
+    }
+
+    #[test]
+    fn read_only_intent_is_thread_local() {
+        let _guard = ReadOnlyIntentGuard::enter();
+        assert!(read_only_intent_is_active());
+
+        let other_thread = std::thread::spawn(|| read_only_intent_is_active());
+        // The flag is per-thread: a spawned thread should not see this
+        // thread's active intent.
+        assert!(!other_thread.join().expect("thread joined"));
+    }
+
+    #[test]
+    fn reconcile_archive_state_before_init_short_circuits_under_read_intent() {
+        // #126(a) regression: an `am <read-subcommand>` that sets
+        // `ReadOnlyIntentGuard` before opening the pool must NOT trigger an
+        // archive-driven reconstruction even when the primary file is
+        // missing — reconstruction is a mutation that contends with the
+        // owning daemon's WAL.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("read-intent-proj");
+        let agent_dir = proj_dir.join("agents").join("SwiftFox");
+        let msg_dir = proj_dir.join("messages").join("2026").join("01");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"read-intent-proj","human_key":"/tmp/read-intent-proj"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"SwiftFox","program":"coder","model":"claude","inception_ts":"2026-01-15T10:00:00Z","last_active_ts":"2026-01-15T10:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-01-15T10-05-00Z__test__7.md"),
+            "---json\n{\"id\":7,\"from\":\"SwiftFox\",\"to\":[\"CalmLake\"],\"subject\":\"Test\",\"thread_id\":\"t1\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-01-15T10:05:00Z\",\"attachments\":[]}\n---\n\nTest body\n",
+        )
+        .unwrap();
+
+        // Without the guard this would reconstruct the primary db from the
+        // archive (mutation). With the guard it must return Ok(false) and
+        // leave the file untouched.
+        let _guard = ReadOnlyIntentGuard::enter();
+        assert!(
+            !reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "reconcile must short-circuit under read intent"
+        );
+        assert!(
+            !primary.exists(),
+            "no mutation should have created the primary db under read intent"
+        );
+    }
+
+    #[test]
+    fn refuse_mutating_mailbox_when_owned_passes_under_read_intent() {
+        // Even with no actual owner, the function returns Ok(()) — so this
+        // test mainly proves the early-return path doesn't accidentally
+        // fail. (Without a way to fake `inspect_mailbox_ownership` from a
+        // unit test, the full "owned mailbox + read intent succeeds" path
+        // is exercised by the CLI integration suite via the live
+        // serve-http daemon.) Pinning the no-owner path under the guard
+        // protects against a regression that would tighten the early-return
+        // condition.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        let _guard = ReadOnlyIntentGuard::enter();
+        refuse_mutating_mailbox_when_owned(&primary, &storage_root)
+            .expect("read intent must suppress the mutation refusal");
     }
 
     #[test]

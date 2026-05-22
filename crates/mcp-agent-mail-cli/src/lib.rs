@@ -2884,11 +2884,105 @@ fn emit_error(err: &CliError) {
     ftui_runtime::ftui_eprintln!("error: {err}");
 }
 
+/// Classify a top-level [`Commands`] as read-only so the DB-init path can
+/// bypass the mailbox-ownership refusal (#126 part a).
+///
+/// A subcommand is read-only when **every** code path it exercises performs
+/// only `SELECT`-shaped queries against the live mailbox; anything that
+/// writes rows, mutates archive state, or relies on the
+/// archive-reconcile/rebuild branch must stay write-classified so the
+/// ownership guard continues to fire. New subcommands default to
+/// write-classified — opt in here only after auditing the handler.
+///
+/// Nested subcommand enums (`Mail`, `Agents`, `Acks`, `Archive`, `Projects`,
+/// `Contacts`, `FileReservations`, `Share`) are delegated to per-enum
+/// classifiers below so a write action inside an otherwise read-heavy group
+/// is not accidentally allowed past the guard.
+#[allow(clippy::too_many_lines)]
+fn command_is_read_only(command: &Commands) -> bool {
+    match command {
+        // Pure read commands (top-level)
+        Commands::ListProjects { .. }
+        | Commands::ListAcks { .. }
+        | Commands::Inbox { .. }
+        | Commands::Thread { .. }
+        | Commands::Health { .. }
+        | Commands::CheckInbox { .. }
+        | Commands::Status { .. }
+        | Commands::Capabilities { .. }
+        | Commands::Reservations { .. } => true,
+
+        // Nested-enum delegation
+        Commands::Agents { action } => agents_command_is_read_only(action),
+        Commands::Mail { action } => mail_command_is_read_only(action),
+        Commands::Acks { action } => acks_command_is_read_only(action),
+        Commands::FileReservations { action } => file_reservations_command_is_read_only(action),
+        Commands::Contacts { action } => contacts_command_is_read_only(action),
+
+        // Everything else (incl. Projects/Archive/Guard/Doctor/Service/Setup
+        // /Macros/Beads/Atc/Release/Bench/Migrate/etc.) stays write-classified
+        // and therefore still hits the mailbox-mutation refusal — that is the
+        // pre-#126 status quo, which is safe.
+        _ => false,
+    }
+}
+
+fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
+    matches!(
+        action,
+        AgentsCommand::List { .. } | AgentsCommand::Show { .. } | AgentsCommand::Detect { .. }
+    )
+}
+
+fn mail_command_is_read_only(action: &MailCommand) -> bool {
+    matches!(
+        action,
+        MailCommand::Status { .. }
+            | MailCommand::Inbox { .. }
+            | MailCommand::Read { .. }
+            | MailCommand::Search { .. }
+            | MailCommand::SummarizeThread { .. }
+    )
+}
+
+fn acks_command_is_read_only(action: &AcksCommand) -> bool {
+    // `Remind` issues a write (sends reminder messages); `Pending` and
+    // `Overdue` are SELECT-only listings of unacked messages.
+    matches!(
+        action,
+        AcksCommand::Pending { .. } | AcksCommand::Overdue { .. }
+    )
+}
+
+fn file_reservations_command_is_read_only(action: &FileReservationsCommand) -> bool {
+    // Read variants list existing reservations or compute conflict views;
+    // Reserve/Renew/Release mutate rows in `file_reservations`.
+    matches!(
+        action,
+        FileReservationsCommand::List { .. }
+            | FileReservationsCommand::Active { .. }
+            | FileReservationsCommand::Soon { .. }
+            | FileReservationsCommand::Conflicts { .. }
+    )
+}
+
+fn contacts_command_is_read_only(action: &ContactsCommand) -> bool {
+    // `Request`, `Respond`, and `Policy` mutate the contacts graph;
+    // `ListContacts` is the only pure read.
+    matches!(action, ContactsCommand::ListContacts { .. })
+}
+
 fn execute(cli: Cli) -> CliResult<()> {
     let command = match cli.command {
         Some(cmd) => cmd,
         None => return handle_default_launch(),
     };
+    // #126(a): mark the thread as read-intent BEFORE handlers open the pool,
+    // so the DB-init / archive-reconcile path can suppress the
+    // mailbox-mutation refusal that otherwise blocks reads while a
+    // `serve-http` daemon owns the mailbox.
+    let _read_intent =
+        command_is_read_only(&command).then(mcp_agent_mail_db::ReadOnlyIntentGuard::enter);
     match command {
         Commands::Share { action } => handle_share(action),
         Commands::Doctor { action } => handle_doctor(action),
