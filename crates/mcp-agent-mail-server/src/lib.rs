@@ -3554,6 +3554,55 @@ async fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Res
     .await
 }
 
+enum HttpServerJoinWait {
+    Completed(std::io::Result<()>),
+    TimedOut,
+    TimeoutWakeFailed(std::io::Error),
+}
+
+async fn wait_for_http_server_join_with_wall_timeout(
+    mut join: Pin<&mut AsyncJoinHandle<std::io::Result<()>>>,
+    timeout_duration: Duration,
+) -> HttpServerJoinWait {
+    let deadline = Instant::now()
+        .checked_add(timeout_duration)
+        .unwrap_or_else(Instant::now);
+    let mut wake_thread_started = false;
+
+    std::future::poll_fn(move |cx| {
+        if let Poll::Ready(result) = join.as_mut().poll(cx) {
+            return Poll::Ready(HttpServerJoinWait::Completed(result));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Poll::Ready(HttpServerJoinWait::TimedOut);
+        }
+
+        if !wake_thread_started {
+            let waker = cx.waker().clone();
+            let sleep_for = deadline.saturating_duration_since(now);
+            if let Err(err) = std::thread::Builder::new()
+                .name("am-http-stop-timeout".to_string())
+                .spawn(move || {
+                    std::thread::sleep(sleep_for);
+                    waker.wake();
+                })
+            {
+                return Poll::Ready(HttpServerJoinWait::TimeoutWakeFailed(
+                    std::io::Error::other(format!(
+                        "failed to spawn HTTP stop timeout wake thread: {err}"
+                    )),
+                ));
+            }
+            wake_thread_started = true;
+        }
+
+        Poll::Pending
+    })
+    .await
+}
+
 async fn stop_http_server_instance_with_timeouts(
     instance: HttpServerInstance,
     join_timeout: Duration,
@@ -3563,26 +3612,30 @@ async fn stop_http_server_instance_with_timeouts(
     let HttpServerInstance { join, shutdown, .. } = instance;
     let mut join = Box::pin(join);
     let _ = shutdown.begin_drain(drain_timeout);
-    if let Ok(result) = timeout(wall_now(), join_timeout, &mut join).await {
-        result
-    } else {
-        let forced = shutdown.begin_force_close();
-        tracing::warn!(
-            forced,
-            join_timeout_ms = join_timeout.as_millis(),
-            force_close_timeout_ms = force_close_timeout.as_millis(),
-            "HTTP server task exceeded drain timeout; escalating to force-close"
-        );
-        timeout(wall_now(), force_close_timeout, &mut join)
-            .await
-            .unwrap_or_else(|_| {
-                Err(std::io::Error::new(
+    match wait_for_http_server_join_with_wall_timeout(join.as_mut(), join_timeout).await {
+        HttpServerJoinWait::Completed(result) => result,
+        HttpServerJoinWait::TimeoutWakeFailed(err) => Err(err),
+        HttpServerJoinWait::TimedOut => {
+            let forced = shutdown.begin_force_close();
+            tracing::warn!(
+                forced,
+                join_timeout_ms = join_timeout.as_millis(),
+                force_close_timeout_ms = force_close_timeout.as_millis(),
+                "HTTP server task exceeded drain timeout; escalating to force-close"
+            );
+            match wait_for_http_server_join_with_wall_timeout(join.as_mut(), force_close_timeout)
+                .await
+            {
+                HttpServerJoinWait::Completed(result) => result,
+                HttpServerJoinWait::TimeoutWakeFailed(err) => Err(err),
+                HttpServerJoinWait::TimedOut => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
                         "server task did not stop within {join_timeout:?} drain + {force_close_timeout:?} force-close window"
                     ),
-                ))
-            })
+                )),
+            }
+        }
     }
 }
 
@@ -4179,8 +4232,10 @@ static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<HealthCountCacheValue>> =
 /// This covers the more expensive archive-vs-index parity check used by
 /// `/health/readiness`, while still failing closed quickly when the mailbox
 /// enters a bad state.
+#[cfg(test)]
 const READINESS_SEMANTIC_CACHE_TTL: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
 #[derive(Clone)]
 struct ReadinessSemanticCacheEntry {
     database_url: String,
@@ -4188,8 +4243,10 @@ struct ReadinessSemanticCacheEntry {
     result: Result<(), String>,
 }
 
+#[cfg(test)]
 type ReadinessSemanticCacheValue = (Instant, Option<ReadinessSemanticCacheEntry>);
 
+#[cfg(test)]
 static READINESS_SEMANTIC_CACHE: std::sync::LazyLock<Mutex<ReadinessSemanticCacheValue>> =
     std::sync::LazyLock::new(|| Mutex::new((Instant::now(), None)));
 
@@ -7064,6 +7121,7 @@ fn runtime_output_mode(config: &mcp_agent_mail_core::Config) -> RuntimeOutputMod
 
 const JWKS_CACHE_TTL: Duration = Duration::from_mins(1);
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const JWKS_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 struct DashboardDbStats {
@@ -9272,6 +9330,138 @@ struct HttpState {
     self_ref: std::sync::OnceLock<std::sync::Weak<HttpState>>,
 }
 
+fn parse_plain_http_authority(authority: &str) -> Result<(String, u16, String), ()> {
+    if authority.is_empty() || authority.contains('@') {
+        return Err(());
+    }
+
+    let host_header = authority.to_string();
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = rest.split_once(']') else {
+            return Err(());
+        };
+        if host.is_empty() {
+            return Err(());
+        }
+        let port = if suffix.is_empty() {
+            80
+        } else {
+            suffix
+                .strip_prefix(':')
+                .and_then(|value| value.parse::<u16>().ok())
+                .ok_or(())?
+        };
+        return Ok((host.to_string(), port, host_header));
+    }
+
+    if authority.matches(':').count() > 1 {
+        return Err(());
+    }
+
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, port.parse::<u16>().map_err(|_| ())?)
+        }
+        Some(_) | None => (authority, 80),
+    };
+    if host.is_empty() {
+        return Err(());
+    }
+    Ok((host.to_string(), port, host_header))
+}
+
+fn http_header_end(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn http_content_length(headers: &str) -> Option<usize> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn fetch_plain_http_body_blocking(
+    url: &str,
+    timeout_duration: Duration,
+) -> Result<Option<Vec<u8>>, ()> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Ok(None);
+    };
+    let (authority, path_tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port, host_header) = parse_plain_http_authority(authority)?;
+    let path = format!("/{path_tail}");
+    let mut stream = None;
+    for addr in (host.as_str(), port).to_socket_addrs().map_err(|_| ())? {
+        if let Ok(value) = TcpStream::connect_timeout(&addr, timeout_duration) {
+            stream = Some(value);
+            break;
+        }
+    }
+    let mut stream = stream.ok_or(())?;
+    stream
+        .set_read_timeout(Some(timeout_duration))
+        .map_err(|_| ())?;
+    stream
+        .set_write_timeout(Some(timeout_duration))
+        .map_err(|_| ())?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).map_err(|_| ())?;
+    stream.flush().map_err(|_| ())?;
+
+    let mut response = Vec::new();
+    let mut buf = [0_u8; 8192];
+    let mut expected_len = None;
+    loop {
+        let n = stream.read(&mut buf).map_err(|_| ())?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+        if response.len() > JWKS_MAX_RESPONSE_BYTES {
+            return Err(());
+        }
+        if expected_len.is_none()
+            && let Some(header_end) = http_header_end(&response)
+        {
+            let header_text = std::str::from_utf8(&response[..header_end]).map_err(|_| ())?;
+            expected_len = http_content_length(header_text).map(|body_len| header_end + body_len);
+            if expected_len.is_some_and(|len| len > JWKS_MAX_RESPONSE_BYTES) {
+                return Err(());
+            }
+        }
+        if expected_len.is_some_and(|len| response.len() >= len) {
+            break;
+        }
+    }
+
+    let header_end = http_header_end(&response).ok_or(())?;
+    let header_text = std::str::from_utf8(&response[..header_end]).map_err(|_| ())?;
+    let status_ok = header_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        == Some("200");
+    if !status_ok {
+        return Err(());
+    }
+    let body_end = expected_len.unwrap_or(response.len()).min(response.len());
+    Ok(Some(response[header_end..body_end].to_vec()))
+}
+
 impl HttpState {
     fn new(
         router: Arc<fastmcp_server::Router>,
@@ -9597,7 +9787,7 @@ impl HttpState {
                         &serde_json::json!({"status":"warming_up"}),
                     ));
                 }
-                if let Err(_err) = readiness_check_with_archive_reconcile(&self.config) {
+                if let Err(_err) = readiness_check_request_path(&self.config) {
                     tracing::warn!(error = %_err, "readiness check failed");
                     return Some(self.error_response(req, 503, "service unavailable"));
                 }
@@ -9879,6 +10069,14 @@ impl HttpState {
         constant_time_eq(auth, expected_header.as_str())
     }
 
+    fn static_bearer_rbac_roles(&self) -> Vec<String> {
+        if self.config.http_rbac_writer_roles.is_empty() {
+            vec![self.config.http_rbac_default_role.clone()]
+        } else {
+            self.config.http_rbac_writer_roles.clone()
+        }
+    }
+
     fn request_cx(&self) -> Cx {
         let budget = if self.request_timeout_secs == 0 {
             Budget::INFINITE
@@ -10062,14 +10260,20 @@ to skip auth for local requests.</p>
         }
 
         let result = async {
-            let fut = Box::pin(self.jwks_http_client.get(cx, url));
-            let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
-                return Err(());
+            let body = if let Some(body) = fetch_plain_http_body_blocking(url, JWKS_FETCH_TIMEOUT)?
+            {
+                body
+            } else {
+                let fut = Box::pin(self.jwks_http_client.get(cx, url));
+                let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
+                    return Err(());
+                };
+                if resp.status != 200 {
+                    return Err(());
+                }
+                resp.body
             };
-            if resp.status != 200 {
-                return Err(());
-            }
-            let jwks: JwkSet = serde_json::from_slice(&resp.body).map_err(|_| ())?;
+            let jwks: JwkSet = serde_json::from_slice(&body).map_err(|_| ())?;
             let jwks = Arc::new(jwks);
 
             {
@@ -10093,7 +10297,7 @@ to skip auth for local requests.</p>
 
     #[cfg(test)]
     async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
-        let cx = Cx::for_testing();
+        let cx = Cx::current().unwrap_or_else(Cx::for_testing);
         self.fetch_jwks_with_cx(&cx, url, force).await
     }
 
@@ -10352,10 +10556,11 @@ to skip auth for local requests.</p>
     ) -> Option<Http1Response> {
         let (kind, tool_name) = classify_request(json_rpc);
         let is_local_ok = self.allow_local_unauthenticated(req);
+        let has_static_bearer = self.has_expected_bearer_header(req);
         let local_bypass_jwt_sub = if self.config.http_rate_limit_enabled
             && is_local_ok
             && self.config.http_jwt_enabled
-            && !self.has_expected_bearer_header(req)
+            && !has_static_bearer
         {
             self.decode_jwt_with_cx(cx, req)
                 .await
@@ -10375,14 +10580,16 @@ to skip auth for local requests.</p>
                 local_bypass_jwt_sub,
             )
         } else if self.config.http_jwt_enabled {
-            if self.has_expected_bearer_header(req) {
-                (vec![self.config.http_rbac_default_role.clone()], None)
+            if has_static_bearer {
+                (self.static_bearer_rbac_roles(), None)
             } else {
                 match self.decode_jwt_with_cx(cx, req).await {
                     Ok(ctx) => (ctx.roles, ctx.sub),
                     Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
                 }
             }
+        } else if has_static_bearer {
+            (self.static_bearer_rbac_roles(), None)
         } else {
             (vec![self.config.http_rbac_default_role.clone()], None)
         };
@@ -10405,13 +10612,31 @@ to skip auth for local requests.</p>
                 if let Some(ref name) = tool_name {
                     if self.config.http_rbac_readonly_tools.contains(name) {
                         if !is_reader && !is_writer {
-                            return Some(self.error_response(req, 403, "Forbidden"));
+                            return Some(self.jsonrpc_error_response(
+                                req,
+                                json_rpc,
+                                403,
+                                McpErrorCode::ResourceForbidden,
+                                "Forbidden",
+                            ));
                         }
                     } else if !is_writer {
-                        return Some(self.error_response(req, 403, "Forbidden"));
+                        return Some(self.jsonrpc_error_response(
+                            req,
+                            json_rpc,
+                            403,
+                            McpErrorCode::ResourceForbidden,
+                            "Forbidden",
+                        ));
                     }
                 } else if !is_writer {
-                    return Some(self.error_response(req, 403, "Forbidden"));
+                    return Some(self.jsonrpc_error_response(
+                        req,
+                        json_rpc,
+                        403,
+                        McpErrorCode::ResourceForbidden,
+                        "Forbidden",
+                    ));
                 }
             }
         }
@@ -10429,7 +10654,13 @@ to skip auth for local requests.</p>
                 .http
                 .record_rate_limit_check(allowed);
             if !allowed {
-                return Some(self.error_response(req, 429, "Rate limit exceeded"));
+                return Some(self.jsonrpc_error_response(
+                    req,
+                    json_rpc,
+                    429,
+                    McpErrorCode::Custom(fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE),
+                    "Rate limit exceeded",
+                ));
             }
         }
 
@@ -10913,6 +11144,29 @@ to skip auth for local requests.</p>
             &self.config.http_cors_allow_headers,
         );
         resp
+    }
+
+    fn jsonrpc_error_response(
+        &self,
+        req: &Http1Request,
+        json_rpc: &JsonRpcRequest,
+        status: u16,
+        code: McpErrorCode,
+        message: &str,
+    ) -> Http1Response {
+        let error = JsonRpcError::from(McpError::new(code, message));
+        let body = JsonRpcResponse::error(json_rpc.id.clone(), error);
+        let value = serde_json::to_value(&body).unwrap_or_else(|_| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": i32::from(McpErrorCode::InternalError),
+                    "message": "failed to encode JSON-RPC error response",
+                }
+            })
+        });
+        self.json_response(req, status, &value)
     }
 
     fn json_response(
@@ -13765,6 +14019,7 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     readiness_check_with_integrity(config, true)
 }
 
+#[cfg(test)]
 fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
@@ -13812,6 +14067,54 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     readiness_check_cached_semantic_status(config, &conn)
 }
 
+fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
+    let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+    let sqlite_path = if is_memory {
+        None
+    } else {
+        resolve_server_database_url_sqlite_path(&config.database_url)
+    };
+    let _sqlite_activity_lock = if let Some(sqlite_path) = sqlite_path.as_ref() {
+        acquire_mailbox_activity_lock_for_sqlite_path(sqlite_path, MailboxActivityLockMode::Shared)
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+
+    let conn = if is_memory {
+        DbConn::open_memory().map_err(|e| e.to_string())?
+    } else {
+        let sqlite_path = sqlite_path
+            .as_ref()
+            .ok_or_else(|| "cannot resolve sqlite path for readiness check".to_string())?;
+        if !sqlite_path.exists() {
+            return Err(format!(
+                "SQLite database is missing at {}; readiness refuses to initialize the mailbox",
+                sqlite_path.display()
+            ));
+        }
+        open_best_effort_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+            .map_err(|e| e.to_string())?
+    };
+
+    if let Err(e) = conn.query_sync("SELECT 1", &[]) {
+        let error = e.to_string();
+        if mcp_agent_mail_db::is_corruption_error_message(&error) {
+            return Err(format!(
+                "SQLite corruption detected during readiness check; automatic server-side recovery is disabled: {error}"
+            ));
+        }
+        return Err(error);
+    }
+
+    if is_memory {
+        return Ok(());
+    }
+
+    readiness_check_schema_status(&conn)
+}
+
+#[cfg(test)]
 fn readiness_check_with_archive_reconcile(
     config: &mcp_agent_mail_core::Config,
 ) -> Result<(), String> {
@@ -13846,6 +14149,7 @@ fn readiness_check_with_archive_reconcile(
     }
 }
 
+#[cfg(test)]
 fn readiness_check_cached_semantic_status(
     config: &mcp_agent_mail_core::Config,
     conn: &DbConn,
@@ -13874,10 +14178,23 @@ fn readiness_check_cached_semantic_status(
     result
 }
 
+#[cfg(test)]
 fn readiness_check_semantic_status(
     config: &mcp_agent_mail_core::Config,
     conn: &DbConn,
 ) -> Result<(), String> {
+    readiness_check_schema_status(conn)?;
+
+    if let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
+        && let Some(drift) = inspect_archive_db_drift(&config.storage_root, &sqlite_path, conn)?
+    {
+        return Err(drift.readiness_error());
+    }
+
+    Ok(())
+}
+
+fn readiness_check_schema_status(conn: &DbConn) -> Result<(), String> {
     let rows = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -13897,12 +14214,6 @@ fn readiness_check_semantic_status(
             "sqlite schema missing required readiness tables: {}",
             missing_tables.join(", ")
         ));
-    }
-
-    if let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
-        && let Some(drift) = inspect_archive_db_drift(&config.storage_root, &sqlite_path, conn)?
-    {
-        return Err(drift.readiness_error());
     }
 
     Ok(())
@@ -16225,7 +16536,77 @@ first body
     }
 
     #[test]
-    fn health_readiness_reconciles_archive_ahead_db() {
+    fn readiness_check_with_archive_reconcile_reconstructs_archive_ahead_db() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("stale-readiness-reconcile.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        readiness_check_with_archive_reconcile(&config)
+            .expect("archive-ahead readiness repair should reconcile");
+
+        let conn =
+            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open reconciled db");
+        let rows = conn
+            .query_sync(
+                "SELECT \
+                    (SELECT COUNT(*) FROM projects) AS project_count, \
+                    (SELECT COUNT(*) FROM agents) AS agent_count, \
+                    (SELECT COUNT(*) FROM messages) AS message_count",
+                &[],
+            )
+            .expect("query reconciled inventory");
+        let row = rows.first().expect("inventory row");
+        assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 1);
+        assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn health_readiness_does_not_reconcile_archive_ahead_db_on_probe_path() {
         with_serialized_health_route(|| {
             *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
 
@@ -16283,7 +16664,7 @@ first body
             assert_eq!(body["status"], "ready");
 
             let conn =
-                DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open reconciled db");
+                DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
             let rows = conn
                 .query_sync(
                     "SELECT \
@@ -16292,11 +16673,11 @@ first body
                     (SELECT COUNT(*) FROM messages) AS message_count",
                     &[],
                 )
-                .expect("query reconciled inventory");
+                .expect("query probed inventory");
             let row = rows.first().expect("inventory row");
-            assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 1);
-            assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 2);
-            assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 1);
+            assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
+            assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
+            assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
         });
     }
 
@@ -16765,7 +17146,29 @@ first body
         assert_eq!(resp.status, 403);
         let body: serde_json::Value =
             serde_json::from_slice(&resp.body).expect("forbidden response json");
-        assert_eq!(body["detail"], "Forbidden");
+        if let Some(error) = body.get("error") {
+            assert_eq!(body["jsonrpc"], "2.0");
+            assert_eq!(error["code"], i32::from(McpErrorCode::ResourceForbidden));
+            assert_eq!(error["message"], "Forbidden");
+        } else {
+            assert_eq!(body["detail"], "Forbidden");
+        }
+    }
+
+    fn assert_jsonrpc_error_response(
+        resp: &Http1Response,
+        status: u16,
+        id: serde_json::Value,
+        code: i32,
+        message: &str,
+    ) {
+        assert_eq!(resp.status, status);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("json-rpc error response json");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], id);
+        assert_eq!(body["error"]["code"], code);
+        assert_eq!(body["error"]["message"], message);
     }
 
     fn with_jwks_server<F>(jwks_body: &[u8], max_requests: usize, f: F)
@@ -19396,10 +19799,13 @@ first body
         req2.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 2_i64))
             .expect("serialize json-rpc");
         let resp2 = block_on(state.handle(req2));
-        assert_eq!(resp2.status, 429);
-
-        let body: serde_json::Value = serde_json::from_slice(&resp2.body).expect("json response");
-        assert_eq!(body["detail"], "Rate limit exceeded");
+        assert_jsonrpc_error_response(
+            &resp2,
+            429,
+            serde_json::json!(2),
+            fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+            "Rate limit exceeded",
+        );
     }
 
     #[test]
@@ -19449,7 +19855,7 @@ first body
     }
 
     #[test]
-    fn http_post_rbac_forbidden_returns_403_with_detail() {
+    fn http_post_rbac_forbidden_returns_403_with_jsonrpc_error() {
         let config = mcp_agent_mail_core::Config {
             http_jwt_enabled: true,
             http_jwt_secret: Some("secret".to_string()),
@@ -19476,9 +19882,13 @@ first body
         .expect("serialize json-rpc");
 
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 403);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
-        assert_eq!(body["detail"], "Forbidden");
+        assert_jsonrpc_error_response(
+            &resp,
+            403,
+            serde_json::json!(33),
+            i32::from(McpErrorCode::ResourceForbidden),
+            "Forbidden",
+        );
     }
 
     #[test]
@@ -19653,7 +20063,13 @@ first body
 
         // Reader role is forbidden for send_message (writer tool).
         let reader_resp = block_on(state.handle(make_send_message_call(reader_auth.as_str(), 40)));
-        assert_eq!(reader_resp.status, 403);
+        assert_jsonrpc_error_response(
+            &reader_resp,
+            403,
+            serde_json::json!(40),
+            i32::from(McpErrorCode::ResourceForbidden),
+            "Forbidden",
+        );
 
         // First writer request with same sub should still pass rate limit gate.
         let writer_first = block_on(state.handle(make_send_message_call(writer_auth.as_str(), 41)));
@@ -19663,10 +20079,13 @@ first body
         // Second writer request for same sub should hit the one-request bucket.
         let writer_second =
             block_on(state.handle(make_send_message_call(writer_auth.as_str(), 42)));
-        assert_eq!(writer_second.status, 429);
-        let body: serde_json::Value =
-            serde_json::from_slice(&writer_second.body).expect("json response");
-        assert_eq!(body["detail"], "Rate limit exceeded");
+        assert_jsonrpc_error_response(
+            &writer_second,
+            429,
+            serde_json::json!(42),
+            fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+            "Rate limit exceeded",
+        );
     }
 
     #[test]
@@ -20897,13 +21316,12 @@ first body
         let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
         let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
             .expect("should be rate limited");
-        assert_eq!(resp.status, 429);
-
-        let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("429 response body must be valid JSON");
-        assert_eq!(
-            body["detail"], "Rate limit exceeded",
-            "429 response must contain detail field with rate limit message"
+        assert_jsonrpc_error_response(
+            &resp,
+            429,
+            serde_json::json!(1),
+            fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+            "Rate limit exceeded",
         );
     }
 
@@ -21747,6 +22165,92 @@ first body
             }),
         );
         assert!(resp.is_none(), "reader should be allowed for readonly tool");
+    }
+
+    #[test]
+    fn rbac_reader_can_call_list_agents_directory_read() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({
+            "name": "list_agents",
+            "arguments": {
+                "project_key": "/tmp/project"
+            }
+        });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_reader_can_call_list_agents_directory_read",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "list_agents",
+                "peer_addr": peer.to_string(),
+                "is_local_ok": state.allow_local_unauthenticated(&req),
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(resp.is_none(), "reader should be allowed for list_agents");
+    }
+
+    #[test]
+    fn rbac_static_bearer_can_call_write_tool() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("static-secret-token".to_string()),
+            http_jwt_enabled: false,
+            http_rbac_enabled: true,
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let params = serde_json::json!({
+            "name": "macro_start_session",
+            "arguments": {
+                "human_key": "/tmp/project",
+                "program": "codex-cli",
+                "model": "gpt-5"
+            }
+        });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", "Bearer static-secret-token")],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_static_bearer_can_call_write_tool",
+            &serde_json::json!({
+                "tool": "macro_start_session",
+                "peer_addr": peer.to_string(),
+                "auth": "static-bearer",
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(
+            resp.is_none(),
+            "static bearer token should grant write access for CLI/server bridge calls"
+        );
     }
 
     #[test]
@@ -28200,7 +28704,7 @@ first body
     {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Instant;
 
         std::thread::scope(|s| {
@@ -28208,11 +28712,15 @@ first body
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
             let body = jwks_body.to_vec();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_worker = Arc::clone(&stop);
 
             s.spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
-                    if request_counter.load(Ordering::SeqCst) >= max_requests {
+                    if stop_worker.load(Ordering::SeqCst)
+                        || request_counter.load(Ordering::SeqCst) >= max_requests
+                    {
                         return;
                     }
                     match listener.accept() {
@@ -28268,6 +28776,7 @@ first body
 
             let url = format!("http://{addr}/jwks");
             f(url);
+            stop.store(true, Ordering::SeqCst);
         });
     }
 
