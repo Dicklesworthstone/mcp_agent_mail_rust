@@ -5083,6 +5083,215 @@ fn render_message_bundle_content(message: &serde_json::Value, body_md: &str) -> 
     Ok(format!("---json\n{frontmatter}\n---\n\n{body_md}"))
 }
 
+fn positive_message_id(message: &serde_json::Value) -> Option<i64> {
+    message
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0)
+}
+
+fn collect_canonical_message_paths_with_id(
+    messages_root: &Path,
+    message_id: i64,
+    matches: &mut Vec<PathBuf>,
+) {
+    let wanted_ids = HashSet::from([message_id]);
+    let index = collect_canonical_message_id_index(messages_root, &wanted_ids);
+    if let Some(paths) = index.get(&message_id) {
+        matches.extend(paths.iter().cloned());
+    }
+}
+
+fn collect_canonical_message_id_index(
+    messages_root: &Path,
+    wanted_ids: &HashSet<i64>,
+) -> HashMap<i64, Vec<PathBuf>> {
+    let mut index = HashMap::new();
+    if wanted_ids.is_empty() {
+        return index;
+    }
+    if !path_is_nonsymlink_dir(messages_root) {
+        return index;
+    }
+
+    let Ok(year_entries) = fs::read_dir(messages_root) else {
+        return index;
+    };
+    for year_entry in year_entries.flatten() {
+        let year_path = year_entry.path();
+        let Ok(year_type) = year_entry.file_type() else {
+            continue;
+        };
+        if !year_type.is_dir() || year_type.is_symlink() {
+            continue;
+        }
+        let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let Ok(month_entries) = fs::read_dir(&year_path) else {
+            continue;
+        };
+        for month_entry in month_entries.flatten() {
+            let month_path = month_entry.path();
+            let Ok(month_type) = month_entry.file_type() else {
+                continue;
+            };
+            if !month_type.is_dir() || month_type.is_symlink() {
+                continue;
+            }
+            let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if month_name.len() != 2 || !month_name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+
+            let Ok(file_entries) = fs::read_dir(&month_path) else {
+                continue;
+            };
+            for file_entry in file_entries.flatten() {
+                let file_path = file_entry.path();
+                let Ok(file_type) = file_entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file()
+                    || file_type.is_symlink()
+                    || file_path.extension().is_none_or(|ext| ext != "md")
+                {
+                    continue;
+                }
+
+                let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
+                    continue;
+                };
+                let Some(existing_id) = frontmatter.get("id").and_then(serde_json::Value::as_i64)
+                else {
+                    continue;
+                };
+                if wanted_ids.contains(&existing_id) {
+                    index
+                        .entry(existing_id)
+                        .or_insert_with(Vec::new)
+                        .push(file_path);
+                }
+            }
+        }
+    }
+    index
+}
+
+fn reject_canonical_message_id_collision_against_matches(
+    message_id: i64,
+    matches: &[PathBuf],
+    target_path: &Path,
+    target_content: &str,
+) -> Result<()> {
+    for existing_path in matches {
+        if existing_path == target_path {
+            let existing_content = fs::read_to_string(existing_path)?;
+            if existing_content == target_content {
+                continue;
+            }
+            return Err(StorageError::InvalidPath(format!(
+                "canonical message id {message_id} already exists at {}; refusing to overwrite it with different content",
+                existing_path.display()
+            )));
+        }
+
+        return Err(StorageError::InvalidPath(format!(
+            "canonical message id {message_id} already exists at {}; refusing to write duplicate canonical file {}",
+            existing_path.display(),
+            target_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn reject_canonical_message_id_collision(
+    archive: &ProjectArchive,
+    message: &serde_json::Value,
+    target_path: &Path,
+    target_content: &str,
+) -> Result<()> {
+    let Some(message_id) = positive_message_id(message) else {
+        return Ok(());
+    };
+
+    let messages_root = archive_project_root_checked(archive)?.join("messages");
+    let mut matches = Vec::new();
+    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches);
+    reject_canonical_message_id_collision_against_matches(
+        message_id,
+        &matches,
+        target_path,
+        target_content,
+    )
+}
+
+fn batch_message_ids(entries: &[MessageBundleBatchEntry<'_>]) -> HashSet<i64> {
+    entries
+        .iter()
+        .filter_map(|entry| positive_message_id(entry.message))
+        .collect()
+}
+
+fn reject_canonical_message_id_collision_from_index(
+    existing_ids: &HashMap<i64, Vec<PathBuf>>,
+    message: &serde_json::Value,
+    target_path: &Path,
+    target_content: &str,
+) -> Result<()> {
+    let Some(message_id) = positive_message_id(message) else {
+        return Ok(());
+    };
+    let matches = existing_ids
+        .get(&message_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    reject_canonical_message_id_collision_against_matches(
+        message_id,
+        matches,
+        target_path,
+        target_content,
+    )
+}
+
+fn collect_existing_batch_message_ids(
+    archive: &ProjectArchive,
+    entries: &[MessageBundleBatchEntry<'_>],
+) -> Result<HashMap<i64, Vec<PathBuf>>> {
+    let wanted_ids = batch_message_ids(entries);
+    if wanted_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let messages_root = archive_project_root_checked(archive)?.join("messages");
+    Ok(collect_canonical_message_id_index(
+        &messages_root,
+        &wanted_ids,
+    ))
+}
+
+fn reject_duplicate_message_ids_in_batch(entries: &[MessageBundleBatchEntry<'_>]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let Some(message_id) = positive_message_id(entry.message) else {
+            continue;
+        };
+        if !seen.insert(message_id) {
+            return Err(StorageError::InvalidPath(format!(
+                "message batch contains duplicate canonical message id {message_id}; refusing partial archive write"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn redact_message_bcc_for_inbox(message: &serde_json::Value) -> serde_json::Value {
     let mut redacted = message.clone();
     if let Some(obj) = redacted.as_object_mut()
@@ -5156,19 +5365,14 @@ fn build_message_bundle_commit_meta(
     }
 }
 
-fn append_message_bundle_files(
+fn message_paths_for_bundle(
     archive: &ProjectArchive,
     message: &serde_json::Value,
-    body_md: &str,
     sender: &str,
     recipients: &[String],
-    extra_paths: &[String],
-    rel_paths: &mut Vec<String>,
-) -> Result<MessageBundleCommitMeta> {
+) -> Result<(MessageArchivePaths, DateTime<Utc>, String)> {
     let created = parse_message_timestamp(message);
     let timestamp_str = created.to_rfc3339();
-    let visible_recipients = message_visible_recipients(message);
-
     let paths = message_paths(
         archive,
         sender,
@@ -5178,11 +5382,45 @@ fn append_message_bundle_files(
             .get("subject")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("message"),
-        message
-            .get("id")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0),
+        positive_message_id(message).unwrap_or(0),
     )?;
+    Ok((paths, created, timestamp_str))
+}
+
+fn reject_message_bundle_archive_collision_from_index(
+    existing_ids: &HashMap<i64, Vec<PathBuf>>,
+    archive: &ProjectArchive,
+    message: &serde_json::Value,
+    body_md: &str,
+    sender: &str,
+    recipients: &[String],
+) -> Result<()> {
+    let (paths, _created, _timestamp_str) =
+        message_paths_for_bundle(archive, message, sender, recipients)?;
+    let full_content = render_message_bundle_content(message, body_md)?;
+    reject_canonical_message_id_collision_from_index(
+        existing_ids,
+        message,
+        &paths.canonical,
+        &full_content,
+    )
+}
+
+fn append_message_bundle_files(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    rel_paths: &mut Vec<String>,
+    existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
+) -> Result<MessageBundleCommitMeta> {
+    let message = entry.message;
+    let body_md = entry.body_md;
+    let sender = entry.sender;
+    let recipients = entry.recipients;
+    let extra_paths = entry.extra_paths;
+
+    let visible_recipients = message_visible_recipients(message);
+    let (paths, _created, timestamp_str) =
+        message_paths_for_bundle(archive, message, sender, recipients)?;
 
     let full_content = render_message_bundle_content(message, body_md)?;
     let inbox_message = redact_message_bcc_for_inbox(message);
@@ -5192,6 +5430,17 @@ fn append_message_bundle_files(
         Some(render_message_bundle_content(&inbox_message, body_md)?)
     };
     let inbox_content_ref = inbox_content.as_deref().unwrap_or(&full_content);
+
+    if let Some(existing_ids) = existing_ids {
+        reject_canonical_message_id_collision_from_index(
+            existing_ids,
+            message,
+            &paths.canonical,
+            &full_content,
+        )?;
+    } else {
+        reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
+    }
 
     write_text(&paths.canonical, &full_content, true)?;
     rel_paths.push(rel_path_cached(
@@ -5311,6 +5560,7 @@ pub fn write_message_batch_bundle(
     if entries.is_empty() {
         return Ok(());
     }
+    reject_duplicate_message_ids_in_batch(entries)?;
 
     let total_started = Instant::now();
     let repo_slug = archive.slug.as_str();
@@ -5371,57 +5621,70 @@ pub fn write_message_batch_bundle(
     let mut single_auto_commit_message: Option<String> = None;
 
     let disk_started = Instant::now();
-    for entry in entries {
-        let commit_meta = match append_message_bundle_files(
-            archive,
-            entry.message,
-            entry.body_md,
-            entry.sender,
-            entry.recipients,
-            entry.extra_paths,
-            &mut rel_paths,
-        ) {
-            Ok(meta) => meta,
-            Err(err) => {
-                let error_kind = err.to_string();
-                let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
-                tracing::error!(
-                    target: "mcp_agent_mail::storage::archive::batch_write",
-                    repo_slug = repo_slug,
-                    caller = caller,
-                    args_hash = %args_hash,
-                    duration_ms = duration_ms,
-                    outcome = "error",
-                    git_version = git_version,
-                    batch_id = %args_hash,
-                    files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
-                    total_bytes = total_bytes,
-                    error_kind = %error_kind,
-                    "disk_phase"
-                );
-                tracing::error!(
-                    target: "mcp_agent_mail::storage::archive::batch_write",
-                    repo_slug = repo_slug,
-                    caller = caller,
-                    args_hash = %args_hash,
-                    duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
-                    outcome = "error",
-                    git_version = git_version,
-                    batch_id = %args_hash,
-                    total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
-                    message_count = message_count,
-                    success = false,
-                    error_kind = %error_kind,
-                    "complete"
-                );
-                return Err(err);
-            }
-        };
-        if entries.len() == 1 {
-            single_auto_commit_message = Some(commit_meta.auto_commit_message);
+    with_project_lock(archive, || {
+        let existing_message_ids = collect_existing_batch_message_ids(archive, entries)?;
+
+        for entry in entries {
+            reject_message_bundle_archive_collision_from_index(
+                &existing_message_ids,
+                archive,
+                entry.message,
+                entry.body_md,
+                entry.sender,
+                entry.recipients,
+            )?;
         }
-        summary_lines.push(commit_meta.summary_line);
-    }
+
+        for entry in entries {
+            let commit_meta = match append_message_bundle_files(
+                archive,
+                *entry,
+                &mut rel_paths,
+                Some(&existing_message_ids),
+            ) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    let error_kind = err.to_string();
+                    let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
+                    tracing::error!(
+                        target: "mcp_agent_mail::storage::archive::batch_write",
+                        repo_slug = repo_slug,
+                        caller = caller,
+                        args_hash = %args_hash,
+                        duration_ms = duration_ms,
+                        outcome = "error",
+                        git_version = git_version,
+                        batch_id = %args_hash,
+                        files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+                        total_bytes = total_bytes,
+                        error_kind = %error_kind,
+                        "disk_phase"
+                    );
+                    tracing::error!(
+                        target: "mcp_agent_mail::storage::archive::batch_write",
+                        repo_slug = repo_slug,
+                        caller = caller,
+                        args_hash = %args_hash,
+                        duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+                        outcome = "error",
+                        git_version = git_version,
+                        batch_id = %args_hash,
+                        total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+                        message_count = message_count,
+                        success = false,
+                        error_kind = %error_kind,
+                        "complete"
+                    );
+                    return Err(err);
+                }
+            };
+            if entries.len() == 1 {
+                single_auto_commit_message = Some(commit_meta.auto_commit_message);
+            }
+            summary_lines.push(commit_meta.summary_line);
+        }
+        Ok(())
+    })?;
     tracing::info!(
         target: "mcp_agent_mail::storage::archive::batch_write",
         repo_slug = repo_slug,
@@ -5493,33 +5756,34 @@ pub fn write_message_bundle(
     extra_paths: &[String],
     commit_text: Option<&str>,
 ) -> Result<()> {
-    let repo_root = archive_repo_root_checked(archive)?;
-    let mut rel_paths = Vec::with_capacity(
-        2 + recipients.len()
-            + extra_paths.len()
-            + usize::from(
-                message
-                    .get("thread_id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|thread_id| !thread_id.trim().is_empty()),
-            ),
-    );
-    let commit_meta = append_message_bundle_files(
-        archive,
-        message,
-        body_md,
-        sender,
-        recipients,
-        extra_paths,
-        &mut rel_paths,
-    )?;
-    let commit_message = commit_text
-        .map(ToString::to_string)
-        .unwrap_or(commit_meta.auto_commit_message);
+    with_project_lock(archive, || {
+        let repo_root = archive_repo_root_checked(archive)?;
+        let mut rel_paths = Vec::with_capacity(
+            2 + recipients.len()
+                + extra_paths.len()
+                + usize::from(
+                    message
+                        .get("thread_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|thread_id| !thread_id.trim().is_empty()),
+                ),
+        );
+        let entry = MessageBundleBatchEntry {
+            message,
+            body_md,
+            sender,
+            recipients,
+            extra_paths,
+        };
+        let commit_meta = append_message_bundle_files(archive, entry, &mut rel_paths, None)?;
+        let commit_message = commit_text
+            .map(ToString::to_string)
+            .unwrap_or(commit_meta.auto_commit_message);
 
-    enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
+        enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn message_visible_recipients(message: &serde_json::Value) -> Vec<String> {
@@ -9811,6 +10075,111 @@ mod tests {
     }
 
     #[test]
+    fn write_message_bundle_rejects_duplicate_canonical_id_at_different_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let original = serde_json::json!({
+            "id": 42,
+            "subject": "Original",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "proj",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &original,
+            "original body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let duplicate = serde_json::json!({
+            "id": 42,
+            "subject": "Different path",
+            "created_ts": "2026-01-16T10:00:00Z",
+            "project": "proj",
+        });
+        let err = write_message_bundle(
+            &archive,
+            &config,
+            &duplicate,
+            "duplicate body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .expect_err("duplicate canonical id must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("canonical message id 42 already exists"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            list_message_files(&archive.root.join("messages"))
+                .unwrap()
+                .len(),
+            1,
+            "duplicate-id rejection must not create a second canonical file"
+        );
+    }
+
+    #[test]
+    fn write_message_bundle_rejects_same_canonical_path_with_different_content() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 43,
+            "subject": "Stable path",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "proj",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "first body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let err = write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "second body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .expect_err("same canonical path with different content must be rejected");
+
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "unexpected error: {err}"
+        );
+        let canonical_path = list_message_files(&archive.root.join("messages"))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("canonical file");
+        let (_frontmatter, body) = read_message_file(&canonical_path).unwrap();
+        assert_eq!(body, "first body");
+    }
+
+    #[test]
     fn test_write_message_bundle_keeps_bcc_inbox_private_from_thread_digest() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -9966,6 +10335,127 @@ mod tests {
         assert!(
             contents.contains("\n..."),
             "expected truncated preview marker"
+        );
+    }
+
+    #[test]
+    fn write_message_batch_bundle_rejects_duplicate_ids_before_partial_writes() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let first = serde_json::json!({
+            "id": 50,
+            "subject": "Batch first",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "proj",
+        });
+        let second = serde_json::json!({
+            "id": 50,
+            "subject": "Batch duplicate",
+            "created_ts": "2026-01-15T10:01:00Z",
+            "project": "proj",
+        });
+        let recipients = vec!["RecipientAgent".to_string()];
+        let entries = vec![
+            MessageBundleBatchEntry {
+                message: &first,
+                body_md: "first body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            },
+            MessageBundleBatchEntry {
+                message: &second,
+                body_md: "second body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            },
+        ];
+
+        let err = write_message_batch_bundle(&archive, &config, &entries, None)
+            .expect_err("duplicate batch ids must be rejected before writing");
+        assert!(
+            err.to_string()
+                .contains("duplicate canonical message id 50"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            list_message_files(&archive.root.join("messages"))
+                .unwrap()
+                .is_empty(),
+            "duplicate batch id rejection must not write partial files"
+        );
+    }
+
+    #[test]
+    fn write_message_batch_bundle_preflights_archive_collisions_before_writing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let existing = serde_json::json!({
+            "id": 60,
+            "subject": "Existing",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "proj",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &existing,
+            "existing body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let fresh = serde_json::json!({
+            "id": 61,
+            "subject": "Fresh batch entry",
+            "created_ts": "2026-01-15T10:01:00Z",
+            "project": "proj",
+        });
+        let colliding = serde_json::json!({
+            "id": 60,
+            "subject": "Colliding batch entry",
+            "created_ts": "2026-01-15T10:02:00Z",
+            "project": "proj",
+        });
+        let recipients = vec!["RecipientAgent".to_string()];
+        let entries = vec![
+            MessageBundleBatchEntry {
+                message: &fresh,
+                body_md: "fresh body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            },
+            MessageBundleBatchEntry {
+                message: &colliding,
+                body_md: "colliding body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            },
+        ];
+
+        let err = write_message_batch_bundle(&archive, &config, &entries, None)
+            .expect_err("archive collision must reject the entire batch");
+        assert!(
+            err.to_string()
+                .contains("canonical message id 60 already exists"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            list_message_files(&archive.root.join("messages"))
+                .unwrap()
+                .len(),
+            1,
+            "batch preflight must leave only the pre-existing canonical file"
         );
     }
 
