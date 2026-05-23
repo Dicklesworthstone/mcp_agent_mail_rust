@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Shared test helpers (shim builders, repo factories, metrics snapshots) — br-8ujfs.7.6"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [dependencies]
 git2.workspace = true

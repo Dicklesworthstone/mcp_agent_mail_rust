@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Database layer for MCP Agent Mail"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
+publish = false
 
 [dependencies]
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }

@@ -1,13 +1,18 @@
 name: Publish Crates
 
+# Manual-only. This workspace is distributed as binary-only via dist.yml +
+# install.sh; every member sets `publish = false` because the workspace
+# depends on unpublished sibling path crates (frankensqlite, fastmcp_rust,
+# asupersync, frankensearch, sqlmodel_rust). Auto-publishing on push/tag
+# was structurally broken — `cargo publish --dry-run` cannot resolve the
+# path deps from crates.io — so it has been removed. Keep workflow_dispatch
+# so the maintainer can manually preflight (and eventually publish) once
+# every sibling crate is on crates.io.
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Run cargo publish in dry-run mode only"
+        description: "Preflight only (dry-run). Set to false to attempt real publish — currently expected to fail until sibling path deps are on crates.io."
         required: false
         default: true
         type: boolean
@@ -36,45 +41,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Verify release context
+      - name: Verify dispatch context
         shell: bash
         run: |
           set -euo pipefail
-
-          git fetch origin main --depth=1
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "Release commit $GITHUB_SHA is not reachable from origin/main"
-            exit 1
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            TAG="${GITHUB_REF_NAME}"
-            if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-              echo "Tag '$TAG' is not a supported release tag (expected vX.Y.Z)"
-              exit 1
-            fi
-          elif [[ "$GITHUB_REF_NAME" != "main" ]]; then
+          if [[ "$GITHUB_REF_NAME" != "main" ]]; then
             echo "workflow_dispatch must run from main (got: $GITHUB_REF_NAME)"
-            exit 1
-          fi
-
-      - name: Verify workspace version matches tag
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          WORKSPACE_VERSION="$(python - <<'PY'
-          import pathlib
-          import tomllib
-          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          print(cargo["workspace"]["package"]["version"])
-          PY
-          )"
-
-          if [[ "$WORKSPACE_VERSION" != "$TAG_VERSION" ]]; then
-            echo "Workspace version ($WORKSPACE_VERSION) does not match tag ($TAG_VERSION)"
             exit 1
           fi
 
@@ -83,48 +55,118 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            echo "mode=publish" >> "$GITHUB_OUTPUT"
-            echo "flag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           DRY_RUN="$(jq -r '.inputs.dry_run // "true"' "$GITHUB_EVENT_PATH")"
-          if [[ "$DRY_RUN" != "true" ]]; then
-            echo "Manual non-dry-run publish is blocked; push a release tag instead."
-            exit 1
-          fi
-
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "mode=dry-run" >> "$GITHUB_OUTPUT"
-            echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=publish" >> "$GITHUB_OUTPUT"
           fi
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
 
-      - name: Preflight package validation
+      - name: Preflight publishability summary
+        id: preflight
         shell: bash
         run: |
           set -euo pipefail
 
-          crates=(
-            mcp-agent-mail-core
-            mcp-agent-mail-db
-            mcp-agent-mail-storage
-            mcp-agent-mail-guard
-            mcp-agent-mail-share
-            mcp-agent-mail-tools
-            mcp-agent-mail-server
-            mcp-agent-mail-cli
-            mcp-agent-mail
-          )
+          : > /tmp/publishable.txt
+          : > /tmp/unpublishable.txt
 
-          for crate in "${crates[@]}"; do
-            echo "Preflight: $crate"
-            cargo publish -p "$crate" --locked --dry-run
-          done
+          {
+            echo "## Workspace publishability"
+            echo ""
+            echo "| Member | \`publish\` | Notes |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cargo metadata --format-version 1 --no-deps > /tmp/meta.json
+
+          # publish field: null/true => publishable (default), false (as `[]`) => not publishable
+          jq -r '.packages[] | [.name, (.publish // "null" | tostring)] | @tsv' /tmp/meta.json \
+            | while IFS=$'\t' read -r name pub; do
+                case "$pub" in
+                  "null"|"true")
+                    echo "$name" >> /tmp/publishable.txt
+                    echo "| \`$name\` | (default = publishable) | path deps to unpublished siblings will still fail \`cargo publish\` |" >> "$GITHUB_STEP_SUMMARY"
+                    ;;
+                  "[]"|"false")
+                    echo "$name" >> /tmp/unpublishable.txt
+                    echo "| \`$name\` | \`publish = false\` | intentionally not for crates.io |" >> "$GITHUB_STEP_SUMMARY"
+                    ;;
+                  *)
+                    echo "$name" >> /tmp/unpublishable.txt
+                    echo "| \`$name\` | \`$pub\` | restricted registry — skipping |" >> "$GITHUB_STEP_SUMMARY"
+                    ;;
+                esac
+              done
+
+          {
+            echo ""
+            echo "### Path-dep override summary"
+            echo ""
+            echo "Root \`Cargo.toml\` has the following \`[patch.crates-io]\` entries pointing at sibling repos. While any of these are path-only (no published version on crates.io), \`cargo publish\` cannot succeed for crates that transitively depend on them."
+            echo ""
+            echo '```toml'
+            awk '/^\[patch\.crates-io\]/{flag=1; next} /^\[/{flag=0} flag' Cargo.toml || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          publishable_count=$(wc -l < /tmp/publishable.txt | tr -d ' ')
+          unpublishable_count=$(wc -l < /tmp/unpublishable.txt | tr -d ' ')
+          echo "publishable_count=$publishable_count" >> "$GITHUB_OUTPUT"
+          echo "unpublishable_count=$unpublishable_count" >> "$GITHUB_OUTPUT"
+
+          {
+            echo ""
+            echo "**$publishable_count publishable, $unpublishable_count not publishable.**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preflight cargo publish --dry-run (publishable members only)
+        if: steps.preflight.outputs.publishable_count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### \`cargo publish --dry-run\` preflight"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          status=0
+          while read -r crate; do
+            [[ -z "$crate" ]] && continue
+            echo "::group::Preflight: $crate"
+            set +e
+            out="$(cargo publish -p "$crate" --locked --dry-run 2>&1)"
+            rc=$?
+            set -e
+            echo "$out"
+            echo "::endgroup::"
+
+            if [[ $rc -eq 0 ]]; then
+              echo "- \`$crate\`: dry-run **OK**" >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=1
+              echo "- \`$crate\`: dry-run **FAILED** (rc=$rc)" >> "$GITHUB_STEP_SUMMARY"
+              echo '  <details><summary>last 5 lines</summary>' >> "$GITHUB_STEP_SUMMARY"
+              echo '' >> "$GITHUB_STEP_SUMMARY"
+              echo '  ```' >> "$GITHUB_STEP_SUMMARY"
+              echo "$out" | tail -5 | sed 's/^/  /' >> "$GITHUB_STEP_SUMMARY"
+              echo '  ```' >> "$GITHUB_STEP_SUMMARY"
+              echo '  </details>' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < /tmp/publishable.txt
+
+          if [[ "${{ steps.mode.outputs.mode }}" == "dry-run" ]]; then
+            # In dry-run mode, surface preflight failures but do not fail the job
+            # (the maintainer ran this manually to see the report).
+            exit 0
+          fi
+
+          exit $status
 
       - name: Publish crates to crates.io
-        if: steps.mode.outputs.mode == 'publish'
+        if: steps.mode.outputs.mode == 'publish' && steps.preflight.outputs.publishable_count != '0'
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -166,19 +208,20 @@ jobs:
             return 1
           }
 
-          crates=(
-            mcp-agent-mail-core
-            mcp-agent-mail-db
-            mcp-agent-mail-storage
-            mcp-agent-mail-guard
-            mcp-agent-mail-share
-            mcp-agent-mail-tools
-            mcp-agent-mail-server
-            mcp-agent-mail-cli
-            mcp-agent-mail
-          )
-
-          for crate in "${crates[@]}"; do
+          while read -r crate; do
+            [[ -z "$crate" ]] && continue
             publish_with_retry "$crate"
             sleep 15
-          done
+          done < /tmp/publishable.txt
+
+      - name: Nothing to publish
+        if: steps.preflight.outputs.publishable_count == '0'
+        shell: bash
+        run: |
+          {
+            echo ""
+            echo "### Result"
+            echo ""
+            echo "No workspace members are currently publishable (all set \`publish = false\`). This is by design — see the workflow header for context."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "No publishable members; nothing to do."

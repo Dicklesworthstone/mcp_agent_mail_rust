@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "MCP Agent Mail - multi-agent coordination via MCP"
+# Distributed as binary-only via dist.yml + curl|bash installer.
+# Workspace depends on unpublished sibling path crates (frankensqlite, fastmcp_rust,
+# asupersync, frankensearch, sqlmodel_rust), so cargo publish is not viable.
+publish = false
 
 [[bin]]
 name = "mcp-agent-mail"
