@@ -19,6 +19,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -93,6 +111,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -139,6 +176,25 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -263,6 +319,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -303,6 +378,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -445,6 +539,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -492,6 +605,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -690,6 +822,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -757,6 +908,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -800,6 +970,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -893,6 +1082,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -1006,6 +1214,25 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
+            echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
+            exit 1
+          fi
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust ../toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust ../rich_rust
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
