@@ -209,3 +209,7 @@ vendor/*
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
 .claude/settings.local.json
+
+# am doctor per-run artifacts (world-class doctor surface)
+.doctor/
+*.doctor-lock

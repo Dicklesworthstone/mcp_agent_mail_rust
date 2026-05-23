@@ -1735,6 +1735,10 @@ struct RepoQueue {
     processing: AtomicBool,
     /// Microsecond timestamp of last time a worker finished processing this repo.
     last_serviced_us: AtomicU64,
+    /// Earliest time this repo may be retried after a persistent commit error.
+    retry_after: Mutex<Option<Instant>>,
+    /// Consecutive commit failures used to calculate per-repo retry backoff.
+    failure_streak: AtomicU64,
     /// Per-repo metrics for observability.
     metrics: RepoCommitMetrics,
 }
@@ -1774,6 +1778,21 @@ impl Default for RepoCommitMetrics {
             adaptive_flush_enabled: AtomicU64::new(0),
             adaptive_flush_target_ms: AtomicU64::new(DEFAULT_ARCHIVE_BATCH_MS),
             adaptive_flush_effective_ms: AtomicU64::new(DEFAULT_ARCHIVE_BATCH_MS),
+        }
+    }
+}
+
+impl Default for RepoQueue {
+    fn default() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            spill: Mutex::new(CoalescerSpillState::default()),
+            depth: AtomicU64::new(0),
+            processing: AtomicBool::new(false),
+            last_serviced_us: AtomicU64::new(0),
+            retry_after: Mutex::new(None),
+            failure_streak: AtomicU64::new(0),
+            metrics: RepoCommitMetrics::default(),
         }
     }
 }
@@ -1844,6 +1863,9 @@ const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
 const COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS: usize = 120;
+const COALESCER_RETRY_BACKOFF_BASE_MS: u64 = 250;
+const COALESCER_RETRY_BACKOFF_MAX_MS: u64 = 30_000;
+const COALESCER_RETRY_BACKOFF_EXP_CAP: u64 = 7;
 
 #[inline]
 fn clamp_coalescer_flush_interval(interval: Duration) -> Duration {
@@ -2000,6 +2022,52 @@ fn record_coalescer_adaptive_decision(rq: &RepoQueue, decision: CoalescerAdaptiv
     );
 }
 
+fn coalescer_failure_backoff(streak: u64) -> Duration {
+    let exponent = streak
+        .saturating_sub(1)
+        .min(COALESCER_RETRY_BACKOFF_EXP_CAP);
+    let multiplier = 1_u64.checked_shl(exponent as u32).unwrap_or(u64::MAX);
+    let delay_ms = COALESCER_RETRY_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(COALESCER_RETRY_BACKOFF_MAX_MS);
+    Duration::from_millis(delay_ms)
+}
+
+fn coalescer_retry_wait(rq: &RepoQueue) -> Option<Duration> {
+    let mut guard = rq.retry_after.lock().unwrap_or_else(|e| e.into_inner());
+    let retry_at = (*guard)?;
+    let now = Instant::now();
+    if retry_at > now {
+        Some(retry_at.saturating_duration_since(now))
+    } else {
+        *guard = None;
+        None
+    }
+}
+
+fn coalescer_note_commit_failure(rq: &RepoQueue) {
+    let streak = rq
+        .failure_streak
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    rq.metrics.retries_total.fetch_add(1, Ordering::Relaxed);
+
+    let delay = coalescer_failure_backoff(streak);
+    let retry_at = Instant::now() + delay;
+    *rq.retry_after.lock().unwrap_or_else(|e| e.into_inner()) = Some(retry_at);
+
+    tracing::warn!(
+        streak,
+        delay_ms = duration_millis_u64(delay),
+        "[commit-coalescer] backing off repo after commit failure"
+    );
+}
+
+fn coalescer_note_commit_success(rq: &RepoQueue) {
+    rq.failure_streak.store(0, Ordering::Relaxed);
+    *rq.retry_after.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Auto-detect worker count bounded by `Config::coalescer_max_workers`.
 ///
 /// When the configured max is `1`, honor that explicitly instead of trying to
@@ -2082,14 +2150,7 @@ impl CommitCoalescer {
         if let Some(rq) = repos.get(repo_root) {
             return Arc::clone(rq);
         }
-        let rq = Arc::new(RepoQueue {
-            queue: Mutex::new(VecDeque::new()),
-            spill: Mutex::new(CoalescerSpillState::default()),
-            depth: AtomicU64::new(0),
-            processing: AtomicBool::new(false),
-            last_serviced_us: AtomicU64::new(0),
-            metrics: RepoCommitMetrics::default(),
-        });
+        let rq = Arc::new(RepoQueue::default());
         repos.insert(repo_root.to_path_buf(), Arc::clone(&rq));
         rq
     }
@@ -2375,6 +2436,9 @@ fn coalescer_repo_readiness(
     let depth = rq.depth.load(Ordering::Relaxed);
     if depth == 0 {
         return CoalescerRepoReadiness::Empty;
+    }
+    if let Some(wait_for) = coalescer_retry_wait(rq) {
+        return CoalescerRepoReadiness::Waiting(wait_for);
     }
     if force_flush || depth >= u64::try_from(max_batch_size).unwrap_or(u64::MAX) {
         return CoalescerRepoReadiness::Ready;
@@ -2742,8 +2806,10 @@ fn self_process_repo(
 
             if outcome.committed_requests > 0 {
                 coalescer_update_pending(pending_requests, outcome.committed_requests);
+                coalescer_note_commit_success(rq);
             }
             if !failed_requests.is_empty() {
+                coalescer_note_commit_failure(rq);
                 coalescer_requeue_requests(rq, failed_requests);
             }
         }
@@ -2757,6 +2823,7 @@ fn self_process_repo(
         let outcome = coalescer_commit_spilled_work(work, stats, batch_sizes);
         if let Some(failed_work) = outcome.failed_work {
             rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            coalescer_note_commit_failure(rq);
             coalescer_restore_spilled_work(rq, failed_work);
         }
 
@@ -2789,6 +2856,7 @@ fn self_process_repo(
                 .fetch_add(1, Ordering::Relaxed);
 
             coalescer_update_pending(pending_requests, outcome.committed_requests);
+            coalescer_note_commit_success(rq);
         }
         if outcome.committed_commits > 0 {
             rq.metrics
@@ -9339,14 +9407,7 @@ mod tests {
     }
 
     fn test_repo_queue() -> RepoQueue {
-        RepoQueue {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
-            depth: AtomicU64::new(0),
-            processing: AtomicBool::new(false),
-            last_serviced_us: AtomicU64::new(0),
-            metrics: RepoCommitMetrics::default(),
-        }
+        RepoQueue::default()
     }
 
     #[test]
@@ -9390,6 +9451,39 @@ mod tests {
 
         assert_eq!(
             coalescer_repo_readiness(&rq, 2, Duration::from_secs(3_600), false),
+            CoalescerRepoReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn coalescer_repo_readiness_respects_failure_backoff() {
+        let rq = test_repo_queue();
+        {
+            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(CoalescerCommitFields {
+                enqueued_at: Instant::now(),
+                enqueued_wall: Utc::now(),
+                git_author_name: "Backoff".to_string(),
+                git_author_email: "backoff@example.com".to_string(),
+                message: "one".to_string(),
+                rel_paths: vec!["one.txt".to_string()],
+            });
+        }
+        rq.depth.store(1, Ordering::Relaxed);
+
+        coalescer_note_commit_failure(&rq);
+        assert!(
+            matches!(
+                coalescer_repo_readiness(&rq, 1, Duration::ZERO, true),
+                CoalescerRepoReadiness::Waiting(wait) if wait > Duration::ZERO
+            ),
+            "failure backoff should suppress immediate retry"
+        );
+
+        *rq.retry_after.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(
+            coalescer_repo_readiness(&rq, 1, Duration::ZERO, true),
             CoalescerRepoReadiness::Ready
         );
     }
@@ -15394,14 +15488,7 @@ mod tests {
 
     #[test]
     fn coalescer_restore_spilled_work_restores_depth_and_paths() {
-        let rq = RepoQueue {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
-            depth: AtomicU64::new(0),
-            processing: AtomicBool::new(false),
-            last_serviced_us: AtomicU64::new(0),
-            metrics: RepoCommitMetrics::default(),
-        };
+        let rq = RepoQueue::default();
         let work = CoalescerSpilledWork {
             repo_root: std::path::PathBuf::from("/tmp/fake-repo"),
             pending_requests: 2,
@@ -15429,14 +15516,7 @@ mod tests {
 
     #[test]
     fn spill_depth_roundtrip_tracks_spilled_requests_without_underflow() {
-        let rq = RepoQueue {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
-            depth: AtomicU64::new(0),
-            processing: AtomicBool::new(false),
-            last_serviced_us: AtomicU64::new(0),
-            metrics: RepoCommitMetrics::default(),
-        };
+        let rq = RepoQueue::default();
 
         CommitCoalescer::spill_to_repo(
             &rq,
@@ -15479,14 +15559,7 @@ mod tests {
 
     #[test]
     fn coalescer_restore_drained_work_on_panic_requeues_inflight_before_remaining_batch() {
-        let rq = RepoQueue {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
-            depth: AtomicU64::new(0),
-            processing: AtomicBool::new(false),
-            last_serviced_us: AtomicU64::new(0),
-            metrics: RepoCommitMetrics::default(),
-        };
+        let rq = RepoQueue::default();
         let mk_req = |message: &str, path: &str| CoalescerCommitFields {
             enqueued_at: std::time::Instant::now(),
             enqueued_wall: Utc::now(),
