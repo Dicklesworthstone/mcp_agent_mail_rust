@@ -249,6 +249,7 @@ fn error_code_catalog_is_stable() {
         "DATABASE_POOL_EXHAUSTED",
         "DISK_FULL",
         "DURABILITY_DEGRADED",
+        "EMPTY_AGENT_NAME",
         "EMPTY_MODEL",
         "EMPTY_PATHS",
         "EMPTY_PROGRAM",

@@ -666,6 +666,15 @@ fn main() {
 
     let cli = Cli::parse();
 
+    if let Some(Commands::External(external_args)) = &cli.command {
+        // Denial gate (ADR-001 Invariant 4, SPEC-denial-ux-contract).
+        // This path is intentionally before config loading and tracing setup so
+        // wrong-surface CLI commands cannot touch mailbox state.
+        let command = external_args.first().map_or("(unknown)", String::as_str);
+        render_denial(command);
+        std::process::exit(2);
+    }
+
     // Load configuration and stamp interface mode (binary-level, per ADR-001).
     let mut config = Config::from_env();
     config.interface_mode = InterfaceMode::Mcp;
@@ -822,7 +831,7 @@ fn main() {
             ftui_runtime::ftui_println!("{:#?}", config);
         }
         Some(Commands::External(external_args)) => {
-            // Denial gate (ADR-001 Invariant 4, SPEC-denial-ux-contract)
+            // Already handled before config loading.
             let command = external_args.first().map_or("(unknown)", String::as_str);
             render_denial(command);
             std::process::exit(2);

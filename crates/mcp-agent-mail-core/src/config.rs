@@ -1270,6 +1270,7 @@ impl Default for Config {
                 "health_check".to_string(),
                 "fetch_inbox".to_string(),
                 "whois".to_string(),
+                "list_agents".to_string(),
                 "search_messages".to_string(),
                 "summarize_thread".to_string(),
                 "list_contacts".to_string(),

@@ -3537,6 +3537,40 @@ fn systemd_service_configured_bind() -> Option<ManagedServiceBinding> {
     None
 }
 
+fn parse_systemd_environment_value(content: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some(value) = trimmed
+            .strip_prefix("Environment=")
+            .or_else(|| trimmed.strip_prefix("Environment ="))
+        else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let Some(rest) = value.strip_prefix(&needle) else {
+            continue;
+        };
+        let token = rest.trim().trim_matches('"').trim_matches('\'');
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_bearer_token() -> Option<String> {
+    let unit_path = systemd_unit_path()?;
+    let content = std::fs::read_to_string(unit_path).ok()?;
+    parse_systemd_environment_value(&content, "HTTP_BEARER_TOKEN")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_service_bearer_token() -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn launchd_plist_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -3587,6 +3621,30 @@ fn launchd_service_configured_bind() -> Option<ManagedServiceBinding> {
 #[cfg(not(target_os = "macos"))]
 fn launchd_service_configured_bind() -> Option<ManagedServiceBinding> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_service_bearer_token() -> Option<String> {
+    let plist_path = launchd_plist_path()?;
+    let value = plist::Value::from_file(&plist_path).ok()?;
+    value
+        .as_dictionary()?
+        .get("EnvironmentVariables")?
+        .as_dictionary()?
+        .get("HTTP_BEARER_TOKEN")?
+        .as_string()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_service_bearer_token() -> Option<String> {
+    None
+}
+
+fn managed_service_bearer_token() -> Option<String> {
+    systemd_service_bearer_token().or_else(launchd_service_bearer_token)
 }
 
 #[cfg(target_os = "macos")]
@@ -5872,6 +5930,13 @@ fn normalize_connect_host_for_client_url(host: &str) -> std::borrow::Cow<'_, str
 fn local_server_url_from_parts(host: &str, port: u16, http_path: &str) -> String {
     let connect_host = normalize_connect_host_for_client_url(host);
     format!("http://{connect_host}:{port}{http_path}")
+}
+
+fn local_server_bearer_token(config: &mcp_agent_mail_core::Config) -> Option<String> {
+    config
+        .http_bearer_token
+        .clone()
+        .or_else(managed_service_bearer_token)
 }
 
 fn mcp_base_alias_path(path: &str) -> Option<&'static str> {
@@ -20252,42 +20317,17 @@ fn probe_local_http_health(
         config.http_port
     );
 
-    match context::run_async(async {
-        use asupersync::http::h1::Method;
-        use asupersync::time::{timeout, wall_now};
-        use std::time::Duration;
-
-        let cx = asupersync::Cx::for_testing();
-        let request = Box::pin(products_http_client().request(
-            &cx,
-            Method::Get,
-            &url,
-            Vec::new(),
-            Vec::new(),
-        ));
-        match timeout(
-            wall_now(),
-            Duration::from_secs(DOCTOR_RUNTIME_HTTP_TIMEOUT_SECS),
-            request,
-        )
-        .await
-        {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => Err(CliError::Other(format!(
-                "transport failure calling {url}: {error}"
-            ))),
-            Err(_) => Err(CliError::Other(format!(
-                "request to {url} timed out after {}s",
-                DOCTOR_RUNTIME_HTTP_TIMEOUT_SECS
-            ))),
-        }
-    }) {
-        Ok(response) if (200..=399).contains(&response.status) => {
+    match get_blocking_http_request(&url, DOCTOR_RUNTIME_HTTP_TIMEOUT_SECS) {
+        Ok(Some(response)) if (200..=399).contains(&response.status) => {
             DoctorProbeResult::ok(format!("/health responded with HTTP {}", response.status))
         }
-        Ok(response) => {
+        Ok(Some(response)) => {
             DoctorProbeResult::fail(format!("/health responded with HTTP {}", response.status))
         }
+        Ok(None) => DoctorProbeResult::fail(format!(
+            "/health probe failed for {}:{}: unsupported URL scheme for {url}",
+            config.http_host, config.http_port
+        )),
         Err(error) => DoctorProbeResult::fail(format!(
             "/health probe failed for {}:{}: {}",
             config.http_host, config.http_port, error
@@ -25198,7 +25238,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
         server_config.http_port,
         &server_config.http_path,
     );
-    let bearer = server_config.http_bearer_token;
+    let bearer = local_server_bearer_token(&server_config);
 
     match action {
         MailCommand::Status { .. } => unreachable!("handled in sync path"),
@@ -25871,6 +25911,113 @@ fn build_server_send_message_arguments(
     serde_json::Value::Object(arguments)
 }
 
+fn build_server_register_agent_arguments(
+    project_key: &str,
+    program: &str,
+    model: &str,
+    name: Option<&str>,
+    task: Option<&str>,
+    attachments_policy: &str,
+) -> serde_json::Value {
+    let mut arguments = serde_json::Map::from_iter([
+        ("project_key".to_string(), serde_json::json!(project_key)),
+        ("program".to_string(), serde_json::json!(program)),
+        ("model".to_string(), serde_json::json!(model)),
+        (
+            "attachments_policy".to_string(),
+            serde_json::json!(attachments_policy),
+        ),
+    ]);
+    if let Some(name) = name {
+        arguments.insert("name".to_string(), serde_json::json!(name));
+    }
+    if let Some(task) = task {
+        arguments.insert("task_description".to_string(), serde_json::json!(task));
+    }
+    serde_json::Value::Object(arguments)
+}
+
+fn build_server_create_agent_identity_arguments(
+    project_key: &str,
+    program: &str,
+    model: &str,
+    name_hint: Option<&str>,
+    task: Option<&str>,
+    attachments_policy: &str,
+) -> serde_json::Value {
+    let mut arguments = serde_json::Map::from_iter([
+        ("project_key".to_string(), serde_json::json!(project_key)),
+        ("program".to_string(), serde_json::json!(program)),
+        ("model".to_string(), serde_json::json!(model)),
+        (
+            "attachments_policy".to_string(),
+            serde_json::json!(attachments_policy),
+        ),
+    ]);
+    if let Some(name_hint) = name_hint {
+        arguments.insert("name_hint".to_string(), serde_json::json!(name_hint));
+    }
+    if let Some(task) = task {
+        arguments.insert("task_description".to_string(), serde_json::json!(task));
+    }
+    serde_json::Value::Object(arguments)
+}
+
+fn build_server_list_agents_arguments(project_key: &str) -> serde_json::Value {
+    serde_json::json!({ "project_key": project_key })
+}
+
+fn build_server_whois_arguments(project_key: &str, agent_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "include_recent_commits": false,
+        "commit_limit": 0,
+    })
+}
+
+fn build_server_macro_start_session_arguments(
+    human_key: &str,
+    program: &str,
+    model: &str,
+    agent_name: Option<&str>,
+    task: Option<&str>,
+    reserve_paths: &[String],
+    reserve_reason: Option<&str>,
+    reserve_ttl: i64,
+    inbox_limit: usize,
+) -> serde_json::Value {
+    let mut arguments = serde_json::Map::from_iter([
+        ("human_key".to_string(), serde_json::json!(human_key)),
+        ("program".to_string(), serde_json::json!(program)),
+        ("model".to_string(), serde_json::json!(model)),
+        ("inbox_limit".to_string(), serde_json::json!(inbox_limit)),
+    ]);
+    if let Some(agent_name) = agent_name {
+        arguments.insert("agent_name".to_string(), serde_json::json!(agent_name));
+    }
+    if let Some(task) = task {
+        arguments.insert("task_description".to_string(), serde_json::json!(task));
+    }
+    if !reserve_paths.is_empty() {
+        arguments.insert(
+            "file_reservation_paths".to_string(),
+            serde_json::json!(reserve_paths),
+        );
+        arguments.insert(
+            "file_reservation_ttl_seconds".to_string(),
+            serde_json::json!(reserve_ttl),
+        );
+        if let Some(reason) = reserve_reason {
+            arguments.insert(
+                "file_reservation_reason".to_string(),
+                serde_json::json!(reason),
+            );
+        }
+    }
+    serde_json::Value::Object(arguments)
+}
+
 fn build_server_reply_message_arguments(
     project_key: &str,
     message_id: i64,
@@ -26103,8 +26250,13 @@ fn handle_agents(action: AgentsCommand) -> CliResult<()> {
 }
 
 async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
-    let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let server_url = local_server_url_from_parts(
+        &server_config.http_host,
+        server_config.http_port,
+        &server_config.http_path,
+    );
+    let bearer = local_server_bearer_token(&server_config);
 
     match action {
         AgentsCommand::Register {
@@ -26126,6 +26278,37 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             if model.is_empty() {
                 return Err(CliError::InvalidArgument("model cannot be empty".into()));
             }
+
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "register_agent",
+                build_server_register_agent_arguments(
+                    &project_key,
+                    &program,
+                    &model,
+                    name.as_deref(),
+                    task.as_deref(),
+                    &attachments_policy,
+                ),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("register_agent", result)?;
+                    render_agent_payload(&payload, fmt);
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "register_agent via server failed: {message}"
+                    )));
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
 
             // Resolve project
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
@@ -26190,6 +26373,38 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 return Err(CliError::InvalidArgument("model cannot be empty".into()));
             }
 
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "create_agent_identity",
+                build_server_create_agent_identity_arguments(
+                    &project_key,
+                    &program,
+                    &model,
+                    name_hint.as_deref(),
+                    task.as_deref(),
+                    &attachments_policy,
+                ),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let payload =
+                        coerce_tool_result_json_or_error("create_agent_identity", result)?;
+                    render_agent_payload(&payload, fmt);
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "create_agent_identity via server failed: {message}"
+                    )));
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
+
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let agent_name = name_hint
@@ -26241,6 +26456,29 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "list_agents",
+                build_server_list_agents_arguments(&project_key),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("list_agents", result)?;
+                    render_agent_list_payload(&payload, fmt);
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "list_agents via server failed: {message}"
+                    )));
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let agents =
@@ -26260,25 +26498,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 };
 
             let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
-            if data.is_empty() {
-                output::emit_empty(fmt, "No agents found.");
-                return Ok(());
-            }
-
-            output::emit_output(&data, fmt, || {
-                let mut table =
-                    output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
-                for a in &agents {
-                    table.add_row(vec![
-                        a.name.clone(),
-                        a.program.clone(),
-                        a.model.clone(),
-                        truncate_str(&a.task_description, 40),
-                        context::format_ts_short(a.last_active_ts),
-                    ]);
-                }
-                table.render();
-            });
+            render_agent_list_payload(&serde_json::Value::Array(data), fmt);
             Ok(())
         }
 
@@ -26289,6 +26509,32 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "whois",
+                build_server_whois_arguments(&project_key, &agent),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let mut payload = coerce_tool_result_json_or_error("whois", result)?;
+                    if let Some(object) = payload.as_object_mut() {
+                        object.remove("recent_commits");
+                    }
+                    render_agent_payload(&payload, fmt);
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "whois via server failed: {message}"
+                    )));
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let row = match mcp_agent_mail_db::queries::get_agent(
@@ -26451,15 +26697,105 @@ fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
 
 fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, format: output::CliOutputFormat) {
     let payload = agent_row_to_json(row);
-    output::emit_output(&payload, format, || {
-        output::success(&format!("Agent: {}", row.name));
-        output::kv("ID", &row.id.unwrap_or(0).to_string());
-        output::kv("Program", &row.program);
-        output::kv("Model", &row.model);
-        output::kv("Task", &row.task_description);
-        output::kv("Attachments", &row.attachments_policy);
-        output::kv("Inception", &context::format_ts(row.inception_ts));
-        output::kv("Last Active", &context::format_ts(row.last_active_ts));
+    render_agent_payload(&payload, format);
+}
+
+fn agent_payload_string(payload: &serde_json::Value, key: &str) -> String {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn agent_payload_i64(payload: &serde_json::Value, key: &str) -> i64 {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default()
+}
+
+fn render_agent_payload(payload: &serde_json::Value, format: output::CliOutputFormat) {
+    output::emit_output(payload, format, || {
+        output::success(&format!("Agent: {}", agent_payload_string(payload, "name")));
+        output::kv("ID", &agent_payload_i64(payload, "id").to_string());
+        output::kv("Program", &agent_payload_string(payload, "program"));
+        output::kv("Model", &agent_payload_string(payload, "model"));
+        output::kv("Task", &agent_payload_string(payload, "task_description"));
+        output::kv(
+            "Attachments",
+            &agent_payload_string(payload, "attachments_policy"),
+        );
+        output::kv("Inception", &agent_payload_string(payload, "inception_ts"));
+        output::kv(
+            "Last Active",
+            &agent_payload_string(payload, "last_active_ts"),
+        );
+    });
+}
+
+fn render_agent_list_payload(payload: &serde_json::Value, format: output::CliOutputFormat) {
+    let agents = payload.as_array().cloned().unwrap_or_default();
+    if agents.is_empty() {
+        output::emit_empty(format, "No agents found.");
+        return;
+    }
+
+    output::emit_output(&agents, format, || {
+        let mut table =
+            output::CliTable::new(vec!["NAME", "PROGRAM", "MODEL", "TASK", "LAST_ACTIVE"]);
+        for agent in &agents {
+            table.add_row(vec![
+                agent_payload_string(agent, "name"),
+                agent_payload_string(agent, "program"),
+                agent_payload_string(agent, "model"),
+                truncate_str(&agent_payload_string(agent, "task_description"), 40),
+                agent_payload_string(agent, "last_active_ts"),
+            ]);
+        }
+        table.render();
+    });
+}
+
+fn json_path_string<'a>(payload: &'a serde_json::Value, path: &[&str]) -> &'a str {
+    path.iter()
+        .try_fold(payload, |value, key| value.get(*key))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn json_path_array_len(payload: &serde_json::Value, path: &[&str]) -> usize {
+    path.iter()
+        .try_fold(payload, |value, key| value.get(*key))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+fn render_macro_start_session_payload(
+    payload: &serde_json::Value,
+    format: output::CliOutputFormat,
+    program: &str,
+    model: &str,
+) {
+    output::emit_output(payload, format, || {
+        output::success(&format!(
+            "Session started for project: {}",
+            json_path_string(payload, &["project", "slug"])
+        ));
+        output::kv("Agent", json_path_string(payload, &["agent", "name"]));
+        output::kv("Program", program);
+        output::kv("Model", model);
+        let reservation_count = json_path_array_len(payload, &["file_reservations", "granted"]);
+        if reservation_count > 0 {
+            output::kv(
+                "Reservations",
+                &format!("{reservation_count} path(s) reserved"),
+            );
+        }
+        output::kv(
+            "Inbox",
+            &format!("{} message(s)", json_path_array_len(payload, &["inbox"])),
+        );
     });
 }
 
@@ -26471,8 +26807,13 @@ fn handle_macros(action: MacroCommand) -> CliResult<()> {
 
 #[allow(clippy::too_many_lines)]
 async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
-    let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let server_url = local_server_url_from_parts(
+        &server_config.http_host,
+        server_config.http_port,
+        &server_config.http_path,
+    );
+    let bearer = local_server_bearer_token(&server_config);
 
     match action {
         MacroCommand::StartSession {
@@ -26503,6 +26844,40 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let model = parse_cli_macro_required_text("macros start-session", "model", model)?;
             let agent_name = normalize_cli_macro_optional_agent_name(agent_name)?;
             let inbox_limit = parse_cli_macro_inbox_limit("macros start-session", inbox_limit)?;
+
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "macro_start_session",
+                build_server_macro_start_session_arguments(
+                    &human_key,
+                    &program,
+                    &model,
+                    Some(agent_name.as_str()),
+                    task.as_deref(),
+                    &reserve_paths,
+                    reserve_reason.as_deref(),
+                    reserve_ttl,
+                    inbox_limit,
+                ),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("macro_start_session", result)?;
+                    render_macro_start_session_payload(&payload, fmt, &program, &model);
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    return Err(CliError::Other(format!(
+                        "macro_start_session via server failed: {message}"
+                    )));
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
 
             // 1. Ensure project
             let proj = resolve_project_async(&cx, &ctx.pool, &human_key).await?;
@@ -26612,6 +26987,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             format,
             json,
         } => {
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let fmt = output::CliOutputFormat::resolve(format, json);
             let should_register = context::resolve_bool(register, no_register, true);
             let include_examples = context::resolve_bool(examples, no_examples, true);
@@ -26763,6 +27140,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             format,
             json,
         } => {
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let fmt = output::CliOutputFormat::resolve(format, json);
             let is_exclusive = context::resolve_bool(exclusive, no_exclusive, true);
 
@@ -26867,6 +27246,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             format,
             json,
         } => {
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
@@ -27238,12 +27619,16 @@ mod mail_server_cli_bridge_tests {
         CliError, ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
         acquire_doctor_mailbox_activity_lock_for_sqlite_path,
         acquire_doctor_mailbox_activity_lock_for_storage_root,
-        build_server_fetch_inbox_product_arguments, build_server_reply_message_arguments,
-        build_server_send_message_arguments, classify_server_tool_call, coerce_tool_result_json,
-        coerce_tool_result_json_or_error, ensure_message_in_project,
-        fetch_inbox_server_rejection_allows_local_fallback, is_resource_busy_cli_error,
+        build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
+        build_server_list_agents_arguments, build_server_macro_start_session_arguments,
+        build_server_register_agent_arguments, build_server_reply_message_arguments,
+        build_server_send_message_arguments, build_server_whois_arguments,
+        classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
+        ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
+        get_blocking_http_request, is_resource_busy_cli_error,
         mail_server_rejection_allows_local_fallback, normalize_cli_product_inbox_agent_name,
-        parse_cli_fetch_inbox_product_limit, parse_cli_search_limit, product_inbox_row_to_json,
+        parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
+        post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
         server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
     };
@@ -27293,6 +27678,294 @@ mod mail_server_cli_bridge_tests {
             object.get("thread_id").and_then(serde_json::Value::as_str),
             Some("br-123")
         );
+    }
+
+    #[test]
+    fn register_agent_server_arguments_match_tool_schema() {
+        let args = build_server_register_agent_arguments(
+            "/tmp/project",
+            "codex-cli",
+            "gpt-5",
+            Some("BlueLake"),
+            Some("Coordination"),
+            "auto",
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert_eq!(
+            object
+                .get("project_key")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            object.get("name").and_then(serde_json::Value::as_str),
+            Some("BlueLake")
+        );
+        assert_eq!(
+            object
+                .get("task_description")
+                .and_then(serde_json::Value::as_str),
+            Some("Coordination")
+        );
+        assert_eq!(
+            object
+                .get("attachments_policy")
+                .and_then(serde_json::Value::as_str),
+            Some("auto")
+        );
+    }
+
+    #[test]
+    fn create_agent_identity_server_arguments_omit_absent_optional_fields() {
+        let args = build_server_create_agent_identity_arguments(
+            "/tmp/project",
+            "claude-code",
+            "opus-4.7",
+            None,
+            None,
+            "file",
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert!(!object.contains_key("name_hint"));
+        assert!(!object.contains_key("task_description"));
+        assert_eq!(
+            object
+                .get("attachments_policy")
+                .and_then(serde_json::Value::as_str),
+            Some("file")
+        );
+    }
+
+    #[test]
+    fn list_agents_server_arguments_match_tool_schema() {
+        let args = build_server_list_agents_arguments("/tmp/project");
+
+        assert_eq!(
+            args.get("project_key").and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(args.as_object().map(serde_json::Map::len), Some(1));
+    }
+
+    #[test]
+    fn whois_server_arguments_disable_commit_lookup_for_cli_show() {
+        let args = build_server_whois_arguments("/tmp/project", "BlueLake");
+
+        let object = args.as_object().expect("object arguments");
+        assert_eq!(
+            object
+                .get("project_key")
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            object.get("agent_name").and_then(serde_json::Value::as_str),
+            Some("BlueLake")
+        );
+        assert_eq!(
+            object
+                .get("include_recent_commits")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            object
+                .get("commit_limit")
+                .and_then(serde_json::Value::as_i64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn macro_start_session_server_arguments_match_tool_schema() {
+        let reserve_paths = vec!["src/**".to_string(), "tests/**".to_string()];
+        let args = build_server_macro_start_session_arguments(
+            "/tmp/project",
+            "codex-cli",
+            "gpt-5",
+            Some("BlueLake"),
+            Some("Startup task"),
+            &reserve_paths,
+            Some("br-123"),
+            7200,
+            20,
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert_eq!(
+            object.get("human_key").and_then(serde_json::Value::as_str),
+            Some("/tmp/project")
+        );
+        assert_eq!(
+            object
+                .get("task_description")
+                .and_then(serde_json::Value::as_str),
+            Some("Startup task")
+        );
+        assert_eq!(
+            object
+                .get("file_reservation_paths")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            object
+                .get("file_reservation_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("br-123")
+        );
+        assert_eq!(
+            object
+                .get("file_reservation_ttl_seconds")
+                .and_then(serde_json::Value::as_i64),
+            Some(7200)
+        );
+        assert_eq!(
+            object
+                .get("inbox_limit")
+                .and_then(serde_json::Value::as_u64),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn macro_start_session_server_arguments_omit_empty_reservations() {
+        let args = build_server_macro_start_session_arguments(
+            "/tmp/project",
+            "codex-cli",
+            "gpt-5",
+            None,
+            None,
+            &[],
+            None,
+            3600,
+            10,
+        );
+
+        let object = args.as_object().expect("object arguments");
+        assert!(!object.contains_key("file_reservation_paths"));
+        assert!(!object.contains_key("file_reservation_ttl_seconds"));
+        assert!(!object.contains_key("file_reservation_reason"));
+        assert!(!object.contains_key("agent_name"));
+        assert!(!object.contains_key("task_description"));
+    }
+
+    #[test]
+    fn blocking_http_url_parser_keeps_target_and_default_port() {
+        let parsed = parse_blocking_http_url("http://127.0.0.1/mcp/?a=b#fragment")
+            .expect("parse should succeed")
+            .expect("http URL should use blocking transport");
+
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 80);
+        assert_eq!(parsed.host_header, "127.0.0.1");
+        assert_eq!(parsed.request_target, "/mcp/?a=b");
+    }
+
+    #[test]
+    fn blocking_jsonrpc_http_returns_after_content_length_without_close() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if super::find_http_header_end(&request).is_some() {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.contains("POST /mcp/ HTTP/1.1"));
+            assert!(request_text.contains("Authorization: Bearer token-123"));
+
+            let body = br#"{"jsonrpc":"2.0","id":"1","result":{"ok":true}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            )
+            .expect("write response head");
+            stream.write_all(body).expect("write response body");
+            stream.flush().expect("flush response");
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let response = post_jsonrpc_request_blocking_http(
+            &format!("http://{addr}/mcp/"),
+            Some("token-123"),
+            &serde_json::json!({"jsonrpc": "2.0", "id": "1", "method": "tools/list"}),
+            2,
+        )
+        .expect("blocking request should succeed")
+        .expect("http URL should use blocking transport");
+        assert_eq!(response.status, 200);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("response JSON");
+        assert_eq!(payload["result"]["ok"].as_bool(), Some(true));
+
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn blocking_http_get_returns_after_content_length_without_close() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if super::find_http_header_end(&request).is_some() {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.contains("GET /health HTTP/1.1"));
+            assert!(request_text.contains("Connection: close"));
+
+            let body = br#"{"status":"ready"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            )
+            .expect("write response head");
+            stream.write_all(body).expect("write response body");
+            stream.flush().expect("flush response");
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let response = get_blocking_http_request(&format!("http://{addr}/health"), 2)
+            .expect("blocking GET should succeed")
+            .expect("http URL should use blocking transport");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#"{"status":"ready"}"#);
+
+        server.join().expect("server thread");
     }
 
     #[test]
@@ -28937,6 +29610,121 @@ mod tests {
         extract_json_delimited(s, '[', ']')
     }
 
+    struct TestHttpResponse {
+        status: u16,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    fn read_test_http_chunk(
+        stream: &mut std::net::TcpStream,
+        chunk: &mut [u8],
+        deadline: std::time::Instant,
+    ) -> usize {
+        use std::io::Read;
+
+        loop {
+            match stream.read(chunk) {
+                Ok(read) => return read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("read response: {error}"),
+            }
+        }
+    }
+
+    fn read_test_http_response(stream: &mut std::net::TcpStream) -> TestHttpResponse {
+        use std::io::Read;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .expect("set read timeout");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let read = read_test_http_chunk(stream, &mut chunk, deadline);
+            if read == 0 {
+                break raw.windows(4).position(|w| w == b"\r\n\r\n");
+            }
+            raw.extend_from_slice(&chunk[..read]);
+            if let Some(index) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break Some(index);
+            }
+        }
+        .expect("header split");
+
+        let (head, body_with_delimiter) = raw.split_at(header_end + 4);
+        let head_str = String::from_utf8_lossy(head);
+        let mut lines = head_str.split("\r\n");
+        let status: u16 = lines
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+
+        let mut headers = HashMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+
+        let mut body = body_with_delimiter.to_vec();
+        if let Some(len) = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            while body.len() < len {
+                let read = read_test_http_chunk(stream, &mut chunk, deadline);
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..read]);
+            }
+            assert_eq!(body.len(), len, "response body length mismatch");
+        } else {
+            while std::time::Instant::now() < deadline {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => body.extend_from_slice(&chunk[..read]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("read response body: {error}"),
+                }
+            }
+        }
+
+        TestHttpResponse {
+            status,
+            headers,
+            body,
+        }
+    }
+
     fn sqlite_message_count(sqlite_path: &Path) -> i64 {
         let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.display().to_string())
             .expect("open db");
@@ -29409,6 +30197,31 @@ mod tests {
         assert!(
             unit.contains("Environment=HTTP_BEARER_TOKEN=secret-token"),
             "unit must preserve configured bearer token"
+        );
+    }
+
+    #[test]
+    fn parse_systemd_environment_value_reads_plain_bearer_token() {
+        let unit = r#"
+[Service]
+Environment=HTTP_HOST=127.0.0.1
+Environment=HTTP_BEARER_TOKEN=secret-token
+"#;
+        assert_eq!(
+            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN").as_deref(),
+            Some("secret-token")
+        );
+    }
+
+    #[test]
+    fn parse_systemd_environment_value_reads_quoted_bearer_token() {
+        let unit = r#"
+[Service]
+Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
+"#;
+        assert_eq!(
+            parse_systemd_environment_value(unit, "HTTP_BEARER_TOKEN").as_deref(),
+            Some("tok&en with spaces")
         );
     }
 
@@ -33141,7 +33954,7 @@ http_headers = { Authorization = "Bearer secret" }
 
     #[test]
     fn share_preview_status_endpoint_and_hotkeys() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::{SocketAddr, TcpStream};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -33152,42 +33965,14 @@ http_headers = { Authorization = "Bearer secret" }
         ) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
             let mut stream = TcpStream::connect(addr).expect("connect");
             let req = format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+                "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n",
                 host = addr
             );
             stream.write_all(req.as_bytes()).expect("write request");
             stream.flush().expect("flush");
 
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).expect("read response");
-
-            let split = buf
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .expect("header split");
-            let (head, body) = buf.split_at(split + 4);
-
-            let head_str = String::from_utf8_lossy(head);
-            let mut lines = head_str.split("\r\n");
-            let status_line = lines.next().unwrap_or_default();
-            let code: u16 = status_line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-
-            let mut headers = std::collections::HashMap::new();
-            for line in lines {
-                if line.is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = line.split_once(':') {
-                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-                }
-            }
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            (code, headers, body.to_vec())
+            let response = read_test_http_response(&mut stream);
+            (response.status, response.headers, response.body)
         }
 
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -33297,7 +34082,7 @@ http_headers = { Authorization = "Bearer secret" }
     #[test]
     #[cfg(unix)]
     fn share_preview_does_not_serve_symlink_escape() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::{SocketAddr, TcpStream};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -33305,33 +34090,14 @@ http_headers = { Authorization = "Bearer secret" }
         fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
             let mut stream = TcpStream::connect(addr).expect("connect");
             let req = format!(
-                "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+                "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n",
                 host = addr
             );
             stream.write_all(req.as_bytes()).expect("write request");
             stream.flush().expect("flush");
 
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).expect("read response");
-
-            let split = buf
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .expect("header split");
-            let (head, body) = buf.split_at(split + 4);
-
-            let head_str = String::from_utf8_lossy(head);
-            let code: u16 = head_str
-                .split("\r\n")
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            (code, body.to_vec())
+            let response = read_test_http_response(&mut stream);
+            (response.status, response.body)
         }
 
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -59513,6 +60279,386 @@ fn parse_jsonrpc_error(payload: &serde_json::Value) -> Option<String> {
     })
 }
 
+#[derive(Debug)]
+struct BlockingHttpUrl {
+    host: String,
+    port: u16,
+    host_header: String,
+    request_target: String,
+}
+
+#[derive(Debug)]
+struct BlockingHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+const JSONRPC_BLOCKING_MAX_HEADER_BYTES: usize = 64 * 1024;
+const JSONRPC_BLOCKING_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn parse_blocking_http_port(port_text: &str, authority: &str) -> CliResult<u16> {
+    port_text.parse::<u16>().map_err(|error| {
+        CliError::Other(format!(
+            "invalid HTTP port in JSON-RPC URL authority '{authority}': {error}"
+        ))
+    })
+}
+
+fn parse_blocking_http_authority(authority: &str) -> CliResult<(String, u16, String)> {
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err(CliError::Other(format!(
+            "invalid HTTP authority in JSON-RPC URL: '{authority}'"
+        )));
+    }
+
+    if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return Err(CliError::Other(format!(
+                "invalid bracketed IPv6 authority in JSON-RPC URL: '{authority}'"
+            )));
+        };
+        let host = &authority[1..end];
+        let rest = &authority[end + 1..];
+        let port = if rest.is_empty() {
+            80
+        } else if let Some(port_text) = rest.strip_prefix(':') {
+            parse_blocking_http_port(port_text, authority)?
+        } else {
+            return Err(CliError::Other(format!(
+                "invalid bracketed IPv6 authority in JSON-RPC URL: '{authority}'"
+            )));
+        };
+        let host_header = if rest.is_empty() {
+            format!("[{host}]")
+        } else {
+            authority.to_string()
+        };
+        return Ok((host.to_string(), port, host_header));
+    }
+
+    if let Some((host, port_text)) = authority.rsplit_once(':') {
+        if !host.contains(':')
+            && !port_text.is_empty()
+            && port_text.bytes().all(|b| b.is_ascii_digit())
+        {
+            let port = parse_blocking_http_port(port_text, authority)?;
+            return Ok((host.to_string(), port, authority.to_string()));
+        }
+        return Err(CliError::Other(format!(
+            "invalid HTTP authority in JSON-RPC URL: '{authority}'"
+        )));
+    }
+
+    Ok((authority.to_string(), 80, authority.to_string()))
+}
+
+fn parse_blocking_http_url(raw: &str) -> CliResult<Option<BlockingHttpUrl>> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("https://") {
+        return Ok(None);
+    }
+    let Some(remainder) = trimmed.strip_prefix("http://") else {
+        return Err(CliError::Other(format!(
+            "unsupported JSON-RPC URL scheme for {trimmed}"
+        )));
+    };
+
+    let without_fragment = remainder
+        .split_once('#')
+        .map_or(remainder, |(prefix, _)| prefix);
+    let authority_end = without_fragment
+        .find(['/', '?'])
+        .unwrap_or(without_fragment.len());
+    let authority = &without_fragment[..authority_end];
+    let raw_target = &without_fragment[authority_end..];
+    let request_target = if raw_target.is_empty() {
+        "/".to_string()
+    } else if raw_target.starts_with('/') {
+        raw_target.to_string()
+    } else {
+        format!("/{raw_target}")
+    };
+    let (host, port, host_header) = parse_blocking_http_authority(authority)?;
+
+    Ok(Some(BlockingHttpUrl {
+        host,
+        port,
+        host_header,
+        request_target,
+    }))
+}
+
+fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn parse_http_status(status_line: &str, server_url: &str) -> CliResult<u16> {
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "malformed HTTP response from {server_url}: missing status code"
+            ))
+        })?
+        .parse::<u16>()
+        .map_err(|error| {
+            CliError::Other(format!(
+                "malformed HTTP response from {server_url}: invalid status code: {error}"
+            ))
+        })
+}
+
+fn read_http_body_bytes(
+    stream: &mut std::net::TcpStream,
+    server_url: &str,
+    body: &mut Vec<u8>,
+    content_length: usize,
+) -> CliResult<()> {
+    if content_length > JSONRPC_BLOCKING_MAX_BODY_BYTES {
+        return Err(CliError::Other(format!(
+            "response body from {server_url} exceeds {} byte limit",
+            JSONRPC_BLOCKING_MAX_BODY_BYTES
+        )));
+    }
+
+    let mut chunk = [0_u8; 8192];
+    while body.len() < content_length {
+        let read = std::io::Read::read(stream, &mut chunk).map_err(|error| {
+            CliError::Other(format!("transport failure calling {server_url}: {error}"))
+        })?;
+        if read == 0 {
+            return Err(CliError::Other(format!(
+                "truncated HTTP response from {server_url}: expected {content_length} body bytes, got {}",
+                body.len()
+            )));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_blocking_http_response(
+    stream: &mut std::net::TcpStream,
+    server_url: &str,
+) -> CliResult<BlockingHttpResponse> {
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let header_end = loop {
+        let read = std::io::Read::read(stream, &mut chunk).map_err(|error| {
+            CliError::Other(format!("transport failure calling {server_url}: {error}"))
+        })?;
+        if read == 0 {
+            break find_http_header_end(&raw);
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        if raw.len() > JSONRPC_BLOCKING_MAX_HEADER_BYTES {
+            return Err(CliError::Other(format!(
+                "HTTP response headers from {server_url} exceed {} byte limit",
+                JSONRPC_BLOCKING_MAX_HEADER_BYTES
+            )));
+        }
+        if let Some(index) = find_http_header_end(&raw) {
+            break Some(index);
+        }
+    }
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "malformed HTTP response from {server_url}: missing header terminator"
+        ))
+    })?;
+
+    let head = std::str::from_utf8(&raw[..header_end]).map_err(|error| {
+        CliError::Other(format!(
+            "malformed HTTP response from {server_url}: non-UTF-8 headers: {error}"
+        ))
+    })?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let status = parse_http_status(status_line, server_url)?;
+
+    let mut content_length = None;
+    let mut transfer_encoding = String::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.parse::<usize>().map_err(|error| {
+                    CliError::Other(format!(
+                        "malformed HTTP response from {server_url}: invalid Content-Length: {error}"
+                    ))
+                })?);
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                transfer_encoding = value.to_ascii_lowercase();
+            }
+        }
+    }
+
+    if transfer_encoding.contains("chunked") && content_length.is_none() {
+        return Err(CliError::Other(format!(
+            "unsupported chunked JSON-RPC response from {server_url}"
+        )));
+    }
+
+    let mut body = raw[header_end..].to_vec();
+    if let Some(length) = content_length {
+        read_http_body_bytes(stream, server_url, &mut body, length)?;
+    } else {
+        std::io::Read::read_to_end(stream, &mut body).map_err(|error| {
+            CliError::Other(format!("transport failure calling {server_url}: {error}"))
+        })?;
+        if body.len() > JSONRPC_BLOCKING_MAX_BODY_BYTES {
+            return Err(CliError::Other(format!(
+                "response body from {server_url} exceeds {} byte limit",
+                JSONRPC_BLOCKING_MAX_BODY_BYTES
+            )));
+        }
+    }
+
+    Ok(BlockingHttpResponse { status, body })
+}
+
+fn connect_blocking_http(
+    target: &BlockingHttpUrl,
+    timeout: std::time::Duration,
+    server_url: &str,
+) -> CliResult<std::net::TcpStream> {
+    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(target.host.as_str(), target.port))
+        .map_err(|error| {
+            CliError::Other(format!("transport failure calling {server_url}: {error}"))
+        })?;
+    let mut last_error = None;
+    for addr in addrs {
+        match std::net::TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(CliError::Other(format!(
+        "transport failure calling {server_url}: {}",
+        last_error.map_or_else(
+            || "no socket addresses resolved".to_string(),
+            |error| error.to_string()
+        )
+    )))
+}
+
+fn post_jsonrpc_request_blocking_http(
+    server_url: &str,
+    bearer: Option<&str>,
+    payload: &serde_json::Value,
+    timeout_seconds: u64,
+) -> CliResult<Option<BlockingHttpResponse>> {
+    let Some(target) = parse_blocking_http_url(server_url)? else {
+        return Ok(None);
+    };
+    let body = serde_json::to_vec(payload)
+        .map_err(|error| CliError::Other(format!("failed to encode JSON-RPC request: {error}")))?;
+    let timeout = std::time::Duration::from_secs(timeout_seconds.max(1));
+    let mut stream = connect_blocking_http(&target, timeout, server_url)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let authorization = if let Some(token) = bearer.filter(|value| !value.is_empty()) {
+        if token.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+            return Err(CliError::InvalidArgument(
+                "bearer token must not contain newlines".to_string(),
+            ));
+        }
+        format!("Authorization: Bearer {token}\r\n")
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+        target.request_target,
+        target.host_header,
+        body.len(),
+        authorization
+    );
+    std::io::Write::write_all(&mut stream, head.as_bytes()).map_err(|error| {
+        CliError::Other(format!("transport failure calling {server_url}: {error}"))
+    })?;
+    std::io::Write::write_all(&mut stream, &body).map_err(|error| {
+        CliError::Other(format!("transport failure calling {server_url}: {error}"))
+    })?;
+    std::io::Write::flush(&mut stream).map_err(|error| {
+        CliError::Other(format!("transport failure calling {server_url}: {error}"))
+    })?;
+
+    Ok(Some(read_blocking_http_response(&mut stream, server_url)?))
+}
+
+fn get_blocking_http_request(
+    server_url: &str,
+    timeout_seconds: u64,
+) -> CliResult<Option<BlockingHttpResponse>> {
+    let Some(target) = parse_blocking_http_url(server_url)? else {
+        return Ok(None);
+    };
+    let timeout = std::time::Duration::from_secs(timeout_seconds.max(1));
+    let mut stream = connect_blocking_http(&target, timeout, server_url)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        target.request_target, target.host_header
+    );
+    std::io::Write::write_all(&mut stream, head.as_bytes()).map_err(|error| {
+        CliError::Other(format!("transport failure calling {server_url}: {error}"))
+    })?;
+    std::io::Write::flush(&mut stream).map_err(|error| {
+        CliError::Other(format!("transport failure calling {server_url}: {error}"))
+    })?;
+
+    Ok(Some(read_blocking_http_response(&mut stream, server_url)?))
+}
+
+fn decode_jsonrpc_http_response(
+    server_url: &str,
+    status: u16,
+    body: &[u8],
+) -> CliResult<serde_json::Value> {
+    if matches!(status, 401 | 403 | 429)
+        && let Ok(payload) = serde_json::from_slice::<serde_json::Value>(body)
+        && payload.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+        && payload.get("error").is_some()
+    {
+        return Ok(payload);
+    }
+
+    if status == 401 || status == 403 {
+        return Err(CliError::Other(format!(
+            "authentication failed (HTTP {status}) while calling {server_url}; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
+        )));
+    }
+    if status != 200 {
+        return Err(CliError::Other(format!(
+            "unexpected HTTP status {status} from {server_url}"
+        )));
+    }
+
+    serde_json::from_slice(body).map_err(|error| {
+        CliError::Other(format!(
+            "invalid JSON in server response from {server_url}: {error}"
+        ))
+    })
+}
+
 async fn post_jsonrpc_request(
     server_url: &str,
     bearer: Option<&str>,
@@ -59522,6 +60668,12 @@ async fn post_jsonrpc_request(
     use asupersync::http::h1::Method;
     use asupersync::time::{timeout, wall_now};
     use std::time::Duration;
+
+    if let Some(response) =
+        post_jsonrpc_request_blocking_http(server_url, bearer, payload, timeout_seconds)?
+    {
+        return decode_jsonrpc_http_response(server_url, response.status, &response.body);
+    }
 
     let body = serde_json::to_vec(payload)
         .map_err(|e| CliError::Other(format!("failed to encode JSON-RPC request: {e}")))?;
@@ -59547,24 +60699,7 @@ async fn post_jsonrpc_request(
         }
     };
 
-    if response.status == 401 || response.status == 403 {
-        return Err(CliError::Other(format!(
-            "authentication failed (HTTP {}) while calling {server_url}; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN",
-            response.status
-        )));
-    }
-    if response.status != 200 {
-        return Err(CliError::Other(format!(
-            "unexpected HTTP status {} from {server_url}",
-            response.status
-        )));
-    }
-
-    serde_json::from_slice(&response.body).map_err(|e| {
-        CliError::Other(format!(
-            "invalid JSON in server response from {server_url}: {e}"
-        ))
-    })
+    decode_jsonrpc_http_response(server_url, response.status, &response.body)
 }
 
 fn normalize_fetch_inbox_rows(result_payload: serde_json::Value) -> Option<Vec<serde_json::Value>> {
@@ -62890,7 +64025,47 @@ fn preview_log_line(log: &Option<PreviewLog>, line: &str) {
     let _ = writeln!(file, "{line}");
 }
 
-fn apply_preview_no_cache_headers(resp: &mut asupersync::http::h1::types::Response) {
+struct PreviewHttpRequest {
+    method: String,
+    uri: String,
+    host: Option<String>,
+}
+
+struct PreviewHttpResponse {
+    status: u16,
+    reason: &'static str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl PreviewHttpResponse {
+    fn new(status: u16, reason: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            reason,
+            headers: Vec::new(),
+            body,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PreviewShutdownSignal {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake_addr: std::net::SocketAddr,
+}
+
+impl PreviewShutdownSignal {
+    fn begin_drain(&self, _grace: std::time::Duration) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = std::net::TcpStream::connect_timeout(
+            &self.wake_addr,
+            std::time::Duration::from_millis(100),
+        );
+    }
+}
+
+fn apply_preview_no_cache_headers(resp: &mut PreviewHttpResponse) {
     resp.headers.push((
         "Cache-Control".to_string(),
         "no-store, no-cache, must-revalidate".to_string(),
@@ -62921,9 +64096,248 @@ fn push_unique_preview_host(hosts: &mut Vec<String>, host: String) {
     }
 }
 
+fn normalize_preview_request_host(host: &str) -> String {
+    let trimmed = host.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((inside, _tail)) = rest.split_once(']')
+    {
+        return inside.to_ascii_lowercase();
+    }
+
+    if trimmed.matches(':').count() == 1
+        && let Some((host_part, port_part)) = trimmed.rsplit_once(':')
+        && port_part.parse::<u16>().is_ok()
+    {
+        return host_part.to_ascii_lowercase();
+    }
+
+    trimmed.trim_matches(['[', ']']).to_ascii_lowercase()
+}
+
+fn preview_host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
+    let Some(host) = host else {
+        return true;
+    };
+    let normalized = normalize_preview_request_host(host);
+    allowed_hosts.iter().any(|allowed| allowed == &normalized)
+}
+
+fn read_preview_http_request(
+    stream: &mut std::net::TcpStream,
+) -> Result<PreviewHttpRequest, String> {
+    use std::io::Read;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .map_err(|e| format!("failed to set read timeout: {e}"))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return Err("connection closed before request headers".to_string());
+            }
+            Ok(read) => {
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if raw.len() > 64 * 1024 {
+                    return Err("request headers exceeded 64 KiB".to_string());
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("failed to read request: {error}")),
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out reading request headers".to_string());
+        }
+    }
+
+    let text = String::from_utf8_lossy(&raw);
+    let mut lines = text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "missing request method".to_string())?
+        .to_string();
+    let uri = parts
+        .next()
+        .ok_or_else(|| "missing request URI".to_string())?
+        .to_string();
+
+    let mut host = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("host")
+        {
+            host = Some(value.trim().to_string());
+        }
+    }
+
+    Ok(PreviewHttpRequest { method, uri, host })
+}
+
+fn preview_request_path(uri: &str) -> &str {
+    let path = if let Some(rest) = uri.strip_prefix("http://") {
+        rest.split_once('/').map_or("/", |(_, path)| path)
+    } else if let Some(rest) = uri.strip_prefix("https://") {
+        rest.split_once('/').map_or("/", |(_, path)| path)
+    } else {
+        uri
+    };
+    path.split('?').next().unwrap_or("/")
+}
+
+fn build_preview_response(
+    dir: &Path,
+    log: &Option<PreviewLog>,
+    allowed_hosts: &[String],
+    req: &PreviewHttpRequest,
+) -> PreviewHttpResponse {
+    let path = preview_request_path(&req.uri);
+    preview_log_line(log, &format!("{} {path}", req.method));
+
+    if !preview_host_allowed(req.host.as_deref(), allowed_hosts) {
+        let mut resp = PreviewHttpResponse::new(403, "Forbidden", b"Forbidden".to_vec());
+        apply_preview_no_cache_headers(&mut resp);
+        return resp;
+    }
+
+    if !req.method.eq_ignore_ascii_case("GET") && !req.method.eq_ignore_ascii_case("HEAD") {
+        let mut resp =
+            PreviewHttpResponse::new(405, "Method Not Allowed", b"Method Not Allowed".to_vec());
+        apply_preview_no_cache_headers(&mut resp);
+        return resp;
+    }
+
+    if path == "/__preview__/status" {
+        let payload = collect_preview_status(dir);
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        let mut resp = PreviewHttpResponse::new(200, "OK", body);
+        resp.headers
+            .push(("Content-Type".to_string(), "application/json".to_string()));
+        apply_preview_no_cache_headers(&mut resp);
+        return resp;
+    }
+
+    if path == "/favicon.ico" || path.ends_with(".map") || path.starts_with("/.well-known/") {
+        let mut resp = PreviewHttpResponse::new(204, "No Content", Vec::new());
+        apply_preview_no_cache_headers(&mut resp);
+        return resp;
+    }
+
+    let relative = path.trim_start_matches('/');
+    if relative.split('/').any(|seg| seg == "..") {
+        let mut resp = PreviewHttpResponse::new(404, "Not Found", b"Not Found".to_vec());
+        apply_preview_no_cache_headers(&mut resp);
+        return resp;
+    }
+
+    let mut file_path = if relative.is_empty() {
+        dir.join("index.html")
+    } else {
+        dir.join(relative)
+    };
+    if file_path.is_dir() {
+        file_path = file_path.join("index.html");
+    }
+
+    let resolved = file_path.canonicalize().ok();
+    let within_root = resolved.as_ref().is_some_and(|p| p.starts_with(dir));
+    let mut resp = if within_root && resolved.as_ref().is_some_and(|p| p.is_file()) {
+        let resolved = resolved.as_ref().expect("within_root guarantees Some");
+        match std::fs::read(resolved) {
+            Ok(content) => {
+                let ct = guess_content_type(resolved);
+                let mut resp = PreviewHttpResponse::new(200, "OK", content);
+                resp.headers
+                    .push(("Content-Type".to_string(), ct.to_string()));
+                resp
+            }
+            Err(_) => PreviewHttpResponse::new(500, "Internal Server Error", Vec::new()),
+        }
+    } else {
+        PreviewHttpResponse::new(404, "Not Found", b"Not Found".to_vec())
+    };
+    apply_preview_no_cache_headers(&mut resp);
+    resp
+}
+
+fn write_preview_http_response(
+    stream: &mut std::net::TcpStream,
+    mut resp: PreviewHttpResponse,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    if !resp
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        resp.headers
+            .push(("Content-Length".to_string(), resp.body.len().to_string()));
+    }
+    if !resp
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        resp.headers
+            .push(("Connection".to_string(), "close".to_string()));
+    }
+
+    let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
+    for (name, value) in resp.headers {
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| format!("failed to set write timeout: {e}"))?;
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(&resp.body))
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("failed to write response: {e}"))
+}
+
+fn handle_preview_connection(
+    mut stream: std::net::TcpStream,
+    dir: &Path,
+    log: &Option<PreviewLog>,
+    allowed_hosts: &[String],
+) -> Result<(), String> {
+    let req = read_preview_http_request(&mut stream)?;
+    let resp = build_preview_response(dir, log, allowed_hosts, &req);
+    write_preview_http_response(&mut stream, resp)
+}
+
 struct PreviewServerHandle {
     addr: std::net::SocketAddr,
-    shutdown: asupersync::server::shutdown::ShutdownSignal,
+    shutdown: PreviewShutdownSignal,
     join: std::thread::JoinHandle<Result<(), String>>,
 }
 
@@ -62933,171 +64347,50 @@ fn start_preview_server(
     port: u16,
     log: Option<PreviewLog>,
 ) -> CliResult<PreviewServerHandle> {
-    use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
-    use asupersync::http::h1::server::{HostPolicy, Http1Config};
-    use asupersync::http::h1::types::Response;
-    use asupersync::runtime::RuntimeBuilder;
-    use std::sync::mpsc;
-
     // Avoid serving files outside the preview root via symlink escape.
     let base_dir = dir.canonicalize().unwrap_or(dir);
 
-    let socket_addr = resolve_socket_bind_addr(&host, port)
+    let listener = bind_tcp_listener(&host, port)
+        .map_err(|e| CliError::Other(format!("failed to bind preview listener: {e}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| CliError::Other(format!("failed to set nonblocking listener: {e}")))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| CliError::Other(format!("failed to read local addr: {e}")))?;
+    let wake_addr = resolve_socket_bind_addr(&host, local_addr.port())
         .map_err(|e| CliError::InvalidArgument(format!("invalid address: {e}")))?;
 
-    let (ready_tx, ready_rx) = mpsc::channel::<
-        Result<
-            (
-                std::net::SocketAddr,
-                asupersync::server::shutdown::ShutdownSignal,
-            ),
-            String,
-        >,
-    >();
-
     let allowed_hosts = preview_allowed_hosts(&host);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = PreviewShutdownSignal {
+        stop: stop.clone(),
+        wake_addr,
+    };
     let join = std::thread::spawn(move || {
-        let runtime = match RuntimeBuilder::current_thread().build() {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                let msg = format!("failed to build runtime: {e}");
-                let _ = ready_tx.send(Err(msg.clone()));
-                return Err(msg);
-            }
-        };
-        let handle = runtime.handle();
-        runtime.block_on(async move {
-            let dir = base_dir.clone();
-            let log = log.clone();
-            let listener_config = Http1ListenerConfig::default().http_config(
-                Http1Config::default().host_policy(HostPolicy::allow_list(allowed_hosts)),
-            );
-            let listener = match Http1Listener::bind_with_config(
-                socket_addr,
-                move |req| {
-                    let dir = dir.clone();
-                    let log = log.clone();
-                    async move {
-                        let uri = &req.uri;
-                        let path = uri.split('?').next().unwrap_or("/");
-                        preview_log_line(&log, &format!("GET {path}"));
-
-                        if path == "/__preview__/status" {
-                            let payload = collect_preview_status(&dir);
-                            let body = serde_json::to_vec(&payload).unwrap_or_default();
-                            let mut resp = Response::new(200, "OK", body);
-                            let len = resp.body.len();
-                            resp.headers
-                                .push(("Content-Type".to_string(), "application/json".to_string()));
-                            resp.headers
-                                .push(("Content-Length".to_string(), len.to_string()));
-                            apply_preview_no_cache_headers(&mut resp);
-                            return resp;
-                        }
-
-                        if path == "/favicon.ico"
-                            || path.ends_with(".map")
-                            || path.starts_with("/.well-known/")
-                        {
-                            let mut resp = Response::new(204, "No Content", Vec::new());
-                            resp.headers
-                                .push(("Content-Length".to_string(), "0".to_string()));
-                            apply_preview_no_cache_headers(&mut resp);
-                            return resp;
-                        }
-
-                        let relative = path.trim_start_matches('/');
-                        if relative.split('/').any(|seg| seg == "..") {
-                            let mut resp = Response::new(404, "Not Found", b"Not Found".to_vec());
-                            resp.headers
-                                .push(("Content-Length".to_string(), resp.body.len().to_string()));
-                            apply_preview_no_cache_headers(&mut resp);
-                            return resp;
-                        }
-
-                        let mut file_path = if relative.is_empty() {
-                            dir.join("index.html")
-                        } else {
-                            dir.join(relative)
-                        };
-                        if file_path.is_dir() {
-                            file_path = file_path.join("index.html");
-                        }
-
-                        let resolved = file_path.canonicalize().ok();
-                        let within_root = resolved.as_ref().is_some_and(|p| p.starts_with(&dir));
-                        let mut resp = if within_root
-                            && resolved.as_ref().is_some_and(|p| p.is_file())
-                        {
-                            let resolved = resolved.as_ref().expect("within_root guarantees Some");
-                            match std::fs::read(resolved) {
-                                Ok(content) => {
-                                    let ct = guess_content_type(resolved);
-                                    let mut resp = Response::new(200, "OK", content);
-                                    resp.headers
-                                        .push(("Content-Type".to_string(), ct.to_string()));
-                                    resp.headers.push((
-                                        "Content-Length".to_string(),
-                                        resp.body.len().to_string(),
-                                    ));
-                                    resp
-                                }
-                                Err(_) => {
-                                    let mut resp =
-                                        Response::new(500, "Internal Server Error", Vec::new());
-                                    resp.headers
-                                        .push(("Content-Length".to_string(), "0".to_string()));
-                                    resp
-                                }
-                            }
-                        } else {
-                            let mut resp = Response::new(404, "Not Found", b"Not Found".to_vec());
-                            resp.headers
-                                .push(("Content-Length".to_string(), resp.body.len().to_string()));
-                            resp
-                        };
-                        apply_preview_no_cache_headers(&mut resp);
-                        resp
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
                     }
-                },
-                listener_config,
-            )
-            .await
-            {
-                Ok(listener) => listener,
-                Err(e) => {
-                    let msg = format!("failed to bind HTTP listener: {e}");
-                    let _ = ready_tx.send(Err(msg.clone()));
-                    return Err(msg);
+                    if let Err(error) =
+                        handle_preview_connection(stream, &base_dir, &log, &allowed_hosts)
+                    {
+                        preview_log_line(&log, &format!("request error: {error}"));
+                    }
                 }
-            };
-
-            let shutdown = listener.shutdown_signal();
-            let local_addr = match listener.local_addr() {
-                Ok(addr) => addr,
-                Err(e) => {
-                    let msg = format!("failed to read local addr: {e}");
-                    let _ = ready_tx.send(Err(msg.clone()));
-                    return Err(msg);
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-            };
-            let _ = ready_tx.send(Ok((local_addr, shutdown.clone())));
-
-            listener
-                .run(&handle)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("listener run error: {e}"))
-        })
+                Err(error) => return Err(format!("listener accept error: {error}")),
+            }
+        }
+        Ok(())
     });
 
-    let (addr, shutdown) = ready_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .map_err(|e| CliError::Other(format!("preview server failed to start: {e}")))?
-        .map_err(CliError::Other)?;
-
     Ok(PreviewServerHandle {
-        addr,
+        addr: local_addr,
         shutdown,
         join,
     })
@@ -63239,7 +64532,7 @@ fn run_share_preview_with_control(
     }
 
     ftui_runtime::ftui_println!("Stopping preview server...");
-    let _ = server
+    server
         .shutdown
         .begin_drain(std::time::Duration::from_secs(2));
     let _ = server.join.join();

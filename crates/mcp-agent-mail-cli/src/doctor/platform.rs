@@ -110,7 +110,10 @@ pub(crate) fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{} is a reparse point (symlink/junction); refusing", path.display()),
+                format!(
+                    "{} is a reparse point (symlink/junction); refusing",
+                    path.display()
+                ),
             ));
         }
     }
@@ -171,7 +174,10 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     let resolved = link
         .parent()
         .map_or_else(|| target.to_path_buf(), |p| p.join(target));
-    if std::fs::metadata(&resolved).map(|m| m.is_dir()).unwrap_or(false) {
+    if std::fs::metadata(&resolved)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         std::os::windows::fs::symlink_dir(target, link)
     } else {
         std::os::windows::fs::symlink_file(target, link)
@@ -182,6 +188,7 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// where the doctor never encounters POSIX FIFOs in a mailbox archive.
 #[cfg(unix)]
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn is_fifo(meta: &Metadata) -> bool {
     use std::os::unix::fs::FileTypeExt;
     meta.file_type().is_fifo()
@@ -189,6 +196,7 @@ pub(crate) fn is_fifo(meta: &Metadata) -> bool {
 
 #[cfg(not(unix))]
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn is_fifo(_meta: &Metadata) -> bool {
     false
 }

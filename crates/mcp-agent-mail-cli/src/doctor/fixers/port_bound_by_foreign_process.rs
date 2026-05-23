@@ -70,7 +70,9 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError};
 use serde::Serialize;
-use std::net::{TcpListener, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 pub const FM_ID: &str = "fm-runtime-processes-port-bound-by-foreign-process";
 const FM_SEVERITY: &str = "P0";
@@ -180,6 +182,69 @@ pub struct DetectInputs {
     pub port: u16,
 }
 
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn health_probe_connect_host(host: &str) -> &str {
+    match host {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        _ => host,
+    }
+}
+
+fn health_probe_host_header(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn agent_mail_health_probe(host: &str, port: u16) -> bool {
+    let connect_host = health_probe_connect_host(host);
+    let Ok(addrs) = (connect_host, port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs.take(4) {
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, HEALTH_PROBE_TIMEOUT) else {
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(HEALTH_PROBE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(HEALTH_PROBE_TIMEOUT));
+        let request = format!(
+            "GET /health/liveness HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            health_probe_host_header(connect_host, port),
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            continue;
+        }
+        let _ = stream.shutdown(Shutdown::Write);
+
+        let mut response = Vec::with_capacity(512);
+        let mut buf = [0_u8; 512];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.len() >= 4096 {
+                        break;
+                    }
+                    if response.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let lower = String::from_utf8_lossy(&response).to_ascii_lowercase();
+        if lower.starts_with("http/1.1 200") && lower.contains("\r\nx-agent-mail-health: 1") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detector. PURE w.r.t. inputs; performs a transient TCP bind
 /// probe but immediately drops the listener if it succeeds — no
 /// state is left behind.
@@ -191,6 +256,10 @@ pub fn detect(inputs: &DetectInputs) -> Vec<PortBoundByForeignProcessFinding> {
     // `(&str, u16).to_socket_addrs()` instead — it returns an
     // iterator of resolved addresses and handles IPv4, IPv6, and
     // host-name resolution correctly.
+    if agent_mail_health_probe(&inputs.host, inputs.port) {
+        return Vec::new();
+    }
+
     let mut addrs = match (inputs.host.as_str(), inputs.port).to_socket_addrs() {
         Ok(it) => it,
         Err(_) => return Vec::new(), // malformed host — different FM
@@ -233,6 +302,7 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     /// Bind to an OS-assigned ephemeral port, then return that
     /// port number plus a held listener. The listener stays
@@ -243,6 +313,27 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         (listener, port)
+    }
+
+    fn spawn_probe_server(include_agent_mail_header: bool) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 512];
+            let _ = stream.read(&mut buf);
+            let header = if include_agent_mail_header {
+                "x-agent-mail-health: 1\r\n"
+            } else {
+                "server: other\r\n"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n{header}content-length: 18\r\n\r\n{{\"status\":\"alive\"}}"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+        port
     }
 
     #[test]
@@ -269,6 +360,31 @@ mod tests {
         assert_eq!(findings[0].reason, Reason::AddrInUse);
         assert_eq!(findings[0].port, port);
         // _held drops here, releasing the port.
+    }
+
+    #[test]
+    fn detector_ignores_live_agent_mail_health_endpoint() {
+        let port = spawn_probe_server(true);
+        let inputs = DetectInputs {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        assert!(
+            detect(&inputs).is_empty(),
+            "healthy Agent Mail listener should not be reported as foreign",
+        );
+    }
+
+    #[test]
+    fn detector_still_flags_non_agent_mail_listener() {
+        let port = spawn_probe_server(false);
+        let inputs = DetectInputs {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let findings = detect(&inputs);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].reason, Reason::AddrInUse);
     }
 
     #[test]
