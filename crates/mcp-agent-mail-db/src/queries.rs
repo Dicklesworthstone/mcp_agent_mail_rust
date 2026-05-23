@@ -15,7 +15,6 @@ use crate::models::{
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
-use asupersync::time::{sleep, wall_now};
 use asupersync::{CancelReason, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
@@ -1516,7 +1515,7 @@ async fn durability_probe_query(
                     error = %e,
                     "durability probe hit transient busy, retrying"
                 );
-                durability_probe_backoff(attempt).await;
+                durability_probe_backoff(attempt);
             }
             _ => return out,
         }
@@ -1537,7 +1536,7 @@ fn is_probe_transient_busy(e: &DbError) -> bool {
 /// Exponential backoff for durability probe retries.
 ///
 /// Base: 25 ms, max: 200 ms (lightweight — probes should unblock quickly).
-async fn durability_probe_backoff(attempt: u32) {
+fn durability_probe_backoff(attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
@@ -1545,7 +1544,7 @@ async fn durability_probe_backoff(attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    let () = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
+    std::thread::sleep(config.delay_for_attempt(attempt));
 }
 
 /// Fetch an agent row directly from `SQLite` after commit to verify durability.
@@ -3430,7 +3429,7 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 /// `snapshot_high` permanently lags behind `commit_seq`.  Callers achieve
 /// this by placing `begin_concurrent_tx` inside the closure passed here.
 async fn run_with_mvcc_retry<T, F, Fut>(
-    cx: &Cx,
+    _cx: &Cx,
     operation: &'static str,
     mut op: F,
 ) -> Outcome<T, DbError>
@@ -3450,7 +3449,7 @@ where
                     operation,
                     "MVCC write conflict, retrying whole transaction"
                 );
-                mvcc_backoff(cx, attempt).await;
+                mvcc_backoff(attempt);
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) && attempt < max => {
                 tracing::warn!(
@@ -3460,7 +3459,7 @@ where
                     operation,
                     "SQLite write contention, retrying whole transaction"
                 );
-                mvcc_backoff(cx, attempt).await;
+                mvcc_backoff(attempt);
             }
             Outcome::Err(e) if is_mvcc_error(&e) => {
                 MVCC_EXHAUSTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3503,7 +3502,7 @@ where
 /// concurrent writers with ~4s each to all settle (see #98). The 3s
 /// ceiling (raised from 2s) lets later retries outlast the tail of WAL
 /// checkpoint stalls that occasionally stretch to 1-2s on busy disks.
-async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
+fn mvcc_backoff(attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
@@ -3511,7 +3510,7 @@ async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
         use_circuit_breaker: false,
         ..Default::default()
     };
-    let () = sleep(wall_now(), config.delay_for_attempt(attempt)).await;
+    std::thread::sleep(config.delay_for_attempt(attempt));
 }
 
 /// Snapshot of MVCC retry metrics for health/diagnostics.

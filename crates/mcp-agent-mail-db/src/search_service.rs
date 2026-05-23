@@ -2068,7 +2068,7 @@ fn build_two_tier_indexing_health(bridge: &TwoTierBridge) -> TwoTierIndexingHeal
     }
 }
 
-#[cfg(feature = "hybrid")]
+#[cfg(all(feature = "hybrid", test))]
 fn build_two_tier_indexing_health_from_context() -> TwoTierIndexingHealth {
     let ctx = get_two_tier_context();
     let config = ctx.config();
@@ -2087,12 +2087,28 @@ fn build_two_tier_indexing_health_from_context() -> TwoTierIndexingHealth {
     }
 }
 
+#[cfg(feature = "hybrid")]
+fn build_uninitialized_two_tier_indexing_health() -> TwoTierIndexingHealth {
+    let config = TwoTierConfig::default();
+
+    TwoTierIndexingHealth {
+        availability: "not-initialized".to_string(),
+        total_docs: 0,
+        quality_doc_count: 0,
+        quality_coverage_ratio: 0.0,
+        quality_coverage_percent: 0.0,
+        fast_dimension: config.fast_dimension,
+        quality_dimension: config.quality_dimension,
+        metrics: TwoTierMetrics::default().snapshot(),
+    }
+}
+
 /// Snapshot current two-tier index health, including quality coverage.
 #[cfg(feature = "hybrid")]
 #[must_use]
 pub fn two_tier_indexing_health() -> Option<TwoTierIndexingHealth> {
     Some(
-        get_two_tier_bridge().map_or_else(build_two_tier_indexing_health_from_context, |bridge| {
+        get_two_tier_bridge().map_or_else(build_uninitialized_two_tier_indexing_health, |bridge| {
             build_two_tier_indexing_health(&bridge)
         }),
     )
@@ -7369,6 +7385,27 @@ mod tests {
 
         let bridge = SemanticBridge::default_config();
         assert_eq!(bridge.index().config().dimension, expected_dimension);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn two_tier_indexing_health_uninitialized_snapshot_is_lightweight() {
+        let health = build_uninitialized_two_tier_indexing_health();
+
+        assert_eq!(health.availability, "not-initialized");
+        assert_eq!(health.total_docs, 0);
+        assert_eq!(health.quality_doc_count, 0);
+        assert!(health.quality_coverage_ratio.abs() < f32::EPSILON);
+        assert!(health.quality_coverage_percent.abs() < f32::EPSILON);
+        assert_eq!(
+            health.fast_dimension,
+            TwoTierConfig::default().fast_dimension
+        );
+        assert_eq!(
+            health.quality_dimension,
+            TwoTierConfig::default().quality_dimension
+        );
+        assert!(health.metrics.init.is_none());
     }
 
     #[cfg(feature = "hybrid")]

@@ -5793,8 +5793,10 @@ pub fn read_only_intent_is_active() -> bool {
 }
 
 /// RAII guard that marks the current thread as executing a read-only DB
-/// operation. While at least one guard is alive the mailbox-ownership refusal
-/// and the archive-reconcile reconstruction path are bypassed in
+/// operation.
+///
+/// While at least one guard is alive the mailbox-ownership refusal and the
+/// archive-reconcile reconstruction path are bypassed in
 /// `ensure_sqlite_file_healthy_with_archive` and
 /// `reconcile_archive_state_before_init`.
 ///
@@ -7527,6 +7529,21 @@ mod tests {
         }
     }
 
+    fn write_id_floor_canonical_message(storage_root: &Path, project: &str, id: i64) {
+        let dir = storage_root
+            .join("projects")
+            .join(project)
+            .join("messages")
+            .join("2026")
+            .join("05");
+        std::fs::create_dir_all(&dir).expect("create canonical archive dir");
+        std::fs::write(
+            dir.join(format!("22__{id}.md")),
+            format!("---json\n{{\"id\": {id}, \"subject\": \"archived\"}}\n---\n\nbody\n"),
+        )
+        .expect("write canonical archive message");
+    }
+
     #[test]
     fn recent_reconstruct_cache_returns_fresh_entry_within_window() {
         // Regression for #105: back-to-back reconstructs with identical
@@ -7930,6 +7947,98 @@ mod tests {
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         assert_eq!(min, (cpus * 4).clamp(10, 50));
         assert_eq!(max, (cpus * 12).clamp(50, 200));
+    }
+
+    #[test]
+    fn archive_id_floor_scan_prevents_next_insert_from_reusing_canonical_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("id_floor_scan.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&cfg).expect("create pool");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let (project_id, sender_id) = rt.block_on(async {
+            let project =
+                crate::queries::ensure_project(&cx, &pool, "/data/projects/am-id-floor-repro")
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = crate::queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("id-floor regression"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let first = crate::queries::create_message(
+                &cx, &pool, project_id, sender_id, "one", "body", None, "normal", false, "{}",
+            )
+            .await
+            .into_result()
+            .expect("create first message");
+            let second = crate::queries::create_message(
+                &cx, &pool, project_id, sender_id, "two", "body", None, "normal", false, "{}",
+            )
+            .await
+            .into_result()
+            .expect("create second message");
+            assert_eq!(first.id, Some(1));
+            assert_eq!(second.id, Some(2));
+
+            (project_id, sender_id)
+        });
+
+        write_id_floor_canonical_message(&storage_root, "archived-project", 9001);
+
+        assert_eq!(
+            pool.advance_message_id_floor_from_archive()
+                .expect("advance id floor from archive"),
+            Some(9001)
+        );
+
+        let next = rt.block_on(async {
+            crate::queries::create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "after archive floor",
+                "body",
+                None,
+                "normal",
+                false,
+                "{}",
+            )
+            .await
+            .into_result()
+            .expect("create message after id floor advance")
+        });
+        assert_eq!(
+            next.id,
+            Some(9002),
+            "next normal INSERT must allocate strictly above the archive max"
+        );
     }
 
     /// Verify PRAGMA settings contain `busy_timeout=60000` matching legacy Python.
@@ -10949,7 +11058,7 @@ mod tests {
         let _guard = ReadOnlyIntentGuard::enter();
         assert!(read_only_intent_is_active());
 
-        let other_thread = std::thread::spawn(|| read_only_intent_is_active());
+        let other_thread = std::thread::spawn(read_only_intent_is_active);
         // The flag is per-thread: a spawned thread should not see this
         // thread's active intent.
         assert!(!other_thread.join().expect("thread joined"));

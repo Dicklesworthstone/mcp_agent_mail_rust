@@ -114,32 +114,80 @@ fn stress_concurrent_pool_warmup_has_no_sqlite_busy() {
 
     let n_threads = 50;
     let barrier_start = Arc::new(Barrier::new(n_threads));
-    let barrier_hold = Arc::new(Barrier::new(n_threads));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let handles: Vec<_> = (0..n_threads)
         .map(|_| {
             let pool = pool.clone();
             let barrier_start = Arc::clone(&barrier_start);
-            let barrier_hold = Arc::clone(&barrier_hold);
+            let release = Arc::clone(&release);
+            let result_tx = result_tx.clone();
             std::thread::spawn(move || {
                 barrier_start.wait();
                 let conn = match block_on(|cx| async move { pool.acquire(&cx).await }) {
                     Outcome::Ok(c) => c,
                     Outcome::Err(e) => {
-                        panic!("pool warmup acquire should succeed without SQLITE_BUSY: {e:?}")
+                        let _ = result_tx.send(Err(format!(
+                            "pool warmup acquire should succeed without SQLITE_BUSY: {e:?}"
+                        )));
+                        return;
                     }
-                    Outcome::Cancelled(r) => panic!("pool warmup acquire cancelled: {r:?}"),
-                    Outcome::Panicked(p) => panic!("{p}"),
+                    Outcome::Cancelled(r) => {
+                        let _ =
+                            result_tx.send(Err(format!("pool warmup acquire cancelled: {r:?}")));
+                        return;
+                    }
+                    Outcome::Panicked(p) => {
+                        let _ = result_tx.send(Err(p.to_string()));
+                        return;
+                    }
                 };
-                barrier_hold.wait();
+                let _ = result_tx.send(Ok(()));
+                while !release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 drop(conn);
             })
         })
         .collect();
+    drop(result_tx);
 
-    for h in handles {
-        h.join().expect("thread join");
+    let mut errors = Vec::new();
+    for _ in 0..n_threads {
+        match result_rx.recv_timeout(std::time::Duration::from_secs(75)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => {
+                errors.push(format!(
+                    "timed out waiting for pool warmup worker result: {e}"
+                ));
+                break;
+            }
+        }
     }
+    release.store(true, Ordering::Release);
+    for h in handles {
+        if let Err(payload) = h.join() {
+            let panic_msg = payload
+                .downcast_ref::<&str>()
+                .map_or_else(
+                    || {
+                        payload
+                            .downcast_ref::<String>()
+                            .map_or("unknown panic payload", String::as_str)
+                    },
+                    |msg| *msg,
+                )
+                .to_string();
+            errors.push(format!("pool warmup worker panicked: {panic_msg}"));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "pool warmup workers failed:\n{}",
+        errors.join("\n")
+    );
 
     // Verify we end up at a consistent latest schema (no migration races).
     block_on(|cx| async move {

@@ -746,6 +746,12 @@ pub struct VerdictOptions {
     pub stale_threshold_abs: usize,
     /// Skip integrity check (expensive).
     pub skip_integrity_check: bool,
+    /// Skip SQLite file sanity probes.
+    ///
+    /// The sanity probe intentionally reopens the database through both the
+    /// primary and compatibility read paths. That is useful for doctor/startup
+    /// diagnostics, but too expensive for request-path health probes.
+    pub skip_db_sanity_check: bool,
     /// Skip live mailbox owner discovery.
     ///
     /// Ownership inspection walks `/proc/*/fd` on Linux to find processes with
@@ -763,6 +769,7 @@ impl Default for VerdictOptions {
             stale_threshold_pct: 0.05,
             stale_threshold_abs: 100,
             skip_integrity_check: false,
+            skip_db_sanity_check: false,
             skip_ownership_check: false,
             check_recovery_lock: true,
         }
@@ -776,6 +783,7 @@ impl VerdictOptions {
         Self {
             skip_archive_count: true,
             skip_integrity_check: true,
+            skip_db_sanity_check: true,
             skip_ownership_check: true,
             check_recovery_lock: true,
             ..Default::default()
@@ -880,8 +888,13 @@ pub fn compute_mailbox_verdict(
         .unwrap_or_else(|| PathBuf::from(":memory:"));
 
     probes.push(probe_db_file_exists(&db_path));
-    if probes.last().is_some_and(|probe| probe.passed) {
+    if probes.last().is_some_and(|probe| probe.passed) && !options.skip_db_sanity_check {
         probes.push(probe_db_file_sanity(&db_path));
+    } else if options.skip_db_sanity_check {
+        probes.push(ProbeResult::ok(
+            "db_sanity",
+            "SQLite file sanity probe skipped by verdict options",
+        ));
     }
 
     probes.push(probe_archive_accessible(archive_root));
@@ -2330,6 +2343,7 @@ mod tests {
         let opts = VerdictOptions::default();
         assert!(!opts.skip_archive_count);
         assert!(!opts.skip_integrity_check);
+        assert!(!opts.skip_db_sanity_check);
         assert!(!opts.skip_ownership_check);
         assert!(opts.check_recovery_lock);
         assert!((opts.stale_threshold_pct - 0.05).abs() < f64::EPSILON);
@@ -2341,6 +2355,7 @@ mod tests {
         let opts = VerdictOptions::fast();
         assert!(opts.skip_archive_count);
         assert!(opts.skip_integrity_check);
+        assert!(opts.skip_db_sanity_check);
         assert!(opts.skip_ownership_check);
         assert!(opts.check_recovery_lock);
     }
@@ -2602,6 +2617,35 @@ first body
             .find(|probe| probe.name == "mailbox_ownership")
             .expect("mailbox ownership probe present");
         assert!(ownership_probe.passed);
+    }
+
+    #[test]
+    fn compute_mailbox_verdict_fast_skips_db_sanity_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = dir.path().join("fast-sanity.sqlite3");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        let verdict = compute_mailbox_verdict(
+            &format!("sqlite:///{}", db_path.display()),
+            &storage_root,
+            &VerdictOptions::fast(),
+        );
+
+        let sanity_probe = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "db_sanity")
+            .expect("db_sanity probe present");
+        assert!(sanity_probe.passed);
+        assert!(
+            sanity_probe.detail.contains("skipped by verdict options"),
+            "fast verdict must not run request-path SQLite quick checks: {sanity_probe:?}"
+        );
     }
 
     // ── DurabilityState tests ────────────────────────────────────────
