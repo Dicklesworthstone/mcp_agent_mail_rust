@@ -22,7 +22,26 @@ jobs:
   notify-acfs:
     runs-on: ubuntu-latest
     steps:
+      # The dispatch is an *optimisation* over ACFS's periodic checksum-drift
+      # poller (systemd timer `acfs-manifest-drift.timer`, every 2h). If the
+      # cross-repo PAT secret is not configured on this repo, fall through to
+      # the poller rather than failing the workflow — a hard fail here used
+      # to red-flag every release without changing user-visible behaviour
+      # (ACFS still picked up the new checksum within the polling window).
+      - name: Preflight — is dispatch secret configured?
+        id: secret_probe
+        env:
+          ACFS_TOKEN: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
+        run: |
+          if [[ -n "${ACFS_TOKEN:-}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ACFS_REPO_DISPATCH_TOKEN is not configured on this repo; ACFS will pick up the new checksum via its periodic poller (acfs-manifest-drift.timer) instead of an immediate dispatch."
+          fi
+
       - name: Trigger ACFS checksum update
+        if: steps.secret_probe.outputs.configured == 'true'
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
@@ -40,7 +59,11 @@ jobs:
 
       - name: Log dispatch
         run: |
-          echo "Dispatched upstream-changed event to ACFS"
+          if [[ "${{ steps.secret_probe.outputs.configured }}" == "true" ]]; then
+            echo "Dispatched upstream-changed event to ACFS"
+          else
+            echo "Skipped dispatch — ACFS_REPO_DISPATCH_TOKEN not configured; relying on ACFS periodic poller."
+          fi
           echo "  Tool: ${{ env.TOOL_NAME }}"
           echo "  SHA: ${{ github.sha }}"
           echo "  Triggered by: ${{ github.actor }}"
