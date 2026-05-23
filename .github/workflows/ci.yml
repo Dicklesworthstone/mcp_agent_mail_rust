@@ -23,6 +23,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -116,6 +121,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -181,6 +191,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -324,6 +339,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -383,6 +403,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -544,6 +569,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -610,6 +640,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -827,6 +862,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -913,6 +953,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -975,6 +1020,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -1087,6 +1137,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
@@ -1219,6 +1274,11 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          # frankensearch's tools/optimize_params workspace member depends on
+          # ../../../fast_cmaes — required for cargo metadata/fmt/clippy on the
+          # full workspace (cargo build -p X can skip it, but workspace-wide
+          # commands cannot).
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
