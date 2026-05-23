@@ -372,8 +372,7 @@ set_artifact_url() {
       TAR=$(basename "$ARTIFACT_URL")
       URL="$ARTIFACT_URL"
     elif [ -n "$TARGET" ]; then
-      TAR="mcp-agent-mail-${TARGET}.tar.xz"
-      URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+      set_target_artifact "$TARGET"
     else
       warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
       FROM_SOURCE=1
@@ -382,16 +381,26 @@ set_artifact_url() {
   verbose "set_artifact_url:done tar=${TAR:-<none>} url=${URL:-<none>} from_source=${FROM_SOURCE}"
 }
 
-artifact_url_for_target() {
+artifact_url_for_target_ext() {
   local target="$1"
-  printf 'https://github.com/%s/%s/releases/download/%s/mcp-agent-mail-%s.tar.xz' \
-    "$OWNER" "$REPO" "$VERSION" "$target"
+  local ext="$2"
+  printf 'https://github.com/%s/%s/releases/download/%s/mcp-agent-mail-%s.%s' \
+    "$OWNER" "$REPO" "$VERSION" "$target" "$ext"
+}
+
+artifact_url_for_target() {
+  artifact_url_for_target_ext "$1" "tar.xz"
+}
+
+set_target_artifact_ext() {
+  TARGET="$1"
+  local ext="$2"
+  TAR="mcp-agent-mail-${TARGET}.${ext}"
+  URL="$(artifact_url_for_target_ext "$TARGET" "$ext")"
 }
 
 set_target_artifact() {
-  TARGET="$1"
-  TAR="mcp-agent-mail-${TARGET}.tar.xz"
-  URL="$(artifact_url_for_target "$TARGET")"
+  set_target_artifact_ext "$1" "tar.xz"
 }
 
 linux_x86_64_gnu_fallback_allowed() {
@@ -403,16 +412,47 @@ artifact_url_reachable() {
   curl -fsSI --connect-timeout 3 --max-time 5 -o /dev/null "$url" 2>/dev/null
 }
 
+artifact_target_fallback_allowed() {
+  [ -n "${TARGET:-}" ] && [ -z "${ARTIFACT_URL:-}" ]
+}
+
+select_artifact_for_target_if_available() {
+  local target="$1"
+  local ext url
+  for ext in tar.xz tar.gz; do
+    url="$(artifact_url_for_target_ext "$target" "$ext")"
+    artifact_url_reachable "$url" || continue
+    set_target_artifact_ext "$target" "$ext"
+    return 0
+  done
+  return 1
+}
+
+select_current_target_artifact_if_available() {
+  artifact_target_fallback_allowed || return 1
+  select_artifact_for_target_if_available "$TARGET"
+}
+
+select_same_target_gzip_artifact() {
+  artifact_target_fallback_allowed || return 1
+  case "${TAR:-}" in
+    *.tar.xz)
+      set_target_artifact_ext "$TARGET" "tar.gz"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 select_linux_x86_64_gnu_artifact() {
   set_target_artifact "x86_64-unknown-linux-gnu"
 }
 
 select_linux_x86_64_gnu_artifact_if_available() {
   linux_x86_64_gnu_fallback_allowed || return 1
-  local fallback_url
-  fallback_url="$(artifact_url_for_target "x86_64-unknown-linux-gnu")"
-  artifact_url_reachable "$fallback_url" || return 1
-  select_linux_x86_64_gnu_artifact
+  select_artifact_for_target_if_available "x86_64-unknown-linux-gnu"
 }
 
 check_disk_space() {
@@ -604,6 +644,11 @@ check_network() {
     return 0
   fi
   if artifact_url_reachable "$URL"; then
+    return 0
+  fi
+  if select_current_target_artifact_if_available; then
+    info "Selected ${TAR} for $VERSION"
+    verbose "network:same_target_extension_fallback version=${VERSION} url=${URL}"
     return 0
   fi
   if select_linux_x86_64_gnu_artifact_if_available; then
@@ -5116,6 +5161,66 @@ if [ "$EASY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 1 ] && [ -e /dev/tty ]; 
   esac
 fi
 
+remove_installer_lock_dir() {
+  local lock_dir="$1"
+  [ -n "$lock_dir" ] || return 0
+  [ -d "$lock_dir" ] || return 0
+  case "$lock_dir" in
+    "/"|"$HOME"|"/tmp"|"/var/tmp")
+      warn "Refusing unsafe installer lock cleanup path: ${lock_dir}"
+      return 1
+      ;;
+  esac
+
+  local unexpected
+  unexpected=$(find "$lock_dir" -mindepth 1 ! -name pid -print -quit 2>/dev/null || true)
+  if [ -n "$unexpected" ]; then
+    warn "Installer lock ${lock_dir} contains unexpected entry ${unexpected}; refusing automatic cleanup"
+    return 1
+  fi
+
+  if [ -e "$lock_dir/pid" ]; then
+    if [ ! -f "$lock_dir/pid" ] && [ ! -L "$lock_dir/pid" ]; then
+      warn "Installer lock ${lock_dir}/pid is not a regular file; refusing automatic cleanup"
+      return 1
+    fi
+    rm -f "$lock_dir/pid" || return 1
+  fi
+  rmdir "$lock_dir"
+}
+
+remove_installer_tmp_dir() {
+  local tmp_dir="$1"
+  [ -n "$tmp_dir" ] || return 0
+  [ -d "$tmp_dir" ] || return 0
+  case "${tmp_dir##*/}" in
+    mcp-agent-mail-install.*) ;;
+    *)
+      warn "Refusing automatic cleanup for unexpected temp path: ${tmp_dir}"
+      return 1
+      ;;
+  esac
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$tmp_dir" <<'PY'
+import pathlib
+import shutil
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.name.startswith("mcp-agent-mail-install."):
+    raise SystemExit("refusing unexpected temp path")
+shutil.rmtree(path)
+PY
+    return $?
+  fi
+
+  find "$tmp_dir" -depth -mindepth 1 -type f -exec rm -f {} + 2>/dev/null || true
+  find "$tmp_dir" -depth -mindepth 1 -type l -exec rm -f {} + 2>/dev/null || true
+  find "$tmp_dir" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
+  rmdir "$tmp_dir"
+}
+
 # Cross-platform locking using mkdir (atomic on all POSIX systems)
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
@@ -5126,7 +5231,7 @@ else
   if [ -f "$LOCK_DIR/pid" ]; then
     OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
     if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      rm -rf "$LOCK_DIR"
+      remove_installer_lock_dir "$LOCK_DIR" || true
       if mkdir "$LOCK_DIR" 2>/dev/null; then
         LOCKED=1
         echo $$ > "$LOCK_DIR/pid"
@@ -5144,9 +5249,9 @@ fi
 
 cleanup() {
   local rc=$?
-  [ -n "${TMP:-}" ] && rm -rf "$TMP"
+  [ -n "${TMP:-}" ] && remove_installer_tmp_dir "$TMP" || true
   if [ "${LOCKED:-0}" -eq 1 ]; then
-    rm -rf "${LOCK_DIR:-}"
+    remove_installer_lock_dir "${LOCK_DIR:-}" || true
   fi
   if [ "$rc" -ne 0 ]; then
     dump_verbose_tail
@@ -5154,12 +5259,25 @@ cleanup() {
   return "$rc"
 }
 
-TMP=$(mktemp -d)
+TMP_PARENT="${TMPDIR:-/tmp}"
+TMP=$(mktemp -d "${TMP_PARENT%/}/mcp-agent-mail-install.XXXXXX")
 trap cleanup EXIT
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
+  binary_download_failed=0
   if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+    binary_download_failed=1
+    if select_same_target_gzip_artifact; then
+      warn "tar.xz artifact not available for $TARGET at $VERSION; trying tar.gz"
+      verbose "binary-download:same_target_tar_gz_fallback version=${VERSION} url=${URL}"
+      info "Downloading $URL"
+      if download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+        binary_download_failed=0
+      fi
+    fi
+  fi
+  if [ "$binary_download_failed" -eq 1 ]; then
     # If we preferred a musl artifact that isn't published for this release
     # (older tags only shipped gnu), fall back to the gnu artifact before
     # giving up and attempting a source build.
@@ -5169,10 +5287,22 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
       select_linux_x86_64_gnu_artifact
       info "Downloading $URL"
       if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
-        warn "Binary download failed (release may not exist for $VERSION)"
-        warn "Attempting build from source as fallback..."
-        verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-        FROM_SOURCE=1
+        if select_same_target_gzip_artifact; then
+          warn "gnu tar.xz artifact not available for $VERSION; trying gnu tar.gz"
+          verbose "binary-download:gnu_tar_gz_fallback version=${VERSION} url=${URL}"
+          info "Downloading $URL"
+          if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+            warn "Binary download failed (release may not exist for $VERSION)"
+            warn "Attempting build from source as fallback..."
+            verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
+            FROM_SOURCE=1
+          fi
+        else
+          warn "Binary download failed (release may not exist for $VERSION)"
+          warn "Attempting build from source as fallback..."
+          verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
+          FROM_SOURCE=1
+        fi
       fi
     else
       warn "Binary download failed (release may not exist for $VERSION)"
@@ -5313,8 +5443,8 @@ fi
 info "Extracting"
 tar -xf "$TMP/$TAR" -C "$TMP"
 
-# Nested-archive detection: some releases accidentally nest a .tar.gz inside
-# the outer .tar.xz.  If we find one after the first extraction, unpack it too.
+# Nested-archive detection: some releases accidentally nest a second archive
+# inside the outer archive. If we find one after the first extraction, unpack it too.
 shopt -s nullglob
 for nested in "$TMP"/*.tar.gz "$TMP"/mcp-agent-mail-*/*.tar.gz; do
   if [ -f "$nested" ]; then

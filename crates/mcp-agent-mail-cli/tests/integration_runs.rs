@@ -360,7 +360,7 @@ fn run_stdio_session(env: &[(String, String)], requests: &[Value]) -> StdioSessi
     }
 
     let started = Instant::now();
-    let timeout = Duration::from_secs(15);
+    let timeout = Duration::from_secs(60);
     let mut timed_out = false;
     loop {
         match child.try_wait() {

@@ -300,7 +300,9 @@ fn native_tui_accessibility_gate() {
     let step = 2usize;
     let mut checks = Vec::new();
     let adapter_manifest = run_root.join("adapter_result.json");
-    let adapter_target_dir = run_root.join("cargo_target");
+    let adapter_target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| run_root.join("cargo_target"));
     fs::create_dir_all(&adapter_target_dir).expect("create adapter target dir");
     let seed = 2_026_021_300u64 + u64::from(std::process::id());
     let mut cmd = Command::new("bash");
@@ -501,7 +503,10 @@ fn native_tui_accessibility_gate() {
     steps.push(StepRecord {
         step,
         name: "shell_adapter".to_string(),
-        command: "bash scripts/e2e_tui_a11y.sh (CARGO_TARGET_DIR=<isolated>, AM_TUI_A11Y_SKIP_CONTRAST=1, AM_TUI_A11Y_ADAPTER_OUTPUT=<path>)".to_string(),
+        command: format!(
+            "bash scripts/e2e_tui_a11y.sh (CARGO_TARGET_DIR={}, AM_TUI_A11Y_SKIP_CONTRAST=1, AM_TUI_A11Y_ADAPTER_OUTPUT=<path>)",
+            adapter_target_dir.display()
+        ),
         cwd: repo_root.display().to_string(),
         timeout_ms: 900_000,
         duration_ms: outcome.duration_ms,

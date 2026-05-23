@@ -266,19 +266,19 @@
         {
           "display": "<TMP_ROOT>/home/.local/bin/am",
           "matches_source_version": true,
-          "parsed_version": "0.2.54",
+          "parsed_version": "0.3.2",
           "path": "<TMP_ROOT>/home/.local/bin/am",
           "source": "path",
-          "version_line": "am 0.2.54"
+          "version_line": "am 0.3.2"
         }
       ],
       "category": "environment",
       "check": "binary_version",
-      "detail": "am on PATH/install matches source version v0.2.54",
+      "detail": "am on PATH/install matches source version v0.3.2",
       "expected_install_path": "<TMP_ROOT>/home/.local/bin/am",
       "path_binary": "<TMP_ROOT>/home/.local/bin/am",
       "running_exe": "<RUNNING_EXE>",
-      "source_version": "0.2.54",
+      "source_version": "0.3.2",
       "status": "ok"
     },
     {
@@ -287,19 +287,19 @@
         {
           "display": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
           "matches_source_version": true,
-          "parsed_version": "0.2.54",
+          "parsed_version": "0.3.2",
           "path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
           "source": "path",
-          "version_line": "mcp-agent-mail 0.2.54"
+          "version_line": "mcp-agent-mail 0.3.2"
         }
       ],
       "category": "environment",
       "check": "server_binary_version",
-      "detail": "mcp-agent-mail on PATH/install matches source version v0.2.54",
+      "detail": "mcp-agent-mail on PATH/install matches source version v0.3.2",
       "expected_install_path": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
       "path_binary": "<TMP_ROOT>/home/.local/bin/mcp-agent-mail",
       "running_exe": "<RUNNING_EXE>",
-      "source_version": "0.2.54",
+      "source_version": "0.3.2",
       "status": "ok"
     },
     {
@@ -407,7 +407,7 @@
     "changes_since_last_healthy": [],
     "checkpoint_status": "no_checkpoint",
     "current": {
-      "binary_version": "0.2.54",
+      "binary_version": "0.3.2",
       "database_path": "<TMP_ROOT>/mailbox.sqlite3",
       "generated_at": "<GENERATED_AT>",
       "schema_version": "0",

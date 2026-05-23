@@ -317,6 +317,44 @@ jsonrpc_call() {
     e2e_rpc_read_response "${case_id}"
 }
 
+wait_tui_http_ready() {
+    local port="$1"
+    local timeout_s="${2:-30}"
+    local url="http://127.0.0.1:${port}/health/readiness"
+    local deadline
+    deadline=$(( $(date +%s) + timeout_s ))
+
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        if curl -fsS --connect-timeout 1 --max-time 2 "${url}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    return 1
+}
+
+jsonrpc_call_retry() {
+    local port="$1"
+    local tool="$2"
+    local params="$3"
+    local attempts="${4:-12}"
+    local delay_s="${5:-1}"
+    local out=""
+    local attempt=1
+
+    while [ "${attempt}" -le "${attempts}" ]; do
+        if out="$(jsonrpc_call "${port}" "${tool}" "${params}")"; then
+            printf '%s\n' "${out}"
+            return 0
+        fi
+        sleep "${delay_s}"
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
 # Start a TUI session via expect with proper terminal dimensions.
 # Args: label bin port db storage raw_log expect_script
 run_tui_expect() {
@@ -441,7 +479,7 @@ send "\t\t\t"
 sleep 0.5
 send "7"
 sleep 0.5
-send "\033[Z"
+send "\033\[Z"
 sleep 0.4
 
 # Basic keyboard interaction on Tools screen
@@ -454,25 +492,59 @@ sleep 0.2
 send "v"
 sleep 0.2
 
+if {[info exists env(AM_TUI_A11Y_SEED_DONE)] && $env(AM_TUI_A11Y_SEED_DONE) ne ""} {
+    set seed_deadline [expr {[clock seconds] + 20}]
+    while {[clock seconds] < $seed_deadline} {
+        if {[file exists $env(AM_TUI_A11Y_SEED_DONE)]} {
+            break
+        }
+        sleep 1
+    }
+}
+
 send "q"
 expect eof
 '
 
+SEED_DONE2="${E2E_ARTIFACT_DIR}/core_screens.seed.done"
+export AM_TUI_A11Y_SEED_DONE="${SEED_DONE2}"
 run_tui_expect "core_screens" "${BIN}" "${PORT2}" "${DB2}" "${STORAGE2}" "${RAW2}" "${EXPECT_SCRIPT_CORE}" &
 EXPECT_PID2=$!
+unset AM_TUI_A11Y_SEED_DONE
 
 sleep 6
 if e2e_wait_port 127.0.0.1 "${PORT2}" 10; then
-    EP="$(jsonrpc_call "${PORT2}" "ensure_project" '{"human_key":"/data/e2e/tui_a11y"}')"
-    REG1="$(jsonrpc_call "${PORT2}" "register_agent" '{"project_key":"/data/e2e/tui_a11y","program":"e2e","model":"test","name":"A11yFox","task_description":"seed"}')"
-    MSG="$(jsonrpc_call "${PORT2}" "send_message" '{"project_key":"/data/e2e/tui_a11y","sender_name":"A11yFox","to":["A11yFox"],"subject":"A11Y seed","body_md":"seeded"}')"
+    if wait_tui_http_ready "${PORT2}" 30; then
+        e2e_pass "TUI HTTP readiness endpoint became ready"
+    else
+        e2e_fail "TUI HTTP readiness endpoint became ready"
+    fi
+    EP=""
+    REG1=""
+    MSG=""
+    SEED_OK=1
+    if ! EP="$(jsonrpc_call_retry "${PORT2}" "ensure_project" '{"human_key":"/data/e2e/tui_a11y"}')"; then
+        e2e_fail "seed ensure_project during live TUI session"
+        SEED_OK=0
+    fi
+    if ! REG1="$(jsonrpc_call_retry "${PORT2}" "register_agent" '{"project_key":"/data/e2e/tui_a11y","program":"e2e","model":"test","name":"A11yFox","task_description":"seed"}')"; then
+        e2e_fail "seed register_agent during live TUI session"
+        SEED_OK=0
+    fi
+    if ! MSG="$(jsonrpc_call_retry "${PORT2}" "send_message" '{"project_key":"/data/e2e/tui_a11y","sender_name":"A11yFox","to":["A11yFox"],"subject":"A11Y seed","body_md":"seeded"}')"; then
+        e2e_fail "seed send_message during live TUI session"
+        SEED_OK=0
+    fi
     e2e_save_artifact "case_02_seed_project.json" "${EP}"
     e2e_save_artifact "case_02_seed_agent.json" "${REG1}"
     e2e_save_artifact "case_02_seed_message.json" "${MSG}"
-    e2e_pass "seeded data during live TUI session"
+    if [ "${SEED_OK}" = "1" ]; then
+        e2e_pass "seeded data during live TUI session"
+    fi
 else
     e2e_fail "server port not reachable during live TUI session"
 fi
+: > "${SEED_DONE2}"
 
 wait "${EXPECT_PID2}" 2>/dev/null || true
 

@@ -4,7 +4,7 @@
     "partial_failures": []
   },
   "product": {
-    "created_at": "1970-01-01T00:00:00.000000Z",
+    "created_at": "2024-01-01T00:00:00.000000Z",
     "id": 1,
     "name": "Test Product",
     "product_uid": "abc123"

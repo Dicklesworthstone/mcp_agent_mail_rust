@@ -890,6 +890,10 @@ def parse_ts(value: str):
 cases = OrderedDict()
 artifact_map = defaultdict(set)
 
+def is_private_case_artifact(rel_path: str) -> bool:
+    normalized = rel_path.replace(os.sep, "/")
+    return normalized == ".case_artifacts.tsv" or normalized.endswith("/.case_artifacts.tsv")
+
 if case_artifacts_path and os.path.isfile(case_artifacts_path):
     with open(case_artifacts_path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -897,7 +901,7 @@ if case_artifacts_path and os.path.isfile(case_artifacts_path):
             if not line or "\t" not in line:
                 continue
             case_name, rel_path = line.split("\t", 1)
-            if case_name and rel_path:
+            if case_name and rel_path and not is_private_case_artifact(rel_path):
                 artifact_map[case_name].add(rel_path)
 
 def ensure_case(name: str):
@@ -960,6 +964,8 @@ for case_name, case in cases.items():
             for filename in files:
                 abs_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(abs_path, artifact_dir).replace(os.sep, "/")
+                if is_private_case_artifact(rel_path):
+                    continue
                 artifact_map[case_name].add(rel_path)
 
     case["artifacts"].update(
@@ -1449,9 +1455,13 @@ e2e_write_bundle_manifest() {
     fi
 
     local bundle_files=()
+    local bundle_list_dir bundle_list_file
+    bundle_list_dir="$(e2e_mktemp "e2e_bundle_files")"
+    bundle_list_file="${bundle_list_dir}/files.txt"
+    find "$artifact_dir" -type f ! -path "$manifest" ! -name ".case_artifacts.tsv" | sort >"$bundle_list_file"
     while IFS= read -r f; do
         bundle_files+=("$f")
-    done < <(find "$artifact_dir" -type f ! -path "$manifest" ! -name ".case_artifacts.tsv" | sort)
+    done <"$bundle_list_file"
 
     {
         echo "{"

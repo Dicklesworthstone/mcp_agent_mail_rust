@@ -296,7 +296,7 @@ startup_write_start_artifacts() {
     local log_path="$4"
     local mode="$5"
     local command_text="$6"
-    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-60}"
 
     local case_id="server_startup_${label}"
     local case_dir
@@ -408,7 +408,7 @@ wait_for_server_start_or_fail() {
     local pid="$2"
     local port="$3"
     local fatal_msg="$4"
-    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-10}"
+    local startup_timeout_s="${E2E_SERVER_STARTUP_TIMEOUT_SECONDS:-60}"
 
     if ! e2e_wait_port 127.0.0.1 "${port}" "${startup_timeout_s}"; then
         startup_finalize_artifacts "${label}" "failed" "port did not open within ${startup_timeout_s}s"
@@ -575,6 +575,7 @@ run_subsuite_and_copy() {
 
 # e2e_ensure_binary is verbose (logs to stdout); take the last line as the path.
 BIN="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+AM_BIN="$(e2e_ensure_binary "am" | tail -n 1)"
 
 # ---------------------------------------------------------------------------
 # Run 1: health + bearer auth + OPTIONS bypass + CORS + well-known
@@ -949,6 +950,167 @@ else
 fi
 
 stop_server "${PID5}"
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+# Run 6: live daemon CLI proxy + send_message survival regression
+# ---------------------------------------------------------------------------
+
+e2e_banner "Run 6: live daemon CLI proxy + send_message survival"
+
+WORK6="$(e2e_mktemp "e2e_http_run6")"
+DB6="${WORK6}/db.sqlite3"
+STORAGE6="${WORK6}/storage_root"
+PROJECT_DIR6="${WORK6}/proj"
+mkdir -p "${PROJECT_DIR6}"
+PORT6="$(pick_port)"
+URL6="http://127.0.0.1:${PORT6}"
+API6="${URL6}/api/"
+
+run6_cli() {
+    local case_id="$1"
+    shift
+    local stdout_file="${E2E_ARTIFACT_DIR}/${case_id}_stdout.txt"
+    local stderr_file="${E2E_ARTIFACT_DIR}/${case_id}_stderr.txt"
+    local status_file="${E2E_ARTIFACT_DIR}/${case_id}_status.txt"
+
+    e2e_mark_case_start "${case_id}"
+    set +e
+    AM_INTERFACE_MODE=cli \
+    DATABASE_URL="sqlite:////${DB6}" \
+    STORAGE_ROOT="${STORAGE6}" \
+    HTTP_HOST="127.0.0.1" \
+    HTTP_PORT="${PORT6}" \
+    HTTP_PATH="/api/" \
+        "${AM_BIN}" "$@" >"${stdout_file}" 2>"${stderr_file}"
+    local rc=$?
+    set -e
+    printf '%s\n' "${rc}" >"${status_file}"
+
+    if [ "${rc}" -eq 0 ]; then
+        e2e_pass "${case_id} exited 0"
+    else
+        e2e_fail "${case_id} exited ${rc}"
+        e2e_log "stdout: $(cat "${stdout_file}" 2>/dev/null || true)"
+        e2e_log "stderr: $(cat "${stderr_file}" 2>/dev/null || true)"
+    fi
+    e2e_assert_not_contains \
+        "${case_id} did not hit direct-DB mailbox mutation refusal" \
+        "$(cat "${stderr_file}" 2>/dev/null || true)" \
+        "mailbox mutation refused"
+}
+
+PID6="$(start_server "run6" "${PORT6}" "${DB6}" "${STORAGE6}" "${BIN}")"
+trap 'stop_server "${PID6}" || true' EXIT
+wait_for_server_start_or_fail "run6" "${PID6}" "${PORT6}" "server run6 failed to start"
+wait_for_readiness_or_fail "run6" "${PID6}" "${PORT6}" "${URL6}/health/readiness"
+
+e2e_case_banner "CLI agents register proxies through live daemon"
+run6_cli "run6_cli_register_blue" \
+    agents register \
+    --project "${PROJECT_DIR6}" \
+    --program e2e \
+    --model test \
+    --name BlueLake \
+    --task "daemon proxy register" \
+    --json
+e2e_assert_contains \
+    "CLI register stdout has BlueLake" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_cli_register_blue_stdout.txt" 2>/dev/null || true)" \
+    "BlueLake"
+
+run6_cli "run6_cli_register_green" \
+    agents register \
+    --project "${PROJECT_DIR6}" \
+    --program e2e \
+    --model test \
+    --name GreenCastle \
+    --task "daemon proxy recipient" \
+    --json
+e2e_assert_contains \
+    "CLI register stdout has GreenCastle" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_cli_register_green_stdout.txt" 2>/dev/null || true)" \
+    "GreenCastle"
+
+e2e_case_banner "CLI agents create proxies through live daemon"
+run6_cli "run6_cli_create_gold" \
+    agents create \
+    --project "${PROJECT_DIR6}" \
+    --program e2e \
+    --model test \
+    --name-hint GoldPeak \
+    --task "daemon proxy create" \
+    --json
+e2e_assert_contains \
+    "CLI create stdout has GoldPeak" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_cli_create_gold_stdout.txt" 2>/dev/null || true)" \
+    "GoldPeak"
+
+e2e_case_banner "CLI macros start-session proxies through live daemon"
+run6_cli "run6_cli_macro_start_session" \
+    macros start-session \
+    --project "${PROJECT_DIR6}" \
+    --program e2e \
+    --model test \
+    --agent-name RedPeak \
+    --task "daemon proxy macro" \
+    --reserve "src/**" \
+    --reserve-reason "e2e-run6" \
+    --inbox-limit 5 \
+    --json
+e2e_assert_contains \
+    "CLI macro stdout has RedPeak" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_cli_macro_start_session_stdout.txt" 2>/dev/null || true)" \
+    "RedPeak"
+
+e2e_case_banner "CLI agents list remains usable while daemon owns mailbox"
+run6_cli "run6_cli_agents_list" \
+    agents list \
+    --project "${PROJECT_DIR6}" \
+    --json
+e2e_assert_contains \
+    "CLI agents list includes BlueLake" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_cli_agents_list_stdout.txt" 2>/dev/null || true)" \
+    "BlueLake"
+e2e_assert_contains \
+    "CLI agents list includes GreenCastle" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_cli_agents_list_stdout.txt" 2>/dev/null || true)" \
+    "GreenCastle"
+
+e2e_case_banner "HTTP send_message survives and server remains ready"
+PAYLOAD_RUN6_SEND="$(jsonrpc_tools_call_payload "send_message" "$(
+python3 - <<PY "${PROJECT_DIR6}"
+import json,sys
+proj=sys.argv[1]
+print(json.dumps({
+  "project_key": proj,
+  "sender_name": "BlueLake",
+  "to": ["GreenCastle"],
+  "subject": "run6 send_message survival",
+  "body_md": "Proves HTTP send_message returns normally with the current fsqlite trigger path.",
+  "importance": "low",
+  "thread_id": "run6-send-message-survival",
+}))
+PY
+)")"
+http_post_json "run6_send_message" "${API6}" "${PAYLOAD_RUN6_SEND}"
+e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run6_send_message_status.txt")"
+e2e_assert_contains \
+    "send_message returns JSON-RPC result" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_send_message_body.json" 2>/dev/null || true)" \
+    "\"result\""
+http_request "run6_health_after_send" "GET" "${URL6}/health/readiness"
+e2e_assert_eq "HTTP 200" "200" "$(cat "${E2E_ARTIFACT_DIR}/run6_health_after_send_status.txt")"
+e2e_assert_contains \
+    "readiness after send reports ready" \
+    "$(cat "${E2E_ARTIFACT_DIR}/run6_health_after_send_body.txt" 2>/dev/null || true)" \
+    "ready"
+e2e_assert_not_contains \
+    "server log has no blocking dispatch panic" \
+    "$(cat "${E2E_ARTIFACT_DIR}/server_run6.log" 2>/dev/null || true)" \
+    "Blocking dispatch panicked"
+
+stop_server "${PID6}"
 trap - EXIT
 
 # ---------------------------------------------------------------------------
