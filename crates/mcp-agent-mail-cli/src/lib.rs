@@ -34307,12 +34307,12 @@ http_headers = { Authorization = "Bearer secret" }
 
         let args = ShareWizardArgs {
             bundle: Some(bundle_dir),
-            provider: Some("github".to_string()),
-            github_repo: None, // required for github provider
+            provider: Some("s3".to_string()),
+            github_repo: None,
             github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
-            s3_bucket: None,
+            s3_bucket: None, // required for s3 provider
             cloudfront_id: None,
             base_url: None,
             output: None,

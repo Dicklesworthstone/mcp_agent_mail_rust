@@ -20029,14 +20029,14 @@ mod tests {
                 drop(local_conn);
 
                 let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-                let project_dir = storage_root.join("projects").join("unrelated-project");
+                let project_dir = storage_root.join("projects").join("demo-project");
                 let agent_dir = project_dir.join("agents").join("RiverStone");
                 let canonical_dir = project_dir.join("messages").join("2026").join("04");
                 std::fs::create_dir_all(&agent_dir).expect("create agent dir");
                 std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
                 std::fs::write(
                     project_dir.join("project.json"),
-                    r#"{"slug":"unrelated-project","human_key":"/tmp/unrelated-project","created_at":0}"#,
+                    r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
                 )
                 .expect("write project metadata");
                 std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");

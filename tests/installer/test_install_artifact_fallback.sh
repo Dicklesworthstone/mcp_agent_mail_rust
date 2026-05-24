@@ -195,7 +195,7 @@ output_c=$(
         source '$extract'
         OWNER=Dicklesworthstone
         REPO=mcp_agent_mail_rust
-        VERSION=v0.3.3
+        VERSION=v0.3.4
         FROM_SOURCE=0
         OFFLINE=0
         ARTIFACT_URL=''
