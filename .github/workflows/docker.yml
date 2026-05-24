@@ -1,0 +1,167 @@
+# Build + publish a multi-arch container image to ghcr.io.
+#
+# Triggers
+# --------
+#   push tag v*          — tagged releases (matches dist.yml). Publishes
+#                          :<tag>, :latest, and the SemVer aliases.
+#   workflow_dispatch    — manual builds (e.g. between releases). The
+#                          dispatch form accepts inputs.am_ref and
+#                          inputs.sibling_ref so users can rebuild from any
+#                          commit without cutting a release.
+#
+# The Dockerfile clones the source tree itself (via the AM_REF build arg),
+# so the workflow does not need to checkout the repo for the image to match
+# a specific commit. We still run a checkout step so docker/build-push-action
+# can find the Dockerfile in the workspace.
+name: docker
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      am_ref:
+        description: 'Git ref of mcp_agent_mail_rust to build (tag, branch, or SHA).'
+        required: false
+        default: 'main'
+      sibling_ref:
+        description: 'Git ref for sibling dependencies (frankensearch, asupersync, ...).'
+        required: false
+        default: 'main'
+      tag_suffix:
+        description: 'Extra image tag to push (in addition to :sha-<short>).'
+        required: false
+        default: 'manual'
+
+# Cancel an in-progress workflow only for non-tag refs. We never want to
+# cancel a release build mid-flight because that could leave the image
+# registry inconsistent with the GitHub Release artifacts.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# Minimal default permissions; jobs request what they need.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  # Image path is forced lowercase because the GitHub repository slug
+  # contains a mixed-case owner ("Dicklesworthstone") but OCI registries
+  # require lowercase image names.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build & push multi-arch image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read       # for actions/checkout
+      packages: write      # for ghcr.io push
+      id-token: write      # for SLSA provenance attestation
+      attestations: write  # for actions/attest-build-provenance
+
+    steps:
+      - name: Checkout (Dockerfile + workflow only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Lowercase image name
+        id: image
+        env:
+          RAW_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          lowered="${RAW_IMAGE,,}"
+          printf 'image=%s\n' "$lowered" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build refs
+        id: refs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_AM_REF: ${{ inputs.am_ref }}
+          INPUT_SIBLING_REF: ${{ inputs.sibling_ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # On a tag push, build *that* tag for the project and main for siblings.
+          # On manual dispatch, honor the user inputs (already defaulted to main).
+          if [ "$EVENT_NAME" = "push" ]; then
+            am_ref="$REF_NAME"
+            sibling_ref="main"
+          else
+            am_ref="${INPUT_AM_REF:-main}"
+            sibling_ref="${INPUT_SIBLING_REF:-main}"
+          fi
+          printf 'am_ref=%s\n' "$am_ref" >> "$GITHUB_OUTPUT"
+          printf 'sibling_ref=%s\n' "$sibling_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@5964de0df58d5ad28b04d8fe2e6b80ad47105b91  # v3.5.0
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          images: ${{ steps.image.outputs.image }}
+          # Tag strategy:
+          #   semver tag → :v0.3.6, :0.3.6, :0.3, :latest
+          #   manual run  → :manual-<short>, :sha-<short>
+          tags: |
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ inputs.tag_suffix }}-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=sha,format=short,prefix=sha-
+
+      - name: Build and push multi-arch image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Distinct cache scopes per arch so cross-compilation doesn't
+          # invalidate the other arch's layer cache on every run.
+          cache-from: type=gha,scope=docker-${{ github.workflow }}
+          cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}
+          build-args: |
+            AM_REF=${{ steps.refs.outputs.am_ref }}
+            SIBLING_REF=${{ steps.refs.outputs.sibling_ref }}
+          provenance: true
+          sbom: true
+
+      - name: Attest build provenance
+        if: ${{ steps.build.outputs.digest != '' }}
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a  # v3.0.0
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Print published image references
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          printf 'Published image: %s@%s\n' "$IMAGE" "$DIGEST"
+          printf 'Tags:\n%s\n' "$TAGS"

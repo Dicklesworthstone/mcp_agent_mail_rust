@@ -1,0 +1,210 @@
+# syntax=docker/dockerfile:1.7
+#
+# Multi-stage Dockerfile for MCP Agent Mail (Rust).
+#
+# Mirrors the sibling-clone build pattern from .github/workflows/dist.yml:
+# this workspace depends on path-patched local checkouts of frankensearch,
+# franken_agent_detection, asupersync, sqlmodel_rust, frankensqlite,
+# frankentui, beads_rust, fastmcp_rust, toon_rust, and rich_rust (see the
+# `[patch.crates-io]` block in /Cargo.toml). The build clones each of those
+# repos as a sibling of /build/mcp_agent_mail_rust so cargo resolves the
+# patch paths correctly.
+#
+# Build arguments
+# ---------------
+#   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
+#                Pass a tag, branch, or commit SHA.
+#   SIBLING_REF  Git ref for every sibling dependency (default: main).
+#                Usually you want `main` here even when AM_REF is a tag,
+#                because sibling repos are released independently.
+#
+# Examples
+# --------
+#   # Build the current tip of main:
+#   docker build -t mcp-agent-mail-rust:dev .
+#
+#   # Build a tagged release:
+#   docker build --build-arg AM_REF=v0.3.6 -t mcp-agent-mail-rust:v0.3.6 .
+#
+#   # Build a specific commit (e.g. between releases):
+#   docker build --build-arg AM_REF=abc1234 -t mcp-agent-mail-rust:dev .
+#
+# Runtime
+# -------
+# The image ships two binaries that share a /data volume:
+#   * mcp-agent-mail (the server, ENTRYPOINT)
+#   * am             (the operator CLI)
+#
+# Default CMD is `serve --no-tui` — containers are headless. To get an
+# interactive operator console, override CMD with `am tui` and run with
+# `-it -e TUI_ENABLED=true`.
+
+# ─── Stage 1: builder ────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS builder
+
+# rustup is installed instead of FROM rust:<version>-slim because this
+# workspace pins a specific nightly via rust-toolchain.toml; rustup will
+# auto-install the pinned channel on first cargo invocation. This keeps the
+# Dockerfile in lock-step with rust-toolchain.toml without manual edits.
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        pkg-config \
+        libsqlite3-dev \
+        build-essential \
+        cmake \
+        clang \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none --no-modify-path \
+    && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
+
+WORKDIR /build
+
+ARG AM_REF=main
+ARG SIBLING_REF=main
+
+# Clone sibling dependencies first so they're cached separately from the
+# project source layer. frankensqlite uses a sparse checkout to skip the
+# multi-GB perf-fixture history.
+#
+# The `set -eux` here matches the dist.yml behaviour: any clone failure
+# aborts the build immediately rather than silently dropping a dependency.
+RUN set -eux; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/frankensearch.git           /build/frankensearch; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/franken_agent_detection.git /build/franken_agent_detection; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/asupersync.git              /build/asupersync; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/sqlmodel_rust.git           /build/sqlmodel_rust; \
+    git clone --depth 1 --sparse --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/frankensqlite.git  /build/frankensqlite; \
+    (cd /build/frankensqlite \
+     && git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates); \
+    if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' \
+        /build/frankensqlite/crates/fsqlite-core/src/connection.rs; then \
+      echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2; \
+      exit 1; \
+    fi; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/frankentui.git    /build/frankentui; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/beads_rust.git    /build/beads_rust; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/fastmcp_rust.git  /build/fastmcp_rust; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/toon_rust.git     /build/toon_rust; \
+    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/rich_rust.git     /build/rich_rust
+
+# Clone the project source at the requested ref. We clone (rather than COPY
+# the build context) so the image is reproducible from `docker build .` with
+# no local working tree: passing AM_REF=v0.3.6 produces the exact same image
+# from any checkout. CI passes ${{ github.sha }} for tagged releases.
+RUN git clone --depth 1 --branch "${AM_REF}" \
+        https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git \
+        /build/mcp_agent_mail_rust
+
+WORKDIR /build/mcp_agent_mail_rust
+
+# Pre-install the pinned nightly toolchain so the build step's diagnostics
+# don't interleave a toolchain download with cargo output. `rustup show` is
+# the documented incantation that triggers rust-toolchain.toml resolution.
+RUN rustup show active-toolchain || rustup show
+
+# Mirrors the release flags in dist.yml exactly:
+#   --no-default-features --features portable excludes the hybrid/fastembed
+#   ONNX runtime (its AVX2-only static libs SIGILL on older x86 CPUs).
+#   Portable retains s3fifo + tantivy-engine.
+#
+# strip is applied here (in addition to the workspace `strip = "symbols"`
+# release profile) for belt-and-braces — keeps the runtime image small even
+# if the profile is ever relaxed.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/mcp_agent_mail_rust/target,sharing=locked \
+    cargo build --release \
+        -p mcp-agent-mail -p mcp-agent-mail-cli \
+        --no-default-features --features portable \
+    && mkdir -p /out \
+    && cp target/release/mcp-agent-mail /out/mcp-agent-mail \
+    && cp target/release/am             /out/am \
+    && strip /out/mcp-agent-mail /out/am
+
+# Surface verification: refuse to ship if the two binaries got swapped or
+# either is missing its expected CLI surface. Same checks as dist.yml.
+RUN /out/mcp-agent-mail --help > /tmp/server.help \
+    && /out/am --help          > /tmp/cli.help \
+    && grep -qE '^Usage: mcp-agent-mail ' /tmp/server.help \
+    && grep -qE '(^|[[:space:]])serve([[:space:]]|$)' /tmp/server.help \
+    && grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)' /tmp/cli.help
+
+# ─── Stage 2: runtime ────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime needs:
+#   * ca-certificates — outbound HTTPS (e.g. share-link uploads)
+#   * curl            — HEALTHCHECK
+#   * git             — `am` shells out for repo introspection
+#   * libsqlite3-0    — frankensqlite ships its own engine but SQLite system
+#                       libs are needed for some integration paths
+#   * tini            — PID 1 reaper so signal handling and zombie reaping
+#                       work correctly when running under Docker/Kubernetes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        libsqlite3-0 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --system --group --home /home/appuser --uid 10001 appuser \
+    && mkdir -p /data/mailbox \
+    && chown -R appuser:appuser /data /home/appuser
+
+COPY --from=builder /out/mcp-agent-mail /usr/local/bin/mcp-agent-mail
+COPY --from=builder /out/am             /usr/local/bin/am
+
+# Environment defaults
+#   HTTP_HOST=0.0.0.0  — bind all interfaces (the in-container default of
+#                        127.0.0.1 is unreachable from outside).
+#   HTTP_PORT=8765     — matches dist.yml + Python image conventions.
+#   HTTP_PATH=/mcp/    — server default; surfaced here for visibility.
+#   STORAGE_ROOT=/data/mailbox — single mounted volume keeps DB + archives
+#                                co-located for backups.
+#   TUI_ENABLED=false  — containers are headless. Override + run with -it
+#                        to use the operator console.
+#   AM_INTERFACE_MODE=mcp — explicit default (matches code default).
+ENV HTTP_HOST=0.0.0.0 \
+    HTTP_PORT=8765 \
+    HTTP_PATH=/mcp/ \
+    STORAGE_ROOT=/data/mailbox \
+    TUI_ENABLED=false \
+    AM_INTERFACE_MODE=mcp \
+    RUST_LOG=info
+
+EXPOSE 8765
+VOLUME ["/data"]
+
+USER appuser
+WORKDIR /home/appuser
+
+# Liveness probe hits the unauthenticated health endpoint. 10s start period
+# keeps Docker from flapping the container during the initial DB migration
+# on first boot.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${HTTP_PORT}/health/liveness" || exit 1
+
+# tini handles signal forwarding + zombie reaping. The server itself ignores
+# SIGPIPE by default, but tini ensures SIGTERM from `docker stop` reaches it
+# promptly without the 10s grace timeout.
+ENTRYPOINT ["/usr/bin/tini", "--", "mcp-agent-mail"]
+CMD ["serve", "--no-tui"]
+
+# OCI labels — discoverable via `docker inspect` and shown on the GHCR page.
+LABEL org.opencontainers.image.title="MCP Agent Mail (Rust)" \
+      org.opencontainers.image.description="Multi-agent coordination via MCP — Rust rewrite. Ships mcp-agent-mail (server) and am (operator CLI)." \
+      org.opencontainers.image.source="https://github.com/Dicklesworthstone/mcp_agent_mail_rust" \
+      org.opencontainers.image.licenses="LicenseRef-MIT-Rider" \
+      org.opencontainers.image.vendor="Jeff Emanuel"
