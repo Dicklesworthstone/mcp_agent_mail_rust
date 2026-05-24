@@ -21,7 +21,11 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 --sparse https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          (
+            cd ../frankensqlite
+            git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
+          )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -57,7 +61,11 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 --sparse https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          (
+            cd ../frankensqlite
+            git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
+          )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
@@ -111,11 +119,19 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
+          # Windows MAX_PATH (260 chars) trips on frankensqlite's perf-fixture
+          # paths; enable git's long-path support before cloning. No-op on
+          # Unix runners (the setting is harmless).
+          git config --global core.longpaths true
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 --sparse https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          (
+            cd ../frankensqlite
+            git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates
+          )
           if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' ../frankensqlite/crates/fsqlite-core/src/connection.rs; then
             echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2
             exit 1
