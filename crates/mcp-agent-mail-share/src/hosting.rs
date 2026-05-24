@@ -66,21 +66,23 @@ fn detect_github_pages(output_dir: &Path, git_remote: Option<&str>, hints: &mut 
         }
     }
 
-    // Check git remote
+    // Check git remote.
     if let Some(remote) = git_remote
         && remote.contains("github")
     {
         signals.push(format!("Git remote: {remote}"));
     }
 
-    // Check environment
-    if std::env::var("GITHUB_REPOSITORY").is_ok() {
-        signals.push("GITHUB_REPOSITORY env var set".to_string());
+    // Check if inside docs/ directory.
+    let inside_docs = is_inside_docs_dir(output_dir);
+    if inside_docs {
+        signals.push("Output inside docs/ directory".to_string());
     }
 
-    // Check if inside docs/ directory
-    if is_inside_docs_dir(output_dir) {
-        signals.push("Output inside docs/ directory".to_string());
+    // Ambient GitHub Actions variables are only useful when the output directory already has a
+    // local Pages signal. Otherwise random temp directories in CI look like GitHub Pages projects.
+    if std::env::var("GITHUB_REPOSITORY").is_ok() && !signals.is_empty() {
+        signals.push("GITHUB_REPOSITORY env var set".to_string());
     }
 
     if !signals.is_empty() {

@@ -82,13 +82,23 @@ e2e_run_cargo() {
 }
 
 e2e_sqlite3_compat_bin() {
+    local system_bin
+    system_bin="$(type -P sqlite3 2>/dev/null || true)"
+    if [ -n "${system_bin}" ] && [ -x "${system_bin}" ]; then
+        printf '%s\n' "${system_bin}"
+        return 0
+    fi
+
     local bin="${CARGO_TARGET_DIR}/debug/test_db"
     if [ -x "${bin}" ]; then
         printf '%s\n' "${bin}"
         return 0
     fi
 
-    if ! e2e_run_cargo build -q -p mcp-agent-mail-cli --bin test_db >/dev/null 2>&1; then
+    # test_db is executed by this local shell as a sqlite3 compatibility shim.
+    # Building it through rch can succeed on a remote worker while leaving no
+    # executable at the local CARGO_TARGET_DIR path checked below.
+    if ! cargo build -q -p mcp-agent-mail-cli --bin test_db >/dev/null 2>&1; then
         return 127
     fi
     if [ ! -x "${bin}" ]; then

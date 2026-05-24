@@ -460,21 +460,19 @@ fn apply_github_env_vars(
 }
 
 fn determine_recommended_provider(env: &DetectedEnvironment) -> Option<HostingProvider> {
-    // Priority: explicit env signals > config files > git remote
+    // Priority: provider-specific env signals > local project config > ambient CI/git context.
+    //
+    // GitHub Actions variables are often present while testing or running from a CI checkout, but
+    // they are not as specific as a Cloudflare/Netlify project marker in the bundle's own tree.
 
-    // Check Cloudflare (highest priority if explicitly in CF environment)
+    // Check Cloudflare (highest priority if explicitly in CF environment).
     if env.cloudflare_env {
         return Some(HostingProvider::CloudflarePages);
     }
 
-    // Check Netlify
+    // Check Netlify.
     if env.netlify_env {
         return Some(HostingProvider::Netlify);
-    }
-
-    // Check GitHub (common case)
-    if env.github_env || env.github_repo.is_some() {
-        return Some(HostingProvider::GithubPages);
     }
 
     // Check for config file signals
@@ -508,6 +506,12 @@ fn determine_recommended_provider(env: &DetectedEnvironment) -> Option<HostingPr
         if has_s3_script {
             return Some(HostingProvider::S3);
         }
+    }
+
+    // Check GitHub (common case). This sits after local config so GitHub Actions env vars do not
+    // swamp an explicitly Cloudflare/Netlify project under test or deployment.
+    if env.github_env || env.github_repo.is_some() {
+        return Some(HostingProvider::GithubPages);
     }
 
     // Default to GitHub Pages if git remote is GitHub
@@ -1226,6 +1230,40 @@ mod tests {
         assert_eq!(
             determine_recommended_provider(&env),
             Some(HostingProvider::GithubPages)
+        );
+    }
+
+    #[test]
+    fn determine_provider_cloudflare_config_beats_github_actions_env() {
+        let env = DetectedEnvironment {
+            github_env: true,
+            signals: vec![DetectedSignal {
+                source: "config_file".to_string(),
+                detail: "wrangler.toml found".to_string(),
+                confidence: DetectionConfidence::High,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            determine_recommended_provider(&env),
+            Some(HostingProvider::CloudflarePages)
+        );
+    }
+
+    #[test]
+    fn determine_provider_netlify_config_beats_github_actions_env() {
+        let env = DetectedEnvironment {
+            github_env: true,
+            signals: vec![DetectedSignal {
+                source: "config_file".to_string(),
+                detail: "netlify.toml found".to_string(),
+                confidence: DetectionConfidence::High,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            determine_recommended_provider(&env),
+            Some(HostingProvider::Netlify)
         );
     }
 
