@@ -76,14 +76,33 @@ ARG SIBLING_REF=main
 # project source layer. frankensqlite uses a sparse checkout to skip the
 # multi-GB perf-fixture history.
 #
-# The `set -eux` here matches the dist.yml behaviour: any clone failure
-# aborts the build immediately rather than silently dropping a dependency.
-RUN set -eux; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/frankensearch.git           /build/frankensearch; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/franken_agent_detection.git /build/franken_agent_detection; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/asupersync.git              /build/asupersync; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/sqlmodel_rust.git           /build/sqlmodel_rust; \
-    git clone --depth 1 --sparse --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/frankensqlite.git  /build/frankensqlite; \
+# `git clone --depth 1 --branch <ref>` only accepts branch/tag names — passing
+# a commit SHA fails with "Remote branch <sha> not found in upstream origin".
+# `clone_at` detects 7-40-hex SHAs and falls back to init+fetch+checkout so
+# every build arg shape (tag, branch, full SHA, short SHA) Just Works.
+#
+# `set -eu` (no `x`) keeps logs readable; per-clone `echo` provides progress.
+# Any failure aborts the build immediately rather than silently dropping a
+# dependency (same guarantee as dist.yml).
+RUN set -eu; \
+    clone_at() { \
+      url="$1"; ref="$2"; dest="$3"; shift 3; \
+      echo "+ clone_at $url @ $ref -> $dest $*"; \
+      if printf '%s' "$ref" | grep -Eq '^[0-9a-f]{7,40}$'; then \
+        git init -q "$dest"; \
+        ( cd "$dest" \
+          && git remote add origin "$url" \
+          && git fetch --depth 1 "$@" origin "$ref" \
+          && git checkout -q FETCH_HEAD ); \
+      else \
+        git clone --depth 1 --branch "$ref" "$@" "$url" "$dest"; \
+      fi; \
+    }; \
+    clone_at https://github.com/Dicklesworthstone/frankensearch.git           "${SIBLING_REF}" /build/frankensearch; \
+    clone_at https://github.com/Dicklesworthstone/franken_agent_detection.git "${SIBLING_REF}" /build/franken_agent_detection; \
+    clone_at https://github.com/Dicklesworthstone/asupersync.git              "${SIBLING_REF}" /build/asupersync; \
+    clone_at https://github.com/Dicklesworthstone/sqlmodel_rust.git           "${SIBLING_REF}" /build/sqlmodel_rust; \
+    clone_at https://github.com/Dicklesworthstone/frankensqlite.git           "${SIBLING_REF}" /build/frankensqlite --sparse; \
     (cd /build/frankensqlite \
      && git sparse-checkout set --no-cone Cargo.toml Cargo.lock LICENSE README.md rust-toolchain.toml .cargo crates); \
     if grep -q 'let old_schema_fingerprint = schema_fingerprint(&self.schema.borrow());' \
@@ -91,19 +110,31 @@ RUN set -eux; \
       echo "frankensqlite checkout is missing the scoped schema-borrow reload fix; refusing to package a crash-prone am binary" >&2; \
       exit 1; \
     fi; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/frankentui.git    /build/frankentui; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/beads_rust.git    /build/beads_rust; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/fastmcp_rust.git  /build/fastmcp_rust; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/toon_rust.git     /build/toon_rust; \
-    git clone --depth 1 --branch "${SIBLING_REF}" https://github.com/Dicklesworthstone/rich_rust.git     /build/rich_rust
+    clone_at https://github.com/Dicklesworthstone/frankentui.git    "${SIBLING_REF}" /build/frankentui; \
+    clone_at https://github.com/Dicklesworthstone/beads_rust.git    "${SIBLING_REF}" /build/beads_rust; \
+    clone_at https://github.com/Dicklesworthstone/fastmcp_rust.git  "${SIBLING_REF}" /build/fastmcp_rust; \
+    clone_at https://github.com/Dicklesworthstone/toon_rust.git     "${SIBLING_REF}" /build/toon_rust; \
+    clone_at https://github.com/Dicklesworthstone/rich_rust.git     "${SIBLING_REF}" /build/rich_rust
 
 # Clone the project source at the requested ref. We clone (rather than COPY
 # the build context) so the image is reproducible from `docker build .` with
 # no local working tree: passing AM_REF=v0.3.6 produces the exact same image
 # from any checkout. CI passes ${{ github.sha }} for tagged releases.
-RUN git clone --depth 1 --branch "${AM_REF}" \
+#
+# Same SHA-vs-ref handling as the sibling clones above — see the `clone_at`
+# helper for why `--branch <sha>` doesn't work and what we do instead.
+RUN set -eu; \
+    if printf '%s' "${AM_REF}" | grep -Eq '^[0-9a-f]{7,40}$'; then \
+      git init -q /build/mcp_agent_mail_rust; \
+      cd /build/mcp_agent_mail_rust; \
+      git remote add origin https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git; \
+      git fetch --depth 1 origin "${AM_REF}"; \
+      git checkout -q FETCH_HEAD; \
+    else \
+      git clone --depth 1 --branch "${AM_REF}" \
         https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git \
-        /build/mcp_agent_mail_rust
+        /build/mcp_agent_mail_rust; \
+    fi
 
 WORKDIR /build/mcp_agent_mail_rust
 
@@ -161,7 +192,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --system --group --home /home/appuser --uid 10001 appuser \
     && mkdir -p /data/mailbox \
-    && chown -R appuser:appuser /data /home/appuser
+    && chown -R appuser:appuser /data /home/appuser \
+    # Bind-mounted /data volumes inherit the host's uid/gid, which is rarely
+    # 10001:10001 — without `safe.directory` git refuses to run with "dubious
+    # ownership" the first time `am` touches a project's git repo. Configure
+    # both system-wide and per-user so it works regardless of who runs git.
+    && git config --system --add safe.directory '*' \
+    && install -d -o appuser -g appuser /home/appuser/.config/git \
+    && printf '[safe]\n\tdirectory = *\n' \
+        > /home/appuser/.config/git/config \
+    && chown appuser:appuser /home/appuser/.config/git/config
 
 COPY --from=builder /out/mcp-agent-mail /usr/local/bin/mcp-agent-mail
 COPY --from=builder /out/am             /usr/local/bin/am
@@ -190,10 +230,12 @@ VOLUME ["/data"]
 USER appuser
 WORKDIR /home/appuser
 
-# Liveness probe hits the unauthenticated health endpoint. 10s start period
-# keeps Docker from flapping the container during the initial DB migration
-# on first boot.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# Liveness probe hits the unauthenticated health endpoint. The 20s start
+# period + 5 retries (matching the Python sibling image's HEALTHCHECK) keeps
+# Docker from flapping the container during the initial DB migration on first
+# boot, especially on slow ARM hosts or under QEMU emulation where the Rust
+# binary's startup can take noticeably longer than on amd64.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
     CMD curl -fsS "http://127.0.0.1:${HTTP_PORT}/health/liveness" || exit 1
 
 # tini handles signal forwarding + zombie reaping. The server itself ignores
