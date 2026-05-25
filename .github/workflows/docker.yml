@@ -118,13 +118,22 @@ jobs:
         with:
           images: ${{ steps.image.outputs.image }}
           # Tag strategy:
-          #   semver tag → :v0.3.6, :0.3.6, :0.3, :latest
-          #   manual run  → :manual-<short>, :sha-<short>
+          #   stable tag (vX.Y.Z) → :v0.3.6, :0.3.6, :0.3, :latest
+          #   pre-release (vX.Y.Z-rc1, -beta, ...) → :v0.3.6-rc1, :0.3.6-rc1
+          #     (NO :latest, NO :{major.minor} — those should only ever point
+          #      at stable releases to avoid surprising `:latest` consumers.)
+          #   manual run → :manual-<short>, :sha-<short>
+          #
+          # docker/metadata-action surfaces `meta.outputs.is-default-branch`-
+          # style booleans, but it does not expose "is-stable-semver" directly.
+          # We use the `latest=false` flag on type=semver patterns to suppress
+          # implicit `:latest` and emit it ourselves only when the tag has no
+          # prerelease suffix (i.e. matches `refs/tags/vN.N.N` exactly).
           tags: |
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
             type=raw,value=${{ inputs.tag_suffix }}-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }}
             type=sha,format=short,prefix=sha-
 
@@ -138,8 +147,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Distinct cache scopes per arch so cross-compilation doesn't
-          # invalidate the other arch's layer cache on every run.
+          # One GHA cache scope per workflow. buildx stores per-platform
+          # manifests inside this scope, so linux/amd64 and linux/arm64
+          # layers coexist without evicting each other (`mode=max` also
+          # captures intermediate stages, not just the final image).
           cache-from: type=gha,scope=docker-${{ github.workflow }}
           cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}
           build-args: |
