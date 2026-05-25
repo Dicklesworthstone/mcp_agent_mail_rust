@@ -78,8 +78,15 @@ ARG SIBLING_REF=main
 #
 # `git clone --depth 1 --branch <ref>` only accepts branch/tag names — passing
 # a commit SHA fails with "Remote branch <sha> not found in upstream origin".
-# `clone_at` detects 7-40-hex SHAs and falls back to init+fetch+checkout so
-# every build arg shape (tag, branch, full SHA, short SHA) Just Works.
+# `clone_at` detects full 40-char SHAs and falls back to init+fetch+checkout.
+# GitHub's smart-http upload-pack honors full SHAs (via
+# uploadpack.allowReachableSHA1InWant) but NOT abbreviated/short SHAs —
+# `git fetch origin abc1234` errors out with "couldn't find remote ref".
+# Pass the full 40-char SHA, a branch, or a tag; short SHAs are rejected.
+#
+# `--sparse` is a clone-only flag; the SHA path explicitly initializes
+# sparse-checkout before the fetch instead of passing it through `git fetch`
+# (which doesn't accept `--sparse`).
 #
 # `set -eu` (no `x`) keeps logs readable; per-clone `echo` provides progress.
 # Any failure aborts the build immediately rather than silently dropping a
@@ -88,11 +95,20 @@ RUN set -eu; \
     clone_at() { \
       url="$1"; ref="$2"; dest="$3"; shift 3; \
       echo "+ clone_at $url @ $ref -> $dest $*"; \
-      if printf '%s' "$ref" | grep -Eq '^[0-9a-f]{7,40}$'; then \
+      sparse=0; \
+      pass_args=""; \
+      for arg in "$@"; do \
+        case "$arg" in \
+          --sparse) sparse=1 ;; \
+          *) pass_args="$pass_args $arg" ;; \
+        esac; \
+      done; \
+      if printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then \
         git init -q "$dest"; \
         ( cd "$dest" \
           && git remote add origin "$url" \
-          && git fetch --depth 1 "$@" origin "$ref" \
+          && if [ "$sparse" = 1 ]; then git sparse-checkout init --no-cone; fi \
+          && git fetch --depth 1 $pass_args origin "$ref" \
           && git checkout -q FETCH_HEAD ); \
       else \
         git clone --depth 1 --branch "$ref" "$@" "$url" "$dest"; \
@@ -124,7 +140,7 @@ RUN set -eu; \
 # Same SHA-vs-ref handling as the sibling clones above — see the `clone_at`
 # helper for why `--branch <sha>` doesn't work and what we do instead.
 RUN set -eu; \
-    if printf '%s' "${AM_REF}" | grep -Eq '^[0-9a-f]{7,40}$'; then \
+    if printf '%s' "${AM_REF}" | grep -Eq '^[0-9a-f]{40}$'; then \
       git init -q /build/mcp_agent_mail_rust; \
       cd /build/mcp_agent_mail_rust; \
       git remote add origin https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git; \

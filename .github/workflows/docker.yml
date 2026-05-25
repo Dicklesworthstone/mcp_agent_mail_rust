@@ -22,11 +22,11 @@ on:
   workflow_dispatch:
     inputs:
       am_ref:
-        description: 'Git ref of mcp_agent_mail_rust to build (tag, branch, or SHA).'
+        description: 'Git ref of mcp_agent_mail_rust to build (tag, branch, or full 40-char SHA — short SHAs are not accepted by GitHub upload-pack).'
         required: false
         default: 'main'
       sibling_ref:
-        description: 'Git ref for sibling dependencies (frankensearch, asupersync, ...).'
+        description: 'Git ref for sibling deps (frankensearch, asupersync, ...) — tag, branch, or full 40-char SHA only.'
         required: false
         default: 'main'
       tag_suffix:
