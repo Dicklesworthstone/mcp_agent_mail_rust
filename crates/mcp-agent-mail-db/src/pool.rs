@@ -3935,6 +3935,45 @@ pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<()
     Ok(())
 }
 
+pub struct CanonicalSnapshotTempDir {
+    _guard: tempfile::TempDir,
+    canonical_path: PathBuf,
+}
+
+impl CanonicalSnapshotTempDir {
+    pub fn new(prefix: &str) -> std::io::Result<Self> {
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            let Some(value) = env_value(key) else {
+                continue;
+            };
+            let base = PathBuf::from(value);
+            if base.as_os_str().is_empty() {
+                continue;
+            }
+            return Self::new_in(prefix, &base);
+        }
+
+        Self::from_guard(tempfile::Builder::new().prefix(prefix).tempdir()?)
+    }
+
+    pub fn new_in(prefix: &str, base: &Path) -> std::io::Result<Self> {
+        Self::from_guard(tempfile::Builder::new().prefix(prefix).tempdir_in(base)?)
+    }
+
+    fn from_guard(guard: tempfile::TempDir) -> std::io::Result<Self> {
+        let canonical_path = guard.path().canonicalize()?;
+        Ok(Self {
+            _guard: guard,
+            canonical_path,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
     open_sqlite_file_with_lock_retry_impl(
@@ -7542,6 +7581,39 @@ mod tests {
             format!("---json\n{{\"id\": {id}, \"subject\": \"archived\"}}\n---\n\nbody\n"),
         )
         .expect("write canonical archive message");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_snapshot_tempdir_resolves_symlinked_tmpdir_for_sqlite_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_tmpdir = dir.path().join("real-tmp");
+        let linked_tmpdir = dir.path().join("linked-tmp");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
+        let linked_tmpdir = linked_tmpdir
+            .to_str()
+            .expect("linked tmpdir utf-8")
+            .to_string();
+
+        let snapshot = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", linked_tmpdir.as_str())],
+            || CanonicalSnapshotTempDir::new("sqlite-snapshot-test-"),
+        )
+        .expect("create canonical snapshot tempdir");
+        let db_path = snapshot.path().join("mailbox.sqlite3");
+
+        validate_sqlite_target_path(&db_path, "test sqlite snapshot target")
+            .expect("canonicalized snapshot target should pass sqlite symlink validation");
+        assert!(
+            snapshot
+                .path()
+                .starts_with(real_tmpdir.canonicalize().expect("canonical real tmpdir")),
+            "snapshot path should use the resolved real temp root: {}",
+            snapshot.path().display()
+        );
     }
 
     #[test]

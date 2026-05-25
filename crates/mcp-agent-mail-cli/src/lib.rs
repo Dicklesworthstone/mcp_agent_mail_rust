@@ -8287,7 +8287,38 @@ fn maybe_reconcile_sync_opened_sqlite_archive_drift(
         return Ok((conn, opened_path));
     }
 
-    let db = collect_doctor_db_inventory(&conn)?;
+    let db = match collect_doctor_db_inventory(&conn) {
+        Ok(db) => db,
+        Err(error) => {
+            if doctor_archive_is_authoritative_for_sqlite_path(
+                Path::new(&opened_path),
+                &storage_root,
+                storage_root_is_explicit,
+            ) {
+                tracing::warn!(
+                    source = %opened_path,
+                    storage_root = %storage_root.display(),
+                    error = %error,
+                    "reconstructing sqlite from archive because the live inventory probe failed"
+                );
+                drop(conn);
+                let _mailbox_mutation_locks = if acquire_mutation_locks {
+                    Some(acquire_cli_mailbox_mutation_locks(
+                        database_url,
+                        storage_root_override,
+                    )?)
+                } else {
+                    None
+                };
+                reconcile_sqlite_file_with_archive(Path::new(&opened_path), &storage_root)?;
+                return open_sqlite_with_fallback_and_storage_root(
+                    &opened_path,
+                    Some(&storage_root),
+                );
+            }
+            return Err(error);
+        }
+    };
     if !doctor_archive_is_authoritative_for_db(
         &archive,
         &db,
@@ -21323,6 +21354,28 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
     }
 }
 
+fn doctor_database_inventory_failure_strategy(
+    error: &CliError,
+    archive_has_state: bool,
+    archive_root: &Path,
+) -> DoctorDatabaseFixStrategy {
+    let detail = format!(
+        "Database inventory probe failed: {}",
+        truncate_doctor_command(&error.to_string())
+    );
+    if archive_has_state {
+        DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "{detail}; reconstruct from archive {}",
+            archive_root.display()
+        ))
+    } else {
+        DoctorDatabaseFixStrategy::Repair(format!(
+            "{detail}; no canonical archive data was found under {}, attempting in-place repair",
+            archive_root.display()
+        ))
+    }
+}
+
 fn doctor_database_fix_strategy_with_wal_cleanup(
     database_url: &str,
     storage_root: &Path,
@@ -21446,7 +21499,17 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     if archive_available {
         let archive = collect_doctor_archive_inventory(storage_root);
-        let db = collect_doctor_db_inventory(&opened.conn)?;
+        let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
+        let db = match collect_doctor_db_inventory(&opened.conn) {
+            Ok(db) => db,
+            Err(error) => {
+                return Ok(doctor_database_inventory_failure_strategy(
+                    &error,
+                    archive_has_state,
+                    &archive_root,
+                ));
+            }
+        };
         let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
         if doctor_archive_is_authoritative_for_db(
             &archive,
@@ -22793,8 +22856,8 @@ fn handle_doctor_check_with(
             })),
             Err(err) => checks.push(serde_json::json!({
                 "check": "archive_db_parity",
-                "status": "warn",
-                "detail": format!("Archive/DB inventory probe failed: {err}"),
+                "status": "fail",
+                "detail": format!("Archive/DB inventory probe failed: {err}; run `am doctor reconstruct --dry-run` to inspect archive recovery"),
             })),
         }
     }
@@ -39546,6 +39609,35 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_database_inventory_failure_strategy_prefers_archive_reconstruct_when_archive_has_state()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_root = dir.path().join("projects");
+        let error = CliError::Other(
+            "failed to inspect message inventory: Query error: database disk image is malformed"
+                .to_string(),
+        );
+
+        let strategy = doctor_database_inventory_failure_strategy(&error, true, &archive_root);
+        match strategy {
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+                assert!(detail.contains("Database inventory probe failed"));
+                assert!(detail.contains("reconstruct from archive"));
+            }
+            other => panic!("archive-backed inventory failure should reconstruct: {other:?}"),
+        }
+
+        let strategy = doctor_database_inventory_failure_strategy(&error, false, &archive_root);
+        match strategy {
+            DoctorDatabaseFixStrategy::Repair(detail) => {
+                assert!(detail.contains("Database inventory probe failed"));
+                assert!(detail.contains("no canonical archive data"));
+            }
+            other => panic!("inventory failure without archive data should repair: {other:?}"),
+        }
+    }
+
+    #[test]
     fn doctor_database_fix_strategy_cleans_header_only_wal_before_open_probe() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header-only-wal.sqlite3");
@@ -41874,6 +41966,46 @@ startup_timeout_sec = 42
             .and_then(|row| row.get_named("cnt").ok())
             .unwrap_or(-1);
         assert_eq!(count, 1, "repair should initialize the base schema");
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_reports_truncated_wal_without_opening_database() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("dry-run-truncated-wal.sqlite3");
+        seed_project_only_db(&db_path, "dry-run-truncated-wal", "/dry-run-truncated-wal");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("checkpoint seeded db before adding truncated wal");
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&wal_path, b"").expect("write zero-byte wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = tmp.path().join("storage");
+        let backup_dir = tmp.path().join("backups");
+        let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
+        let result =
+            handle_doctor_repair_with(&db_url, &storage_root, &backup_dir, None, true, true);
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "dry-run repair should report the WAL plan without opening sqlite: {output}"
+        );
+        assert!(
+            output.contains("Would quarantine SQLite WAL sidecar is header-only/truncated"),
+            "dry-run output should explain the WAL quarantine plan: {output}"
+        );
+        assert!(
+            output.contains("Skipping live SQLite probes"),
+            "dry-run output should explain why DB probes were skipped: {output}"
+        );
+        assert!(wal_path.exists(), "dry-run must not move the WAL sidecar");
+        assert!(shm_path.exists(), "dry-run must not move the SHM sidecar");
     }
 
     #[test]
@@ -57809,6 +57941,19 @@ fn handle_doctor_repair_with_options(
         return Ok(());
     }
 
+    if dry_run && let Some(detail) = doctor_truncated_wal_sidecar_detail(&reconstruct_db_path) {
+        ftui_runtime::ftui_println!("  Would quarantine {detail}");
+        let shm_path = sqlite_sidecar_path(&reconstruct_db_path, "-shm");
+        if std::fs::symlink_metadata(&shm_path).is_ok() {
+            ftui_runtime::ftui_println!("  Would quarantine companion SHM: {}", shm_path.display());
+        }
+        ftui_runtime::ftui_println!(
+            "  Skipping live SQLite probes because the WAL sidecar must be repaired before opening the database."
+        );
+        ftui_runtime::ftui_println!("Repair dry run complete.");
+        return Ok(());
+    }
+
     if !dry_run {
         doctor_quarantine_header_only_wal_sidecars(&reconstruct_db_path)?;
     }
@@ -57862,6 +58007,42 @@ fn handle_doctor_repair_with_options(
         open_db_sync_with_database_url_and_storage_root_locked(database_url, Some(storage_root))?
     };
 
+    match collect_doctor_db_inventory(&conn) {
+        Ok(_) => {}
+        Err(error) => {
+            let archive_inventory = collect_doctor_archive_inventory(storage_root);
+            let archive_has_state = archive_inventory.counts() != DoctorInventoryCounts::default();
+            if archive_available && archive_has_state {
+                let detail = truncate_doctor_command(&error.to_string());
+                ftui_runtime::ftui_println!("  Database inventory: FAILED ({detail})");
+                if dry_run {
+                    ftui_runtime::ftui_println!(
+                        "  Would fall back to archive reconstruction from {}",
+                        archive_projects_dir.display()
+                    );
+                    ftui_runtime::ftui_println!("Repair dry run complete.");
+                    return Ok(());
+                }
+                drop(conn);
+                ftui_runtime::ftui_eprintln!(
+                    "  Database table inventory probe failed ({detail}). Automatically falling back to archive reconstruction..."
+                );
+                return handle_doctor_reconstruct_with(
+                    Some(&reconstruct_db_path),
+                    Some(storage_root),
+                    false,
+                    yes,
+                    false,
+                );
+            }
+            return Err(CliError::Other(format!(
+                "database table inventory probe failed during repair: {}; no canonical archive data was found under {}",
+                truncate_doctor_command(&error.to_string()),
+                archive_projects_dir.display()
+            )));
+        }
+    }
+
     // 1b. Run a full PRAGMA integrity_check (not just quick_check) to detect
     // index-level corruption that quick_check misses.  Report the result but
     // do NOT bail to reconstruction — the REINDEX step below will fix index
@@ -57874,8 +58055,34 @@ fn handle_doctor_repair_with_options(
         )
         .unwrap_or(false);
         if !full_ok {
+            let archive_inventory = collect_doctor_archive_inventory(storage_root);
+            let archive_has_state = archive_inventory.counts() != DoctorInventoryCounts::default();
+            if archive_available && archive_has_state {
+                ftui_runtime::ftui_println!(
+                    "  Full integrity_check: FAILED (archive reconstruction recommended)"
+                );
+                if dry_run {
+                    ftui_runtime::ftui_println!(
+                        "  Would fall back to archive reconstruction from {}",
+                        archive_projects_dir.display()
+                    );
+                    ftui_runtime::ftui_println!("Repair dry run complete.");
+                    return Ok(());
+                }
+                drop(conn);
+                ftui_runtime::ftui_eprintln!(
+                    "  Full integrity_check failed. Automatically falling back to archive reconstruction..."
+                );
+                return handle_doctor_reconstruct_with(
+                    Some(&reconstruct_db_path),
+                    Some(storage_root),
+                    false,
+                    yes,
+                    false,
+                );
+            }
             ftui_runtime::ftui_println!(
-                "  Full integrity_check: FAILED (index corruption detected; REINDEX will repair)"
+                "  Full integrity_check: FAILED (no archive data found; attempting in-place repair)"
             );
         } else {
             ftui_runtime::ftui_println!("  Full integrity_check: OK");

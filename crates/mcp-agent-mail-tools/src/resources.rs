@@ -18,8 +18,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
@@ -222,49 +220,9 @@ fn resource_archive_is_ahead(
         || archive_metadata_ahead)
 }
 
-static RESOURCE_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct ResourceSnapshotDirGuard {
-    path: PathBuf,
-}
-
-impl ResourceSnapshotDirGuard {
-    fn new(prefix: &str) -> std::io::Result<Self> {
-        let base = std::env::temp_dir();
-        let pid = std::process::id();
-        for _ in 0..32 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let counter = RESOURCE_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = base.join(format!("{prefix}{pid}_{nanos}_{counter}"));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "failed to allocate unique resource snapshot directory",
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ResourceSnapshotDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 struct ResourceReadPool {
     pool: mcp_agent_mail_db::DbPool,
-    _snapshot_dir: Option<ResourceSnapshotDirGuard>,
+    _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
 }
 
 impl ResourceReadPool {
@@ -390,8 +348,9 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
         return Ok(None);
     }
 
-    let snapshot_dir = ResourceSnapshotDirGuard::new("agent-mail-resource-snapshot-")
-        .map_err(|err| err.to_string())?;
+    let snapshot_dir =
+        mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("agent-mail-resource-snapshot-")
+            .map_err(|err| err.to_string())?;
     let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
     if resolved_path.exists() {
         mcp_agent_mail_db::reconstruct_from_archive_with_salvage(

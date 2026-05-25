@@ -184,7 +184,7 @@ use std::fs;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2342,45 +2342,8 @@ impl SnapshotDirGuard {
     }
 }
 
-fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
-    let mut current = if path.is_absolute() {
-        PathBuf::new()
-    } else {
-        std::env::current_dir()?
-    };
-
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => continue,
-            Component::ParentDir => current.push(".."),
-            Component::Normal(part) => current.push(part),
-        }
-
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-
-    Ok(false)
-}
-
 fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result<PathBuf> {
-    if path_existing_prefix_has_symlink(candidate)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{source} points to symlinked snapshot directory {}",
-                candidate.display()
-            ),
-        ));
-    }
-
-    let metadata = std::fs::symlink_metadata(candidate).map_err(|error| {
+    let canonical = candidate.canonicalize().map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!(
@@ -2389,17 +2352,27 @@ fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result
             ),
         )
     })?;
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "{source} resolved to unusable snapshot directory {}: {error}",
+                canonical.display()
+            ),
+        )
+    })?;
     if !metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{source} points to {} which is not a directory",
-                candidate.display()
+                "{source} points to {} which resolves to {} which is not a directory",
+                candidate.display(),
+                canonical.display()
             ),
         ));
     }
 
-    Ok(candidate.to_path_buf())
+    Ok(canonical)
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
@@ -13844,6 +13817,33 @@ fn startup_integrity_cache_path(
             .join("diagnostics")
             .join("startup_integrity_cache.json"),
     )
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => current.push(".."),
+            std::path::Component::Normal(part) => current.push(part),
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
 }
 
 fn validate_startup_integrity_cache_path(path: &Path) -> std::io::Result<()> {
@@ -25435,7 +25435,7 @@ first body
 
     #[cfg(unix)]
     #[test]
-    fn validate_snapshot_temp_dir_rejects_symlinked_directory() {
+    fn validate_snapshot_temp_dir_canonicalizes_symlinked_directory() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25444,18 +25444,18 @@ first body
         std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
         symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
 
-        let err = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
-            .expect_err("symlinked temp dir should be rejected");
+        let selected = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
+            .expect("internal snapshot temp dirs should canonicalize symlinked tmpdir paths");
 
-        assert!(
-            err.to_string().contains("symlinked snapshot directory"),
-            "{err}"
+        assert_eq!(
+            selected,
+            real_tmpdir.canonicalize().expect("canonical real tmpdir")
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn validate_snapshot_temp_dir_rejects_symlinked_parent() {
+    fn validate_snapshot_temp_dir_canonicalizes_symlinked_parent() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25465,18 +25465,18 @@ first body
         std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
         symlink(&real_parent, &linked_parent).expect("symlink tmpdir parent");
 
-        let err = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
-            .expect_err("temp dir reached through symlinked parent should be rejected");
+        let selected = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
+            .expect("internal snapshot temp dirs should canonicalize symlinked parent paths");
 
-        assert!(
-            err.to_string().contains("symlinked snapshot directory"),
-            "{err}"
+        assert_eq!(
+            selected,
+            real_tmpdir.canonicalize().expect("canonical real tmpdir")
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preferred_snapshot_temp_dir_rejects_symlinked_tmpdir_override() {
+    fn preferred_snapshot_temp_dir_canonicalizes_symlinked_tmpdir_override() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25489,21 +25489,21 @@ first body
             .expect("linked tmpdir utf-8")
             .to_string();
 
-        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let selected = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", linked_tmpdir.as_str())],
             preferred_snapshot_temp_dir,
         )
-        .expect_err("symlinked TMPDIR should be rejected");
+        .expect("internal snapshot temp dirs should canonicalize symlinked TMPDIR");
 
-        assert!(
-            err.to_string().contains("symlinked snapshot directory"),
-            "{err}"
+        assert_eq!(
+            selected,
+            real_tmpdir.canonicalize().expect("canonical real tmpdir")
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preferred_snapshot_temp_dir_rejects_symlinked_parent_override() {
+    fn preferred_snapshot_temp_dir_canonicalizes_symlinked_parent_override() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25518,15 +25518,15 @@ first body
             .expect("linked child utf-8")
             .to_string();
 
-        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let selected = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", linked_tmpdir.as_str())],
             preferred_snapshot_temp_dir,
         )
-        .expect_err("TMPDIR reached through a symlinked parent should be rejected");
+        .expect("internal snapshot temp dirs should canonicalize symlinked TMPDIR parent");
 
-        assert!(
-            err.to_string().contains("symlinked snapshot directory"),
-            "{err}"
+        assert_eq!(
+            selected,
+            real_tmpdir.canonicalize().expect("canonical real tmpdir")
         );
     }
 

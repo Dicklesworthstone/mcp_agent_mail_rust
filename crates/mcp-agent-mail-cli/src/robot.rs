@@ -2650,7 +2650,7 @@ fn resolve_optional_agent_id(
 
 struct RobotDbHandle {
     conn: DbConn,
-    _snapshot_dir: Option<tempfile::TempDir>,
+    _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
 }
 
 impl RobotDbHandle {
@@ -2677,8 +2677,11 @@ impl RobotDbHandle {
         } else {
             None
         };
-        let snapshot_dir = tempfile::tempdir()
-            .map_err(|e| CliError::Other(format!("robot archive snapshot tempdir failed: {e}")))?;
+        let snapshot_dir =
+            mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("robot-archive-snapshot-")
+                .map_err(|e| {
+                    CliError::Other(format!("robot archive snapshot tempdir failed: {e}"))
+                })?;
         let db_path = snapshot_dir.path().join("robot-archive-snapshot.sqlite3");
         mcp_agent_mail_db::reconstruct_from_archive(&db_path, storage_root).map_err(|e| {
             CliError::Other(format!("robot archive snapshot reconstruction failed: {e}"))
@@ -19436,6 +19439,43 @@ mod tests {
                 || err_text.contains("mailbox activity lock is busy"),
             "unexpected error: {err_text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_archive_snapshot_canonicalizes_symlinked_tmpdir_for_sqlite_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real_tmpdir = dir.path().join("real-tmp");
+        let linked_tmpdir = dir.path().join("linked-tmp");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+
+        let linked_tmpdir = linked_tmpdir
+            .to_str()
+            .expect("linked tmpdir utf-8")
+            .to_string();
+        let handle = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", linked_tmpdir.as_str())],
+            || RobotDbHandle::open_archive_snapshot(storage_root.path()),
+        )
+        .expect("archive snapshot should canonicalize symlinked TMPDIR");
+
+        let rows = handle
+            .conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("query archive snapshot projects");
+        assert_eq!(rows[0].get_named::<i64>("cnt").unwrap_or(-1), 1);
     }
 
     #[test]

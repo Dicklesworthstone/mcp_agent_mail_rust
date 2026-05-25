@@ -60,8 +60,6 @@ pub mod tool_util {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -502,11 +500,9 @@ pub mod tool_util {
             || archive_metadata_ahead)
     }
 
-    static READ_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     pub struct ToolReadPool {
         pool: mcp_agent_mail_db::DbPool,
-        _snapshot_dir: Option<ReadSnapshotDirGuard>,
+        _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
     }
 
     impl ToolReadPool {
@@ -523,44 +519,6 @@ pub mod tool_util {
 
         fn deref(&self) -> &Self::Target {
             &self.pool
-        }
-    }
-
-    struct ReadSnapshotDirGuard {
-        path: PathBuf,
-    }
-
-    impl ReadSnapshotDirGuard {
-        fn new(prefix: &str) -> std::io::Result<Self> {
-            let base = std::env::temp_dir();
-            let pid = std::process::id();
-            for _ in 0..32 {
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let counter = READ_SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = base.join(format!("{prefix}{pid}_{nanos}_{counter}"));
-                match std::fs::create_dir(&path) {
-                    Ok(()) => return Ok(Self { path }),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "failed to allocate unique read snapshot directory",
-            ))
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for ReadSnapshotDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
@@ -675,8 +633,9 @@ pub mod tool_util {
             return Ok(None);
         }
 
-        let snapshot_dir = ReadSnapshotDirGuard::new("agent-mail-tool-snapshot-")
-            .map_err(|err| err.to_string())?;
+        let snapshot_dir =
+            mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("agent-mail-tool-snapshot-")
+                .map_err(|err| err.to_string())?;
         let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
         if resolved_path.exists() {
             mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
