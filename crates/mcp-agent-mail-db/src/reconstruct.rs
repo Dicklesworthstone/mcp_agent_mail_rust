@@ -1130,34 +1130,75 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 
 /// Reconstruct the database from the Git archive at `storage_root`.
 ///
-/// Opens (or creates) a fresh `SQLite` database at `db_path`, runs schema
-/// migrations, then walks the archive to recover data.
+/// When archive content exists, opens (or creates) a fresh `SQLite` database at
+/// `db_path`, runs schema migrations, then walks the archive to recover data.
+/// Empty archive roots are reported without creating a target database.
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or if schema creation
 /// fails. Individual archive files that fail to parse are skipped (counted
 /// in `parse_errors`).
-#[allow(clippy::too_many_lines)]
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
+    reconstruct_from_archive_impl(db_path, storage_root, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn reconstruct_from_archive_impl(
+    db_path: &Path,
+    storage_root: &Path,
+    create_empty_target: bool,
+) -> DbResult<ReconstructStats> {
     let mut stats = ReconstructStats::default();
     crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
         .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
-    if !is_real_directory(storage_root) {
+    let projects_dir = storage_root.join("projects");
+    let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
+    if is_real_directory(storage_root) {
+        if is_real_directory(&projects_dir) {
+            if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if !file_type.is_dir() || file_type.is_symlink() {
+                        continue;
+                    }
+                    let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from)
+                    else {
+                        continue;
+                    };
+                    project_dirs.push((slug, path));
+                }
+            }
+        } else {
+            stats.warnings.push(format!(
+                "No projects directory found at {}",
+                projects_dir.display()
+            ));
+            if !create_empty_target {
+                return Ok(stats);
+            }
+        }
+    } else {
         stats.warnings.push(format!(
             "Storage root {} is missing or not a real directory",
             storage_root.display()
         ));
-        return Ok(stats);
+        if !create_empty_target {
+            return Ok(stats);
+        }
     }
-
-    let projects_dir = storage_root.join("projects");
-    if !is_real_directory(&projects_dir) {
+    project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    if project_dirs.is_empty() {
         stats.warnings.push(format!(
-            "No projects directory found at {}",
+            "No project archives found under {}",
             projects_dir.display()
         ));
-        return Ok(stats);
+        if !create_empty_target {
+            return Ok(stats);
+        }
     }
 
     let db_str = db_path.to_string_lossy();
@@ -1238,25 +1279,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         // Maps for deduplication: ((project_id, name) → agent_id)
         let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
 
-        // Phase 1: Discover projects
-        let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_dir() || file_type.is_symlink() {
-                    continue;
-                }
-                let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
-                    continue;
-                };
-                project_dirs.push((slug, path));
-            }
-        }
-        project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
-
+        // Phase 1: Replay projects discovered before opening the target DB.
         for (slug, project_path) in &project_dirs {
             let now = crate::now_micros();
             let human_key = read_project_human_key(project_path, slug, &mut stats);
@@ -1344,9 +1367,16 @@ pub fn reconstruct_from_archive_with_salvage(
     storage_root: &Path,
     salvage_db_path: Option<&Path>,
 ) -> DbResult<ReconstructStats> {
-    let mut stats = reconstruct_from_archive(db_path, storage_root)?;
-    if let Some(salvage_db_path) = salvage_db_path.filter(|path| is_real_file(path)) {
-        match probe_salvage_database_for_merge(salvage_db_path)
+    let salvage_probe = salvage_db_path
+        .filter(|path| is_real_file(path))
+        .map(|path| (path, probe_salvage_database_for_merge(path)));
+    let create_empty_target = salvage_probe
+        .as_ref()
+        .is_some_and(|(_, probe_result)| probe_result.is_ok());
+
+    let mut stats = reconstruct_from_archive_impl(db_path, storage_root, create_empty_target)?;
+    if let Some((salvage_db_path, probe_result)) = salvage_probe {
+        match probe_result
             .and_then(|()| merge_salvaged_database(db_path, salvage_db_path, &mut stats))
         {
             Ok(()) => {}
@@ -4656,6 +4686,31 @@ mod tests {
         assert_eq!(stats.projects, 0);
         assert_eq!(stats.agents, 0);
         assert_eq!(stats.messages, 0);
+    }
+
+    #[test]
+    fn reconstruct_empty_projects_directory_does_not_create_database() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.agents, 0);
+        assert_eq!(stats.messages, 0);
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("No project archives found")),
+            "empty projects dir should be reported as empty archive content: {:?}",
+            stats.warnings
+        );
+        assert!(
+            !db_path.exists(),
+            "empty archive reconstruct should not create a database file"
+        );
     }
 
     #[test]

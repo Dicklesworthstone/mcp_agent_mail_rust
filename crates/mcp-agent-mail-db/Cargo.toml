@@ -23,6 +23,7 @@ regex.workspace = true
 unicode-normalization.workspace = true
 sha2.workspace = true
 hex.workspace = true
+tempfile.workspace = true
 
 # frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
 frankensearch = { workspace = true, optional = true }
@@ -93,7 +94,6 @@ s3fifo = []
 criterion.workspace = true
 loom.workspace = true
 proptest.workspace = true
-tempfile.workspace = true
 
 [[bench]]
 name = "cache_bench"
