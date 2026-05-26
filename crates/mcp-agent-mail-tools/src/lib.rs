@@ -1103,6 +1103,27 @@ pub mod tool_util {
         static READ_POOL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
         #[test]
+        fn process_env_overrides_bypass_stale_dependency_config_cache() {
+            Config::reset_cached();
+            assert!(
+                !Config::get().worktrees_enabled,
+                "default test config should leave worktrees disabled"
+            );
+
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("WORKTREES_ENABLED", "true")],
+                || {
+                    assert!(
+                        Config::get().worktrees_enabled,
+                        "dependency users of with_process_env_overrides_for_test must not reuse stale cached Config"
+                    );
+                },
+            );
+
+            Config::reset_cached();
+        }
+
+        #[test]
         fn legacy_tool_error_sets_payload_shape() {
             let err = legacy_tool_error(
                 "NOT_FOUND",

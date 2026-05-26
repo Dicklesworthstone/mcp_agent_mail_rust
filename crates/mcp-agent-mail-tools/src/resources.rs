@@ -4800,6 +4800,7 @@ mod resource_shape_tests {
         // Other test modules can leave global WBQ state behind after their
         // tempdirs have been dropped. Resource tests are serialized, so make the
         // boundary explicit and then attribute any new degradation to this test.
+        mcp_agent_mail_storage::wbq_start();
         mcp_agent_mail_storage::wbq_flush();
         mcp_agent_mail_storage::flush_async_commits();
         mcp_agent_mail_storage::clear_durability_degraded();

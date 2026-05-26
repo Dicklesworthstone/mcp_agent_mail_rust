@@ -1460,7 +1460,6 @@ impl Default for Config {
 /// Module-level shared config cache (used by `Config::get` and `Config::reset_cached`).
 static CONFIG_CACHE: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
 
-#[cfg(test)]
 fn test_config_env_overrides_active() -> bool {
     let process_overrides_empty = process_env_overrides()
         .lock()
@@ -1469,11 +1468,17 @@ fn test_config_env_overrides_active() -> bool {
     if !process_overrides_empty {
         return true;
     }
-    TEST_ENV_OVERRIDES.with(|cell| !cell.borrow().is_empty())
+    #[cfg(test)]
+    {
+        TEST_ENV_OVERRIDES.with(|cell| !cell.borrow().is_empty())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn global_config_cache_get() -> Config {
-    #[cfg(test)]
     if test_config_env_overrides_active() {
         return Config::from_env();
     }
