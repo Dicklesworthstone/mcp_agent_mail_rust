@@ -5173,7 +5173,7 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
         &storage_root,
         || run_startup_doctor_repair_subprocess(&database_url, &storage_root, &backup_dir),
         |reconstruct_db_path| {
-            handle_doctor_reconstruct_with(
+            handle_doctor_reconstruct_locked_with_path(
                 Some(reconstruct_db_path),
                 Some(&storage_root),
                 false,
@@ -7749,11 +7749,23 @@ fn recover_sqlite_file_with_storage_root(
         swap_validated_sqlite_artifact(path, &temp_restore, &timestamp)?;
         reconcile_sqlite_file_with_archive(path, &storage_root)?;
     } else {
-        // Fall back to archive reconstruction if no backup is available.
+        // Fall back to archive reconstruction if no backup is available and
+        // the archive is authoritative for this SQLite path.
         // Safety (issue #59): reconstruct into a temp file first, validate it,
         // then quarantine the original and swap in the new one. The original DB
         // is NOT moved/modified until the new DB is proven healthy.
-        if storage_root.is_dir() && path_is_real_directory(&storage_root.join("projects")) {
+        let archive_inventory = collect_doctor_archive_inventory(&storage_root);
+        let archive_has_state = archive_inventory.counts() != DoctorInventoryCounts::default();
+        let storage_root_is_explicit =
+            mailbox_activity_storage_root_is_explicit(&storage_root, storage_root_override);
+        let archive_reconstruct_available = storage_root.is_dir()
+            && archive_has_state
+            && doctor_archive_is_authoritative_for_sqlite_path(
+                path,
+                &storage_root,
+                storage_root_is_explicit,
+            );
+        if archive_reconstruct_available {
             ftui_runtime::ftui_println!(
                 "No backup found. Reconstructing database from archive at {}...",
                 storage_root.display()
@@ -7813,7 +7825,7 @@ fn recover_sqlite_file_with_storage_root(
             }
         } else {
             return Err(CliError::Other(format!(
-                "database {} is unhealthy, no healthy backup was found, and no archive projects directory exists under {}; original database is untouched",
+                "database {} is unhealthy, no healthy backup was found, and no authoritative archive data exists under {} for this database path; original database is untouched",
                 path.display(),
                 storage_root.display()
             )));
@@ -21356,21 +21368,21 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
 
 fn doctor_database_inventory_failure_strategy(
     error: &CliError,
-    archive_has_state: bool,
+    archive_reconstruct_available: bool,
     archive_root: &Path,
 ) -> DoctorDatabaseFixStrategy {
     let detail = format!(
         "Database inventory probe failed: {}",
         truncate_doctor_command(&error.to_string())
     );
-    if archive_has_state {
+    if archive_reconstruct_available {
         DoctorDatabaseFixStrategy::Reconstruct(format!(
             "{detail}; reconstruct from archive {}",
             archive_root.display()
         ))
     } else {
         DoctorDatabaseFixStrategy::Repair(format!(
-            "{detail}; no canonical archive data was found under {}, attempting in-place repair",
+            "{detail}; no authoritative archive data was found under {}, attempting in-place repair",
             archive_root.display()
         ))
     }
@@ -21396,11 +21408,23 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     let archive_root = storage_root.join("projects");
     let archive_available = path_is_real_directory(&archive_root);
+    let archive_inventory =
+        archive_available.then(|| collect_doctor_archive_inventory(storage_root));
+    let archive_has_state = archive_inventory
+        .as_ref()
+        .is_some_and(|inventory| inventory.counts() != DoctorInventoryCounts::default());
     let resolved_path = resolve_sqlite_path_with_absolute_candidate(&configured_path);
     let resolved = Path::new(&resolved_path);
+    let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
+    let archive_reconstruct_available = archive_has_state
+        && doctor_archive_is_authoritative_for_sqlite_path(
+            resolved,
+            storage_root,
+            storage_root_is_explicit,
+        );
 
     if !resolved.exists() {
-        return Ok(if archive_available {
+        return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
                 "Database file is missing at {}; reconstruct from archive {}",
                 resolved.display(),
@@ -21408,7 +21432,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             ))
         } else {
             DoctorDatabaseFixStrategy::None(format!(
-                "Database file is missing at {} and no archive was found under {}",
+                "Database file is missing at {} and no authoritative archive data was found under {}",
                 resolved.display(),
                 archive_root.display()
             ))
@@ -21431,19 +21455,19 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     match sqlite_doctor_file_sanity(&resolved_path) {
         Ok((false, detail, _, _)) => {
-            return Ok(if archive_available {
+            return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "{detail}; archive recovery is available under {}",
                     archive_root.display()
                 ))
             } else {
                 DoctorDatabaseFixStrategy::Repair(format!(
-                    "{detail}; archive recovery is unavailable, attempting in-place repair"
+                    "{detail}; no authoritative archive data is available, attempting in-place repair"
                 ))
             });
         }
         Err(error) => {
-            return Ok(if archive_available {
+            return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database sanity probe failed for {}: {}; archive recovery is available under {}",
                     resolved.display(),
@@ -21464,7 +21488,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let opened = match open_db_for_doctor_check_with_context(database_url) {
         Ok(opened) => opened,
         Err(error) => {
-            return Ok(if archive_available {
+            return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database open probe failed: {}; archive recovery is available under {}",
                     truncate_doctor_command(&error.to_string()),
@@ -21481,7 +21505,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     let missing_tables = doctor_required_tables(&opened.conn)?;
     if !missing_tables.is_empty() {
-        return Ok(if archive_available {
+        return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
                 "Core tables missing from {}: {}; reconstruct from archive {}",
                 opened.opened_path,
@@ -21498,19 +21522,17 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     if archive_available {
-        let archive = collect_doctor_archive_inventory(storage_root);
-        let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
+        let archive = archive_inventory.clone().unwrap_or_default();
         let db = match collect_doctor_db_inventory(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
                 return Ok(doctor_database_inventory_failure_strategy(
                     &error,
-                    archive_has_state,
+                    archive_reconstruct_available,
                     &archive_root,
                 ));
             }
         };
-        let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
         if doctor_archive_is_authoritative_for_db(
             &archive,
             &db,
@@ -21539,7 +21561,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                 opened.opened_path
             );
             if is_sqlite_recovery_error_message(&error.to_string()) {
-                return Ok(if archive_available {
+                return Ok(if archive_reconstruct_available {
                     DoctorDatabaseFixStrategy::Reconstruct(format!(
                         "{detail}; reconstruct from archive {}",
                         archive_root.display()
@@ -21552,7 +21574,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         }
     };
     if !integrity_ok {
-        return Ok(if archive_available {
+        return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
                 "PRAGMA integrity_check failed for {}; reconstruct from archive {}",
                 opened.opened_path,
@@ -22835,7 +22857,7 @@ fn handle_doctor_check_with(
                     "check": "archive_db_parity",
                     "status": "warn",
                     "detail": format!(
-                        "No canonical archive content found under {}",
+                        "No authoritative archive data found under {}",
                         storage_root.join("projects").display()
                     ),
                 }));
@@ -24897,7 +24919,13 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     skipped_count += 1;
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
-                        handle_doctor_reconstruct(false, true, false)
+                        handle_doctor_reconstruct_locked(
+                            &cfg.database_url,
+                            storage_root,
+                            false,
+                            true,
+                            false,
+                        )
                     }) {
                         Ok(()) => {
                             results.push(serde_json::json!({
@@ -24934,7 +24962,15 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     skipped_count += 1;
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
-                        handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false)
+                        handle_doctor_repair_with_options(
+                            &cfg.database_url,
+                            storage_root,
+                            &backup_dir,
+                            None,
+                            false,
+                            true,
+                            DoctorRepairOptions::default(),
+                        )
                     }) {
                         Ok(()) => match verify_doctor_database_repair_cleared(
                             &cfg.database_url,
@@ -39596,7 +39632,7 @@ startup_timeout_sec = 42
     #[test]
     fn doctor_database_fix_strategy_prefers_archive_reconstruct_for_missing_db() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        seed_archive_mailbox_project(dir.path());
 
         let db_path = dir.path().join("missing.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -39609,8 +39645,27 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn doctor_database_inventory_failure_strategy_prefers_archive_reconstruct_when_archive_has_state()
-     {
+    fn doctor_database_fix_strategy_skips_reconstruct_for_missing_db_with_empty_archive_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy = doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy");
+
+        match strategy {
+            DoctorDatabaseFixStrategy::None(detail) => {
+                assert!(
+                    detail.contains("no authoritative archive data"),
+                    "empty archive dir should not be treated as recoverable state: {detail}"
+                );
+            }
+            other => panic!("empty archive dir should not trigger reconstruction: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_failure_strategy_prefers_reconstruct_with_archive_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive_root = dir.path().join("projects");
         let error = CliError::Other(
@@ -39631,7 +39686,7 @@ startup_timeout_sec = 42
         match strategy {
             DoctorDatabaseFixStrategy::Repair(detail) => {
                 assert!(detail.contains("Database inventory probe failed"));
-                assert!(detail.contains("no canonical archive data"));
+                assert!(detail.contains("no authoritative archive data"));
             }
             other => panic!("inventory failure without archive data should repair: {other:?}"),
         }
@@ -39847,9 +39902,40 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_database_fix_strategy_ignores_unrelated_default_archive_for_missing_custom_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing-custom.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let xdg_data_home = dir.path().join("xdg");
+        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
+            || {
+                let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+                seed_archive_mailbox_project(&storage_root);
+
+                let strategy =
+                    doctor_database_fix_strategy(&db_url, &storage_root).expect("strategy");
+                match strategy {
+                    DoctorDatabaseFixStrategy::None(detail) => {
+                        assert!(
+                            detail.contains("no authoritative archive data"),
+                            "unrelated default archive should not be authoritative: {detail}"
+                        );
+                    }
+                    other => panic!(
+                        "unrelated default archive should not reconstruct missing custom DB: {other:?}"
+                    ),
+                }
+            },
+        );
+    }
+
+    #[test]
     fn startup_database_self_heal_dispatches_reconstruct_for_missing_db_with_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("projects")).expect("create archive root");
+        seed_archive_mailbox_project(dir.path());
         let db_path = dir.path().join("missing.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         let repair_called = std::cell::Cell::new(false);
@@ -39884,7 +39970,7 @@ startup_timeout_sec = 42
     #[test]
     fn startup_database_self_heal_reconstruct_uses_configured_database_path() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("projects")).expect("create archive root");
+        seed_archive_mailbox_project(dir.path());
         let db_path = dir.path().join("custom.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         let captured_path = std::cell::RefCell::new(None::<std::path::PathBuf>);
@@ -40525,6 +40611,118 @@ startup_timeout_sec = 42
         let result =
             handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, false, true);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn doctor_reconstruct_json_skip_for_empty_archive_names_targets() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let db_path = tmp.path().join("empty-json.sqlite3");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), true, true, true)
+            .expect("empty archive should emit a structured skip");
+        let output = capture.drain_to_string();
+        let payload: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("skip payload should be JSON");
+
+        assert_eq!(payload["status"], "skip");
+        assert_eq!(payload["reason"], "no authoritative archive data found");
+        assert_eq!(payload["db_path"], db_path.display().to_string());
+        assert_eq!(payload["projects_dir"], projects_dir.display().to_string());
+        assert_eq!(payload["actions_taken"], 0);
+        assert!(
+            payload["next_action"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("am doctor repair --dry-run"),
+            "skip payload should point agents at the database-only recovery path: {payload}"
+        );
+    }
+
+    #[test]
+    fn doctor_reconstruct_empty_archive_does_not_create_database() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("projects")).unwrap();
+        let db_path = tmp.path().join("empty-archive-reconstruct.sqlite3");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_reconstruct_with(Some(&db_path), Some(tmp.path()), false, true, false)
+            .expect("empty archive should be a non-mutating skip");
+        let output = capture.drain_to_string();
+
+        assert!(
+            output.contains("No authoritative archive data found"),
+            "empty archive skip should be explicit: {output}"
+        );
+        assert!(
+            !db_path.exists(),
+            "empty archive reconstruct should not create or swap a database"
+        );
+    }
+
+    #[test]
+    fn doctor_reconstruct_locked_uses_explicit_targets_not_env_defaults() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("explicit-storage");
+        let env_storage_root = tmp.path().join("env-storage");
+        let db_path = tmp.path().join("explicit.sqlite3");
+        let env_db_path = tmp.path().join("env.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let env_db_url = format!("sqlite:///{}", env_db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let env_storage_root_text = env_storage_root.to_string_lossy().to_string();
+
+        seed_archive_mailbox_project(&storage_root);
+        std::fs::create_dir_all(&env_storage_root).unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", env_db_url.as_str()),
+                ("STORAGE_ROOT", env_storage_root_text.as_str()),
+            ],
+            || handle_doctor_reconstruct_locked(&db_url, &storage_root, false, true, true),
+        );
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "locked reconstruct should use explicit targets even when env differs: {output}"
+        );
+        assert!(
+            db_path.exists(),
+            "explicit database should be reconstructed"
+        );
+        assert!(
+            !env_db_path.exists(),
+            "ambient env database must remain untouched"
+        );
+        assert!(
+            output.contains(&storage_root_text),
+            "output should name the explicit storage root: {output}"
+        );
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open explicit reconstructed db");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("query reconstructed projects");
+        let project_count: i64 = rows
+            .first()
+            .and_then(|row| row.get_named("cnt").ok())
+            .unwrap_or_default();
+        assert_eq!(project_count, 1);
     }
 
     #[test]
@@ -41997,7 +42195,7 @@ startup_timeout_sec = 42
             "dry-run repair should report the WAL plan without opening sqlite: {output}"
         );
         assert!(
-            output.contains("Would quarantine SQLite WAL sidecar is header-only/truncated"),
+            output.contains("Would quarantine: SQLite WAL sidecar is header-only/truncated"),
             "dry-run output should explain the WAL quarantine plan: {output}"
         );
         assert!(
@@ -42379,6 +42577,16 @@ startup_timeout_sec = 42
             std::fs::read_dir(tmp.path())
                 .unwrap()
                 .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("rollback-replaced-db")),
+            "rollback should preserve the replaced main DB artifact for forensics"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
                 .all(|entry| !entry
                     .file_name()
                     .to_string_lossy()
@@ -42427,7 +42635,7 @@ startup_timeout_sec = 42
         assert_eq!(std::fs::read(&db_path).unwrap(), b"original-main");
         assert!(
             !wal_path.exists(),
-            "replacement wal should be removed during rollback when original had none"
+            "replacement wal should be moved away from the live path during rollback when original had none"
         );
         assert!(
             !shm_path.exists(),
@@ -42442,6 +42650,26 @@ startup_timeout_sec = 42
             "already-moved replacement wal should not remain after rollback"
         );
         assert_eq!(std::fs::read(&temp_shm_path).unwrap(), b"replacement-shm");
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("rollback-replaced-db")),
+            "rollback should preserve the replaced main DB artifact for forensics"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("rollback-replacement-sidecar")),
+            "rollback should preserve the already-moved replacement sidecar for forensics"
+        );
         assert!(
             std::fs::read_dir(tmp.path())
                 .unwrap()
@@ -45114,6 +45342,7 @@ startup_timeout_sec = 42
                 ("STORAGE_ROOT", &storage_root),
                 ("HTTP_HOST", "127.0.0.1"),
                 ("HTTP_PORT", &http_port),
+                ("AM_IGNORE_KNOWN_BAD_GIT", "GIT_2_51_0_INDEX_RACE"),
             ],
             || {
                 let parsed = run_doctor_check_json(&db_url, dir.path());
@@ -52821,7 +53050,7 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn open_db_sync_with_database_url_auto_quarantines_corrupt_db_without_backup() {
+    fn open_db_sync_with_database_url_refuses_corrupt_db_without_backup_or_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -52830,19 +53059,29 @@ startup_timeout_sec = 42
 
         std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("STORAGE_ROOT", &storage_root.display().to_string())],
-            || {
-                let conn = open_db_sync_with_database_url(&db_url).expect("open after quarantine");
-                let rows = conn
-                    .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
-                    .expect("query projects count");
-                assert!(
-                    !rows.is_empty(),
-                    "schema init should recreate core tables after quarantine"
-                );
-                drop(conn);
-            },
+            || open_db_sync_with_database_url(&db_url),
+        );
+        let error = match result {
+            Ok(_) => {
+                panic!("corrupt DB without backup or authoritative archive should fail closed")
+            }
+            Err(error) => error,
+        };
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("no authoritative archive data exists"),
+            "unexpected error: {error_text}"
+        );
+        assert!(
+            error_text.contains("original database is untouched"),
+            "error should make preservation explicit: {error_text}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read original db"),
+            b"NOT A SQLITE DATABASE",
+            "original corrupt DB should remain in place for forensics"
         );
 
         let quarantine_count = std::fs::read_dir(dir.path())
@@ -52857,8 +53096,8 @@ startup_timeout_sec = 42
             })
             .count();
         assert!(
-            quarantine_count >= 1,
-            "corrupt DB should be preserved as quarantined artifact"
+            quarantine_count == 0,
+            "corrupt DB should not be quarantined without a verified replacement"
         );
     }
 
@@ -53397,8 +53636,8 @@ startup_timeout_sec = 42
                 let output = capture.drain_to_string();
 
                 assert!(
-                    output.contains("No archive is available under"),
-                    "repair should report in-place recovery when archive is unavailable: {output}"
+                    output.contains("No authoritative archive data was found under"),
+                    "repair should report in-place recovery when archive is not authoritative: {output}"
                 );
                 assert!(
                     !output.contains("Nothing to reconstruct"),
@@ -53433,7 +53672,7 @@ startup_timeout_sec = 42
         let err_text = err.to_string();
 
         assert!(
-            output.contains("No archive is available under"),
+            output.contains("No authoritative archive data was found under"),
             "repair should explain why it is staying on the in-place path: {output}"
         );
         assert!(
@@ -57942,7 +58181,7 @@ fn handle_doctor_repair_with_options(
     }
 
     if dry_run && let Some(detail) = doctor_truncated_wal_sidecar_detail(&reconstruct_db_path) {
-        ftui_runtime::ftui_println!("  Would quarantine {detail}");
+        ftui_runtime::ftui_println!("  Would quarantine: {detail}");
         let shm_path = sqlite_sidecar_path(&reconstruct_db_path, "-shm");
         if std::fs::symlink_metadata(&shm_path).is_ok() {
             ftui_runtime::ftui_println!("  Would quarantine companion SHM: {}", shm_path.display());
@@ -57970,6 +58209,21 @@ fn handle_doctor_repair_with_options(
         ftui_runtime::ftui_println!("  Forensics: {}", bundle_dir.display());
     }
 
+    let archive_projects_dir = storage_root.join("projects");
+    let archive_available = path_is_real_directory(&archive_projects_dir);
+    let archive_inventory =
+        archive_available.then(|| collect_doctor_archive_inventory(storage_root));
+    let archive_has_state = archive_inventory
+        .as_ref()
+        .is_some_and(|inventory| inventory.counts() != DoctorInventoryCounts::default());
+    let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
+    let archive_reconstruct_available = archive_has_state
+        && doctor_archive_is_authoritative_for_sqlite_path(
+            &reconstruct_db_path,
+            storage_root,
+            storage_root_is_explicit,
+        );
+
     // 1. File sanity check via the canonical FrankenSQLite probe so doctor
     // repair does not misclassify healthy databases as corrupt.
     let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
@@ -57980,10 +58234,16 @@ fn handle_doctor_repair_with_options(
         if integrity_ok { "OK" } else { "FAILED" }
     );
 
-    let archive_projects_dir = storage_root.join("projects");
-    let archive_available = path_is_real_directory(&archive_projects_dir);
-    if !integrity_ok && !dry_run {
-        if archive_available {
+    if !integrity_ok {
+        if archive_reconstruct_available {
+            if dry_run {
+                ftui_runtime::ftui_println!(
+                    "  Would fall back to archive reconstruction from {}",
+                    archive_projects_dir.display()
+                );
+                ftui_runtime::ftui_println!("Repair dry run complete.");
+                return Ok(());
+            }
             ftui_runtime::ftui_eprintln!(
                 "  Database corruption detected ({integrity_detail}). Automatically falling back to archive reconstruction..."
             );
@@ -57995,8 +58255,16 @@ fn handle_doctor_repair_with_options(
                 false,
             );
         }
+        if dry_run {
+            ftui_runtime::ftui_println!(
+                "  Would attempt in-place repair because no authoritative archive data was found under {}",
+                archive_projects_dir.display()
+            );
+            ftui_runtime::ftui_println!("Repair dry run complete.");
+            return Ok(());
+        }
         ftui_runtime::ftui_eprintln!(
-            "  Database corruption detected ({integrity_detail}). No archive is available under {}; repair will attempt in-place recovery from the database file and any healthy backups...",
+            "  Database corruption detected ({integrity_detail}). No authoritative archive data was found under {}; repair will attempt in-place recovery from the database file and any healthy backups...",
             archive_projects_dir.display(),
         );
     }
@@ -58010,9 +58278,7 @@ fn handle_doctor_repair_with_options(
     match collect_doctor_db_inventory(&conn) {
         Ok(_) => {}
         Err(error) => {
-            let archive_inventory = collect_doctor_archive_inventory(storage_root);
-            let archive_has_state = archive_inventory.counts() != DoctorInventoryCounts::default();
-            if archive_available && archive_has_state {
+            if archive_reconstruct_available {
                 let detail = truncate_doctor_command(&error.to_string());
                 ftui_runtime::ftui_println!("  Database inventory: FAILED ({detail})");
                 if dry_run {
@@ -58036,17 +58302,17 @@ fn handle_doctor_repair_with_options(
                 );
             }
             return Err(CliError::Other(format!(
-                "database table inventory probe failed during repair: {}; no canonical archive data was found under {}",
+                "database table inventory probe failed during repair: {}; no authoritative archive data was found under {}",
                 truncate_doctor_command(&error.to_string()),
                 archive_projects_dir.display()
             )));
         }
     }
 
-    // 1b. Run a full PRAGMA integrity_check (not just quick_check) to detect
-    // index-level corruption that quick_check misses.  Report the result but
-    // do NOT bail to reconstruction — the REINDEX step below will fix index
-    // corruption in-place.
+    // 1b. Run a full PRAGMA integrity_check (not just quick_check) to catch
+    // corruption outside quick_check's reach. If the archive has authoritative
+    // state, reconstruction is safer than trying to guess which in-place repair
+    // operation can recover a malformed b-tree or index.
     {
         let full_ok = sqlite_conn_check_ok_with_canonical_file_fallback(
             &conn,
@@ -58055,9 +58321,7 @@ fn handle_doctor_repair_with_options(
         )
         .unwrap_or(false);
         if !full_ok {
-            let archive_inventory = collect_doctor_archive_inventory(storage_root);
-            let archive_has_state = archive_inventory.counts() != DoctorInventoryCounts::default();
-            if archive_available && archive_has_state {
+            if archive_reconstruct_available {
                 ftui_runtime::ftui_println!(
                     "  Full integrity_check: FAILED (archive reconstruction recommended)"
                 );
@@ -58082,7 +58346,7 @@ fn handle_doctor_repair_with_options(
                 );
             }
             ftui_runtime::ftui_println!(
-                "  Full integrity_check: FAILED (no archive data found; attempting in-place repair)"
+                "  Full integrity_check: FAILED (no authoritative archive data found; attempting in-place repair)"
             );
         } else {
             ftui_runtime::ftui_println!("  Full integrity_check: OK");
@@ -58438,23 +58702,20 @@ fn handle_doctor_restore_to(
 fn handle_doctor_reconstruct(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let db_path = doctor_reconstruct_db_path_from_config(&cfg)?;
-    let _mailbox_storage_root_lock =
-        acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
-    let _mailbox_sqlite_lock =
-        acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
-    handle_doctor_reconstruct_with(
-        Some(&db_path),
-        Some(&config.storage_root),
-        dry_run,
-        yes,
-        json,
-    )
+    handle_doctor_reconstruct_locked(&cfg.database_url, &config.storage_root, dry_run, yes, json)
 }
 
 fn doctor_reconstruct_db_path_from_config(
     cfg: &mcp_agent_mail_db::DbPoolConfig,
 ) -> CliResult<PathBuf> {
+    doctor_reconstruct_db_path_from_database_url(&cfg.database_url)
+}
+
+fn doctor_reconstruct_db_path_from_database_url(database_url: &str) -> CliResult<PathBuf> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
     let db_path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
@@ -58466,6 +58727,46 @@ fn doctor_reconstruct_db_path_from_config(
     Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
         &db_path,
     )))
+}
+
+fn handle_doctor_reconstruct_locked(
+    database_url: &str,
+    storage_root: &Path,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> CliResult<()> {
+    let db_path = doctor_reconstruct_db_path_from_database_url(database_url)?;
+    handle_doctor_reconstruct_locked_with_path(
+        Some(&db_path),
+        Some(storage_root),
+        dry_run,
+        yes,
+        json,
+    )
+}
+
+fn handle_doctor_reconstruct_locked_with_path(
+    db_path_override: Option<&Path>,
+    storage_root_override: Option<&Path>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> CliResult<()> {
+    let config = Config::from_env();
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let storage_root = storage_root_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.storage_root.clone());
+    let db_path = match db_path_override {
+        Some(p) => p.to_path_buf(),
+        None => doctor_reconstruct_db_path_from_config(&cfg)?,
+    };
+    let _mailbox_storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
+    let _mailbox_sqlite_lock =
+        acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
+    handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), dry_run, yes, json)
 }
 
 #[derive(Debug)]
@@ -58513,18 +58814,52 @@ fn quarantine_sqlite_state(
 
 fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult<()> {
     if path_is_occupied(&state.original_db) {
-        std::fs::remove_file(&state.original_db)?;
+        preserve_rollback_replacement_artifact(&state.original_db, "rollback-replaced-db")?;
     }
     std::fs::rename(&state.quarantined_db, &state.original_db)?;
     for (original, quarantined) in &state.sidecars {
         if path_is_occupied(original) {
-            std::fs::remove_file(original)?;
+            preserve_rollback_replacement_artifact(original, "rollback-replaced-sidecar")?;
         }
         if path_is_occupied(quarantined) {
             std::fs::rename(quarantined, original)?;
         }
     }
     Ok(())
+}
+
+fn next_rollback_preserved_artifact_path(path: &Path, label: &str) -> PathBuf {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let mut candidate = path_with_file_name_suffix(
+        path,
+        &format!(".{label}-{timestamp}"),
+        &format!("storage.sqlite3.{label}-{timestamp}"),
+    );
+    let mut suffix = 1_u32;
+    while path_is_occupied(&candidate) {
+        candidate = path_with_file_name_suffix(
+            path,
+            &format!(".{label}-{timestamp}-{suffix:02}"),
+            &format!("storage.sqlite3.{label}-{timestamp}-{suffix:02}"),
+        );
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
+fn preserve_rollback_replacement_artifact(path: &Path, label: &str) -> CliResult<Option<PathBuf>> {
+    if !path_is_occupied(path) {
+        return Ok(None);
+    }
+    let preserved = next_rollback_preserved_artifact_path(path, label);
+    std::fs::rename(path, &preserved).map_err(|e| {
+        CliError::Other(format!(
+            "failed to preserve rollback replacement artifact {} as {}: {e}",
+            path.display(),
+            preserved.display()
+        ))
+    })?;
+    Ok(Some(preserved))
 }
 
 fn sqlite_artifact_conflicts(candidate: &Path) -> bool {
@@ -58676,14 +59011,7 @@ fn cleanup_replacement_sqlite_sidecars(
     context: &str,
 ) -> Result<(), CliError> {
     for sidecar in sidecars.iter().rev() {
-        if path_is_occupied(sidecar) {
-            std::fs::remove_file(sidecar).map_err(|e| {
-                CliError::Other(format!(
-                    "failed to remove replacement sidecar {} during {context}: {e}",
-                    sidecar.display()
-                ))
-            })?;
-        }
+        preserve_rollback_replacement_artifact(sidecar, &format!("{context}-replacement-sidecar"))?;
     }
     Ok(())
 }
@@ -59132,6 +59460,11 @@ fn handle_doctor_reconstruct_with(
         Some(p) => p.to_path_buf(),
         None => doctor_reconstruct_db_path_from_config(&cfg)?,
     };
+    let forensic_database_url = if db_path_override.is_some() {
+        format!("sqlite:///{}", db_path.display())
+    } else {
+        cfg.database_url.clone()
+    };
     if db_path.as_os_str() == OsStr::new(":memory:") {
         return Err(CliError::InvalidArgument(
             "cannot reconstruct an in-memory database (:memory:)".to_string(),
@@ -59163,7 +59496,11 @@ fn handle_doctor_reconstruct_with(
                 serde_json::json!({
                     "status": "skip",
                     "reason": "no projects directory found",
-                    "storage_root": storage_root.display().to_string()
+                    "db_path": db_path.display().to_string(),
+                    "storage_root": storage_root.display().to_string(),
+                    "projects_dir": projects_dir.display().to_string(),
+                    "actions_taken": 0,
+                    "next_action": "Create mailbox archive content first, or run am doctor repair --dry-run for database-only recovery."
                 })
             );
         } else {
@@ -59171,6 +59508,31 @@ fn handle_doctor_reconstruct_with(
                 "No projects directory found at {}. Nothing to reconstruct.",
                 projects_dir.display()
             );
+        }
+        return Ok(());
+    }
+    let archive_inventory = collect_doctor_archive_inventory(&storage_root);
+    if archive_inventory.counts() == DoctorInventoryCounts::default() {
+        if json {
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::json!({
+                    "status": "skip",
+                    "reason": "no authoritative archive data found",
+                    "db_path": db_path.display().to_string(),
+                    "storage_root": storage_root.display().to_string(),
+                    "projects_dir": projects_dir.display().to_string(),
+                    "actions_taken": 0,
+                    "next_action": "Create mailbox archive content first, or run am doctor repair --dry-run for database-only recovery."
+                })
+            );
+        } else {
+            ftui_runtime::ftui_println!(
+                "No authoritative archive data found under {}. Nothing to reconstruct.",
+                projects_dir.display()
+            );
+            ftui_runtime::ftui_println!("Database path: {}", db_path.display());
+            ftui_runtime::ftui_println!("Storage root: {}", storage_root.display());
         }
         return Ok(());
     }
@@ -59238,7 +59600,7 @@ fn handle_doctor_reconstruct_with(
     if !dry_run
         && let Some(bundle_dir) = capture_doctor_forensic_bundle(
             "reconstruct",
-            &cfg.database_url,
+            &forensic_database_url,
             &db_path,
             &storage_root,
             None,
