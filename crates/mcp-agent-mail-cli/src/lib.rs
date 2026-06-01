@@ -17949,12 +17949,20 @@ fn doctor_orphaned_message_recipients(
             rowid: row
                 .get_as(0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            message_id: row
-                .get_as(1)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            agent_id: row
-                .get_as(2)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            // `message_id`/`agent_id` can hold a non-integer value on a database
+            // salvaged with `sqlite3 .recover`, which can resurrect a cell with
+            // the wrong column affinity (TEXT/NULL where an i64 id belongs). Such
+            // a row is *definitionally* orphaned — a non-integer foreign key
+            // matches no parent, so the `CASE` columns above already flag it via
+            // `missing_message`/`missing_agent` — and it stays actionable through
+            // its always-integer `rowid`. Decode these display ids leniently
+            // (sentinel -1 = unknown) so a single malformed row is reported and
+            // cleaned instead of aborting the entire repair with
+            // "expected i64, found TEXT". `agent_id` only feeds downstream logic
+            // (affected-agent inbox-stat rebuilds) for rows where the agent
+            // exists (`!missing_agent`), in which case it is guaranteed a real i64.
+            message_id: row.get_as::<i64>(1).unwrap_or(-1),
+            agent_id: row.get_as::<i64>(2).unwrap_or(-1),
             missing_message: row
                 .get_as::<i64>(3)
                 .map(|value| value != 0)
@@ -17990,12 +17998,20 @@ fn doctor_orphaned_message_recipients_canonical(
             rowid: row
                 .get_as(0)
                 .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            message_id: row
-                .get_as(1)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            agent_id: row
-                .get_as(2)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            // `message_id`/`agent_id` can hold a non-integer value on a database
+            // salvaged with `sqlite3 .recover`, which can resurrect a cell with
+            // the wrong column affinity (TEXT/NULL where an i64 id belongs). Such
+            // a row is *definitionally* orphaned — a non-integer foreign key
+            // matches no parent, so the `CASE` columns above already flag it via
+            // `missing_message`/`missing_agent` — and it stays actionable through
+            // its always-integer `rowid`. Decode these display ids leniently
+            // (sentinel -1 = unknown) so a single malformed row is reported and
+            // cleaned instead of aborting the entire repair with
+            // "expected i64, found TEXT". `agent_id` only feeds downstream logic
+            // (affected-agent inbox-stat rebuilds) for rows where the agent
+            // exists (`!missing_agent`), in which case it is guaranteed a real i64.
+            message_id: row.get_as::<i64>(1).unwrap_or(-1),
+            agent_id: row.get_as::<i64>(2).unwrap_or(-1),
             missing_message: row
                 .get_as::<i64>(3)
                 .map(|value| value != 0)
@@ -53789,6 +53805,67 @@ startup_timeout_sec = 42
                 .get_named::<i64>("ack_pending_count")
                 .unwrap_or(-1),
             1
+        );
+    }
+
+    #[test]
+    fn doctor_orphaned_recipients_tolerates_non_integer_ids_from_recover() {
+        // Regression: a row salvaged by `sqlite3 .recover` can hold a TEXT
+        // `message_id` (wrong column affinity). The orphan scan must surface it
+        // for cleanup keyed by its always-integer rowid, NOT abort the whole
+        // database repair with "Type error: expected i64, found TEXT".
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_orphan_text_id.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'recover-fk', '/tmp/recover-fk', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (2, 1, 'Recipient', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agent");
+        // A recipient whose message_id is TEXT (recover affinity drift). No
+        // integer message can match it, so it is definitionally a
+        // missing-message orphan that cleanup should be able to drop.
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES ('autosave-form-lock', 2, 'to', NULL, NULL)",
+        )
+        .expect("insert text-message_id recipient");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint fixture rows");
+
+        let orphans = doctor_orphaned_message_recipients(&conn)
+            .expect("scan must tolerate non-integer ids instead of erroring");
+        assert_eq!(orphans.len(), 1, "the malformed row must still be surfaced");
+        let row = &orphans[0];
+        assert!(
+            row.rowid > 0,
+            "row must be keyed by its real rowid for cleanup, got {}",
+            row.rowid
+        );
+        assert_eq!(
+            row.message_id, -1,
+            "an un-decodable message_id falls back to the -1 sentinel"
+        );
+        assert!(
+            row.missing_message,
+            "a TEXT message_id matches no message row"
+        );
+        assert!(
+            !row.missing_agent,
+            "the real integer agent_id (2) still resolves"
         );
     }
 
