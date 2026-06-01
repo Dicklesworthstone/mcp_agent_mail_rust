@@ -52,7 +52,7 @@
           <div class="flex items-center gap-4 flex-wrap text-white/90">
             <div class="flex items-center gap-2">
               <div class="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center">
-                <span class="text-sm font-bold">{{ commit.author[0].upper() }}</span>
+                <span class="text-sm font-bold">{{ commit.author[0]|upper }}</span>
               </div>
               <span class="font-medium">{{ commit.author }}</span>
             </div>
