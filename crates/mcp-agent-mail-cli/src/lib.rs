@@ -3916,9 +3916,12 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
 
     // Detach truncated/corrupt WAL and orphaned SHM sidecars from the live DB.
     //
-    // Issue #119: A 32-byte (header-only) WAL file is just as fatal as a
-    // 0-byte truncated WAL. Use the database-layer predicate so startup,
-    // doctor, and pool recovery cannot drift on the frame-data boundary.
+    // Issue #119: A non-empty WAL smaller than (or exactly equal to) the 32-byte
+    // header has no committed frames and is a crash artifact worth quarantining.
+    // A 0-byte WAL, by contrast, is the normal idle/just-checkpointed state and
+    // is left untouched (see `sqlite_wal_is_header_only_or_truncated`). Use the
+    // database-layer predicate so startup, doctor, and pool recovery cannot
+    // drift on the frame-data boundary.
     let wal_path = sqlite_sidecar_path(db_path, "-wal");
     let mut wal_detached = false;
 
@@ -21440,11 +21443,12 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     // Issue #119: cleanup-enabled callers run truncated-WAL self-heal BEFORE
-    // any open or integrity probe.  A header-only or 0-byte WAL sidecar (left
-    // by a force-killed daemon) makes every subsequent SQLite open trip "WAL
-    // file too small for header during rebuild", including the
-    // orphan-recipient probe further down this function.  Read-only callers
-    // report the repair need instead of quarantining sidecars themselves.
+    // any open or integrity probe.  A non-empty header-only/truncated WAL
+    // sidecar makes subsequent SQLite opens trip "WAL file too small for
+    // header during rebuild", including the orphan-recipient probe further down
+    // this function. A 0-byte WAL is a valid idle/checkpointed state. Read-only
+    // callers report repairable non-empty sidecars instead of quarantining
+    // them.
     if cleanup_truncated_wal {
         mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved);
     } else if let Some(detail) = doctor_truncated_wal_sidecar_detail(resolved) {

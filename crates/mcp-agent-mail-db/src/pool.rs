@@ -292,7 +292,7 @@ impl RecoveryAction {
                 "Only removes locks whose owning PID no longer exists; idempotent"
             }
             Self::EmptyWalSidecarCleanup => {
-                "Quarantines zero-byte or header-only WAL files that prevent clean open; idempotent"
+                "Quarantines non-empty header-only/truncated (1..=32 byte) WAL files that prevent clean open; a 0-byte WAL is a valid idle state and is left attached; idempotent"
             }
             Self::ConnectionPoolRefresh => {
                 "Closes stale file descriptors and opens fresh connections; no data mutation"
@@ -3273,10 +3273,10 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
-    // Clean up empty/corrupt WAL sidecars before opening any connections.
-    // A 0-byte WAL file (left by a crash during DELETE->WAL journal mode
-    // transition) triggers "WAL file too small for header during rebuild"
-    // errors. Removing it is safe: SQLite recreates WAL on next write.
+    // Clean up corrupt WAL sidecars before opening any connections. A non-empty
+    // WAL with no committed frames (1..=32 bytes) can trigger "WAL file too
+    // small for header during rebuild"; a 0-byte WAL is a valid idle/checkpoint
+    // state and is left attached.
     if sqlite_path != ":memory:" {
         cleanup_empty_wal_sidecar(sqlite_path);
     }
@@ -4347,24 +4347,36 @@ pub const fn sqlite_wal_has_committed_frames(wal_len: u64) -> bool {
 
 #[must_use]
 pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
-    !sqlite_wal_has_committed_frames(wal_len)
+    // A WAL sidecar is a header-only-or-truncated *artifact* only when it
+    // exists on disk with a non-empty body (a partial 1..=31 byte header, or an
+    // exactly header-sized 32-byte body) yet carries no committed frames.
+    //
+    // A 0-byte WAL is NOT such an artifact: it is the normal, valid state of a
+    // WAL-mode database that is idle or was just checkpointed with TRUNCATE.
+    // SQLite recreates frames on the next write and opens an empty WAL without
+    // error. Treating it as truncated made `am doctor` false-fail on a healthy
+    // live server (whose WAL sits at 0 bytes between writes) and made the
+    // startup/pool self-heal endlessly re-quarantine valid empty WALs. Only a
+    // *non-empty* WAL with no committed frames is a genuine truncation artifact.
+    wal_len > 0 && !sqlite_wal_has_committed_frames(wal_len)
 }
 
 /// Quarantine corrupt or truncated WAL/SHM sidecars that cause "WAL file too
 /// small for header" errors during SQLite open.
 ///
-/// The SQLite WAL header is 32 bytes.  Any WAL file shorter than that is
-/// pathological and cannot be used; a header-only WAL has no committed frame
-/// data and is equally safe to move out of the live DB family.  A truncated WAL
+/// The SQLite WAL header is 32 bytes. A non-empty WAL shorter than that is
+/// pathological and cannot be used; a header-only 32-byte WAL has no committed
+/// frame data and is equally safe to move out of the live DB family. A 0-byte
+/// WAL is a valid idle/checkpointed state and is left attached. A truncated WAL
 /// can be left behind when:
 /// - A crash occurs during the `DELETE` -> `WAL` journal mode transition
 /// - A `PRAGMA journal_size_limit` triggers truncation racing with a reader
 /// - The process is killed between WAL creation and first header write
 /// - SIGKILL terminates a writer mid-checkpoint
 ///
-/// Moving a sub-header WAL aside is safe because SQLite recreates the WAL on
-/// the next write.  We also quarantine SHM artifacts whose companion WAL was
-/// moved, since the SHM is meaningless without a WAL.
+/// Moving a non-empty sub-header WAL aside is safe because SQLite recreates the
+/// WAL on the next write. We also quarantine SHM artifacts whose companion WAL
+/// was moved, since the SHM is meaningless without a WAL.
 ///
 /// Public alias for [`cleanup_empty_wal_sidecar`] so callers outside this crate
 /// (e.g. CLI startup self-heal) can run the same WAL cleanup _before_ opening
@@ -4448,9 +4460,9 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
         wal_os.push("-wal");
         let wal_path = PathBuf::from(wal_os);
         match std::fs::symlink_metadata(&wal_path) {
-            // Quarantine WAL files that are header-only or smaller (<= 32
-            // bytes).
-            // GH#99: a 32-byte header-only WAL (normal post-init state) was
+            // Quarantine non-empty WAL files that are header-only or smaller
+            // (1..=32 bytes).
+            // GH#99: a 32-byte header-only WAL sidecar was
             // tripping "WAL file too small for header during rebuild" on
             // checkpoint, which the verdict engine used to escalate to
             // Broken/corrupt. Moving it out of the live DB family prevents
@@ -12483,11 +12495,21 @@ mod tests {
 
     #[test]
     fn sqlite_wal_frame_boundary_treats_header_only_as_no_committed_frames() {
-        assert!(sqlite_wal_is_header_only_or_truncated(0));
+        // An empty (0-byte) WAL is the normal idle/just-checkpointed state, not
+        // a truncated artifact — it must NOT be flagged or quarantined.
+        assert!(!sqlite_wal_is_header_only_or_truncated(0));
+        // A non-empty WAL below the 32-byte header is a genuine partial-header
+        // truncation artifact.
+        assert!(sqlite_wal_is_header_only_or_truncated(1));
+        assert!(sqlite_wal_is_header_only_or_truncated(
+            SQLITE_WAL_HEADER_BYTES - 1
+        ));
+        // A complete-but-frameless 32-byte header is also treated as an artifact.
         assert!(sqlite_wal_is_header_only_or_truncated(
             SQLITE_WAL_HEADER_BYTES
         ));
         assert!(!sqlite_wal_has_committed_frames(SQLITE_WAL_HEADER_BYTES));
+        assert!(!sqlite_wal_has_committed_frames(0));
         assert!(sqlite_wal_has_committed_frames(SQLITE_WAL_HEADER_BYTES + 1));
         assert!(!sqlite_wal_is_header_only_or_truncated(
             SQLITE_WAL_HEADER_BYTES + 1
@@ -12507,7 +12529,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_empty_wal_sidecar_quarantines_zero_byte_wal() {
+    fn cleanup_empty_wal_sidecar_preserves_zero_byte_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup_test.db");
         // Create a real DB so the main file exists.
@@ -12516,7 +12538,7 @@ mod tests {
             .expect("create table");
         drop(conn);
 
-        // Create a 0-byte WAL sidecar (simulating crash artifact).
+        // A 0-byte WAL sidecar is a valid idle/checkpointed WAL-mode state.
         let wal_path = dir.path().join("cleanup_test.db-wal");
         std::fs::write(&wal_path, b"").expect("create empty wal");
         assert!(wal_path.exists());
@@ -12525,20 +12547,14 @@ mod tests {
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
 
         assert!(
-            !wal_path.exists(),
-            "empty WAL should move out of the live DB family"
+            wal_path.exists(),
+            "0-byte WAL should stay attached to the live DB family"
         );
         let quarantines = sqlite_cleanup_quarantines(dir.path(), "cleanup_test.db-wal");
         assert_eq!(
             quarantines.len(),
-            1,
-            "empty WAL should be preserved as a cleanup quarantine artifact"
-        );
-        assert_eq!(
-            std::fs::metadata(&quarantines[0])
-                .expect("quarantined WAL metadata")
-                .len(),
-            0
+            0,
+            "0-byte WAL should not create a cleanup quarantine artifact"
         );
     }
 
@@ -12566,7 +12582,7 @@ mod tests {
 
     #[test]
     fn cleanup_empty_wal_sidecar_quarantines_header_only_wal_and_companion_shm() {
-        // GH#99: a 32-byte header-only WAL (normal post-init state) was
+        // GH#99: a 32-byte header-only WAL sidecar was
         // causing "WAL file too small for header during rebuild" on
         // checkpoint. Moving it out of the live DB family short-circuits
         // that cycle without destroying the evidence.
@@ -12659,7 +12675,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_sqlite_file_healthy_cleans_zero_byte_wal_before_recovery() {
+    fn ensure_sqlite_file_healthy_preserves_zero_byte_wal_before_recovery() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("zero-byte-wal.db");
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
@@ -12669,27 +12685,30 @@ mod tests {
 
         let wal = dir.path().join("zero-byte-wal.db-wal");
         std::fs::write(&wal, b"").expect("create empty wal");
-        assert!(wal.exists(), "empty wal stub should exist before recovery");
+        assert!(
+            wal.exists(),
+            "empty wal stub should exist before health check"
+        );
 
-        ensure_sqlite_file_healthy(&primary).expect("healthy db with empty wal should recover");
+        ensure_sqlite_file_healthy(&primary).expect("healthy db with empty wal should pass");
 
         assert!(
-            sqlite_file_is_healthy(&primary).expect("health check after cleanup"),
-            "primary db should remain healthy after empty wal cleanup"
+            sqlite_file_is_healthy(&primary).expect("health check after zero-byte wal"),
+            "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists(),
-            "empty wal stub should move out of the live DB family instead of forcing backup/reinit recovery"
+            wal.exists(),
+            "empty wal stub should remain in the live DB family"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal.db-wal").len(),
-            1,
-            "automatic recovery should preserve the empty WAL as a quarantine artifact"
+            0,
+            "automatic recovery should not quarantine a valid empty WAL"
         );
     }
 
     #[test]
-    fn ensure_sqlite_file_healthy_with_archive_cleans_zero_byte_wal_before_recovery() {
+    fn ensure_sqlite_file_healthy_with_archive_preserves_zero_byte_wal_before_recovery() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("zero-byte-wal-archive.db");
         let storage_root = dir.path().join("storage");
@@ -12704,24 +12723,24 @@ mod tests {
         std::fs::write(&wal, b"").expect("create empty wal");
         assert!(
             wal.exists(),
-            "empty wal stub should exist before archive-aware recovery"
+            "empty wal stub should exist before archive-aware health check"
         );
 
         ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect("healthy db with empty wal should recover");
+            .expect("healthy db with empty wal should pass");
 
         assert!(
-            sqlite_file_is_healthy(&primary).expect("health check after archive-aware cleanup"),
-            "primary db should remain healthy after archive-aware empty wal cleanup"
+            sqlite_file_is_healthy(&primary).expect("health check after archive-aware empty wal"),
+            "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            !wal.exists(),
-            "archive-aware recovery should move the empty wal stub out of the live DB family instead of escalating"
+            wal.exists(),
+            "archive-aware recovery should keep the empty wal stub in the live DB family"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal-archive.db-wal").len(),
-            1,
-            "archive-aware recovery should preserve the empty WAL as a quarantine artifact"
+            0,
+            "archive-aware recovery should not quarantine a valid empty WAL"
         );
     }
 
