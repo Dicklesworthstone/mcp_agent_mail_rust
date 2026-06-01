@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*"]
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -82,7 +82,7 @@ minijinja = "2.15.1"
 ammonia = "4.1.2"
 regex = "1"
 unicode-normalization = "0.1"
-similar = "3.1.0"
+similar = "3.1.1"
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 glob = "0.3.3"
 globset = "0.4"
