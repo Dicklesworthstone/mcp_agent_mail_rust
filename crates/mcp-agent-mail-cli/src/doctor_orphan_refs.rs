@@ -15,7 +15,9 @@
 //!   refuse without `--force`.
 //! - **Backups** of pruned refs written to
 //!   `<STORAGE_ROOT>/backups/refs/<project_slug>/<ts>.txt` before
-//!   deletion. Last 10 backups per project kept; older ones pruned.
+//!   deletion. Last 10 backups per project stay in the active backup
+//!   directory; older ones are moved into `retired/` rather than
+//!   deleted.
 //! - **Per-repo flock** held for the full detect+prune+repack
 //!   sequence to prevent interleaving with concurrent committers.
 //!
@@ -38,7 +40,7 @@ use mcp_agent_mail_storage::recovery::{
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 
-/// Backup retention: keep the last N backups per project, prune older.
+/// Backup retention: keep the last N backups active per project.
 const BACKUP_RETENTION: usize = 10;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -341,7 +343,7 @@ fn scan_one_project(
         // Note: we rotate AFTER repack_refs (not before) so the
         // packed-refs backup it writes is included in the retention
         // calculation. Otherwise a repack backup would escape the
-        // first rotation and only get reaped on the next apply.
+        // first rotation and only get retired on the next apply.
         match repack_refs(project_path, config) {
             Ok(()) => {
                 actions.push(ActionRecord {
@@ -545,23 +547,53 @@ fn rotate_backups(project_path: &Path, config: &Config) -> Result<(), String> {
     // Sort: newest mtime first; secondary by path (Reverse) so ties
     // are deterministic across runs.
     files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    if files.len() <= BACKUP_RETENTION {
+        return Ok(());
+    }
+
+    let retired_dir = dir.join("retired");
+    fs::create_dir_all(&retired_dir)
+        .map_err(|e| format!("mkdir retired backup dir {}: {e}", retired_dir.display()))?;
     for (_, p) in files.iter().skip(BACKUP_RETENTION) {
-        if let Err(e) = fs::remove_file(p) {
+        let retired_path = unique_retired_backup_path(&retired_dir, p);
+        if let Err(e) = fs::rename(p, &retired_path) {
             tracing::warn!(
                 target: "mcp_agent_mail::doctor::fix_orphan_refs",
                 path = %p.display(),
+                retired_path = %retired_path.display(),
                 err = %e,
-                "backup_rotation_remove_failed"
+                "backup_rotation_retire_failed"
             );
         } else {
             tracing::debug!(
                 target: "mcp_agent_mail::doctor::fix_orphan_refs",
                 path = %p.display(),
-                "backup_pruned"
+                retired_path = %retired_path.display(),
+                "backup_retired"
             );
         }
     }
     Ok(())
+}
+
+fn unique_retired_backup_path(retired_dir: &Path, source: &Path) -> PathBuf {
+    let file_name = source
+        .file_name()
+        .map_or_else(|| "backup".into(), std::ffi::OsStr::to_os_string);
+    let candidate = retired_dir.join(&file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let display_name = file_name.to_string_lossy();
+    for suffix in 1..=u32::MAX {
+        let candidate = retired_dir.join(format!("{display_name}.retired-{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    retired_dir.join(format!("{display_name}.retired-overflow"))
 }
 
 fn project_slug(project_path: &Path) -> String {
@@ -672,5 +704,66 @@ fn print_human(report: &Report) {
     if report.dry_run && report.summary.total_findings > 0 {
         println!();
         println!("NOTE: dry-run by default. Re-run with --apply to actually prune.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn count_regular_files(dir: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.metadata().is_ok_and(|meta| meta.is_file()))
+            .count()
+    }
+
+    #[test]
+    fn rotate_backups_retires_old_files_without_deleting_them() {
+        let temp = TempDir::new().expect("tempdir");
+        let project_path = temp.path().join("repo");
+        fs::create_dir_all(&project_path).expect("repo dir");
+
+        let config = Config {
+            storage_root: temp.path().join("storage"),
+            ..Config::default()
+        };
+        let backup_dir = config
+            .storage_root
+            .join("backups")
+            .join("refs")
+            .join(project_slug(&project_path));
+        fs::create_dir_all(&backup_dir).expect("backup dir");
+
+        for idx in 0..(BACKUP_RETENTION + 2) {
+            fs::write(backup_dir.join(format!("{idx:02}.txt")), format!("{idx}\n"))
+                .expect("backup file");
+        }
+
+        rotate_backups(&project_path, &config).expect("rotate backups");
+
+        assert_eq!(count_regular_files(&backup_dir), BACKUP_RETENTION);
+        assert_eq!(count_regular_files(&backup_dir.join("retired")), 2);
+        assert_eq!(
+            count_regular_files(&backup_dir) + count_regular_files(&backup_dir.join("retired")),
+            BACKUP_RETENTION + 2,
+            "rotation must move old backup artifacts, not delete them"
+        );
+    }
+
+    #[test]
+    fn unique_retired_backup_path_avoids_existing_retired_names() {
+        let temp = TempDir::new().expect("tempdir");
+        let retired_dir = temp.path().join("retired");
+        fs::create_dir_all(&retired_dir).expect("retired dir");
+        fs::write(retired_dir.join("123.txt"), b"old").expect("existing retired backup");
+
+        let next = unique_retired_backup_path(&retired_dir, Path::new("/tmp/123.txt"));
+
+        assert_eq!(next, retired_dir.join("123.txt.retired-1"));
     }
 }
