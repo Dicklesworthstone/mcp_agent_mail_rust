@@ -3,7 +3,7 @@
 //! Compiles [`SearchFilter`] into Tantivy `Box<dyn Query>` clauses that can be
 //! combined with full-text queries via `BooleanQuery`. Filters target exact-match
 //! (STRING) and fast (FAST) fields:
-//! - `sender` — exact agent name match
+//! - `sender` / `agent` — exact sender name match in this metadata-only compiler
 //! - `project_id` — exact project ID match
 //! - `thread_id` — exact thread ID match
 //! - `importance` — exact importance level or set membership
@@ -81,8 +81,11 @@ impl CompiledFilters {
 pub fn compile_filters(filter: &SearchFilter, handles: &FieldHandles) -> CompiledFilters {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-    // Sender filter (exact match on STRING field)
-    if let Some(ref sender) = filter.sender {
+    // Sender filter (exact match on STRING field). The Search V3 service routes
+    // recipient-sensitive agent filters through SQL before this compiler runs;
+    // direct Tantivy callers still treat `agent` as the sender-side alias used
+    // by the sibling search-core compiler.
+    if let Some(sender) = filter.sender.as_ref().or(filter.agent.as_ref()) {
         clauses.push(term_filter(handles.sender, sender));
     }
 
@@ -605,6 +608,17 @@ mod tests {
             let (index, handles) = setup_index();
             let filter = SearchFilter {
                 sender: Some("BlueLake".to_string()),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert_eq!(ids, vec![1]);
+        }
+
+        #[test]
+        fn filter_by_agent_alias_matches_sender() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                agent: Some("BlueLake".to_string()),
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
