@@ -1,0 +1,11 @@
+Upgrade helper: detect legacy install, import data, refresh setup
+
+Usage: am upgrade [OPTIONS]
+
+Options:
+      --search-root <SEARCH_ROOT>  Root directory to inspect for legacy markers and env files
+      --dry-run                    Show operations without making changes
+      --yes                        Skip interactive confirmation prompt
+      --format <FORMAT>            Output format: table, json, or toon
+      --json                       Output JSON (shorthand for --format json)
+  -h, --help                       Print help
