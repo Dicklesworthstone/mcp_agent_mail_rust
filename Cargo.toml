@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*"]
 
 [workspace.package]
-version = "0.3.9"
+version = "0.3.10"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
