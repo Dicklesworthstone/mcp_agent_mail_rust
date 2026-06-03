@@ -9509,6 +9509,27 @@ fn golden_matches_filter(name: &str, pattern: Option<&glob::Pattern>) -> bool {
     pattern.is_none_or(|p| p.matches(name))
 }
 
+fn seed_golden_capture_checksums(
+    dir: &Path,
+    filtered: bool,
+) -> CliResult<BTreeMap<String, String>> {
+    if !filtered {
+        return Ok(BTreeMap::new());
+    }
+
+    let checksums_path = dir.join("checksums.sha256");
+    if !checksums_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    golden::read_checksums_file(&checksums_path).map_err(|err| {
+        CliError::Other(format!(
+            "failed to read existing {} before filtered capture: {err}",
+            checksums_path.display()
+        ))
+    })
+}
+
 fn resolve_sibling_binary(current_exe: &Path, sibling_name: &str) -> PathBuf {
     current_exe
         .parent()
@@ -9683,7 +9704,7 @@ fn handle_golden_capture(
     std::fs::create_dir_all(&dir)?;
 
     let mut rows = Vec::new();
-    let mut checksums = std::collections::BTreeMap::new();
+    let mut checksums = seed_golden_capture_checksums(&dir, filter_pattern.is_some())?;
     let mut failures = 0usize;
 
     for spec in specs {
@@ -44361,6 +44382,33 @@ startup_timeout_sec = 42
             }
             other => panic!("expected Golden Capture, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn filtered_golden_capture_preserves_existing_checksum_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checksums_path = dir.path().join("checksums.sha256");
+        let mut existing = BTreeMap::new();
+        existing.insert("am_help.txt".to_string(), golden::sha256_hex("help\n"));
+        existing.insert(
+            "am_version.txt".to_string(),
+            golden::sha256_hex("am 0.3.8\n"),
+        );
+        golden::write_checksums_file(&checksums_path, &existing).expect("write checksums");
+
+        let seeded = seed_golden_capture_checksums(dir.path(), true)
+            .expect("filtered capture should load existing checksums");
+        assert_eq!(
+            seeded, existing,
+            "filtered capture must merge into the existing catalog rather than truncating it"
+        );
+
+        let unfiltered = seed_golden_capture_checksums(dir.path(), false)
+            .expect("unfiltered capture starts a fresh catalog");
+        assert!(
+            unfiltered.is_empty(),
+            "unfiltered capture intentionally rewrites the whole checksum catalog"
+        );
     }
 
     #[test]
