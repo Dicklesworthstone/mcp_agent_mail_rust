@@ -1088,16 +1088,16 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
 fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
     match mcp_agent_mail_storage::heal_archive_locks(config) {
         Ok(report) => {
-            if !report.locks_removed.is_empty() || !report.metadata_removed.is_empty() {
+            if !report.locks_quarantined.is_empty() || !report.metadata_quarantined.is_empty() {
                 tracing::info!(
-                    "[startup-heal] removed {} stale lock files and {} orphan lock metadata files (scanned={})",
-                    report.locks_removed.len(),
-                    report.metadata_removed.len(),
+                    "[startup-heal] quarantined {} stale lock files and {} orphan lock metadata files (scanned={})",
+                    report.locks_quarantined.len(),
+                    report.metadata_quarantined.len(),
                     report.locks_scanned
                 );
             } else {
                 tracing::debug!(
-                    "[startup-heal] lock scan complete (scanned={}, removed=0)",
+                    "[startup-heal] lock scan complete (scanned={}, quarantined=0)",
                     report.locks_scanned
                 );
             }

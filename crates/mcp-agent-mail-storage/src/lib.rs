@@ -15,6 +15,7 @@ pub mod boot_check;
 pub mod recovery;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
@@ -1022,6 +1023,72 @@ struct LockOwnerMeta {
     created_ts: f64,
 }
 
+static STARTUP_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn path_is_occupied(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn startup_quarantine_path_with_nonce(
+    path: &Path,
+    fallback_name: &str,
+    timestamp: &str,
+    nonce: u64,
+) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| OsString::from(fallback_name));
+    name.push(format!(
+        ".startup-quarantine-{timestamp}-{}-{nonce:06}",
+        std::process::id()
+    ));
+    path.with_file_name(name)
+}
+
+fn next_startup_quarantine_path(path: &Path, fallback_name: &str) -> PathBuf {
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+
+    for _ in 0..1024 {
+        let nonce = STARTUP_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = startup_quarantine_path_with_nonce(path, fallback_name, &timestamp, nonce);
+        if !path_is_occupied(&candidate) {
+            return candidate;
+        }
+    }
+
+    let nonce = STARTUP_QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    startup_quarantine_path_with_nonce(path, fallback_name, &timestamp, nonce)
+}
+
+fn quarantine_startup_artifact_if_exists(
+    path: &Path,
+    fallback_name: &str,
+    context: &str,
+) -> Option<PathBuf> {
+    if !path_is_occupied(path) {
+        return None;
+    }
+
+    let quarantine = next_startup_quarantine_path(path, fallback_name);
+    match fs::rename(path, &quarantine) {
+        Ok(()) => Some(quarantine),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                quarantine = %quarantine.display(),
+                error = %error,
+                "[startup-heal] failed to quarantine {context}"
+            );
+            None
+        }
+    }
+}
+
 /// Per-project advisory file lock with stale detection.
 ///
 /// Mirrors the Python `AsyncFileLock` semantics:
@@ -1109,6 +1176,11 @@ impl FileLock {
                 break;
             }
 
+            if self.path.exists() && self.cleanup_if_stale()? {
+                // Stale lock quarantined; retry immediately with a fresh lock path.
+                continue;
+            }
+
             // Try to create and exclusively lock the file
             let file = fs::OpenOptions::new()
                 .create(true)
@@ -1133,7 +1205,7 @@ impl FileLock {
                 Err(_) => {
                     // Lock held by another process - check for stale owner first.
                     if self.cleanup_if_stale()? {
-                        // Stale lock cleaned up; retry immediately without backoff.
+                        // Stale lock quarantined; retry immediately without backoff.
                         continue;
                     }
 
@@ -1220,11 +1292,11 @@ impl FileLock {
         }
     }
 
-    /// Check whether this lock artifact is stale and remove it when safe.
+    /// Check whether this lock artifact is stale and quarantine it when safe.
     ///
     /// Safety rules:
-    /// - Never remove a lock file unless we can first acquire an exclusive flock
-    ///   on the current inode (prevents deleting an actively-held lock).
+    /// - Never quarantine a lock file unless we can first acquire an exclusive
+    ///   flock on the current inode (prevents moving an actively-held lock).
     /// - Consider stale when owner PID is dead, or lock age exceeds `stale_timeout`
     ///   (when `stale_timeout > 0`).
     /// - Return `Ok(false)` for benign races/permission issues so callers can retry.
@@ -1288,20 +1360,25 @@ impl FileLock {
             return Ok(false);
         }
 
-        // Try removing while lock is held (best race safety).
-        let removed = match fs::remove_file(&self.path) {
+        // Try quarantining while lock is held (best race safety).
+        let quarantine = next_startup_quarantine_path(&self.path, "archive-lock-artifact");
+        let quarantined = match fs::rename(&self.path, &quarantine) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Windows can require closing/unlocking first before unlinking.
+                // Windows can require closing/unlocking first before renaming.
                 let _ = file.unlock();
                 drop(file);
-                fs::remove_file(&self.path).is_ok()
+                fs::rename(&self.path, &quarantine).is_ok()
             }
             Err(_) => false,
         };
 
-        if removed {
-            let _ = fs::remove_file(&self.metadata_path);
+        if quarantined {
+            let _ = quarantine_startup_artifact_if_exists(
+                &self.metadata_path,
+                "archive-lock-artifact",
+                "stale lock owner metadata",
+            );
             return Ok(true);
         }
 
@@ -4186,7 +4263,7 @@ pub fn commit_paths_with_retry(
 // Stale lock healing (startup cleanup)
 // ---------------------------------------------------------------------------
 
-/// Scan the archive root for stale lock artifacts and clean them.
+/// Scan the archive root for stale lock artifacts and quarantine them.
 ///
 /// Should be called at application startup.
 pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
@@ -4211,6 +4288,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         if name.ends_with(".lock.owner.json") {
             metadata_candidates.push(path.to_path_buf());
+        }
+    }
+
+    fn entry_file_type(entry: &fs::DirEntry) -> std::io::Result<Option<fs::FileType>> {
+        match entry.file_type() {
+            Ok(file_type) => Ok(Some(file_type)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -4239,24 +4324,35 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
             use fs2::FileExt;
             if f.try_lock_exclusive().is_ok() {
-                let mut removed = false;
-                match std::fs::remove_file(path) {
-                    Ok(()) => removed = true,
+                let quarantine = next_startup_quarantine_path(path, "archive-lock-artifact");
+                let mut quarantined = false;
+                match fs::rename(path, &quarantine) {
+                    Ok(()) => quarantined = true,
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        // Windows can require closing/unlocking first before unlinking.
+                        // Windows can require closing/unlocking first before renaming.
                         let _ = f.unlock();
                         drop(f);
-                        removed = std::fs::remove_file(path).is_ok();
+                        quarantined = fs::rename(path, &quarantine).is_ok();
                     }
                     Err(_) => {}
                 }
 
-                if removed {
-                    result.locks_removed.push(path.display().to_string());
-                    // Try to remove corresponding metadata file.
+                if quarantined {
+                    result
+                        .locks_quarantined
+                        .push(quarantine.display().to_string());
+                    // Try to quarantine corresponding metadata file.
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     let meta_path = path.with_file_name(format!("{name}.owner.json"));
-                    let _ = std::fs::remove_file(meta_path);
+                    if let Some(meta_quarantine) = quarantine_startup_artifact_if_exists(
+                        &meta_path,
+                        "archive-lock-artifact",
+                        "archive lock owner metadata",
+                    ) {
+                        result
+                            .metadata_quarantined
+                            .push(meta_quarantine.display().to_string());
+                    }
                 }
             }
         }
@@ -4272,7 +4368,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
+            let Some(file_type) = entry_file_type(&entry)? else {
+                continue;
+            };
             if file_type.is_symlink() {
                 // Avoid recursing into symlink loops or scanning outside the archive root.
                 continue;
@@ -4298,7 +4396,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
+            let Some(file_type) = entry_file_type(&entry)? else {
+                continue;
+            };
             if !file_type.is_file() {
                 continue;
             }
@@ -4327,7 +4427,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         if path_is_nonsymlink_dir(&projects_dir) {
             for entry in fs::read_dir(&projects_dir)? {
                 let entry = entry?;
-                let file_type = entry.file_type()?;
+                let Some(file_type) = entry_file_type(&entry)? else {
+                    continue;
+                };
                 if file_type.is_dir() && !file_type.is_symlink() {
                     push_dir(entry.path());
                 }
@@ -4345,9 +4447,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
     }
 
-    // Clean orphaned metadata files (no matching lock) without re-walking.
+    // Quarantine orphaned metadata files (no matching lock) without re-walking.
     for path in metadata_candidates {
-        if !path.exists() {
+        if !path_is_occupied(&path) {
             continue;
         }
         let Some(parent) = path.parent() else {
@@ -4358,8 +4460,16 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             continue;
         };
         let lock_candidate = parent.join(lock_name);
-        if !lock_candidate.exists() && fs::remove_file(&path).is_ok() {
-            result.metadata_removed.push(path.display().to_string());
+        if !path_is_occupied(&lock_candidate)
+            && let Some(quarantine) = quarantine_startup_artifact_if_exists(
+                &path,
+                "archive-lock-artifact",
+                "orphan archive lock owner metadata",
+            )
+        {
+            result
+                .metadata_quarantined
+                .push(quarantine.display().to_string());
         }
     }
 
@@ -4370,8 +4480,8 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealResult {
     pub locks_scanned: usize,
-    pub locks_removed: Vec<String>,
-    pub metadata_removed: Vec<String>,
+    pub locks_quarantined: Vec<String>,
+    pub metadata_quarantined: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -11761,6 +11871,19 @@ mod tests {
     // Advisory file lock tests
     // -----------------------------------------------------------------------
 
+    fn quarantined_paths_with_prefix(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect()
+    }
+
     #[test]
     fn test_file_lock_acquire_release() {
         let tmp = TempDir::new().unwrap();
@@ -11863,6 +11986,18 @@ mod tests {
         let mut lock = FileLock::new(lock_path.clone());
         lock.acquire().unwrap();
 
+        let stale_lock_quarantines =
+            quarantined_paths_with_prefix(tmp.path(), "stale.lock.startup-quarantine-");
+        let stale_meta_quarantines =
+            quarantined_paths_with_prefix(tmp.path(), "stale.lock.owner.json.startup-quarantine-");
+        assert_eq!(stale_lock_quarantines.len(), 1);
+        assert_eq!(stale_meta_quarantines.len(), 1);
+        assert_eq!(fs::read(&stale_lock_quarantines[0]).unwrap(), b"locked");
+        assert_eq!(
+            fs::read_to_string(&stale_meta_quarantines[0]).unwrap(),
+            meta.to_string()
+        );
+
         // Verify we hold the lock now
         assert!(lock_path.exists());
         let new_meta: LockOwnerMeta =
@@ -11899,17 +12034,21 @@ mod tests {
             }));
         }
 
-        let removed_count = handles
+        let quarantined_count = handles
             .into_iter()
             .map(|h| h.join().expect("thread join"))
-            .filter(|removed| *removed)
+            .filter(|quarantined| *quarantined)
             .count();
 
         assert_eq!(
-            removed_count, 1,
-            "exactly one contender should report stale-lock removal"
+            quarantined_count, 1,
+            "exactly one contender should report stale-lock quarantine"
         );
-        assert!(!lock_path.exists(), "lock file should be removed");
+        assert!(!lock_path.exists(), "lock file should be quarantined");
+        let quarantined =
+            quarantined_paths_with_prefix(tmp.path(), "race.lock.startup-quarantine-");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), b"locked");
     }
 
     #[test]
@@ -11930,9 +12069,13 @@ mod tests {
 
         assert!(
             lock.cleanup_if_stale().unwrap(),
-            "second scan should clean newly appeared stale lock"
+            "second scan should quarantine newly appeared stale lock"
         );
         assert!(!lock_path.exists());
+        let quarantined =
+            quarantined_paths_with_prefix(tmp.path(), "appearing.lock.startup-quarantine-");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), b"locked");
     }
 
     #[test]
@@ -11956,7 +12099,7 @@ mod tests {
         );
         assert!(
             meta_path.exists(),
-            "cleanup_if_stale should not remove metadata when lock is already missing"
+            "cleanup_if_stale should not quarantine metadata when lock is already missing"
         );
     }
 
@@ -11979,6 +12122,10 @@ mod tests {
             "old lock should expire even if PID is currently alive"
         );
         assert!(!lock_path.exists());
+        let quarantined =
+            quarantined_paths_with_prefix(tmp.path(), "alive-expire.lock.startup-quarantine-");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&quarantined[0]).unwrap(), b"locked");
     }
 
     #[cfg(unix)]
@@ -12004,19 +12151,19 @@ mod tests {
         fs::set_permissions(&lock_dir, perms).unwrap();
 
         let lock = FileLock::new(lock_path.clone());
-        let removed = lock.cleanup_if_stale().unwrap();
+        let quarantined = lock.cleanup_if_stale().unwrap();
 
         let mut restore = fs::metadata(&lock_dir).unwrap().permissions();
         restore.set_mode(0o700);
         fs::set_permissions(&lock_dir, restore).unwrap();
 
         assert!(
-            !removed,
+            !quarantined,
             "permission failure must not report successful healing"
         );
         assert!(
             lock_path.exists(),
-            "lock should remain when removal is denied"
+            "lock should remain when quarantine is denied"
         );
     }
 
@@ -12357,8 +12504,8 @@ mod tests {
 
         let result = heal_archive_locks(&config).unwrap();
         assert_eq!(result.locks_scanned, 0);
-        assert!(result.locks_removed.is_empty());
-        assert!(result.metadata_removed.is_empty());
+        assert!(result.locks_quarantined.is_empty());
+        assert!(result.metadata_quarantined.is_empty());
     }
 
     #[test]
@@ -12373,12 +12520,74 @@ mod tests {
         fs::write(&meta_path, r#"{"pid": 1, "created_ts": 0.0}"#).unwrap();
 
         let result = heal_archive_locks(&config).unwrap();
-        assert_eq!(result.metadata_removed.len(), 1);
+        assert_eq!(result.metadata_quarantined.len(), 1);
         assert!(!meta_path.exists());
+        let quarantined = PathBuf::from(&result.metadata_quarantined[0]);
+        assert_eq!(
+            fs::read_to_string(&quarantined).unwrap(),
+            r#"{"pid": 1, "created_ts": 0.0}"#
+        );
+        assert!(
+            quarantined
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("test.lock.owner.json.startup-quarantine-"),
+            "unexpected metadata quarantine path: {}",
+            quarantined.display()
+        );
     }
 
     #[test]
-    fn test_heal_archive_locks_never_removes_git_index_lock() {
+    fn test_heal_archive_locks_quarantines_stale_lock_and_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive_root(&config).unwrap();
+
+        let project_dir = tmp.path().join("projects").join("quarantine-lock");
+        fs::create_dir_all(&project_dir).unwrap();
+        let lock_path = project_dir.join(".archive.lock");
+        let meta_path = project_dir.join(".archive.lock.owner.json");
+        fs::write(&lock_path, b"stale-lock").unwrap();
+        fs::write(&meta_path, b"stale-owner").unwrap();
+
+        let result = heal_archive_locks(&config).unwrap();
+
+        assert_eq!(result.locks_scanned, 1);
+        assert_eq!(result.locks_quarantined.len(), 1);
+        assert_eq!(result.metadata_quarantined.len(), 1);
+        assert!(!lock_path.exists(), "live lock path should be cleared");
+        assert!(
+            !meta_path.exists(),
+            "live lock metadata path should be cleared"
+        );
+
+        let lock_quarantine = PathBuf::from(&result.locks_quarantined[0]);
+        let meta_quarantine = PathBuf::from(&result.metadata_quarantined[0]);
+        assert_eq!(fs::read(&lock_quarantine).unwrap(), b"stale-lock");
+        assert_eq!(fs::read(&meta_quarantine).unwrap(), b"stale-owner");
+        assert!(
+            lock_quarantine
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".archive.lock.startup-quarantine-"),
+            "unexpected lock quarantine path: {}",
+            lock_quarantine.display()
+        );
+        assert!(
+            meta_quarantine
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".archive.lock.owner.json.startup-quarantine-"),
+            "unexpected metadata quarantine path: {}",
+            meta_quarantine.display()
+        );
+    }
+
+    #[test]
+    fn test_heal_archive_locks_never_quarantines_git_index_lock() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         ensure_archive_root(&config).unwrap();
@@ -12392,10 +12601,10 @@ mod tests {
         assert!(index_lock.exists(), "git index.lock must be preserved");
         assert!(
             !result
-                .locks_removed
+                .locks_quarantined
                 .iter()
                 .any(|path| path.ends_with(".git/index.lock")),
-            "healer must not report index.lock removal"
+            "healer must not report index.lock quarantine"
         );
     }
 
@@ -12420,10 +12629,10 @@ mod tests {
         let result = heal_archive_locks(&config).unwrap();
         assert!(
             outside_lock.exists(),
-            "healer must not remove locks through a symlinked project directory"
+            "healer must not touch locks through a symlinked project directory"
         );
         assert!(
-            result.locks_removed.is_empty(),
+            result.locks_quarantined.is_empty(),
             "symlinked project directories must be skipped during healing"
         );
     }
