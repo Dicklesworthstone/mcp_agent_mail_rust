@@ -236,13 +236,13 @@ Parallel agent work changes the economics of supervision. One human operator can
 
 **Mail metaphor, not chat.** Agents send discrete messages with subjects, recipients, and thread IDs. Work coordination is structured communication with clear intent, not a firehose. Imagine if your email system at work defaulted to reply-all every time; that's what chat-based coordination does, and it burns context fast.
 
-**Git as the source of truth.** Every message, agent profile, and reservation artifact lives as a file in a per-project Git repository. The entire communication history is human-auditable, diffable, and recoverable. SQLite is the fast index, not the authority.
+**SQLite for live state, Git for the durable ledger.** The accepted write path mutates SQLite first so inboxes, resources, TUI, web, and robot views see one fresh operational state. The same write then emits human-readable message, profile, and reservation artifacts into the per-project Git archive for audit and recovery.
 
 **Advisory, not mandatory.** File reservations are advisory leases, not hard locks. The pre-commit guard enforces them at commit time, but agents can always override if needed. Deadlocks become impossible while accidental conflicts still get caught. Reservations expire on a TTL, so crashed agents don't hold files hostage forever.
 
 **Resilient to agent death.** Agents die all the time: context windows overflow, sessions crash, memory gets wiped. Any agent can vanish without breaking the system. No ringleader agents, no single points of failure. Semi-persistent identities exist for coordination but don't create hard dependencies.
 
-**Dual persistence.** Human-readable Markdown in Git for auditability; SQLite for indexing plus Search V3 for fast lexical/semantic retrieval. Both stay in sync through the write pipeline.
+**Dual persistence.** Human-readable Markdown in Git for auditability; SQLite for live indexing plus Search V3 for fast lexical/semantic retrieval. Both stay in sync through the write pipeline.
 
 **Structured concurrency, no Tokio.** The entire async stack uses [asupersync](https://github.com/Dicklesworthstone/asupersync) with `Cx`-threaded structured concurrency. No orphan tasks, cancel-correct channels, and deterministic testing with virtual time.
 
@@ -1154,13 +1154,14 @@ These are the design rules that let many agents share one checkout without immed
 
 ## Consistency and Recovery Model
 
-- **Git is the artifact ledger.** Canonical messages, inbox/outbox copies, reservation files, and agent profiles are all written as files under per-project archives.
-- **SQLite is the acceleration layer.** It makes inbox fetches, searches, summaries, views, and robot/TUI/web queries fast.
+- **SQLite is the live operational state.** MCP tools, resources, the TUI, the web UI, and robot/CLI reads use SQLite for current inboxes, message IDs, read/ack state, reservations, agents, products, and search planning.
+- **Git is the durable artifact ledger.** Canonical messages, inbox/outbox copies, reservation files, and agent profiles are written as files under per-project archives so the mailbox remains human-auditable and recoverable.
+- **Concurrent writes are queued, not hand-merged.** Parallel agents can send to the same thread at the same time; the server/DB layer serializes the indexed mutations, and the archive write-behind queue plus commit coalescer batches the corresponding Git artifact writes. There is no workflow where two agents create a Git merge conflict and a human resolver has to pick the winning message.
 - **Repair is not reconstruct.** `am doctor repair` is the in-place hygiene path. `am doctor reconstruct` is the archive-first rebuild path when SQLite is no longer trustworthy.
 - **Backups are first-class.** `archive save`, doctor backups, and restore flows all exist because operational recovery is part of the product, not a manual afterthought.
 - **Stale lock cleanup is expected.** Guard hooks, archive lock management, and doctor checks assume agents crash and processes die unexpectedly.
 
-If the fast layer gets sick, the durable layer can rebuild it.
+If the live layer gets sick, the durable ledger can rebuild it.
 
 ---
 
@@ -1489,7 +1490,7 @@ A: Yes. Use `request_contact` / `respond_contact` (or `macro_contact_handshake`)
 A: Yes. You can use a Max account with Agent Mail. Each agent session connects to the same MCP server regardless of subscription tier.
 
 **Q: What happens if the server crashes?**
-A: Git is the source of truth. SQLite indexes can be rebuilt from the Git archive. The commit coalescer uses a write-behind queue that flushes on graceful shutdown.
+A: SQLite is the normal live state and the Git archive is the durable audit/recovery ledger. On a clean shutdown the commit coalescer flushes queued archive writes; after corruption or unrecoverable drift, `am doctor reconstruct` can rebuild SQLite from the archive.
 
 **Q: How does this integrate with Beads?**
 A: Use the Beads issue ID (e.g., `br-123`) as the Mail `thread_id`. Beads owns task status/priority/dependencies; Agent Mail carries the conversations and audit trail. The installer can optionally set up Beads alongside Agent Mail.
