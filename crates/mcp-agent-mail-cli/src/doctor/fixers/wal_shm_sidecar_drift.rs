@@ -14,11 +14,10 @@
 //!    SQLite recreates both on open, but a half-present pair
 //!    usually means a crash mid-checkpoint or a manual delete
 //!    of one half — the next open may replay incorrectly.
-//! 2. **Header-only WAL**: WAL file is ≤ 32 bytes (only the
-//!    file header, no committed frames). If `am serve` is dead
-//!    AND the WAL has been at 32 bytes for long enough that
-//!    no live writer would have caused it, it's leftover from
-//!    a crashed run.
+//! 2. **Header-only/truncated WAL**: WAL file is non-empty but
+//!    ≤ 32 bytes (partial header or only the file header, no
+//!    committed frames). A 0-byte WAL is a valid
+//!    idle/checkpointed WAL-mode state and is not a drift signal.
 //! 3. **Stale WAL**: DB mtime is more than 24h ahead of WAL
 //!    mtime. The WAL is supposed to be the most-recent surface
 //!    SQLite writes to; if main is newer, an external process
@@ -59,7 +58,7 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const FM_ID: &str = "fm-db-state-files-wal-shm-sidecar-drift";
 const FM_SEVERITY: &str = "P0";
@@ -82,7 +81,7 @@ pub const WAL_HEADER_BYTES: u64 = 32;
 pub enum Signal {
     /// WAL exists but SHM doesn't (or vice versa).
     AsymmetricSidecars { wal_exists: bool, shm_exists: bool },
-    /// WAL file size ≤ `WAL_HEADER_BYTES` — no committed frames.
+    /// WAL file size in `1..=WAL_HEADER_BYTES` — no committed frames.
     HeaderOnlyWal { wal_size_bytes: u64 },
     /// DB mtime is `drift_secs` ahead of WAL mtime; threshold
     /// crossed.
@@ -236,6 +235,7 @@ pub fn detect(inputs: &DetectInputs) -> Vec<WalShmSidecarDriftFinding> {
         }
         if let Ok(meta) = &wal_meta
             && meta.file_type().is_file()
+            && meta.len() > 0
             && meta.len() <= WAL_HEADER_BYTES
         {
             signals.push(Signal::HeaderOnlyWal {
@@ -245,16 +245,13 @@ pub fn detect(inputs: &DetectInputs) -> Vec<WalShmSidecarDriftFinding> {
         // Pass-35-review Gemini F1 / Codex F1 (P0/P1): StaleWal
         // pre-fix triggered on any DB whose mtime drifted >24h
         // ahead of the WAL mtime, but a normal SQLite checkpoint
-        // updates the DB mtime AND leaves the WAL truncated to a
-        // 32-byte header. An idle-but-healthy DB after a
-        // checkpoint then sits with DB.mtime > WAL.mtime
-        // indefinitely — false positive.
+        // updates the DB mtime AND can leave the WAL empty or truncated to a
+        // 32-byte header. An idle-but-healthy DB after a checkpoint can then
+        // sit with DB.mtime > WAL.mtime indefinitely — false positive.
         //
         // Fix: only flag StaleWal when the WAL has uncheckpointed
-        // frames (size > 32 bytes). A 32-byte-or-smaller WAL is
-        // either header-only (different signal, HeaderOnlyWal)
-        // or post-checkpoint, both of which legitimately have
-        // older mtimes than the main DB.
+        // frames (size > 32 bytes). A 1..=32 byte WAL is a separate
+        // HeaderOnlyWal signal; a 0-byte WAL is a valid idle/checkpointed state.
         if let (Ok(d), Ok(w)) = (&db_meta, &wal_meta)
             && w.file_type().is_file()
             && w.len() > WAL_HEADER_BYTES
@@ -264,8 +261,8 @@ pub fn detect(inputs: &DetectInputs) -> Vec<WalShmSidecarDriftFinding> {
         {
             let now = inputs.now_override.unwrap_or_else(SystemTime::now);
             signals.push(Signal::StaleWal {
-                db_mtime_secs: epoch_secs(now, d.modified().unwrap_or(now)),
-                wal_mtime_secs: epoch_secs(now, w.modified().unwrap_or(now)),
+                db_mtime_secs: epoch_secs(d.modified().unwrap_or(now)),
+                wal_mtime_secs: epoch_secs(w.modified().unwrap_or(now)),
                 drift_secs: diff.as_secs(),
             });
         }
@@ -299,9 +296,8 @@ fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
     parent.join(format!("{name}{suffix}"))
 }
 
-fn epoch_secs(now: SystemTime, t: SystemTime) -> u64 {
-    let _ = now;
-    t.duration_since(std::time::UNIX_EPOCH)
+fn epoch_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
@@ -310,7 +306,9 @@ fn epoch_secs(now: SystemTime, t: SystemTime) -> u64 {
 /// `.startup-quarantine-*` whose mtime is within the last 24h.
 fn count_recent_quarantine_files(dir: &Path, now_override: Option<SystemTime>) -> usize {
     let now = now_override.unwrap_or_else(SystemTime::now);
-    let cutoff = now - Duration::from_secs(DEFAULT_STALE_WAL_SECS);
+    let cutoff = now
+        .checked_sub(Duration::from_secs(DEFAULT_STALE_WAL_SECS))
+        .unwrap_or(UNIX_EPOCH);
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return 0,
@@ -319,14 +317,16 @@ fn count_recent_quarantine_files(dir: &Path, now_override: Option<SystemTime>) -
     for entry in read.flatten() {
         let name = entry.file_name();
         let name_s = name.to_string_lossy();
-        let matches =
-            name_s.contains(".cleanup-quarantine-") || name_s.contains(".startup-quarantine-");
+        let matches = name_s.starts_with(".cleanup-quarantine-")
+            || name_s.starts_with(".startup-quarantine-");
         if !matches {
             continue;
         }
-        if let Ok(meta) = entry.metadata()
+        if let Ok(meta) = std::fs::symlink_metadata(entry.path())
+            && meta.file_type().is_file()
             && let Ok(mtime) = meta.modified()
             && mtime > cutoff
+            && mtime <= now
         {
             count += 1;
         }
@@ -407,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn detector_does_not_flag_zero_byte_wal_with_shm() {
+        let td = TempDir::new().unwrap();
+        let db = make_db(&td);
+        touch(&td.path().join("storage.sqlite3-wal"), b"");
+        touch(&td.path().join("storage.sqlite3-shm"), &[0u8; 32768]);
+        let findings = detect(&DetectInputs::new(vec![db]));
+        assert!(findings.is_empty(), "0-byte WAL is a valid idle state");
+    }
+
+    #[test]
     fn detector_flags_quarantine_pile_up() {
         let td = TempDir::new().unwrap();
         let db = make_db(&td);
@@ -429,12 +439,66 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_pileup_counter_handles_epoch_now_without_future_matches() {
+        let td = TempDir::new().unwrap();
+        for i in 0..4 {
+            fs::write(td.path().join(format!(".cleanup-quarantine-{i}")), b"x").unwrap();
+        }
+
+        let count = count_recent_quarantine_files(td.path(), Some(UNIX_EPOCH));
+        assert_eq!(
+            count, 0,
+            "future-dated quarantine markers must not count as recent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_does_not_count_quarantine_symlinks_as_pileup() {
+        let td = TempDir::new().unwrap();
+        let db = make_db(&td);
+        touch(&td.path().join("storage.sqlite3-wal"), &[0u8; 4096]);
+        touch(&td.path().join("storage.sqlite3-shm"), &[0u8; 32768]);
+        let target = td.path().join("real-quarantine-file");
+        touch(&target, b"x");
+        for i in 0..4 {
+            std::os::unix::fs::symlink(
+                &target,
+                td.path().join(format!(".cleanup-quarantine-link-{i}")),
+            )
+            .unwrap();
+        }
+
+        let findings = detect(&DetectInputs::new(vec![db]));
+        assert!(
+            findings.is_empty(),
+            "quarantine pile-up counting must not follow symlinks"
+        );
+    }
+
+    #[test]
+    fn detector_only_counts_quarantine_marker_prefixes() {
+        let td = TempDir::new().unwrap();
+        let db = make_db(&td);
+        touch(&td.path().join("storage.sqlite3-wal"), &[0u8; 4096]);
+        touch(&td.path().join("storage.sqlite3-shm"), &[0u8; 32768]);
+        for i in 0..4 {
+            fs::write(td.path().join(format!("not.cleanup-quarantine-{i}")), b"x").unwrap();
+        }
+
+        let findings = detect(&DetectInputs::new(vec![db]));
+        assert!(
+            findings.is_empty(),
+            "quarantine pile-up should only count marker-prefixed filenames"
+        );
+    }
+
+    #[test]
     fn detector_does_not_flag_stale_wal_for_header_only_wal() {
-        // Pass-35-review Gemini F1 / Codex F1 (P0/P1): a normal
-        // SQLite `wal_checkpoint(TRUNCATE)` leaves the WAL at
-        // exactly the 32-byte header. An idle-but-healthy DB
-        // then drifts its mtime ahead of the WAL's, but that's
-        // not "drift" — it's normal post-checkpoint state.
+        // Pass-35-review Gemini F1 / Codex F1 (P0/P1): a normal SQLite
+        // `wal_checkpoint(TRUNCATE)` may leave the WAL empty or at the 32-byte
+        // header. An idle-but-healthy DB can then drift its mtime ahead of the
+        // WAL's, but that's not "drift" — it's normal post-checkpoint state.
         // Pre-fix, this false-positived as StaleWal. Post-fix,
         // the `w.len() > WAL_HEADER_BYTES` precondition gates
         // StaleWal so a header-only WAL only fires the

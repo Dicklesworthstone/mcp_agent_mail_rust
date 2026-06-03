@@ -438,9 +438,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: orphan_foreign_key_rows::FM_ID,
             severity: "P1",
             subsystem: "db_state_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "PRAGMA foreign_key_check reports orphan child rows (FK references a deleted parent; auto-fix via Op::DbExec quarantine deferred — recovery via `am doctor reconstruct`)",
+            op_pattern: "Op::DbExec",
+            auto_fixable: true,
+            one_line_description: "PRAGMA foreign_key_check reports orphan child rows (stale file_reservations/file_reservation_releases auto-fix via DbExec quarantine; message history preserved)",
             source_module: "doctor::fixers::orphan_foreign_key_rows",
         },
         FixerSpec {
@@ -1387,7 +1387,9 @@ pub fn dispatch_only(
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
-            // Detect-only — fix is a no-op.
+            // Auto-fix is intentionally narrow: stale file_reservations
+            // and release-ledger sidecars are quarantined via DbExec;
+            // message-recipient history remains detect-only inside the FM.
             let result = orphan_foreign_key_rows::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;

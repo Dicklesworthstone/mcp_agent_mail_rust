@@ -156,15 +156,40 @@ pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<IntegrityPageMalformedFinding> {
 }
 
 fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding> {
+    if !has_sqlite_header(db_path) {
+        return None;
+    }
     // URI + immutable=1: read-only, no -shm creation, no
     // locking. Matches the pass-35H pattern.
     let uri = super::sqlite_immutable_uri(db_path);
     let mut flags = OpenFlags::read_only();
     flags.uri = true;
     let config = SqliteConfig::file(uri).flags(flags);
-    let conn = SqliteConnection::open(&config).ok()?;
-    let rows = conn.query_sync("PRAGMA integrity_check(1)", &[]).ok()?;
-    let result: String = rows.first()?.get_named::<String>("integrity_check").ok()?;
+    let conn = match SqliteConnection::open(&config) {
+        Ok(conn) => conn,
+        Err(error) => {
+            let detail = error.to_string();
+            if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
+                return None;
+            }
+            let db_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+            return Some(IntegrityPageMalformedFinding {
+                db_path: db_path.to_path_buf(),
+                integrity_check_result: format!("open failed before integrity_check: {detail}"),
+                db_size_bytes,
+            });
+        }
+    };
+    let result = match conn.query_sync("PRAGMA integrity_check(1)", &[]) {
+        Ok(rows) => rows.first()?.get_named::<String>("integrity_check").ok()?,
+        Err(error) => {
+            let detail = error.to_string();
+            if !mcp_agent_mail_db::is_corruption_error_message(&detail) {
+                return None;
+            }
+            format!("PRAGMA integrity_check(1) failed: {detail}")
+        }
+    };
     if result == "ok" {
         return None;
     }
@@ -174,6 +199,40 @@ fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding
         integrity_check_result: result,
         db_size_bytes,
     })
+}
+
+fn has_sqlite_header(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+
+    let Ok(mut file) = open_nonblock_for_read(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() < super::empty_or_truncated_db::SQLITE_HEADER_BYTES
+    {
+        return false;
+    }
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    header == *super::empty_or_truncated_db::SQLITE_MAGIC
+}
+
+#[cfg(unix)]
+fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nonblock_for_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Detect-only FM. `fix()` is a no-op.
@@ -219,14 +278,81 @@ mod tests {
 
     #[test]
     fn detector_skips_non_sqlite_file() {
-        // A non-SQLite file → SqliteConnection::open fails →
-        // silently skipped (sibling FM
+        // A non-SQLite file fails the direct SQLite-header probe
+        // and is silently skipped (sibling FM
         // `empty_or_truncated_db` owns this surface).
         let td = TempDir::new().unwrap();
         let p = td.path().join("garbage.sqlite3");
         std::fs::write(&p, b"not a sqlite db").unwrap();
         let findings = detect(std::slice::from_ref(&p));
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detector_skips_header_only_truncated_file() {
+        // A file with only SQLite's 16-byte magic is not a page-level
+        // integrity failure. The empty/truncated FM owns sub-100-byte
+        // files because SQLite's database header itself is incomplete.
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("truncated.sqlite3");
+        std::fs::write(&p, super::super::empty_or_truncated_db::SQLITE_MAGIC).unwrap();
+        let findings = detect(std::slice::from_ref(&p));
+        assert!(findings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_skips_fifo_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let td = TempDir::new().unwrap();
+        let fifo = td.path().join("storage.sqlite3");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+
+        let findings = detect(std::slice::from_ref(&fifo));
+        assert!(findings.is_empty(), "FIFO must not block or flag");
+    }
+
+    #[test]
+    fn corruption_query_error_becomes_p0_finding() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let conn = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        conn.execute_raw("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        let bytes = std::fs::read(&db).unwrap();
+        let page_size = 4096;
+        assert!(
+            bytes.len() > page_size,
+            "fixture DB should include a second page"
+        );
+        let mut corrupted = bytes;
+        corrupted[page_size] ^= 0x7f;
+        std::fs::write(&db, corrupted).unwrap();
+
+        let findings = detect(std::slice::from_ref(&db));
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .integrity_check_result
+                .contains("PRAGMA integrity_check(1) failed")
+                || findings[0]
+                    .integrity_check_result
+                    .contains("*** in database main ***")
+                || findings[0].integrity_check_result.contains("malformed")
+        );
     }
 
     #[test]

@@ -17927,6 +17927,54 @@ fn doctor_foreign_key_violations(
     Ok(violations)
 }
 
+fn doctor_row_i64_lenient(
+    row: &mcp_agent_mail_db::sqlmodel_core::Row,
+    index: usize,
+) -> Option<i64> {
+    row.get_as::<i64>(index).ok().or_else(|| {
+        row.get_as::<String>(index)
+            .ok()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+    })
+}
+
+fn doctor_optional_i64(row: &mcp_agent_mail_db::sqlmodel_core::Row, index: usize) -> Option<i64> {
+    row.get_as::<Option<i64>>(index).ok().flatten()
+}
+
+fn doctor_orphaned_message_recipient_from_row(
+    row: &mcp_agent_mail_db::sqlmodel_core::Row,
+) -> CliResult<DoctorOrphanedMessageRecipient> {
+    let missing_message = row
+        .get_as::<i64>(3)
+        .map(|value| value != 0)
+        .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?;
+    let missing_agent = row
+        .get_as::<i64>(4)
+        .map(|value| value != 0)
+        .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?;
+
+    Ok(DoctorOrphanedMessageRecipient {
+        rowid: row
+            .get_as(0)
+            .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+        // A database salvaged by `sqlite3 .recover` can contain the wrong
+        // SQLite storage class in INTEGER-affinity foreign-key columns. Rowid is
+        // the cleanup key; these ids are diagnostics plus the affected-agent key
+        // used for inbox_stats rebuilds. Decode integer-looking raw values, then
+        // fall back to the joined parent id so SQLite/Rust coercion differences
+        // cannot make repair delete the right row but rebuild the wrong stats.
+        message_id: doctor_row_i64_lenient(row, 1)
+            .or_else(|| doctor_optional_i64(row, 5))
+            .unwrap_or(-1),
+        agent_id: doctor_row_i64_lenient(row, 2)
+            .or_else(|| doctor_optional_i64(row, 6))
+            .unwrap_or(-1),
+        missing_message,
+        missing_agent,
+    })
+}
+
 fn doctor_orphaned_message_recipients(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
@@ -17934,7 +17982,9 @@ fn doctor_orphaned_message_recipients(
         .query_sync(
             "SELECT mr.rowid, mr.message_id, mr.agent_id, \
                     CASE WHEN m.id IS NULL THEN 1 ELSE 0 END AS missing_message, \
-                    CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent \
+                    CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent, \
+                    m.id AS resolved_message_id, \
+                    a.id AS resolved_agent_id \
              FROM message_recipients mr \
              LEFT JOIN messages m ON m.id = mr.message_id \
              LEFT JOIN agents a ON a.id = mr.agent_id \
@@ -17945,33 +17995,7 @@ fn doctor_orphaned_message_recipients(
         .map_err(|e| CliError::Other(format!("orphaned recipient query failed: {e}")))?;
     let mut recipients = Vec::with_capacity(rows.len());
     for row in rows {
-        recipients.push(DoctorOrphanedMessageRecipient {
-            rowid: row
-                .get_as(0)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            // `message_id`/`agent_id` can hold a non-integer value on a database
-            // salvaged with `sqlite3 .recover`, which can resurrect a cell with
-            // the wrong column affinity (TEXT/NULL where an i64 id belongs). Such
-            // a row is *definitionally* orphaned — a non-integer foreign key
-            // matches no parent, so the `CASE` columns above already flag it via
-            // `missing_message`/`missing_agent` — and it stays actionable through
-            // its always-integer `rowid`. Decode these display ids leniently
-            // (sentinel -1 = unknown) so a single malformed row is reported and
-            // cleaned instead of aborting the entire repair with
-            // "expected i64, found TEXT". `agent_id` only feeds downstream logic
-            // (affected-agent inbox-stat rebuilds) for rows where the agent
-            // exists (`!missing_agent`), in which case it is guaranteed a real i64.
-            message_id: row.get_as::<i64>(1).unwrap_or(-1),
-            agent_id: row.get_as::<i64>(2).unwrap_or(-1),
-            missing_message: row
-                .get_as::<i64>(3)
-                .map(|value| value != 0)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            missing_agent: row
-                .get_as::<i64>(4)
-                .map(|value| value != 0)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-        });
+        recipients.push(doctor_orphaned_message_recipient_from_row(&row)?);
     }
     Ok(recipients)
 }
@@ -17983,7 +18007,9 @@ fn doctor_orphaned_message_recipients_canonical(
         .query_sync(
             "SELECT mr.rowid, mr.message_id, mr.agent_id, \
                     CASE WHEN m.id IS NULL THEN 1 ELSE 0 END AS missing_message, \
-                    CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent \
+                    CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent, \
+                    m.id AS resolved_message_id, \
+                    a.id AS resolved_agent_id \
              FROM message_recipients mr \
              LEFT JOIN messages m ON m.id = mr.message_id \
              LEFT JOIN agents a ON a.id = mr.agent_id \
@@ -17994,33 +18020,7 @@ fn doctor_orphaned_message_recipients_canonical(
         .map_err(|e| CliError::Other(format!("orphaned recipient query failed: {e}")))?;
     let mut recipients = Vec::with_capacity(rows.len());
     for row in rows {
-        recipients.push(DoctorOrphanedMessageRecipient {
-            rowid: row
-                .get_as(0)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            // `message_id`/`agent_id` can hold a non-integer value on a database
-            // salvaged with `sqlite3 .recover`, which can resurrect a cell with
-            // the wrong column affinity (TEXT/NULL where an i64 id belongs). Such
-            // a row is *definitionally* orphaned — a non-integer foreign key
-            // matches no parent, so the `CASE` columns above already flag it via
-            // `missing_message`/`missing_agent` — and it stays actionable through
-            // its always-integer `rowid`. Decode these display ids leniently
-            // (sentinel -1 = unknown) so a single malformed row is reported and
-            // cleaned instead of aborting the entire repair with
-            // "expected i64, found TEXT". `agent_id` only feeds downstream logic
-            // (affected-agent inbox-stat rebuilds) for rows where the agent
-            // exists (`!missing_agent`), in which case it is guaranteed a real i64.
-            message_id: row.get_as::<i64>(1).unwrap_or(-1),
-            agent_id: row.get_as::<i64>(2).unwrap_or(-1),
-            missing_message: row
-                .get_as::<i64>(3)
-                .map(|value| value != 0)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-            missing_agent: row
-                .get_as::<i64>(4)
-                .map(|value| value != 0)
-                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
-        });
+        recipients.push(doctor_orphaned_message_recipient_from_row(&row)?);
     }
     Ok(recipients)
 }
@@ -33452,6 +33452,79 @@ http_headers = { Authorization = "Bearer secret" }
             .unwrap();
         assert!(file_name.starts_with("BlueLake--"));
         assert!(file_name.ends_with(".json"));
+    }
+
+    #[test]
+    fn read_active_leases_ignores_expired_lease_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let lease = LeaseRecord {
+            slot: "frontend-build".to_string(),
+            agent: "OtherAgent".to_string(),
+            branch: "main".to_string(),
+            exclusive: true,
+            acquired_ts: (now - chrono::Duration::seconds(120)).to_rfc3339(),
+            expires_ts: (now - chrono::Duration::seconds(60)).to_rfc3339(),
+            released_ts: None,
+        };
+        let path = lease_path(dir.path(), &lease.agent, &lease.branch);
+        write_lease(&path, &lease).unwrap();
+
+        let conflicts = read_active_leases(dir.path(), "TestAgent", false);
+
+        assert!(
+            conflicts.is_empty(),
+            "expired build slot lease should not block a requester"
+        );
+        assert!(
+            path.exists(),
+            "expired build slot lease files are audit artifacts and must not be deleted by scans"
+        );
+    }
+
+    #[test]
+    fn read_active_leases_ignores_malformed_lease_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+
+        let conflicts = read_active_leases(dir.path(), "TestAgent", false);
+
+        assert!(
+            conflicts.is_empty(),
+            "malformed build slot lease should not block a requester"
+        );
+        assert!(
+            path.exists(),
+            "malformed build slot lease files must be preserved for diagnosis"
+        );
+    }
+
+    #[test]
+    fn read_active_leases_ignores_invalid_expiration_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = LeaseRecord {
+            slot: "frontend-build".to_string(),
+            agent: "OtherAgent".to_string(),
+            branch: "main".to_string(),
+            exclusive: true,
+            acquired_ts: Utc::now().to_rfc3339(),
+            expires_ts: "not-rfc3339".to_string(),
+            released_ts: None,
+        };
+        let path = lease_path(dir.path(), &lease.agent, &lease.branch);
+        write_lease(&path, &lease).unwrap();
+
+        let conflicts = read_active_leases(dir.path(), "TestAgent", false);
+
+        assert!(
+            conflicts.is_empty(),
+            "invalid-expiration build slot lease should not block a requester"
+        );
+        assert!(
+            path.exists(),
+            "invalid build slot lease files must be preserved for diagnosis"
+        );
     }
 
     #[test]
@@ -53870,6 +53943,45 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_orphaned_recipient_decode_uses_resolved_parent_id_for_affinity_drift() {
+        let row = mcp_agent_mail_db::sqlmodel_core::Row::new(
+            vec![
+                "rowid".to_string(),
+                "message_id".to_string(),
+                "agent_id".to_string(),
+                "missing_message".to_string(),
+                "missing_agent".to_string(),
+                "resolved_message_id".to_string(),
+                "resolved_agent_id".to_string(),
+            ],
+            vec![
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(42),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("autosave-form-lock".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("2.0".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::Null,
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+            ],
+        );
+
+        let orphan = doctor_orphaned_message_recipient_from_row(&row)
+            .expect("decode should tolerate recovered storage-class drift");
+
+        assert_eq!(orphan.rowid, 42);
+        assert_eq!(
+            orphan.message_id, -1,
+            "non-integer message id should remain an unknown diagnostic value"
+        );
+        assert_eq!(
+            orphan.agent_id, 2,
+            "existing joined parent id must survive for inbox_stats rebuilds"
+        );
+        assert!(orphan.missing_message);
+        assert!(!orphan.missing_agent);
+    }
+
+    #[test]
     fn doctor_repair_dry_run_preserves_orphaned_message_recipients() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -55404,16 +55516,20 @@ fn read_active_leases(slot_dir: &Path, agent: &str, shared: bool) -> Vec<LeaseRe
         }
         let lease = match read_lease(&path) {
             Some(l) => l,
-            None => continue,
-        };
-        match parse_rfc3339(&lease.expires_ts) {
-            Some(exp) if exp <= now => {
-                let _ = std::fs::remove_file(&path);
+            None => {
+                tracing::warn!(path = %path.display(), "ignoring malformed build slot lease file");
                 continue;
             }
+        };
+        match parse_rfc3339(&lease.expires_ts) {
+            Some(exp) if exp <= now => continue,
             Some(_) => {}
             None => {
-                let _ = std::fs::remove_file(&path);
+                tracing::warn!(
+                    path = %path.display(),
+                    expires_ts = lease.expires_ts,
+                    "ignoring build slot lease with invalid expiration",
+                );
                 continue;
             }
         }
