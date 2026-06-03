@@ -363,9 +363,43 @@ async fn traw_execute(
 /// Generate a URL-safe slug from a human key (path).
 #[must_use]
 pub fn generate_slug(human_key: &str) -> String {
-    // Keep slug semantics identical to the legacy Python `_compute_project_slug` default behavior.
-    // (Collapses runs of non-alphanumerics into a single '-', trims '-', and uses "project" fallback.)
+    // Directory-mode slugs are based on the resolved real path when one exists,
+    // so symlink spellings for the same workspace converge on one project.
     mcp_agent_mail_core::compute_project_slug(human_key)
+}
+
+fn canonical_absolute_path_string(value: &str) -> Option<String> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn human_keys_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let Some(left_canonical) = canonical_absolute_path_string(left) else {
+        return false;
+    };
+    let Some(right_canonical) = canonical_absolute_path_string(right) else {
+        return false;
+    };
+    left_canonical == right_canonical
+}
+
+fn project_matches_human_key_alias(
+    project: &ProjectRow,
+    raw_human_key: &str,
+    resolved_human_key: &str,
+) -> bool {
+    project.human_key == raw_human_key
+        || project.human_key == resolved_human_key
+        || human_keys_equivalent(&project.human_key, raw_human_key)
+        || human_keys_equivalent(&project.human_key, resolved_human_key)
 }
 
 fn map_sql_error(e: &SqlError) -> DbError {
@@ -3550,7 +3584,9 @@ pub async fn ensure_project(
         ));
     }
 
-    let slug = generate_slug(human_key);
+    let identity = mcp_agent_mail_core::resolve_project_identity(human_key);
+    let slug = identity.slug;
+    let resolved_human_key = identity.human_key;
     let cache_scope = cache_scope_for_pool(pool);
 
     // Fast path: check cache first
@@ -3588,6 +3624,21 @@ pub async fn ensure_project(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
+    match find_project_in_inventory(cx, &tracked, |project| {
+        project_matches_human_key_alias(project, human_key, &resolved_human_key)
+    })
+    .await
+    {
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+            return Outcome::Ok(row);
+        }
+        Outcome::Ok(None) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
     // The row doesn't exist yet — we're about to INSERT. This is the only
     // path where the ephemeral-fixture guard should fire. Lookups of
     // already-existing rows (from the SELECT above or the cache) pass
@@ -3600,7 +3651,10 @@ pub async fn ensure_project(
     // bypassed the ephemeral-storage reroute (e.g., by calling this function
     // directly with a real DB pool). Set AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1
     // to opt out (real integration tests that need to register such paths).
-    if mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(human_key)
+    let raw_is_ephemeral = mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(human_key);
+    let resolved_is_ephemeral =
+        mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(&resolved_human_key);
+    if (raw_is_ephemeral || resolved_is_ephemeral)
         && !mcp_agent_mail_core::ephemeral::ephemeral_project_roots_allowed()
     {
         return Outcome::Err(DbError::invalid(
@@ -3619,7 +3673,7 @@ pub async fn ensure_project(
     let fresh = match run_with_mvcc_retry(cx, "ensure_project", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        let row = ProjectRow::new(slug.clone(), human_key.to_string());
+        let row = ProjectRow::new(slug.clone(), resolved_human_key.clone());
         let insert_sql = "INSERT INTO projects (slug, human_key, created_at) \
                           VALUES (?, ?, ?) ON CONFLICT(slug) DO NOTHING";
         let insert_params = [
@@ -3759,7 +3813,7 @@ pub async fn get_project_by_human_key(
                 }
             } else {
                 match find_project_in_inventory(cx, &tracked, |project| {
-                    project.human_key == human_key
+                    project_matches_human_key_alias(project, human_key, human_key)
                 })
                 .await
                 {
@@ -12968,6 +13022,73 @@ mod tests {
         row.get_named("cnt").expect("decode count")
     }
 
+    async fn count_projects_for_test(cx: &Cx, pool: &DbPool) -> i64 {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        let rows = map_sql_outcome(
+            traw_query(cx, &tracked, "SELECT COUNT(*) AS cnt FROM projects", &[]).await,
+        )
+        .into_result()
+        .expect("count projects");
+        let row = rows.first().expect("count row");
+        row.get_named("cnt").expect("decode count")
+    }
+
+    fn create_file_pool_with_schema_for_test(label: &str) -> (tempfile::TempDir, DbPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("{label}-{}.db", crate::timestamps::now_micros()));
+        let init_conn =
+            crate::DbConn::open_file(db_path.display().to_string()).expect("open schema db");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        (dir, pool)
+    }
+
+    async fn insert_project_row_for_test(cx: &Cx, pool: &DbPool, row: &ProjectRow) {
+        let conn = acquire_conn(cx, pool)
+            .await
+            .into_result()
+            .expect("acquire conn");
+        let tracked = tracked(&*conn);
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    Value::BigInt(row.id.expect("project row id")),
+                    Value::Text(row.slug.clone()),
+                    Value::Text(row.human_key.clone()),
+                    Value::BigInt(row.created_at),
+                ],
+            )
+            .await,
+        )
+        .into_result()
+        .expect("insert project row");
+    }
+
     #[test]
     fn cache_scope_for_pool_distinguishes_memory_pools() {
         let config = crate::pool::DbPoolConfig {
@@ -16212,6 +16333,114 @@ mod tests {
             assert_eq!(ensured.slug, by_slug.slug);
             assert_eq!(human_key, by_human_key.human_key);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_project_collapses_symlink_and_realpath_aliases() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::os::unix::fs::symlink;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("WORKTREES_ENABLED", "0"),
+                ("PROJECT_IDENTITY_MODE", "dir"),
+            ],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                let (dir, pool) = create_file_pool_with_schema_for_test("symlink-aliases");
+
+                let real = dir.path().join("real-project");
+                std::fs::create_dir_all(&real).expect("create real project");
+                let link = dir.path().join("project-link");
+                symlink(&real, &link).expect("create symlink");
+
+                let real_key = real.canonicalize().expect("canonical real");
+                let real_key = real_key.to_string_lossy().to_string();
+                let link_key = link.to_string_lossy().to_string();
+
+                rt.block_on(async {
+                    let from_link = ensure_project(&cx, &pool, &link_key)
+                        .await
+                        .into_result()
+                        .expect("ensure via link");
+                    let from_real = ensure_project(&cx, &pool, &real_key)
+                        .await
+                        .into_result()
+                        .expect("ensure via realpath");
+                    let by_raw_link = get_project_by_human_key(&cx, &pool, &link_key)
+                        .await
+                        .into_result()
+                        .expect("lookup by raw link");
+
+                    assert_eq!(from_link.id, from_real.id);
+                    assert_eq!(from_link.id, by_raw_link.id);
+                    assert_eq!(from_link.human_key, real_key);
+                    assert_eq!(from_real.human_key, real_key);
+                    assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+                });
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_project_reuses_existing_raw_symlink_project_row() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::os::unix::fs::symlink;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("WORKTREES_ENABLED", "0"),
+                ("PROJECT_IDENTITY_MODE", "dir"),
+            ],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                let (dir, pool) = create_file_pool_with_schema_for_test("raw-symlink-reuse");
+
+                let real = dir.path().join("real-project");
+                std::fs::create_dir_all(&real).expect("create real project");
+                let link = dir.path().join("project-link");
+                symlink(&real, &link).expect("create symlink");
+
+                let real_key = real.canonicalize().expect("canonical real");
+                let real_key = real_key.to_string_lossy().to_string();
+                let link_key = link.to_string_lossy().to_string();
+                let legacy_raw_slug = mcp_agent_mail_core::slugify(&link_key);
+                let legacy_row = ProjectRow::new(legacy_raw_slug.clone(), link_key.clone());
+                let legacy_row = ProjectRow {
+                    id: Some(41),
+                    ..legacy_row
+                };
+
+                rt.block_on(async {
+                    insert_project_row_for_test(&cx, &pool, &legacy_row).await;
+
+                    let ensured = ensure_project(&cx, &pool, &real_key)
+                        .await
+                        .into_result()
+                        .expect("ensure via realpath");
+                    let by_raw_link = get_project_by_human_key(&cx, &pool, &link_key)
+                        .await
+                        .into_result()
+                        .expect("lookup by raw link");
+
+                    assert_eq!(ensured.id, legacy_row.id);
+                    assert_eq!(ensured.slug, legacy_raw_slug);
+                    assert_eq!(ensured.human_key, link_key);
+                    assert_eq!(by_raw_link.id, legacy_row.id);
+                    assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+                });
+            },
+        );
     }
 
     #[test]

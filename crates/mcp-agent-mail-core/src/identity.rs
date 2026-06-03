@@ -174,6 +174,15 @@ fn resolve_path(human_key: &str) -> PathBuf {
     })
 }
 
+fn dir_mode_slug_source(human_key: &str) -> String {
+    let expanded = shellexpand::tilde(human_key).into_owned();
+    let path = PathBuf::from(&expanded);
+    if path.is_absolute() {
+        return resolve_path(&expanded).to_string_lossy().to_string();
+    }
+    human_key.to_string()
+}
+
 /// Invoke git with the given args in `repo`, returning trimmed stdout.
 ///
 /// br-8ujfs.3.4 (C4): this originally shelled out via
@@ -419,12 +428,12 @@ const fn mode_to_str(mode: ProjectIdentityMode) -> &'static str {
 pub fn compute_project_slug(human_key: &str) -> String {
     let config = &Config::get();
     if !config.worktrees_enabled {
-        return slugify(human_key);
+        return slugify(&dir_mode_slug_source(human_key));
     }
 
     let mode = config.project_identity_mode;
     if mode == ProjectIdentityMode::Dir {
-        return slugify(human_key);
+        return slugify(&dir_mode_slug_source(human_key));
     }
     let target_path = resolve_path(human_key);
     if !target_path.exists() {
@@ -486,7 +495,7 @@ pub fn compute_project_slug(human_key: &str) -> String {
             }
             slugify(human_key)
         }
-        ProjectIdentityMode::Dir => slugify(human_key),
+        ProjectIdentityMode::Dir => slugify(&dir_mode_slug_source(human_key)),
     }
 }
 
@@ -495,12 +504,12 @@ static IDENTITY_CACHE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn fallback_identity(
-    human_key: &str,
+    _human_key: &str,
     target_str: &str,
     identity_mode_used: &str,
 ) -> ProjectIdentity {
     ProjectIdentity {
-        slug: slugify(human_key),
+        slug: slugify(target_str),
         identity_mode_used: identity_mode_used.to_string(),
         canonical_path: target_str.to_string(),
         human_key: target_str.to_string(),
@@ -1135,6 +1144,36 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let slug = compute_project_slug(&tmp.path().display().to_string());
         assert!(!slug.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_dir_identity_collapses_symlink_to_realpath() {
+        use std::os::unix::fs::symlink;
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("WORKTREES_ENABLED", "0"), ("PROJECT_IDENTITY_MODE", "dir")],
+            || {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let real = tmp.path().join("real-project");
+                std::fs::create_dir_all(&real).expect("create real project");
+                let link = tmp.path().join("project-link");
+                symlink(&real, &link).expect("create symlink");
+
+                let real_key = real.canonicalize().expect("canonical real");
+                let real_key = real_key.to_string_lossy().to_string();
+                let link_key = link.to_string_lossy().to_string();
+
+                let real_slug = compute_project_slug(&real_key);
+                let link_slug = compute_project_slug(&link_key);
+                assert_eq!(real_slug, link_slug);
+
+                let identity = resolve_project_identity(&link_key);
+                assert_eq!(identity.slug, real_slug);
+                assert_eq!(identity.human_key, real_key);
+                assert_eq!(identity.canonical_path, real_key);
+            },
+        );
     }
 
     #[test]
