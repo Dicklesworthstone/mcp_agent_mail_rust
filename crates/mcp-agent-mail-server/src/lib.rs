@@ -2040,6 +2040,9 @@ pub(crate) const INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 1_000;
 // The TUI poller and observability paths must tolerate short-lived writer bursts
 // without degrading into chronic "counts present, detail rows missing" snapshots.
 pub(crate) const BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
+// HTTP health probes should never queue behind diagnostic/archive scans long
+// enough to make a live listener look dead to supervisors.
+pub(crate) const HEALTH_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 100;
 
 pub(crate) fn resolve_server_database_url_sqlite_path(
     database_url: &str,
@@ -2106,6 +2109,16 @@ pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbCo
 
 pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     open_sync_db_connection_with_busy_timeout(path, INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS)
+}
+
+pub(crate) fn open_health_probe_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    let conn = open_sync_db_connection_with_busy_timeout(path, HEALTH_SYNC_DB_BUSY_TIMEOUT_MS)?;
+    conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
+        std::io::Error::other(format!(
+            "configure sqlite query_only health probe on {path}: {err}"
+        ))
+    })?;
+    Ok(conn)
 }
 
 pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Option<DbConn> {
@@ -9772,53 +9785,13 @@ impl HttpState {
                     self.config.storage_root.as_path(),
                     &mut body,
                 );
-                // Flip /health to 503 when the mailbox verdict is corrupt,
-                // so external supervisors observing only HTTP status detect
-                // the same "runtime silently auto-reconstructing" state
-                // that `durability_state=corrupt` already surfaces in logs.
-                // (See #94: a 24h `integrity_check` cadence plus silent
-                // archive-fallback previously let /health stay green while
-                // on-disk corruption persisted for hours.)
-                let status_code = probe_runtime_durability_state(
-                    &self.config.database_url,
-                    self.config.storage_root.as_path(),
-                )
-                .map_or(200, |durability| {
-                    use mcp_agent_mail_db::DurabilityState;
-                    body["durability_state"] = serde_json::json!(durability.to_string());
-                    // Exhaustive match so a future DurabilityState variant
-                    // addition is a compile error rather than silently
-                    // falling through to 200.
-                    //
-                    // Mapping: 503 iff `allows_reads()` is false. Both
-                    // Recovering and Corrupt have allows_reads=false per the
-                    // durability state machine, so clients genuinely cannot
-                    // read during either — returning 200 would route
-                    // traffic at a service that can't serve it. The
-                    // `durability_state` + `status` fields still let
-                    // supervisors distinguish the two (Recovering is
-                    // self-healing; Corrupt needs operator intervention)
-                    // if they want to react differently.
-                    match durability {
-                        DurabilityState::Healthy => 200,
-                        DurabilityState::DegradedReadOnly => {
-                            // Reads still work; keep 200 but signal the
-                            // degraded state in the body so callers can
-                            // opt into strict behavior.
-                            body["status"] = serde_json::json!("ready_degraded");
-                            200
-                        }
-                        DurabilityState::Recovering => {
-                            body["status"] = serde_json::json!("recovering");
-                            503
-                        }
-                        DurabilityState::Corrupt => {
-                            body["status"] = serde_json::json!("degraded");
-                            503
-                        }
-                    }
-                });
-                return Some(self.health_json_response(req, status_code, &body));
+                // Keep generic readiness distinct from the heavier durability
+                // verdict. The dedicated /health/durability route still runs
+                // the mailbox verdict engine, while /health must not join
+                // archive or diagnostic scans and make a live listener look
+                // dead under contention.
+                body["durability_state"] = serde_json::json!("not_probed");
+                return Some(self.health_json_response(req, 200, &body));
             }
             "/health/durability" => {
                 if !matches!(req.method, Http1Method::Get) {
@@ -14046,7 +14019,7 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
                 sqlite_path.display()
             ));
         }
-        open_best_effort_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+        open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
             .map_err(|e| e.to_string())?
     };
 
@@ -14093,7 +14066,7 @@ fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<
                 sqlite_path.display()
             ));
         }
-        open_best_effort_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+        open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
             .map_err(|e| e.to_string())?
     };
 
@@ -14268,18 +14241,10 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
     }
 }
 
-/// Enrich a readiness JSON response with database identity metadata so
-/// operators can verify the correct DB file is active at a glance.
-///
-/// Adds: `database_path` (basename only), `project_count`, `message_count`,
-/// and `version`.  Count queries are best-effort — if they fail the
-/// corresponding fields are set to `null` rather than degrading the overall
-/// readiness signal.
-/// Fast-path mailbox-verdict probe used by `/health` and
-/// `/health/durability` (#94). Returns `None` for :memory: DBs — those
-/// have no on-disk state the verdict engine can meaningfully inspect,
-/// so the readiness check is the only health signal. Any durability
-/// state for file-backed DBs is returned as `Some(state)`.
+/// Fast-path mailbox-verdict probe used by `/health/durability` (#94). Returns
+/// `None` for :memory: DBs — those have no on-disk state the verdict engine can
+/// meaningfully inspect, so the readiness check is the only health signal. Any
+/// durability state for file-backed DBs is returned as `Some(state)`.
 fn probe_runtime_durability_state(
     database_url: &str,
     storage_root: &Path,
@@ -14297,6 +14262,39 @@ fn probe_runtime_durability_state(
     ))
 }
 
+fn fetch_health_live_counts(database_url: &str) -> Option<(u64, u64)> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return Some((0, 0));
+    }
+
+    let sqlite_path = resolve_server_database_url_sqlite_path(database_url)?;
+    if !sqlite_path.exists() {
+        return None;
+    }
+
+    let conn = open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref()).ok()?;
+    let projects = health_count(&conn, "SELECT COUNT(*) AS c FROM projects");
+    let messages = health_count(&conn, "SELECT COUNT(*) AS c FROM messages");
+    let counts = projects.zip(messages);
+    mcp_agent_mail_db::close_db_conn(conn, "health count probe");
+    counts
+}
+
+fn health_count(conn: &DbConn, sql: &str) -> Option<u64> {
+    conn.query_sync(sql, &[])
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row.get_named::<i64>("c").ok())
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+/// Enrich a readiness JSON response with database identity metadata so
+/// operators can verify the correct DB file is active at a glance.
+///
+/// Adds: `database_path` (basename only), `project_count`, `message_count`,
+/// and `version`. Count queries are best-effort — if they fail the
+/// corresponding fields are set to `null` rather than degrading the overall
+/// readiness signal.
 fn enrich_readiness_response(
     database_url: &str,
     storage_root: &Path,
@@ -14339,11 +14337,7 @@ fn enrich_readiness_response(
             // Cache is stale — release the lock before doing I/O, then
             // re-acquire to write the refreshed value.
             drop(guard);
-            let fresh = dashboard_open_connection(database_url, storage_root).map(|db| {
-                let projects = dashboard_count(db.conn(), "SELECT COUNT(*) AS c FROM projects");
-                let messages = dashboard_count(db.conn(), "SELECT COUNT(*) AS c FROM messages");
-                (projects, messages)
-            });
+            let fresh = fetch_health_live_counts(database_url);
             let counts =
                 fresh.or_else(|| cached_for_mailbox.as_ref().and_then(|entry| entry.counts));
             *lock_mutex(&HEALTH_COUNT_CACHE) = (
@@ -16662,6 +16656,9 @@ first body
             assert_eq!(resp.status, 200);
             let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(body["status"], "ready");
+            assert_eq!(body["durability_state"], "not_probed");
+            assert_eq!(body["project_count"], serde_json::json!(0));
+            assert_eq!(body["message_count"], serde_json::json!(0));
 
             let conn =
                 DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
@@ -16678,6 +16675,38 @@ first body
             assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
             assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
             assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
+        });
+    }
+
+    #[test]
+    fn health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("storage");
+            let db_path = temp.path().join("locked-health.sqlite3");
+            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("init schema");
+            drop(conn);
+
+            let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
+                &db_path,
+                MailboxActivityLockMode::Exclusive,
+            )
+            .expect("acquire exclusive sqlite activity lock");
+
+            let config = mcp_agent_mail_core::Config {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root,
+                integrity_check_on_startup: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 503);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["detail"], "service unavailable");
         });
     }
 
@@ -24091,6 +24120,7 @@ first body
                 "message_count field must be present"
             );
             assert_eq!(body["database_path"], ":memory:");
+            assert_eq!(body["durability_state"], "not_probed");
         });
     }
 
@@ -24173,6 +24203,7 @@ first body
                 "database_path field must be present"
             );
             assert_eq!(body["database_path"], ":memory:");
+            assert_eq!(body["durability_state"], "not_probed");
         });
     }
 
@@ -25152,6 +25183,45 @@ first body
             })
             .unwrap_or_default();
         assert_eq!(configured, i64::from(INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn open_health_probe_sync_db_connection_uses_short_busy_timeout_and_query_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("health-busy-timeout.db");
+        let seed = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open seed db");
+        seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(seed);
+
+        let conn =
+            open_health_probe_sync_db_connection(db_path.to_string_lossy().as_ref()).expect("open");
+
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("busy_timeout pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("timeout")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(configured, i64::from(HEALTH_SYNC_DB_BUSY_TIMEOUT_MS));
+
+        let query_only = conn
+            .query_sync("PRAGMA query_only", &[])
+            .expect("query_only pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("query_only")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(query_only, 1);
     }
 
     #[test]
