@@ -52,7 +52,7 @@
           <div class="flex items-center gap-4 flex-wrap text-white/90">
             <div class="flex items-center gap-2">
               <div class="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center">
-                <span class="text-sm font-bold">{{ commit.author[0]|upper }}</span>
+                <span class="text-sm font-bold">{% if commit.author %}{{ commit.author[0]|upper }}{% else %}?{% endif %}</span>
               </div>
               <span class="font-medium">{{ commit.author }}</span>
             </div>
@@ -104,10 +104,10 @@
             Metadata
           </h3>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {% for key, value in commit.trailers.items() %}
+            {% for trailer in commit.trailers %}
               <div class="flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg">
-                <span class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">{{ key }}:</span>
-                <span class="text-sm font-medium text-slate-900 dark:text-white">{{ value }}</span>
+                <span class="text-sm font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wide">{{ trailer[0] }}:</span>
+                <span class="text-sm font-medium text-slate-900 dark:text-white">{{ trailer[1] }}</span>
               </div>
             {% endfor %}
           </div>
