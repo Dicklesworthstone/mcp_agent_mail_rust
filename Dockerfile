@@ -14,9 +14,12 @@
 # ---------------
 #   AM_REF       Git ref of mcp_agent_mail_rust to build (default: main).
 #                Pass a tag, branch, or commit SHA.
-#   SIBLING_REF  Git ref for every sibling dependency (default: main).
-#                Usually you want `main` here even when AM_REF is a tag,
-#                because sibling repos are released independently.
+#   SIBLING_REF  Preferred Git ref for every sibling dependency (default: main).
+#                Release builds pass the release tag here first, so sibling
+#                repos with matching tags are pinned instead of floating.
+#   SIBLING_FALLBACK_REF
+#                Fallback ref when SIBLING_REF is a branch/tag that a sibling
+#                repo does not publish yet (default: main).
 #
 # Examples
 # --------
@@ -71,6 +74,7 @@ WORKDIR /build
 
 ARG AM_REF=main
 ARG SIBLING_REF=main
+ARG SIBLING_FALLBACK_REF=main
 
 # Clone sibling dependencies first so they're cached separately from the
 # project source layer. frankensqlite uses a sparse checkout to skip the
@@ -111,7 +115,17 @@ RUN set -eu; \
           && git fetch --depth 1 $pass_args origin "$ref" \
           && git checkout -q FETCH_HEAD ); \
       else \
-        git clone --depth 1 --branch "$ref" "$@" "$url" "$dest"; \
+        selected_ref="$ref"; \
+        if ! git ls-remote --exit-code "$url" "refs/heads/$ref" "refs/tags/$ref" >/dev/null 2>&1; then \
+          if [ -n "${SIBLING_FALLBACK_REF:-}" ] && [ "$ref" != "$SIBLING_FALLBACK_REF" ]; then \
+            echo "+ sibling ref $ref not found for $url; falling back to $SIBLING_FALLBACK_REF"; \
+            selected_ref="$SIBLING_FALLBACK_REF"; \
+          else \
+            echo "sibling ref $ref not found for $url and no fallback is available" >&2; \
+            exit 1; \
+          fi; \
+        fi; \
+        git clone --depth 1 --branch "$selected_ref" "$@" "$url" "$dest"; \
       fi; \
     }; \
     clone_at https://github.com/Dicklesworthstone/frankensearch.git           "${SIBLING_REF}" /build/frankensearch; \

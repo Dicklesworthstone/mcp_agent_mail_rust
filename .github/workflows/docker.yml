@@ -53,15 +53,18 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
-    name: Build & push multi-arch image
+  prepare:
+    name: Prepare image metadata
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      am_ref: ${{ steps.refs.outputs.am_ref }}
+      sibling_ref: ${{ steps.refs.outputs.sibling_ref }}
+      sibling_fallback_ref: ${{ steps.refs.outputs.sibling_fallback_ref }}
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
     permissions:
-      contents: read       # for actions/checkout
-      packages: write      # for ghcr.io push
-      id-token: write      # for SLSA provenance attestation
-      attestations: write  # for actions/attest-build-provenance
+      contents: read
 
     steps:
       - name: Checkout (Dockerfile + workflow only)
@@ -85,32 +88,20 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # On a tag push, build *that* tag for the project and main for siblings.
-          # On manual dispatch, honor the user inputs (already defaulted to main).
+          # Tag pushes build the project tag and first try matching sibling tags.
+          # The Dockerfile falls back per sibling when that repo has no such tag.
           if [ "$EVENT_NAME" = "push" ]; then
             am_ref="$REF_NAME"
-            sibling_ref="main"
+            sibling_ref="$REF_NAME"
           else
             am_ref="${INPUT_AM_REF:-main}"
             sibling_ref="${INPUT_SIBLING_REF:-main}"
           fi
-          printf 'am_ref=%s\n' "$am_ref" >> "$GITHUB_OUTPUT"
-          printf 'sibling_ref=%s\n' "$sibling_ref" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@5964de0df58d5ad28b04d8fe2e6b80ad47105b91  # v3.5.0
-        with:
-          platforms: linux/amd64,linux/arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          {
+            printf 'am_ref=%s\n' "$am_ref"
+            printf 'sibling_ref=%s\n' "$sibling_ref"
+            printf 'sibling_fallback_ref=%s\n' "main"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Compute image tags
         id: meta
@@ -123,12 +114,6 @@ jobs:
           #     (NO :latest, NO :{major.minor} — those should only ever point
           #      at stable releases to avoid surprising `:latest` consumers.)
           #   manual run → :manual-<short>, :sha-<short>
-          #
-          # docker/metadata-action surfaces `meta.outputs.is-default-branch`-
-          # style booleans, but it does not expose "is-stable-semver" directly.
-          # We use the `latest=false` flag on type=semver patterns to suppress
-          # implicit `:latest` and emit it ourselves only when the tag has no
-          # prerelease suffix (i.e. matches `refs/tags/vN.N.N` exactly).
           tags: |
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
@@ -137,41 +122,156 @@ jobs:
             type=raw,value=${{ inputs.tag_suffix }}-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' }}
             type=sha,format=short,prefix=sha-
 
-      - name: Build and push multi-arch image
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            cache_scope: linux-amd64
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            cache_scope: linux-arm64
+            artifact: linux-arm64
+
+    steps:
+      - name: Checkout (Dockerfile + workflow only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image digest
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # One GHA cache scope per workflow. buildx stores per-platform
-          # manifests inside this scope, so linux/amd64 and linux/arm64
-          # layers coexist without evicting each other (`mode=max` also
-          # captures intermediate stages, not just the final image).
-          cache-from: type=gha,scope=docker-${{ github.workflow }}
-          cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ needs.prepare.outputs.labels }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ github.workflow }}-${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=docker-${{ github.workflow }}-${{ matrix.cache_scope }}
           build-args: |
-            AM_REF=${{ steps.refs.outputs.am_ref }}
-            SIBLING_REF=${{ steps.refs.outputs.sibling_ref }}
+            AM_REF=${{ needs.prepare.outputs.am_ref }}
+            SIBLING_REF=${{ needs.prepare.outputs.sibling_ref }}
+            SIBLING_FALLBACK_REF=${{ needs.prepare.outputs.sibling_fallback_ref }}
           provenance: true
           sbom: true
 
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          # shellcheck disable=SC2153
+          digest="${DIGEST#sha256:}"
+          test -n "$digest"
+          touch "$RUNNER_TEMP/digests/$digest"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create and push manifest list
+        id: manifest
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
+          DIGEST_DIR: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            tag_args+=(--tag "$tag")
+          done <<< "$TAGS"
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "metadata-action produced no image tags" >&2
+            exit 1
+          fi
+
+          sources=()
+          while IFS= read -r digest_file; do
+            digest="$(basename "$digest_file")"
+            sources+=("$IMAGE@sha256:$digest")
+          done < <(find "$DIGEST_DIR" -type f | sort)
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "no platform digests downloaded" >&2
+            exit 1
+          fi
+
+          metadata_file="${RUNNER_TEMP:?}/imagetools-metadata.json"
+          docker buildx imagetools create --metadata-file "$metadata_file" "${tag_args[@]}" "${sources[@]}"
+          first_tag="${tag_args[1]}"
+          digest="$(jq -r '."containerimage.descriptor".digest // empty' "$metadata_file")"
+          test -n "$digest"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'first_tag=%s\n' "$first_tag" >> "$GITHUB_OUTPUT"
+
       - name: Attest build provenance
-        if: ${{ steps.build.outputs.digest != '' }}
+        if: ${{ steps.manifest.outputs.digest != '' }}
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a  # v3.0.0
         with:
-          subject-name: ${{ steps.image.outputs.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-name: ${{ needs.prepare.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
       - name: Print published image references
         env:
-          IMAGE: ${{ steps.image.outputs.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
         run: |
           set -euo pipefail
           printf 'Published image: %s@%s\n' "$IMAGE" "$DIGEST"
