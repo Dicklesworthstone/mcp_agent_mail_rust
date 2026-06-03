@@ -255,6 +255,7 @@ fn error_code_catalog_is_stable() {
         "EMPTY_PROGRAM",
         "FEATURE_DISABLED",
         "IDENTITY_NOT_FOUND",
+        "INCONSISTENT_STATE",
         "INVALID_ARGUMENT",
         "INVALID_LIMIT",
         "INVALID_PATH",

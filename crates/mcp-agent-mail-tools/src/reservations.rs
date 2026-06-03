@@ -1275,7 +1275,27 @@ pub async fn force_release_file_reservation(
         ));
     }
 
-    let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
+    let released_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_reservations_by_ids(
+            ctx.cx(),
+            &pool,
+            &[file_reservation_id],
+        )
+        .await,
+    )?;
+    let released_ts = released_rows
+        .iter()
+        .find(|row| row.id == Some(file_reservation_id))
+        .and_then(|row| row.released_ts)
+        .ok_or_else(|| {
+            legacy_tool_error(
+                "INCONSISTENT_STATE",
+                "Reservation release committed but released_ts could not be read back.",
+                false,
+                json!({ "file_reservation_id": file_reservation_id }),
+            )
+        })?;
+    let released_iso = micros_to_iso(released_ts);
 
     if released_count > 0 {
         let res_json = serde_json::json!({
@@ -1287,7 +1307,7 @@ pub async fn force_release_file_reservation(
             "reason": &reservation.reason,
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": now_iso.clone(),
+            "released_ts": released_iso.clone(),
         });
 
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -1464,7 +1484,7 @@ pub async fn force_release_file_reservation(
     // Build response matching Python format
     let response = serde_json::json!({
         "released": released_count,
-        "released_at": &now_iso,
+        "released_at": &released_iso,
         "reservation": {
             "id": file_reservation_id,
             "agent": &holder_agent_name,
@@ -1473,7 +1493,7 @@ pub async fn force_release_file_reservation(
             "reason": reservation.reason,
             "created_ts": micros_to_iso(reservation.created_ts),
             "expires_ts": micros_to_iso(reservation.expires_ts),
-            "released_ts": &now_iso,
+            "released_ts": &released_iso,
             "stale_reasons": stale_reasons,
             "last_agent_activity_ts": holder_last_active_ts.map(micros_to_iso),
             "last_mail_activity_ts": mail_activity.map(micros_to_iso),
@@ -2519,6 +2539,91 @@ mod tests {
                 );
                 assert_eq!(parsed["reservation"]["notified"].as_bool(), Some(false));
                 assert!(parsed["reservation"]["last_agent_activity_ts"].is_null());
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_file_reservation_reports_committed_release_timestamp() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/force-release-db-ts-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let actor = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    &["src/release-timestamp.rs"],
+                    3600,
+                    true,
+                    "force release timestamp regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(1),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                    ],
+                )
+                .expect("expire reservation");
+                drop(conn);
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = force_release_file_reservation(
+                    &ctx,
+                    project.human_key.clone(),
+                    actor.name.clone(),
+                    reservation_id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("force release succeeds");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(parsed["released"].as_i64(), Some(1));
+
+                let rows =
+                    match queries::get_reservations_by_ids(&cx, &pool, &[reservation_id]).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("get_reservations_by_ids failed: {other:?}"),
+                    };
+                let db_release_ts = rows
+                    .iter()
+                    .find(|row| row.id == Some(reservation_id))
+                    .and_then(|row| row.released_ts)
+                    .expect("reservation should have committed released_ts");
+                let db_release_iso = micros_to_iso(db_release_ts);
+
+                assert_eq!(
+                    parsed["released_at"].as_str(),
+                    Some(db_release_iso.as_str())
+                );
+                assert_eq!(
+                    parsed["reservation"]["released_ts"].as_str(),
+                    Some(db_release_iso.as_str())
+                );
             });
         });
     }
