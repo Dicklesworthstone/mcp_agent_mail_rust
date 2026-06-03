@@ -25519,7 +25519,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     });
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "mail send",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     if !mail_server_rejection_allows_local_fallback(&message) {
                         return Err(CliError::Other(format!(
@@ -25620,7 +25628,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     });
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "mail reply",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     if !mail_server_rejection_allows_local_fallback(&message) {
                         return Err(CliError::Other(format!(
@@ -25711,7 +25727,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                         }
                     }
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "mail inbox",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     if fetch_inbox_server_rejection_allows_local_fallback(&message) {
                         server_error = Some(message);
@@ -25831,7 +25855,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     output::success(&format!("Message {message_id} marked as read at {read_at}"));
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "mail read",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "mark_message_read via server failed: {message}"
@@ -25896,7 +25928,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     ));
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "mail ack",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "acknowledge_message via server failed: {message}"
@@ -26457,6 +26497,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
         &server_config.http_path,
     );
     let bearer = local_server_bearer_token(&server_config);
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
     match action {
         AgentsCommand::Register {
@@ -26499,7 +26540,15 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "agents register",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "register_agent via server failed: {message}"
@@ -26594,7 +26643,15 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "agents create",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "create_agent_identity via server failed: {message}"
@@ -26669,7 +26726,15 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     render_agent_list_payload(&payload, fmt);
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "agents list",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "list_agents via server failed: {message}"
@@ -26725,7 +26790,15 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "agents show",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "whois via server failed: {message}"
@@ -27014,6 +27087,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
         &server_config.http_path,
     );
     let bearer = local_server_bearer_token(&server_config);
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
     match action {
         MacroCommand::StartSession {
@@ -27068,7 +27142,15 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     render_macro_start_session_payload(&payload, fmt, &program, &model);
                     return Ok(());
                 }
-                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "macros start-session",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
                 ServerToolCall::Rejected(message) => {
                     return Err(CliError::Other(format!(
                         "macro_start_session via server failed: {message}"
@@ -27829,8 +27911,9 @@ mod mail_server_cli_bridge_tests {
         mail_server_rejection_allows_local_fallback, normalize_cli_product_inbox_agent_name,
         parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
         post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
-        sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
+        reject_local_fallback_with_ownership_probe, server_inbox_payload_to_cli_json,
+        server_message_payload_to_cli_json, sort_product_inbox_items_desc,
+        sqlite_doctor_sanity_with_health_probe,
     };
 
     #[test]
@@ -28795,6 +28878,50 @@ mod mail_server_cli_bridge_tests {
         assert!(fetch_inbox_server_rejection_allows_local_fallback(
             "JSON-RPC error -32000: database is busy (snapshot conflict on pages: page 4434 > snapshot db_size 4433 (latest: 4433)); data=null"
         ));
+    }
+
+    #[test]
+    fn unavailable_server_fallback_refuses_when_mailbox_is_owned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mailbox.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("archive");
+
+        let error = reject_local_fallback_with_ownership_probe(
+            "mail send",
+            "http://127.0.0.1:8765/mcp/",
+            "transport failure calling server",
+            &database_url,
+            &storage_root,
+            |sqlite_path, root| mcp_agent_mail_db::pool::MailboxOwnershipState {
+                disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+                storage_lock_path: root.join(".mailbox.activity.lock").display().to_string(),
+                sqlite_lock_path: format!("{}.activity.lock", sqlite_path.display()),
+                processes: Vec::new(),
+                competing_pids: vec![42],
+                supervised_restart_required: false,
+                detail: "another Agent Mail server owns the mailbox database".to_string(),
+            },
+        )
+        .expect_err("owned mailbox should block local fallback");
+
+        let message = error.to_string();
+        assert!(message.contains("mail send could not be proxied"));
+        assert!(message.contains("Refusing local SQLite fallback"));
+        assert!(message.contains("another Agent Mail server owns the mailbox database"));
+    }
+
+    #[test]
+    fn unavailable_server_fallback_allows_memory_database_without_ownership_probe() {
+        reject_local_fallback_with_ownership_probe(
+            "mail inbox",
+            "http://127.0.0.1:8765/mcp/",
+            "connection refused",
+            "sqlite:///:memory:",
+            std::path::Path::new("/tmp/archive"),
+            |_sqlite_path, _root| panic!("memory database should not inspect ownership"),
+        )
+        .expect("memory DB fallback remains local");
     }
 
     #[test]
@@ -62310,6 +62437,52 @@ fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
 fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
     mail_server_rejection_allows_local_fallback(message)
         || server_rejection_is_transient_resource_busy(message)
+}
+
+fn reject_local_fallback_if_mailbox_owned(
+    command_label: &str,
+    server_url: &str,
+    server_error: &str,
+    database_url: &str,
+    storage_root: &Path,
+) -> CliResult<()> {
+    reject_local_fallback_with_ownership_probe(
+        command_label,
+        server_url,
+        server_error,
+        database_url,
+        storage_root,
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership,
+    )
+}
+
+fn reject_local_fallback_with_ownership_probe(
+    command_label: &str,
+    server_url: &str,
+    server_error: &str,
+    database_url: &str,
+    storage_root: &Path,
+    inspect: impl FnOnce(&Path, &Path) -> mcp_agent_mail_db::pool::MailboxOwnershipState,
+) -> CliResult<()> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return Ok(());
+    }
+    let sqlite_path = match resolve_mailbox_activity_sqlite_path(database_url) {
+        Ok(path) => path,
+        Err(_) => return Ok(()),
+    };
+    let ownership = inspect(&sqlite_path, storage_root);
+    if !ownership.blocks_mutation() {
+        return Ok(());
+    }
+
+    Err(CliError::Other(format!(
+        "{command_label} could not be proxied through the running Agent Mail daemon at \
+         {server_url}: {server_error}. Refusing local SQLite fallback because {}. \
+         Check HTTP_HOST/HTTP_PORT/HTTP_PATH/HTTP_BEARER_TOKEN for the CLI, or restart \
+         the daemon if its HTTP endpoint is wedged.",
+        ownership.detail
+    )))
 }
 
 fn mcp_error_to_cli_error(err: fastmcp::prelude::McpError) -> CliError {
