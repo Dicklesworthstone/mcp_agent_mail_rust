@@ -301,6 +301,55 @@ pub fn plan_archive_maintenance(storage_root: &Path, git_dir: &Path) -> ArchiveM
     }
 }
 
+/// Locate an executable on `$PATH`.
+///
+/// Used to decide whether the low-priority wrappers (`nice`/`ionice`) are
+/// available before invoking them, so archive maintenance degrades gracefully
+/// instead of exec-failing with exit 127 on hosts that lack them (#137).
+fn executable_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+}
+
+/// Build the `git maintenance run` command, wrapping it in `nice`/`ionice` only
+/// when those tools actually exist on this host.
+///
+/// `ionice` is util-linux-only: it is absent on macOS/BSD (#137) and may be
+/// stripped from minimal Linux images. Invoking it unconditionally made `nice`
+/// exec-fail with exit 127 and broke every archive-maintenance run plus
+/// `am doctor pack-archive`. `nice` is POSIX and kept when present; when neither
+/// wrapper is available we fall back to a bare `git`, which always exists.
+fn build_git_maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
+    let use_ionice = cfg!(target_os = "linux") && executable_on_path("ionice");
+    let use_nice = executable_on_path("nice");
+
+    let mut argv: Vec<String> = Vec::with_capacity(14);
+    if use_nice {
+        argv.extend(["nice".to_string(), "-n".to_string(), "19".to_string()]);
+    }
+    if use_ionice {
+        argv.extend(["ionice".to_string(), "-c".to_string(), "3".to_string()]);
+    }
+    argv.extend([
+        "git".to_string(),
+        "--git-dir".to_string(),
+        git_dir.display().to_string(),
+        "--work-tree".to_string(),
+        work_tree.display().to_string(),
+        "maintenance".to_string(),
+        "run".to_string(),
+        "--task=loose-objects".to_string(),
+        "--task=incremental-repack".to_string(),
+    ]);
+
+    // `argv[0]` is always set (`git` at minimum).
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command
+}
+
 /// Run the maintenance tasks on a given archive git directory.
 /// This is the core function used by both the background worker and the CLI.
 pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
@@ -309,23 +358,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
     let pack_before = count_pack_files(git_dir);
     let disk_before = measure_objects_disk_usage(git_dir);
 
-    let mut child = match Command::new("nice")
-        .args([
-            "-n",
-            "19",
-            "ionice",
-            "-c",
-            "3",
-            "git",
-            "--git-dir",
-            &git_dir.display().to_string(),
-            "--work-tree",
-            &work_tree.display().to_string(),
-            "maintenance",
-            "run",
-            "--task=loose-objects",
-            "--task=incremental-repack",
-        ])
+    let mut child = match build_git_maintenance_command(git_dir, work_tree)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -746,6 +779,34 @@ fn shell_arg(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn build_git_maintenance_command_is_well_formed_and_guards_ionice() {
+        let cmd = build_git_maintenance_command(Path::new("/tmp/x/.git"), Path::new("/tmp/x"));
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        let argv: Vec<String> = std::iter::once(program.clone())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+
+        // git is always invoked, with the maintenance subcommand and both tasks.
+        assert!(!program.is_empty());
+        assert!(argv.iter().any(|a| a == "git"), "git missing: {argv:?}");
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "maintenance" && w[1] == "run"),
+            "maintenance run missing: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--task=loose-objects"));
+        assert!(argv.iter().any(|a| a == "--task=incremental-repack"));
+
+        // #137: ionice (util-linux only) must never be invoked off Linux.
+        if !cfg!(target_os = "linux") {
+            assert!(
+                !argv.iter().any(|a| a == "ionice"),
+                "ionice must not run off Linux: {argv:?}"
+            );
+        }
+    }
 
     fn create_fake_git_objects_dir(tmp: &Path) -> PathBuf {
         let git_dir = tmp.join(".git");
