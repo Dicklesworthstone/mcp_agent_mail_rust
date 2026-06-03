@@ -5995,7 +5995,7 @@ fn local_server_url_from_parts(host: &str, port: u16, http_path: &str) -> String
     format!("http://{connect_host}:{port}{http_path}")
 }
 
-fn local_server_bearer_token(config: &mcp_agent_mail_core::Config) -> Option<String> {
+pub(crate) fn local_server_bearer_token(config: &mcp_agent_mail_core::Config) -> Option<String> {
     config
         .http_bearer_token
         .clone()
@@ -6010,7 +6010,7 @@ fn mcp_base_alias_path(path: &str) -> Option<&'static str> {
     }
 }
 
-fn check_inbox_server_urls(host: &str, port: u16, http_path: &str) -> Vec<String> {
+pub(crate) fn check_inbox_server_urls(host: &str, port: u16, http_path: &str) -> Vec<String> {
     let primary_path = normalize_http_path(http_path);
     let connect_host = normalize_connect_host_for_client_url(host);
     let mut urls = vec![format!("http://{connect_host}:{port}{primary_path}")];
@@ -61243,7 +61243,10 @@ fn normalize_agent_mail_url(raw: &str, http_path: &str) -> String {
     format!("{prefix}{normalized_path}{suffix}")
 }
 
-fn check_inbox_server_urls_for_agent_mail_url(raw_url: &str, http_path: &str) -> Vec<String> {
+pub(crate) fn check_inbox_server_urls_for_agent_mail_url(
+    raw_url: &str,
+    http_path: &str,
+) -> Vec<String> {
     let primary = normalize_agent_mail_url(raw_url, http_path);
     let normalized_path = normalize_http_path(http_path);
     let Some(alias_path) = mcp_base_alias_path(&normalized_path) else {
@@ -62386,7 +62389,7 @@ fn check_inbox_rate_limit_scope(agent_name: &str, project_key: &str) -> String {
 }
 
 #[derive(Debug, PartialEq)]
-enum ServerToolCall {
+pub(crate) enum ServerToolCall {
     Success(serde_json::Value),
     Unavailable(String),
     Rejected(String),
@@ -62412,7 +62415,7 @@ fn server_rejection_is_transient_resource_busy(message: &str) -> bool {
     is_resource_busy_cli_error(&CliError::Other(message.trim().to_string()))
 }
 
-fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
+pub(crate) fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty()
         || lower.starts_with("authentication failed")
@@ -62439,7 +62442,7 @@ fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
         || server_rejection_is_transient_resource_busy(message)
 }
 
-fn reject_local_fallback_if_mailbox_owned(
+pub(crate) fn reject_local_fallback_if_mailbox_owned(
     command_label: &str,
     server_url: &str,
     server_error: &str,
@@ -62635,7 +62638,7 @@ fn parse_tool_result_error(payload: &serde_json::Value) -> Option<String> {
     Some("tool execution failed".to_string())
 }
 
-async fn try_call_server_tool(
+pub(crate) async fn try_call_server_tool(
     server_url: &str,
     bearer: Option<&str>,
     tool_name: &str,
@@ -62685,7 +62688,7 @@ fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Valu
     }
 }
 
-fn coerce_tool_result_json_or_error(
+pub(crate) fn coerce_tool_result_json_or_error(
     tool_name: &str,
     result: serde_json::Value,
 ) -> CliResult<serde_json::Value> {

@@ -29,6 +29,8 @@ use crate::tool_util::{
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
+const FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
+
 fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
     if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
         tracing::debug!(
@@ -1358,6 +1360,10 @@ pub struct InboxMessage {
     #[serde(default, skip_serializing)]
     pub bcc: Vec<String>,
     pub created_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_ts: Option<String>,
     pub kind: String,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3085,7 +3091,7 @@ effective_free_bytes={free}"
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Retrieve recent messages for an agent without mutating read/ack state.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
+    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -3095,6 +3101,8 @@ pub async fn fetch_inbox(
     since_ts: Option<String>,
     limit: Option<i32>,
     include_bodies: Option<bool>,
+    unread_only: Option<bool>,
+    ack_overdue_only: Option<bool>,
     topic: Option<String>,
 ) -> McpResult<String> {
     let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox");
@@ -3126,6 +3134,8 @@ pub async fn fetch_inbox(
     })?;
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
+    let unread = unread_only.unwrap_or(false);
+    let ack_overdue = ack_overdue_only.unwrap_or(false);
     reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
@@ -3170,28 +3180,83 @@ pub async fn fetch_inbox(
         None
     };
 
-    let inbox_rows = db_outcome_to_mcp_result(if include_body {
-        mcp_agent_mail_db::queries::fetch_inbox(
-            ctx.cx(),
-            &read_pool,
-            project_id,
-            agent_id,
-            urgent,
-            since_micros,
-            msg_limit,
-        )
-        .await
-    } else {
-        mcp_agent_mail_db::queries::fetch_inbox_metadata(
-            ctx.cx(),
-            &read_pool,
-            project_id,
-            agent_id,
-            urgent,
-            since_micros,
-            msg_limit,
-        )
-        .await
+    let inbox_rows = db_outcome_to_mcp_result(match (include_body, ack_overdue, unread) {
+        (true, true, _) => {
+            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
+            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+                threshold,
+            )
+            .await
+        }
+        (false, true, _) => {
+            let threshold = mcp_agent_mail_db::now_micros() - FETCH_INBOX_ACK_OVERDUE_THRESHOLD_US;
+            mcp_agent_mail_db::queries::fetch_inbox_ack_overdue_metadata(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+                threshold,
+            )
+            .await
+        }
+        (true, false, true) => {
+            mcp_agent_mail_db::queries::fetch_inbox_unread(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
+        (false, false, true) => {
+            mcp_agent_mail_db::queries::fetch_inbox_unread_metadata(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
+        (true, false, false) => {
+            mcp_agent_mail_db::queries::fetch_inbox(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
+        (false, false, false) => {
+            mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                ctx.cx(),
+                &read_pool,
+                project_id,
+                agent_id,
+                urgent,
+                since_micros,
+                msg_limit,
+            )
+            .await
+        }
     })?;
     phase.mark("sqlite_query");
 
@@ -3222,6 +3287,8 @@ pub async fn fetch_inbox(
                 cc,
                 bcc,
                 created_ts: Some(micros_to_iso(row.message.created_ts)),
+                read_ts: row.read_ts.map(micros_to_iso),
+                ack_ts: row.ack_ts.map(micros_to_iso),
                 kind: row.kind,
                 attachments,
                 body_md: if include_body {
@@ -3240,12 +3307,14 @@ pub async fn fetch_inbox(
     });
 
     tracing::debug!(
-        "Fetched {} messages for {} in project {} (limit: {}, urgent: {}, since: {:?})",
+        "Fetched {} messages for {} in project {} (limit: {}, urgent: {}, unread: {}, ack_overdue: {}, since: {:?})",
         messages.len(),
         agent_name,
         project_key,
         msg_limit,
         urgent,
+        unread,
+        ack_overdue,
         since_ts
     );
 
@@ -4566,6 +4635,8 @@ mod tests {
             cc: vec![],
             bcc: vec![],
             created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
             kind: "to".into(),
             attachments: vec![],
             body_md: None,
@@ -4589,6 +4660,8 @@ mod tests {
             cc: vec![],
             bcc: vec![],
             created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
             kind: "to".into(),
             attachments: vec![json!({"path": "img.webp", "type": "file"})],
             body_md: Some("Hello world".into()),
@@ -4638,6 +4711,8 @@ mod tests {
             cc: vec!["GoldHawk".into()],
             bcc: vec!["SilverPeak".into()],
             created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
             kind: "to".into(),
             attachments: vec![],
             body_md: None,

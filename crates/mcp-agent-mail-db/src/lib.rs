@@ -193,7 +193,10 @@ pub use cache::{
     CacheMetricsSnapshot, cache_diagnostics_snapshot, cache_metrics, read_cache,
 };
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
-pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
+pub use error::{
+    DbError, DbResult, is_corruption_error, is_lock_error, is_mailbox_ownership_contention,
+    is_pool_exhausted_error,
+};
 pub use forensics::{
     ForensicFileLock, ForensicPreSnapshot, ForensicProcessHolder, MailboxForensicCapture,
     capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,

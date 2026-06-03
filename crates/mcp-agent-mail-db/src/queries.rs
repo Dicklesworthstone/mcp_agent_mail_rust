@@ -6457,6 +6457,7 @@ pub async fn fetch_inbox(
             urgent_only,
             unread_only: false,
             ack_required_only: false,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -6483,6 +6484,7 @@ pub async fn fetch_inbox_metadata(
             urgent_only,
             unread_only: false,
             ack_required_only: false,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -6509,6 +6511,7 @@ pub async fn fetch_inbox_unread(
             urgent_only,
             unread_only: true,
             ack_required_only: false,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -6535,6 +6538,63 @@ pub async fn fetch_inbox_unread_metadata(
             urgent_only,
             unread_only: true,
             ack_required_only: false,
+            ack_overdue_before: None,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        },
+    )
+    .await
+}
+
+pub async fn fetch_inbox_ack_overdue(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
+            body_policy: InboxBodyPolicy::Full,
+        },
+    )
+    .await
+}
+
+pub async fn fetch_inbox_ack_overdue_metadata(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -6559,6 +6619,7 @@ pub async fn fetch_inbox_ack_required(
             urgent_only: false,
             unread_only: false,
             ack_required_only: true,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -6583,6 +6644,7 @@ pub async fn fetch_inbox_ack_required_metadata(
             urgent_only: false,
             unread_only: false,
             ack_required_only: true,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -6600,6 +6662,7 @@ struct InboxQueryOptions {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
+    ack_overdue_before: Option<i64>,
     body_policy: InboxBodyPolicy,
 }
 
@@ -6624,8 +6687,30 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    let result = if matches!(options.body_policy, InboxBodyPolicy::Full) {
-        crate::sync::fetch_inbox_rows_from_conn(
+    let result = match (options.body_policy, options.ack_overdue_before) {
+        (InboxBodyPolicy::Full, Some(threshold)) => {
+            crate::sync::fetch_inbox_ack_overdue_rows_from_conn(
+                &conn,
+                project_id,
+                agent_id,
+                options.urgent_only,
+                since_ts,
+                limit,
+                threshold,
+            )
+        }
+        (InboxBodyPolicy::MetadataOnly, Some(threshold)) => {
+            crate::sync::fetch_inbox_ack_overdue_metadata_rows_from_conn(
+                &conn,
+                project_id,
+                agent_id,
+                options.urgent_only,
+                since_ts,
+                limit,
+                threshold,
+            )
+        }
+        (InboxBodyPolicy::Full, None) => crate::sync::fetch_inbox_rows_from_conn(
             &conn,
             project_id,
             agent_id,
@@ -6634,9 +6719,8 @@ async fn fetch_inbox_impl(
             options.ack_required_only,
             since_ts,
             limit,
-        )
-    } else {
-        crate::sync::fetch_inbox_metadata_rows_from_conn(
+        ),
+        (InboxBodyPolicy::MetadataOnly, None) => crate::sync::fetch_inbox_metadata_rows_from_conn(
             &conn,
             project_id,
             agent_id,
@@ -6645,7 +6729,7 @@ async fn fetch_inbox_impl(
             options.ack_required_only,
             since_ts,
             limit,
-        )
+        ),
     };
 
     match result {

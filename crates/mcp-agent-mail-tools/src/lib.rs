@@ -238,9 +238,21 @@ pub mod tool_util {
                 if mcp_agent_mail_db::is_lock_error(message) =>
             {
                 let message = message.clone();
+                // #139: mailbox ownership contention (a long-running
+                // `am serve-http` daemon holds the activity lock and a direct
+                // mutation was refused) is still RESOURCE_BUSY, but the actionable
+                // hint differs from a transient SQLITE_BUSY: the caller should route
+                // the write through the running server rather than blindly retrying
+                // a direct write that will keep losing the ownership race.
+                let hint = if mcp_agent_mail_db::is_mailbox_ownership_contention(&message) {
+                    "Resource is temporarily busy: a running Agent Mail server owns this mailbox. \
+                     Route this operation through that server (or stop it) instead of writing directly."
+                } else {
+                    "Resource is temporarily busy. Wait a moment and try again."
+                };
                 legacy_tool_error(
                     "RESOURCE_BUSY",
-                    "Resource is temporarily busy. Wait a moment and try again.",
+                    hint,
                     true,
                     json!({ "error_detail": message }),
                 )

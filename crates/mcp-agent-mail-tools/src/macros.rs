@@ -228,6 +228,8 @@ pub async fn macro_start_session(
         Some(inbox_limit),
         Some(false),
         None,
+        None,
+        None,
     )
     .await?;
     let inbox: Vec<InboxMessage> = parse_json(inbox_json, "inbox")?;
@@ -424,6 +426,8 @@ pub async fn macro_prepare_thread(
         None,
         Some(inbox_limit),
         Some(include_inbox_bodies.unwrap_or(false)),
+        None,
+        None,
         None,
     )
     .await?;
@@ -1310,6 +1314,8 @@ mod tests {
                 cc: Vec::new(),
                 bcc: Vec::new(),
                 created_ts: None,
+                read_ts: None,
+                ack_ts: None,
                 kind: "direct".into(),
                 attachments: Vec::new(),
                 body_md: Some("Body text".into()),

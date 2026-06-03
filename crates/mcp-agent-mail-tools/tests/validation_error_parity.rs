@@ -115,6 +115,8 @@ fn test_invalid_timestamp_message() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("invalid since_ts should fail");
@@ -407,6 +409,8 @@ fn test_invalid_limit_message() {
             Some(0),
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("limit=0 should fail");
@@ -457,6 +461,8 @@ fn test_invalid_limit_negative() {
             Some(-5),
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("limit=-5 should fail");
@@ -494,6 +500,8 @@ fn test_limit_capped_at_1000() {
             None,
             None,
             Some(5000),
+            None,
+            None,
             None,
             None,
         )

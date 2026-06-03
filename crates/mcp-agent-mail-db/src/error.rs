@@ -169,6 +169,36 @@ pub fn is_lock_error(msg: &str) -> bool {
         || lower.contains("unable to open database")
         || lower.contains("disk i/o error")
         || is_mvcc_conflict(msg)
+        || is_mailbox_ownership_contention(msg)
+}
+
+/// Check whether a direct mutation was refused because a live mailbox owner is
+/// already active.
+///
+/// The live owner is typically a long-running `am serve-http` daemon holding
+/// the mailbox's activity lock.
+///
+/// This is distinct from a raw `SQLITE_BUSY` ("database is locked"): the
+/// mailbox ownership gate (`refuse_mutating_mailbox_when_owned` /
+/// `evaluate_write_route`) rejects the write *before* it ever touches the
+/// SQLite file, emitting a `SqlError::Custom` that does not contain the
+/// classic lock phrasing. Without this classifier those refusals fall through
+/// to the generic "A database error occurred" mapping in the tools layer
+/// (issue #139) instead of surfacing as a retryable `RESOURCE_BUSY` with an
+/// actionable "route through the running server" hint.
+#[must_use]
+pub fn is_mailbox_ownership_contention(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("mailbox mutation refused")
+        || lower.contains("owns this mailbox")
+        || lower.contains("owns the mailbox")
+        || lower.contains("already owns the mailbox")
+        || lower.contains("hold the mailbox lock")
+        || lower.contains("holds the mailbox lock")
+        || lower.contains("competing processes hold locks")
+        || lower.contains("mailbox activity lock")
+        || lower.contains("route writes through that process")
+        || lower.contains("wait for the active owner")
 }
 
 /// Check whether an error message indicates an MVCC write conflict
@@ -426,6 +456,57 @@ mod tests {
         assert!(!is_lock_error("table not found"));
         assert!(!is_lock_error("unlocked and healthy"));
         assert!(!is_lock_error(""));
+    }
+
+    // ── is_mailbox_ownership_contention (#139) ──────────────────────────
+
+    #[test]
+    fn mailbox_ownership_contention_patterns() {
+        // The exact phrasing emitted by `refuse_mutating_mailbox_when_owned`
+        // (pool.rs) when a running server owns the mailbox.
+        assert!(is_mailbox_ownership_contention(
+            "mailbox mutation refused for /tmp/mb/storage.sqlite3: \
+             another Agent Mail server owns the mailbox database: pid 4242; \
+             wait for the active owner to finish instead of competing recovery"
+        ));
+        // The write-route refusal reasons from `evaluate_write_route`.
+        assert!(is_mailbox_ownership_contention(
+            "Another active process owns this mailbox (pid 17). \
+             Route writes through that process or stop it first."
+        ));
+        assert!(is_mailbox_ownership_contention(
+            "A stale process appears to hold the mailbox lock."
+        ));
+        assert!(is_mailbox_ownership_contention(
+            "live Agent Mail process still holds the mailbox database \
+             without mailbox activity locks: pid 9"
+        ));
+        // Case-insensitive.
+        assert!(is_mailbox_ownership_contention("MAILBOX MUTATION REFUSED"));
+    }
+
+    #[test]
+    fn mailbox_ownership_contention_is_lock_error() {
+        // #139: ownership-contention refusals must classify as a lock/busy
+        // condition so the tools layer maps them to RESOURCE_BUSY (retryable)
+        // rather than the generic, non-actionable "A database error occurred".
+        let refusal = "mailbox mutation refused for /tmp/mb/storage.sqlite3: \
+             another Agent Mail server owns the mailbox database: pid 4242; \
+             wait for the active owner to finish instead of competing recovery";
+        assert!(is_lock_error(refusal));
+        let e = DbError::Sqlite(refusal.to_string());
+        assert!(e.is_retryable());
+        assert_eq!(e.error_code(), "INTERNAL_ERROR"); // bare DbError code unchanged
+    }
+
+    #[test]
+    fn not_mailbox_ownership_contention() {
+        assert!(!is_mailbox_ownership_contention("syntax error near SELECT"));
+        assert!(!is_mailbox_ownership_contention("database is locked"));
+        assert!(!is_mailbox_ownership_contention(
+            "no competing Agent Mail mailbox owners or live database holders detected"
+        ));
+        assert!(!is_mailbox_ownership_contention(""));
     }
 
     // ── is_mvcc_conflict ────────────────────────────────────────────

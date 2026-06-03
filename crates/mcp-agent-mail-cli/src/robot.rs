@@ -4705,6 +4705,430 @@ struct InboxResult {
     actions: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct RobotInboxData {
+    count: usize,
+    inbox: Vec<InboxEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct RobotInboxServerRequest {
+    project_key: String,
+    agent_name: String,
+    urgent: bool,
+    ack_overdue: bool,
+    unread: bool,
+    all: bool,
+    limit: usize,
+    include_bodies: bool,
+}
+
+#[derive(Debug)]
+struct ServerInboxEntry {
+    entry: InboxEntry,
+    bucket: i64,
+    created_ts: i64,
+}
+
+fn render_inbox_result(
+    cmd_name: &str,
+    format: OutputFormat,
+    result: InboxResult,
+    project: String,
+    agent: String,
+    mut phase: TailLatencyPhaseRecorder,
+) -> Result<String, CliError> {
+    let count = result.entries.len();
+    phase.set_rows_returned(count);
+    let mut env = RobotEnvelope::new(
+        cmd_name,
+        format,
+        RobotInboxData {
+            count,
+            inbox: result.entries,
+        },
+    );
+    env._meta.project = Some(project);
+    env._meta.agent = Some(agent);
+    for (severity, headline, action) in result.alerts {
+        env = env.with_alert(severity, headline, action);
+    }
+    for action in result.actions {
+        env = env.with_action(&action);
+    }
+    env = env.with_diagnostics(phase.snapshot("pre_render"));
+    let output = format_output(&env, format)?;
+    phase.mark("render_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(output)
+}
+
+fn robot_server_project_key(project_flag: Option<&str>) -> Result<String, CliError> {
+    if let Some(project_key) = resolved_project_flag_or_env(project_flag) {
+        return Ok(project_key);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| CliError::Other(format!("cannot get CWD: {error}")))?;
+    Ok(cwd.to_string_lossy().into_owned())
+}
+
+fn build_robot_inbox_server_request(
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+    urgent: bool,
+    ack_overdue: bool,
+    unread: bool,
+    all: bool,
+    limit: Option<usize>,
+    include_bodies: bool,
+) -> Result<Option<RobotInboxServerRequest>, CliError> {
+    let Some(agent_name) = resolved_agent_flag_or_env(agent_flag) else {
+        return Ok(None);
+    };
+    Ok(Some(RobotInboxServerRequest {
+        project_key: robot_server_project_key(project_flag)?,
+        agent_name,
+        urgent,
+        ack_overdue,
+        unread: unread || (!urgent && !ack_overdue && !all),
+        all,
+        limit: limit.unwrap_or(20),
+        include_bodies,
+    }))
+}
+
+fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> {
+    if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL")
+        && !agent_mail_url.trim().is_empty()
+    {
+        return crate::check_inbox_server_urls_for_agent_mail_url(
+            &agent_mail_url,
+            &config.http_path,
+        );
+    }
+    crate::check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path)
+}
+
+fn robot_inbox_server_arguments(request: &RobotInboxServerRequest) -> serde_json::Value {
+    let ack_overdue_only = !request.urgent && request.ack_overdue;
+    let unread_only = if request.urgent {
+        true
+    } else if ack_overdue_only || request.all {
+        false
+    } else {
+        request.unread
+    };
+    serde_json::json!({
+        "project_key": request.project_key,
+        "agent_name": request.agent_name,
+        "urgent_only": request.urgent,
+        "limit": i32::try_from(request.limit).unwrap_or(i32::MAX),
+        "include_bodies": request.include_bodies,
+        "unread_only": unread_only,
+        "ack_overdue_only": ack_overdue_only,
+    })
+}
+
+fn server_inbox_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if let Some(rows) = payload.as_array() {
+        return Some(rows);
+    }
+    if let Some(rows) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    {
+        return Some(rows);
+    }
+    payload.get("result").and_then(serde_json::Value::as_array)
+}
+
+fn server_inbox_iso_micros(row: &serde_json::Value, key: &str) -> Option<i64> {
+    row.get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(mcp_agent_mail_db::iso_to_micros)
+}
+
+fn server_inbox_row_to_entry(
+    row: &serde_json::Value,
+    now_us: i64,
+    ack_threshold: i64,
+    include_bodies: bool,
+) -> ServerInboxEntry {
+    let id = row
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let importance = row
+        .get("importance")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("normal")
+        .to_string();
+    let read_ts = server_inbox_iso_micros(row, "read_ts");
+    let ack_ts = server_inbox_iso_micros(row, "ack_ts");
+    let created_ts = server_inbox_iso_micros(row, "created_ts").unwrap_or(0);
+    let ack_required = row
+        .get("ack_required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let bucket = if matches!(importance.as_str(), "urgent" | "high") && read_ts.is_none() {
+        1
+    } else if ack_required && ack_ts.is_none() && created_ts < ack_threshold {
+        2
+    } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
+        3
+    } else if read_ts.is_none() {
+        4
+    } else if ack_required && ack_ts.is_none() {
+        5
+    } else {
+        6
+    };
+    let priority = match bucket {
+        1 => "urgent",
+        2 => "ack-overdue",
+        3 => "ack-required",
+        4 => "unread",
+        5 => "read-unacked",
+        _ => "read",
+    }
+    .to_string();
+    let ack_status = if !ack_required {
+        "none".to_string()
+    } else if ack_ts.is_some() {
+        "acked".to_string()
+    } else if bucket == 2 {
+        "overdue".to_string()
+    } else if read_ts.is_some() {
+        "pending".to_string()
+    } else {
+        "required".to_string()
+    };
+    let thread_id = row
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let age_seconds = age_seconds_from_micros(now_us, created_ts);
+    ServerInboxEntry {
+        entry: InboxEntry {
+            id,
+            priority,
+            from: row
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            subject: row
+                .get("subject")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            thread: canonical_thread_ref(id, thread_id),
+            age: format_age(age_seconds),
+            ack_status,
+            importance,
+            body_md: if include_bodies {
+                row.get("body_md")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            },
+        },
+        bucket,
+        created_ts,
+    }
+}
+
+fn build_inbox_from_server_payload(
+    payload: &serde_json::Value,
+    request: &RobotInboxServerRequest,
+) -> Result<InboxResult, CliError> {
+    let rows = server_inbox_rows(payload)
+        .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
+    let now_us = mcp_agent_mail_db::now_micros();
+    let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
+    let mut projected = rows
+        .iter()
+        .map(|row| server_inbox_row_to_entry(row, now_us, ack_threshold, request.include_bodies))
+        .filter(|row| {
+            if request.urgent {
+                row.bucket == 1
+            } else if request.ack_overdue {
+                row.bucket == 2
+            } else if request.all {
+                true
+            } else if request.unread {
+                row.bucket <= 4
+            } else {
+                row.bucket <= 5
+            }
+        })
+        .collect::<Vec<_>>();
+    projected.sort_by(|left, right| {
+        left.bucket
+            .cmp(&right.bucket)
+            .then_with(|| right.created_ts.cmp(&left.created_ts))
+            .then_with(|| right.entry.id.cmp(&left.entry.id))
+    });
+    projected.truncate(request.limit);
+
+    let mut overdue_ids = Vec::new();
+    let entries = projected
+        .into_iter()
+        .map(|row| {
+            if row.bucket == 2 {
+                overdue_ids.push(row.entry.id);
+            }
+            row.entry
+        })
+        .collect::<Vec<_>>();
+
+    let mut alerts = Vec::new();
+    if !overdue_ids.is_empty() {
+        let ids = overdue_ids
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>();
+        alerts.push((
+            "warn".to_string(),
+            format!(
+                "{} message(s) ack overdue (>30m): {}",
+                overdue_ids.len(),
+                ids.join(", ")
+            ),
+            Some(format!(
+                "am mail ack --project {} --agent {} {}",
+                request.project_key, request.agent_name, overdue_ids[0]
+            )),
+        ));
+    }
+
+    let mut actions = Vec::new();
+    for &id in overdue_ids.iter().take(3) {
+        actions.push(format!(
+            "am mail ack --project {} --agent {} {id}",
+            request.project_key, request.agent_name
+        ));
+    }
+    if let Some(entry) = entries.first()
+        && !entry.thread.is_empty()
+    {
+        actions.push(format!(
+            "am robot thread --project {} {}",
+            request.project_key, entry.thread
+        ));
+    }
+
+    Ok(InboxResult {
+        entries,
+        alerts,
+        actions,
+    })
+}
+
+fn try_build_inbox_via_server(
+    request: &RobotInboxServerRequest,
+    config: &mcp_agent_mail_core::Config,
+) -> Result<Option<InboxResult>, CliError> {
+    let urls = robot_inbox_server_urls(config);
+    if urls.is_empty() {
+        return Ok(None);
+    }
+    let bearer = crate::local_server_bearer_token(config);
+    let mut last_unavailable: Option<(String, String)> = None;
+
+    for server_url in urls {
+        let arguments = robot_inbox_server_arguments(request);
+        let call = crate::context::run_async(async {
+            Ok(crate::try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "fetch_inbox",
+                arguments,
+            )
+            .await)
+        })?;
+        match call {
+            crate::ServerToolCall::Success(result) => {
+                let payload = crate::coerce_tool_result_json_or_error("fetch_inbox", result)?;
+                return build_inbox_from_server_payload(&payload, request).map(Some);
+            }
+            crate::ServerToolCall::Unavailable(message) => {
+                last_unavailable = Some((server_url, message));
+            }
+            crate::ServerToolCall::Rejected(message) => {
+                if crate::mail_server_rejection_allows_local_fallback(&message) {
+                    tracing::debug!(
+                        message = %message,
+                        "robot inbox fell back to local scope after server scope mismatch"
+                    );
+                    return Ok(None);
+                }
+                return Err(CliError::Other(format!(
+                    "fetch_inbox via server failed: {message}"
+                )));
+            }
+        }
+    }
+
+    if let Some((server_url, message)) = last_unavailable {
+        crate::reject_local_fallback_if_mailbox_owned(
+            "robot inbox",
+            &server_url,
+            &message,
+            &config.database_url,
+            config.storage_root.as_path(),
+        )?;
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_local_inbox_result(
+    cmd_name: &str,
+    format: OutputFormat,
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+    urgent: bool,
+    ack_overdue: bool,
+    unread: bool,
+    all: bool,
+    limit: Option<usize>,
+    include_bodies: bool,
+    mut phase: TailLatencyPhaseRecorder,
+) -> Result<String, CliError> {
+    let scope = resolve_robot_scope(project_flag, agent_flag)?;
+    phase.mark("scope_resolution");
+    let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
+        CliError::InvalidArgument(
+            "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME".to_string(),
+        )
+    })?;
+
+    let result = build_inbox_with_snapshot_cache(
+        scope.conn(),
+        scope.project_id,
+        &scope.project_slug,
+        agent_id,
+        &agent_name_str,
+        urgent,
+        ack_overdue,
+        unread || (!urgent && !ack_overdue && !all),
+        all,
+        limit.unwrap_or(20),
+        include_bodies,
+        Some(&mut phase),
+    )?;
+    render_inbox_result(
+        cmd_name,
+        format,
+        result,
+        scope.project_slug,
+        agent_name_str,
+        phase,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_inbox(
     conn: &DbConn,
@@ -12364,59 +12788,61 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
             phase.set_include_bodies(include_bodies);
             phase.mark("queue_wait");
-            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            phase.mark("scope_resolution");
-            let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
-                CliError::InvalidArgument(
-                    "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
-                        .to_string(),
-                )
-            })?;
-
-            let result = build_inbox_with_snapshot_cache(
-                scope.conn(),
-                scope.project_id,
-                &scope.project_slug,
-                agent_id,
-                &agent_name_str,
+            let config = mcp_agent_mail_core::Config::from_env();
+            if let Some(request) = build_robot_inbox_server_request(
+                args.project.as_deref(),
+                args.agent.as_deref(),
                 urgent,
                 ack_overdue,
-                unread || (!urgent && !ack_overdue && !all),
+                unread,
                 all,
-                limit.unwrap_or(20),
+                limit,
                 include_bodies,
-                Some(&mut phase),
-            )?;
-
-            #[derive(Serialize)]
-            struct InboxData {
-                count: usize,
-                inbox: Vec<InboxEntry>,
+            )? {
+                match try_build_inbox_via_server(&request, &config)? {
+                    Some(result) => {
+                        phase.mark("server_fetch");
+                        render_inbox_result(
+                            cmd_name,
+                            format,
+                            result,
+                            request.project_key,
+                            request.agent_name,
+                            phase,
+                        )?
+                    }
+                    None => {
+                        phase.mark("server_fallback");
+                        render_local_inbox_result(
+                            cmd_name,
+                            format,
+                            args.project.as_deref(),
+                            args.agent.as_deref(),
+                            urgent,
+                            ack_overdue,
+                            unread,
+                            all,
+                            limit,
+                            include_bodies,
+                            phase,
+                        )?
+                    }
+                }
+            } else {
+                render_local_inbox_result(
+                    cmd_name,
+                    format,
+                    args.project.as_deref(),
+                    args.agent.as_deref(),
+                    urgent,
+                    ack_overdue,
+                    unread,
+                    all,
+                    limit,
+                    include_bodies,
+                    phase,
+                )?
             }
-
-            let count = result.entries.len();
-            phase.set_rows_returned(count);
-            let mut env = RobotEnvelope::new(
-                cmd_name,
-                format,
-                InboxData {
-                    count,
-                    inbox: result.entries,
-                },
-            );
-            env._meta.project = Some(scope.project_slug);
-            env._meta.agent = Some(agent_name_str);
-            for (severity, headline, action) in result.alerts {
-                env = env.with_alert(severity, headline, action);
-            }
-            for a in result.actions {
-                env = env.with_action(&a);
-            }
-            env = env.with_diagnostics(phase.snapshot("pre_render"));
-            let output = format_output(&env, format)?;
-            phase.mark("render_serialization");
-            emit_tail_latency_evidence(&phase.finish("ok"));
-            output
         }
         RobotSubcommand::Thread { id, limit, since } => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;
@@ -15086,6 +15512,138 @@ mod tests {
         assert_eq!(inbox_arr[1]["priority"], "urgent");
         assert_eq!(v["_alerts"][0]["severity"], "warn");
         assert_eq!(v["_actions"][0], "am mail ack 1");
+    }
+
+    #[test]
+    fn robot_inbox_server_arguments_preserve_robot_filter_precedence() {
+        let default_request = RobotInboxServerRequest {
+            project_key: "/tmp/demo".into(),
+            agent_name: "BlueLake".into(),
+            urgent: false,
+            ack_overdue: false,
+            unread: true,
+            all: false,
+            limit: 20,
+            include_bodies: false,
+        };
+        let default_args = robot_inbox_server_arguments(&default_request);
+        assert_eq!(default_args["unread_only"], true);
+        assert_eq!(default_args["ack_overdue_only"], false);
+
+        let urgent_request = RobotInboxServerRequest {
+            urgent: true,
+            ack_overdue: true,
+            unread: false,
+            ..default_request.clone()
+        };
+        let urgent_args = robot_inbox_server_arguments(&urgent_request);
+        assert_eq!(urgent_args["urgent_only"], true);
+        assert_eq!(urgent_args["unread_only"], true);
+        assert_eq!(urgent_args["ack_overdue_only"], false);
+
+        let overdue_request = RobotInboxServerRequest {
+            urgent: false,
+            ack_overdue: true,
+            unread: false,
+            ..default_request.clone()
+        };
+        let overdue_args = robot_inbox_server_arguments(&overdue_request);
+        assert_eq!(overdue_args["unread_only"], false);
+        assert_eq!(overdue_args["ack_overdue_only"], true);
+
+        let all_request = RobotInboxServerRequest {
+            unread: false,
+            all: true,
+            ..default_request
+        };
+        let all_args = robot_inbox_server_arguments(&all_request);
+        assert_eq!(all_args["unread_only"], false);
+        assert_eq!(all_args["ack_overdue_only"], false);
+    }
+
+    #[test]
+    fn robot_inbox_server_payload_uses_read_and_ack_timestamps_for_priority() {
+        let now = mcp_agent_mail_db::now_micros();
+        let old = mcp_agent_mail_db::micros_to_iso(now - ACK_OVERDUE_THRESHOLD_US - 60_000_000);
+        let recent = mcp_agent_mail_db::micros_to_iso(now - 60_000_000);
+        let read = mcp_agent_mail_db::micros_to_iso(now - 30_000_000);
+        let payload = serde_json::json!([
+            {
+                "id": 2,
+                "subject": "Normal unread",
+                "from": "GreenCastle",
+                "importance": "normal",
+                "ack_required": false,
+                "created_ts": recent.clone(),
+                "thread_id": "normal-thread",
+                "kind": "to"
+            },
+            {
+                "id": 3,
+                "subject": "Ack overdue",
+                "from": "RedStone",
+                "importance": "normal",
+                "ack_required": true,
+                "created_ts": old.clone(),
+                "read_ts": read.clone(),
+                "thread_id": "ack-thread",
+                "kind": "to"
+            },
+            {
+                "id": 1,
+                "subject": "Urgent unread",
+                "from": "BlueLake",
+                "importance": "urgent",
+                "ack_required": true,
+                "created_ts": old.clone(),
+                "thread_id": "urgent-thread",
+                "kind": "to"
+            },
+            {
+                "id": 4,
+                "subject": "Read and acked",
+                "from": "SilverPeak",
+                "importance": "normal",
+                "ack_required": true,
+                "created_ts": old,
+                "read_ts": read.clone(),
+                "ack_ts": read,
+                "thread_id": "done-thread",
+                "kind": "to"
+            }
+        ]);
+        let request = RobotInboxServerRequest {
+            project_key: "/tmp/demo".into(),
+            agent_name: "BlueLake".into(),
+            urgent: false,
+            ack_overdue: false,
+            unread: true,
+            all: false,
+            limit: 10,
+            include_bodies: false,
+        };
+
+        let result = build_inbox_from_server_payload(&payload, &request).expect("server inbox");
+        let ids = result
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 3, 2]);
+        assert_eq!(result.entries[0].priority, "urgent");
+        assert_eq!(result.entries[1].priority, "ack-overdue");
+        assert_eq!(result.entries[1].ack_status, "overdue");
+        assert_eq!(result.alerts.len(), 1);
+
+        let overdue_request = RobotInboxServerRequest {
+            ack_overdue: true,
+            unread: false,
+            ..request
+        };
+        let overdue =
+            build_inbox_from_server_payload(&payload, &overdue_request).expect("overdue inbox");
+        assert_eq!(overdue.entries.len(), 1);
+        assert_eq!(overdue.entries[0].id, 3);
     }
 
     #[test]

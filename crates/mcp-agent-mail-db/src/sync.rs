@@ -75,6 +75,7 @@ pub fn fetch_inbox_rows_from_conn(
             urgent_only,
             unread_only,
             ack_required_only,
+            ack_overdue_before: None,
             body_policy: InboxBodyPolicy::Full,
         },
     )
@@ -101,6 +102,59 @@ pub fn fetch_inbox_metadata_rows_from_conn(
             urgent_only,
             unread_only,
             ack_required_only,
+            ack_overdue_before: None,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_inbox_ack_overdue_rows_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
+            body_policy: InboxBodyPolicy::Full,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    ack_overdue_before: i64,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: Some(ack_overdue_before),
             body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
@@ -117,6 +171,7 @@ struct InboxFetchOptions {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
+    ack_overdue_before: Option<i64>,
     body_policy: InboxBodyPolicy,
 }
 
@@ -153,6 +208,10 @@ fn fetch_inbox_rows_from_conn_impl(
     }
     if options.ack_required_only {
         sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL");
+    }
+    if let Some(threshold) = options.ack_overdue_before {
+        sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL AND m.created_ts < ?");
+        params.push(Value::BigInt(threshold));
     }
     if let Some(ts) = since_ts {
         sql.push_str(" AND m.created_ts > ?");
