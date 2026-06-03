@@ -1696,6 +1696,7 @@ Common pitfalls
 
 | Document | Purpose |
 |----------|---------|
+| [INDEX.md](docs/INDEX.md) | Navigation map for the docs tree |
 | [OPERATOR_COOKBOOK.md](docs/OPERATOR_COOKBOOK.md) | Canonical copy-paste operator recipes for setup, triage, reservations, messaging, share/export, and diagnostics |
 | [OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md) | Deployment, troubleshooting, diagnostics |
 | [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Dev setup, debugging, testing |
