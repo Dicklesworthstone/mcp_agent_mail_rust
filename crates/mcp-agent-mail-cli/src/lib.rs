@@ -3861,56 +3861,37 @@ fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
     Ok(())
 }
 
-/// Remove stale lock files and corrupt WAL/SHM sidecars that prevent startup.
+/// Quarantine stale lock files and corrupt WAL/SHM sidecars that prevent startup.
 ///
 /// This is called after killing old Agent Mail processes (or when none are
 /// running) to ensure the integrity probe and pool open succeed cleanly.
 fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
-    // Remove stale .activity.lock files.  The flock-based lock logic will
+    // Quarantine stale .activity.lock files.  The flock-based lock logic will
     // re-create a fresh lock file when it acquires the lock.
     let mut lock_os = db_path.as_os_str().to_os_string();
     lock_os.push(".activity.lock");
     let lock_path = PathBuf::from(lock_os);
-    if lock_path.exists() {
-        // Only remove if we can verify no process holds the flock.
-        // Acquire the exclusive lock, delete the file while still holding the
-        // lock (preventing a TOCTOU race), then drop the fd which releases the
-        // lock on the now-unlinked inode.
-        let removed = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .and_then(|f| {
-                fs2::FileExt::try_lock_exclusive(&f)?;
-                // Delete while we hold the lock — no other process can acquire
-                // this inode's flock between our check and the removal.
-                std::fs::remove_file(&lock_path)?;
-                // The flock is released when `f` drops (end of closure).
-                Ok(())
-            })
-            .is_ok();
-        if removed {
-            tracing::debug!(path = %lock_path.display(), "removed stale activity lock file");
-        }
+    if let Some(quarantined) =
+        quarantine_stale_activity_lock_if_unheld(&lock_path, "stale activity lock")?
+    {
+        tracing::debug!(
+            path = %lock_path.display(),
+            quarantine = %quarantined.display(),
+            "quarantined stale activity lock file"
+        );
     }
 
-    // Also clean up the deprecated .mailbox.activity.lock path (legacy).
+    // Also quarantine the deprecated .mailbox.activity.lock path (legacy).
     if let Some(parent) = db_path.parent() {
         let legacy_lock = parent.join(".mailbox.activity.lock");
-        if legacy_lock.exists() {
-            let removed = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&legacy_lock)
-                .and_then(|f| {
-                    fs2::FileExt::try_lock_exclusive(&f)?;
-                    std::fs::remove_file(&legacy_lock)?;
-                    Ok(())
-                })
-                .is_ok();
-            if removed {
-                tracing::debug!(path = %legacy_lock.display(), "removed stale legacy activity lock file");
-            }
+        if let Some(quarantined) =
+            quarantine_stale_activity_lock_if_unheld(&legacy_lock, "stale legacy activity lock")?
+        {
+            tracing::debug!(
+                path = %legacy_lock.display(),
+                quarantine = %quarantined.display(),
+                "quarantined stale legacy activity lock file"
+            );
         }
     }
 
@@ -3925,8 +3906,16 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
     let wal_path = sqlite_sidecar_path(db_path, "-wal");
     let mut wal_detached = false;
 
-    if let Ok(meta) = std::fs::metadata(&wal_path) {
-        if mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len()) {
+    if let Ok(meta) = std::fs::symlink_metadata(&wal_path) {
+        if !meta.file_type().is_file() {
+            let quarantined = quarantine_startup_sqlite_sidecar(&wal_path, "non-file WAL")?;
+            eprintln!(
+                "[info] Quarantined non-file WAL sidecar {} to {}",
+                wal_path.display(),
+                quarantined.display()
+            );
+            wal_detached = true;
+        } else if mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len()) {
             // Header-only or truncated WAL: by definition no committed
             // frames, so detaching it from the live DB is non-destructive.
             // Quarantine it instead of deleting it so recovery remains
@@ -3967,20 +3956,20 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
                     );
                     if let Ok(after_meta) = std::fs::symlink_metadata(&wal_path)
                         && after_meta.file_type().is_file()
-                        && mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(
-                            after_meta.len(),
-                        )
+                        && (after_meta.len() == 0
+                            || mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(
+                                after_meta.len(),
+                            ))
                         && let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
                             &wal_path,
-                            "checkpointed header-only/truncated WAL",
+                            "checkpointed empty/header-only WAL",
                         )?
                     {
                         eprintln!(
-                            "[info] Quarantined checkpointed WAL file {} to {} ({} bytes; <= {} byte WAL header)",
+                            "[info] Quarantined checkpointed WAL file {} to {} ({} bytes; no committed frames remain)",
                             wal_path.display(),
                             quarantined.display(),
-                            after_meta.len(),
-                            mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
+                            after_meta.len()
                         );
                         wal_detached = true;
                     }
@@ -4048,6 +4037,51 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn quarantine_stale_activity_lock_if_unheld(
+    lock_path: &Path,
+    context: &str,
+) -> CliResult<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CliError::Io(error)),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return quarantine_startup_activity_lock_if_exists(lock_path, context);
+    }
+    if !metadata.file_type().is_file() {
+        let quarantined = quarantine_startup_activity_lock_if_exists(lock_path, context)?;
+        if let Some(ref quarantined_path) = quarantined {
+            tracing::warn!(
+                path = %lock_path.display(),
+                quarantine = %quarantined_path.display(),
+                "quarantined non-file activity lock during startup cleanup"
+            );
+        }
+        return Ok(quarantined);
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CliError::Io(error)),
+    };
+    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+        tracing::debug!(
+            path = %lock_path.display(),
+            "activity lock still held; leaving it in place"
+        );
+        return Ok(None);
+    }
+
+    quarantine_startup_activity_lock_if_exists(lock_path, context)
+}
+
 fn next_startup_sqlite_sidecar_artifact_path(
     sidecar_path: &Path,
     label: &str,
@@ -4076,6 +4110,32 @@ fn next_startup_sqlite_sidecar_quarantine_path(sidecar_path: &Path, timestamp: &
 
 fn next_startup_sqlite_sidecar_snapshot_path(sidecar_path: &Path, timestamp: &str) -> PathBuf {
     next_startup_sqlite_sidecar_artifact_path(sidecar_path, "startup-precheckpoint", timestamp)
+}
+
+fn quarantine_startup_activity_lock_if_exists(
+    lock_path: &Path,
+    context: &str,
+) -> CliResult<Option<PathBuf>> {
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(_) => {}
+        Err(e) => {
+            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+            return Err(CliError::Io(e));
+        }
+    }
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let quarantined = next_startup_sqlite_sidecar_quarantine_path(lock_path, &timestamp);
+    match std::fs::rename(lock_path, &quarantined) {
+        Ok(()) => Ok(Some(quarantined)),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => Ok(None),
+        Err(e) => Err(CliError::Other(format!(
+            "failed to quarantine {context} {} to {}: {e}",
+            lock_path.display(),
+            quarantined.display()
+        ))),
+    }
 }
 
 fn quarantine_startup_sqlite_sidecar_if_exists(
@@ -51162,6 +51222,126 @@ startup_timeout_sec = 42
         assert_eq!(
             resolved, absolute_db,
             "auto-clear should target the resolved absolute candidate"
+        );
+    }
+
+    fn quarantined_artifacts_with_prefix(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cleanup_stale_db_artifacts_quarantines_activity_locks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-locks.sqlite3");
+        let current_lock = PathBuf::from(format!("{}.activity.lock", db_path.display()));
+        let legacy_lock = dir.path().join(".mailbox.activity.lock");
+
+        std::fs::write(&current_lock, b"current-lock").expect("write current lock");
+        std::fs::write(&legacy_lock, b"legacy-lock").expect("write legacy lock");
+
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup should quarantine stale locks");
+
+        assert!(
+            !current_lock.exists(),
+            "current activity lock should move out of the live path"
+        );
+        assert!(
+            !legacy_lock.exists(),
+            "legacy activity lock should move out of the live path"
+        );
+        let current_quarantine = quarantined_artifacts_with_prefix(
+            dir.path(),
+            "cleanup-locks.sqlite3.activity.lock.startup-quarantine-",
+        );
+        let legacy_quarantine = quarantined_artifacts_with_prefix(
+            dir.path(),
+            ".mailbox.activity.lock.startup-quarantine-",
+        );
+        assert_eq!(current_quarantine.len(), 1);
+        assert_eq!(legacy_quarantine.len(), 1);
+        assert_eq!(
+            std::fs::read(&current_quarantine[0]).expect("read current quarantine"),
+            b"current-lock"
+        );
+        assert_eq!(
+            std::fs::read(&legacy_quarantine[0]).expect("read legacy quarantine"),
+            b"legacy-lock"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_db_artifacts_quarantines_non_file_activity_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-lock-dir.sqlite3");
+        let current_lock = PathBuf::from(format!("{}.activity.lock", db_path.display()));
+
+        std::fs::create_dir(&current_lock).expect("create blocking activity lock directory");
+
+        cleanup_stale_db_artifacts(&db_path)
+            .expect("cleanup should quarantine non-file activity lock");
+
+        assert!(
+            !current_lock.exists(),
+            "non-file activity lock should move out of the live lock path"
+        );
+        let quarantined = quarantined_artifacts_with_prefix(
+            dir.path(),
+            "cleanup-lock-dir.sqlite3.activity.lock.startup-quarantine-",
+        );
+        assert_eq!(quarantined.len(), 1);
+        assert!(
+            quarantined[0].is_dir(),
+            "activity lock directory should be preserved under startup quarantine"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_stale_db_artifacts_quarantines_activity_lock_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-symlink-lock.sqlite3");
+        let current_lock = PathBuf::from(format!("{}.activity.lock", db_path.display()));
+        let target = dir.path().join("outside-target");
+        std::fs::write(&target, b"do-not-touch").expect("write target");
+        symlink(&target, &current_lock).expect("activity lock symlink");
+
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup should quarantine lock symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&current_lock).is_err(),
+            "symlink should move out of the live lock path"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"do-not-touch",
+            "quarantining the lock symlink must not mutate its target"
+        );
+        let quarantined = quarantined_artifacts_with_prefix(
+            dir.path(),
+            "cleanup-symlink-lock.sqlite3.activity.lock.startup-quarantine-",
+        );
+        assert_eq!(quarantined.len(), 1);
+        assert!(
+            std::fs::symlink_metadata(&quarantined[0])
+                .expect("quarantined symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "the symlink artifact itself should be preserved"
+        );
+        assert_eq!(
+            std::fs::read_link(&quarantined[0]).expect("read quarantined symlink"),
+            target
         );
     }
 
