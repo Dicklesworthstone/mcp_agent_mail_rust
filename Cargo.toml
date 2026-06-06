@@ -33,7 +33,7 @@ fastmcp-server = "0.3.1"
 fastmcp-transport = "0.3.1"
 fastmcp-protocol = "0.3.1"
 
-asupersync = { version = "0.3.2", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.3.3", features = ["tls-webpki-roots"] }
 
 sqlmodel = "0.2.2"
 sqlmodel-core = "0.2.2"
