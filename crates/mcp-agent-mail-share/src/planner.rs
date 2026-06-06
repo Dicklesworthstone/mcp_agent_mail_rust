@@ -744,14 +744,20 @@ fn generate_netlify_plan(
 
     // Step 3: Deploy with Netlify CLI
     let site = inputs.netlify_site.as_deref().unwrap_or("agent-mail");
+    let deploy_command = if let Some(site) = inputs.netlify_site.as_deref() {
+        format!(
+            "netlify deploy --dir {} --prod --site {}",
+            quote_path(&output_dir),
+            quote_str(site)
+        )
+    } else {
+        format!("netlify deploy --dir {} --prod", quote_path(&output_dir))
+    };
     steps.push(PlanStep {
         index: 3,
         id: "netlify_deploy".to_string(),
         description: format!("Deploy to Netlify site: {site}"),
-        command: Some(format!(
-            "netlify deploy --dir {} --prod",
-            quote_path(&output_dir)
-        )),
+        command: Some(deploy_command),
         optional: false,
         requires_confirm: true,
     });
@@ -1552,8 +1558,32 @@ mod tests {
         assert_eq!(
             deploy_step.command,
             Some(format!(
-                "netlify deploy --dir {} --prod",
+                "netlify deploy --dir {} --prod --site my-site",
                 quote_path(&output_dir)
+            ))
+        );
+    }
+
+    #[test]
+    fn netlify_plan_without_site_uses_linked_site_command() {
+        let bundle = tempfile::tempdir().unwrap();
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::Netlify),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment::default();
+
+        let plan = generate_netlify_plan(&inputs, &env, bundle.path()).unwrap();
+        let deploy_step = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "netlify_deploy")
+            .unwrap();
+        assert_eq!(
+            deploy_step.command,
+            Some(format!(
+                "netlify deploy --dir {} --prod",
+                quote_path(bundle.path())
             ))
         );
     }

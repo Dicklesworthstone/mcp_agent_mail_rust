@@ -163,7 +163,9 @@ pub fn detect_cloudflare_pages(cwd: &Path) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
     // Check for wrangler.toml
-    if crate::git::find_ancestor_path(cwd, "wrangler.toml").is_some() {
+    if crate::git::find_ancestor_path(cwd, "wrangler.toml")
+        .is_some_and(|path| crate::is_real_file(&path))
+    {
         signals.push(DetectedSignal {
             source: "config_file".to_string(),
             detail: "wrangler.toml found".to_string(),
@@ -202,7 +204,9 @@ pub fn detect_netlify(cwd: &Path) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
     // Check for netlify.toml
-    if crate::git::find_ancestor_path(cwd, "netlify.toml").is_some() {
+    if crate::git::find_ancestor_path(cwd, "netlify.toml")
+        .is_some_and(|path| crate::is_real_file(&path))
+    {
         signals.push(DetectedSignal {
             source: "config_file".to_string(),
             detail: "netlify.toml found".to_string(),
