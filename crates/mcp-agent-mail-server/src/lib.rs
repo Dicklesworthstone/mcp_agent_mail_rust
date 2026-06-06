@@ -11060,6 +11060,12 @@ to skip auth for local requests.</p>
             return None;
         }
         let origin = header_value(req, "origin")?.to_string();
+        if self.config.http_cors_allow_credentials
+            && cors_wildcard(&self.config.http_cors_origins)
+            && !cors_explicitly_allows(&self.config.http_cors_origins, &origin)
+        {
+            return None;
+        }
         if cors_allows(&self.config.http_cors_origins, &origin) {
             if cors_wildcard(&self.config.http_cors_origins)
                 && !self.config.http_cors_allow_credentials
@@ -15147,6 +15153,10 @@ fn cors_allows(allowed: &[String], origin: &str) -> bool {
     allowed.iter().any(|o| o == "*" || o == origin)
 }
 
+fn cors_explicitly_allows(allowed: &[String], origin: &str) -> bool {
+    allowed.iter().any(|o| o == origin)
+}
+
 fn constant_time_eq(a: &str, b: &str) -> bool {
     // Compare in a way that doesn't early-return on the first mismatch.
     // We still necessarily run proportional to max(len(a), len(b)).
@@ -17830,7 +17840,7 @@ first body
     }
 
     #[test]
-    fn cors_origin_wildcard_echoes_origin_with_credentials() {
+    fn cors_origin_wildcard_denies_unlisted_origin_with_credentials() {
         let config = mcp_agent_mail_core::Config {
             http_cors_enabled: true,
             http_cors_origins: vec!["*".to_string()],
@@ -17843,9 +17853,43 @@ first body
             "/health/liveness",
             &[("Origin", "http://example.com")],
         );
+        assert_eq!(state.cors_origin(&req), None);
+    }
+
+    #[test]
+    fn cors_origin_empty_wildcard_denies_unlisted_origin_with_credentials() {
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: Vec::new(),
+            http_cors_allow_credentials: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://example.com")],
+        );
+        assert_eq!(state.cors_origin(&req), None);
+    }
+
+    #[test]
+    fn cors_origin_credentials_allow_exact_configured_origin() {
+        let config = mcp_agent_mail_core::Config {
+            http_cors_enabled: true,
+            http_cors_origins: vec!["*".to_string(), "http://trusted.example.com".to_string()],
+            http_cors_allow_credentials: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(
+            Http1Method::Get,
+            "/health/liveness",
+            &[("Origin", "http://trusted.example.com")],
+        );
         assert_eq!(
             state.cors_origin(&req),
-            Some("http://example.com".to_string())
+            Some("http://trusted.example.com".to_string())
         );
     }
 
@@ -30669,6 +30713,42 @@ first body
             &serde_json::json!({
                 "claims": claims,
                 "tool": "send_message",
+                "expected_status": 403,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_forbidden(&resp);
+    }
+
+    #[test]
+    fn rbac_reader_role_on_state_mutating_fetch_inbox_denied() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "fetch_inbox", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("reader role should be denied for fetch_inbox");
+        write_rbac_artifact(
+            "rbac_reader_role_on_state_mutating_fetch_inbox_denied",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "fetch_inbox",
                 "expected_status": 403,
                 "actual_status": resp.status,
             }),
