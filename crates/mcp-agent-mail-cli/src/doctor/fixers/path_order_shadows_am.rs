@@ -140,15 +140,32 @@ pub struct DetectInputs {
     pub path_override: Option<String>,
 }
 
+#[cfg(unix)]
+fn am_candidate_names() -> &'static [&'static str] {
+    &["am"]
+}
+
+#[cfg(not(unix))]
+fn am_candidate_names() -> &'static [&'static str] {
+    &["am.exe", "am"]
+}
+
 /// Detector. PURE w.r.t. caller-supplied PATH; performs
 /// filesystem stat + canonicalize calls but never writes.
 pub fn detect(inputs: &DetectInputs) -> Vec<PathOrderShadowsAmFinding> {
+    detect_with_candidate_names(inputs, am_candidate_names())
+}
+
+fn detect_with_candidate_names(
+    inputs: &DetectInputs,
+    candidate_names: &[&str],
+) -> Vec<PathOrderShadowsAmFinding> {
     let path_var = inputs
         .path_override
         .clone()
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
-    if path_var.is_empty() {
+    if path_var.is_empty() || candidate_names.is_empty() {
         return Vec::new();
     }
     let mut hits = Vec::new();
@@ -162,30 +179,35 @@ pub fn detect(inputs: &DetectInputs) -> Vec<PathOrderShadowsAmFinding> {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let probed = dir.join("am");
-        let meta = match std::fs::symlink_metadata(&probed) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        // Skip if the path itself isn't a file or symlink.
-        let ftype = meta.file_type();
-        if !ftype.is_file() && !ftype.is_symlink() {
-            continue;
+        for &candidate_name in candidate_names {
+            let probed = dir.join(candidate_name);
+            let meta = match std::fs::symlink_metadata(&probed) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            // Skip if the path itself isn't a file or symlink.
+            let ftype = meta.file_type();
+            if !ftype.is_file() && !ftype.is_symlink() {
+                continue;
+            }
+            let canonical = match std::fs::canonicalize(&probed) {
+                Ok(c) => c,
+                Err(_) => continue, // dangling symlink — skip
+            };
+            // Skip non-executable (rare but possible).
+            if !is_executable(&canonical) {
+                continue;
+            }
+            seen_canonical.entry(canonical.clone()).or_insert(());
+            hits.push(AmHit {
+                path_index: i,
+                probed,
+                canonical,
+            });
+            // Command resolution picks the first matching executable candidate
+            // within a PATH entry, then moves on to the next PATH entry.
+            break;
         }
-        let canonical = match std::fs::canonicalize(&probed) {
-            Ok(c) => c,
-            Err(_) => continue, // dangling symlink — skip
-        };
-        // Skip non-executable (rare but possible).
-        if !is_executable(&canonical) {
-            continue;
-        }
-        seen_canonical.entry(canonical.clone()).or_insert(());
-        hits.push(AmHit {
-            path_index: i,
-            probed,
-            canonical,
-        });
     }
     let distinct = seen_canonical.len();
     if distinct < 2 {
@@ -281,6 +303,46 @@ mod tests {
         assert_eq!(findings[0].hits.len(), 2);
         assert_eq!(findings[0].hits[0].path_index, 0);
         assert_eq!(findings[0].hits[1].path_index, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_candidate_names_can_find_windows_style_am_exe() {
+        let td = TempDir::new().unwrap();
+        let bin_a = td.path().join("a");
+        let bin_b = td.path().join("b");
+        make_exec(&bin_a.join("am.exe"), b"#!/bin/sh\necho a");
+        make_exec(&bin_b.join("am.exe"), b"#!/bin/sh\necho b");
+        let path_var = format!("{}:{}", bin_a.to_string_lossy(), bin_b.to_string_lossy());
+        let inputs = DetectInputs {
+            path_override: Some(path_var),
+        };
+        let findings = detect_with_candidate_names(&inputs, &["am.exe"]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].distinct_canonical_count, 2);
+        assert_eq!(findings[0].hits.len(), 2);
+        assert!(findings[0].hits.iter().all(|hit| {
+            hit.probed.file_name().and_then(|name| name.to_str()) == Some("am.exe")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detector_candidate_names_do_not_double_count_one_path_entry() {
+        let td = TempDir::new().unwrap();
+        let bin = td.path().join("bin");
+        make_exec(&bin.join("am.exe"), b"#!/bin/sh\necho exe");
+        make_exec(&bin.join("am"), b"#!/bin/sh\necho extensionless");
+        let inputs = DetectInputs {
+            path_override: Some(bin.to_string_lossy().into_owned()),
+        };
+
+        let findings = detect_with_candidate_names(&inputs, &["am.exe", "am"]);
+
+        assert!(
+            findings.is_empty(),
+            "multiple candidate names in one PATH entry should resolve to one command hit"
+        );
     }
 
     #[cfg(unix)]
