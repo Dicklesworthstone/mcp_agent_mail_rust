@@ -7859,20 +7859,12 @@ pub async fn mark_message_read(
     run_with_mvcc_retry(cx, "mark_message_read", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Idempotent: set read_ts if NULL.  Also auto-acknowledge if the
-        // message has ack_required=1 — agents consistently fail to call
-        // acknowledge_message explicitly, so reading IS acknowledgment.
+        // Idempotent: set read_ts if NULL. Acknowledgements are intentionally
+        // separate state; callers must use acknowledge_message to set ack_ts.
         let sql = "UPDATE message_recipients \
-                   SET read_ts = COALESCE(read_ts, ?), \
-                       ack_ts = CASE \
-                           WHEN ack_ts IS NOT NULL THEN ack_ts \
-                           WHEN (SELECT m.ack_required FROM messages m \
-                                 WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                           ELSE ack_ts \
-                       END \
+                   SET read_ts = COALESCE(read_ts, ?) \
                    WHERE agent_id = ? AND message_id = ?";
         let params = [
-            Value::BigInt(now),
             Value::BigInt(now),
             Value::BigInt(agent_id),
             Value::BigInt(message_id),
@@ -7970,24 +7962,15 @@ pub async fn mark_messages_read_batch(
     run_with_mvcc_retry(cx, "mark_messages_read_batch", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Batch UPDATE: mark all messages read + auto-ack in one pass per chunk.
+        // Batch UPDATE: mark all messages read in one pass per chunk.
         for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
             let ph = placeholders(chunk.len());
-            // The SQL uses agent_id as the first two params (for read_ts, ack_ts),
-            // then agent_id again, then the message IDs.
             let sql = format!(
                 "UPDATE message_recipients \
-                 SET read_ts = COALESCE(read_ts, ?), \
-                     ack_ts = CASE \
-                         WHEN ack_ts IS NOT NULL THEN ack_ts \
-                         WHEN (SELECT m.ack_required FROM messages m \
-                               WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                         ELSE ack_ts \
-                     END \
+                 SET read_ts = COALESCE(read_ts, ?) \
                  WHERE agent_id = ? AND message_id IN ({ph})"
             );
-            let mut params = Vec::with_capacity(3 + chunk.len());
-            params.push(Value::BigInt(now));
+            let mut params = Vec::with_capacity(2 + chunk.len());
             params.push(Value::BigInt(now));
             params.push(Value::BigInt(agent_id));
             for &mid in chunk {
@@ -8055,19 +8038,12 @@ pub async fn mark_all_messages_read_in_project(
 
         let count = rows.len();
         if count > 0 {
-            // Mark unread messages as read, and auto-ack any with ack_required=1.
+            // Mark unread messages as read without acknowledging them.
             let sql = "UPDATE message_recipients \
-                       SET read_ts = ?, \
-                           ack_ts = CASE \
-                               WHEN ack_ts IS NOT NULL THEN ack_ts \
-                               WHEN (SELECT m.ack_required FROM messages m \
-                                     WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                               ELSE ack_ts \
-                           END \
+                       SET read_ts = ? \
                        WHERE agent_id = ? AND read_ts IS NULL \
                        AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
             let params = [
-                Value::BigInt(now),
                 Value::BigInt(now),
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
@@ -24104,6 +24080,101 @@ mod tests {
                 other_rows[0].get_named("ack_ts").expect("other ack_ts");
             assert_eq!(other_read_ts, None);
             assert_eq!(other_ack_ts, None);
+        });
+    }
+
+    #[test]
+    fn mark_message_read_keeps_ack_required_messages_pending() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_message_read_keeps_ack_pending.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-keeps-ack-pending")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Ack should stay pending after read",
+                "Body",
+                Some("mark-read-keeps-ack-pending"),
+                "normal",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+            let message_id = message.id.expect("message id");
+
+            let read_ts = mark_message_read(&cx, &pool, recipient_id, message_id)
+                .await
+                .into_result()
+                .expect("mark message read");
+
+            let stats = get_inbox_stats(&cx, &pool, recipient_id)
+                .await
+                .into_result()
+                .expect("get inbox stats")
+                .expect("recipient stats row");
+            assert_eq!(stats.unread_count, 0);
+            assert_eq!(stats.ack_pending_count, 1);
+
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection for verification");
+            let rows = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients \
+                     WHERE agent_id = ? AND message_id = ?",
+                    &[Value::BigInt(recipient_id), Value::BigInt(message_id)],
+                )
+                .expect("query recipient row");
+            assert_eq!(rows.len(), 1, "expected one recipient row");
+            let row = rows.first().expect("recipient row");
+            let stored_read_ts: Option<i64> = row.get_named("read_ts").expect("read_ts");
+            let stored_ack_ts: Option<i64> = row.get_named("ack_ts").expect("ack_ts");
+            assert_eq!(stored_read_ts, Some(read_ts));
+            assert_eq!(stored_ack_ts, None);
         });
     }
 

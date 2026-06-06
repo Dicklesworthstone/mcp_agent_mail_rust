@@ -44,7 +44,7 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `whois` - Inspect an agent profile and optional recent archive commits.
 - `send_message` - Create a message, persist recipients, and write archive copies.
 - `reply_message` - Reply in-thread while preserving the original thread semantics.
-- `fetch_inbox` - Read recent inbox items without mutating archive message contents.
+- `fetch_inbox` - Read recent inbox items and record read state without mutating archive message contents.
 - `mark_message_read` - Mark a delivered message as read for one recipient.
 - `acknowledge_message` - Mark a delivered message as read and acknowledged.
 - `request_contact` - Request permission to open a contact link with another agent.

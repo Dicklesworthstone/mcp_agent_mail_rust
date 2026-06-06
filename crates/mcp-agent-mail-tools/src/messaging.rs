@@ -3069,10 +3069,10 @@ effective_free_bytes={free}"
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
-/// Retrieve recent messages for an agent without mutating read/ack state.
+/// Retrieve recent messages for an agent and mark returned rows read.
 ///
-/// Fetched messages are automatically marked as read and automatically acknowledged
-/// if `ack_required` is true.
+/// Fetched messages are automatically marked as read. Acknowledgement state is
+/// not changed; callers must use `acknowledge_message` for `ack_required` mail.
 ///
 /// # Parameters
 /// - `project_key`: Project identifier
@@ -3081,6 +3081,8 @@ effective_free_bytes={free}"
 /// - `since_ts`: Only messages after this timestamp
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
+/// - `unread_only`: Only messages not yet marked read (default: false)
+/// - `ack_overdue_only`: Only unacknowledged ack-required messages older than the SLA (default: false)
 /// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
 ///
 /// # Conformance
@@ -3318,10 +3320,11 @@ pub async fn fetch_inbox(
         since_ts
     );
 
-    // Auto-mark fetched messages as read (and auto-ack if ack_required=1).
+    // Auto-mark fetched messages as read.
     // Agents consistently fail to call mark_message_read explicitly, so
-    // fetching IS reading.  Best-effort: errors are logged but don't fail
-    // the fetch.
+    // fetching IS reading. Acknowledgement remains explicit through
+    // acknowledge_message. Best-effort: errors are logged but don't fail the
+    // fetch.
     //
     // Uses batch UPDATE (single transaction) instead of N individual
     // mark_message_read calls — ~80% latency reduction for typical 20-message
@@ -3330,7 +3333,7 @@ pub async fn fetch_inbox(
     // The write-back MUST target the live DB, not the archive snapshot,
     // because snapshot pools are read-only reconstructions. If the live DB
     // is degraded the write will fail gracefully (already best-effort).
-    {
+    if !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let write_path = get_db_pool()
             .ok()

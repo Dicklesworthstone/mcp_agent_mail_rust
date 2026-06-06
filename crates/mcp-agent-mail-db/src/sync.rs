@@ -414,18 +414,11 @@ fn mark_messages_read_batch_sync_conn(
         for chunk in unique_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
             let sql = format!(
                 "UPDATE message_recipients \
-                 SET read_ts = COALESCE(read_ts, ?), \
-                     ack_ts = CASE \
-                         WHEN ack_ts IS NOT NULL THEN ack_ts \
-                         WHEN (SELECT m.ack_required FROM messages m \
-                               WHERE m.id = message_recipients.message_id) = 1 THEN ? \
-                         ELSE ack_ts \
-                     END \
+                 SET read_ts = COALESCE(read_ts, ?) \
                  WHERE agent_id = ? AND message_id IN ({})",
                 placeholders(chunk.len())
             );
-            let mut params = Vec::with_capacity(3 + chunk.len());
-            params.push(Value::BigInt(now));
+            let mut params = Vec::with_capacity(2 + chunk.len());
             params.push(Value::BigInt(now));
             params.push(Value::BigInt(agent_id));
             for &message_id in chunk {
@@ -460,6 +453,10 @@ pub fn mark_messages_read_batch_sync(
     agent_id: i64,
     message_ids: &[i64],
 ) -> Result<(), DbError> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
     let conn = open_sync_conn(sqlite_path)?;
     let result = mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids);
     crate::close_db_conn(conn, "mark_messages_read_batch_sync connection");
@@ -1516,8 +1513,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2, "expected two recipient rows");
 
-        let first = &rows[0];
-        let second = &rows[1];
+        let first = rows.first().expect("first recipient row");
+        let second = rows.get(1).expect("second recipient row");
         let first_message_id = first.get_named::<i64>("message_id").unwrap();
         let second_message_id = second.get_named::<i64>("message_id").unwrap();
 
@@ -1539,8 +1536,8 @@ mod tests {
             first
         };
         assert!(
-            ack_row.get_named::<i64>("ack_ts").is_ok(),
-            "ack_required message should auto-ack on read"
+            ack_row.get_named::<i64>("ack_ts").is_err(),
+            "ack_required message should remain pending acknowledgement after mark-read"
         );
         assert!(
             plain_row.get_named::<i64>("ack_ts").is_err(),
@@ -1558,6 +1555,22 @@ mod tests {
             .expect("inbox_stats row should exist");
         assert_eq!(stats_row.get_named::<i64>("total_count").unwrap(), 2);
         assert_eq!(stats_row.get_named::<i64>("unread_count").unwrap(), 0);
-        assert_eq!(stats_row.get_named::<i64>("ack_pending_count").unwrap(), 0);
+        assert_eq!(stats_row.get_named::<i64>("ack_pending_count").unwrap(), 1);
+    }
+
+    #[test]
+    fn mark_messages_read_batch_sync_empty_ids_does_not_create_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite_path = dir.path().join("mailbox.sqlite3");
+        let sqlite_path_str = sqlite_path
+            .to_str()
+            .expect("temporary sqlite path should be valid UTF-8");
+
+        mark_messages_read_batch_sync(sqlite_path_str, 42, &[]).expect("empty batch is a no-op");
+
+        assert!(
+            !sqlite_path.exists(),
+            "empty mark-read batch should not create or open a live DB"
+        );
     }
 }

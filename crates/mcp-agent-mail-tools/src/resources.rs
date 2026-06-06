@@ -306,7 +306,9 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     let durability_forces_snapshot = archive_has_state
         && resource_live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
 
-    let use_archive_snapshot = if durability_forces_snapshot {
+    let use_archive_snapshot = if !resolved_path.exists() {
+        archive_has_state
+    } else if durability_forces_snapshot {
         true
     } else {
         match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
@@ -376,10 +378,44 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     }))
 }
 
+fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return get_db_pool().map(ResourceReadPool::live);
+    }
+
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))?;
+    let resolved_path = PathBuf::from(&resolved.canonical_path);
+    if !resolved_path.exists() {
+        return Err(resource_sync_db_error_to_mcp_error(format!(
+            "resource read-only sqlite source not found: {}",
+            resolved_path.display()
+        )));
+    }
+
+    let mut pool_config = mcp_agent_mail_db::DbPoolConfig::from_env();
+    // Resource handlers are read surfaces. They may inspect an existing live
+    // mailbox, but must not perform startup migrations or archive reconciliation.
+    pool_config.database_url =
+        if resolved.used_absolute_fallback || Path::new(&resolved.canonical_path).is_absolute() {
+            mcp_agent_mail_core::disk::sqlite_url_from_path(&resolved_path)
+        } else {
+            config.database_url
+        };
+    pool_config.storage_root = Some(config.storage_root);
+    pool_config.run_migrations = false;
+    pool_config.warmup_connections = 0;
+
+    mcp_agent_mail_db::create_pool_without_startup_init(&pool_config)
+        .map(ResourceReadPool::live)
+        .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
+}
+
 fn get_resource_db_pool() -> McpResult<ResourceReadPool> {
     match open_resource_read_pool() {
         Ok(Some(pool)) => Ok(pool),
-        Ok(None) => get_db_pool().map(ResourceReadPool::live),
+        Ok(None) => open_live_resource_read_pool(),
         Err(error) => Err(resource_sync_db_error_to_mcp_error(error)),
     }
 }
@@ -1050,13 +1086,13 @@ fn build_tool_directory() -> ToolDirectory {
                 },
                 ToolDirectoryEntry {
                     name: "fetch_inbox".to_string(),
-                    summary: "Poll recent messages for an agent with filters (urgent_only, since_ts).".to_string(),
+                    summary: "Poll recent messages for an agent with filters and record read receipts.".to_string(),
                     use_when: "After each work unit to ingest coordination updates.".to_string(),
                     related: vec!["mark_message_read".to_string(), "acknowledge_message".to_string()],
                     expected_frequency: "Frequent polling in agent loops.".to_string(),
-                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    required_capabilities: vec!["messaging".to_string(), "write".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "Poll".to_string(), sample: "fetch_inbox(project_key='backend', agent_name='BlueLake', since_ts='2025-10-24T00:00:00Z')".to_string() }],
-                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    capabilities: vec!["messaging".to_string(), "write".to_string()],
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
@@ -1065,9 +1101,9 @@ fn build_tool_directory() -> ToolDirectory {
                     use_when: "Clearing inbox notifications once reviewed.".to_string(),
                     related: vec!["acknowledge_message".to_string()],
                     expected_frequency: "Whenever FYI mail is processed.".to_string(),
-                    required_capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    required_capabilities: vec!["messaging".to_string(), "write".to_string()],
                     usage_examples: vec![ToolUsageExample { hint: "Read receipt".to_string(), sample: "mark_message_read(project_key='backend', agent_name='BlueLake', message_id=42)".to_string() }],
-                    capabilities: vec!["messaging".to_string(), "read".to_string()],
+                    capabilities: vec!["messaging".to_string(), "write".to_string()],
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
@@ -4856,7 +4892,7 @@ mod resource_shape_tests {
         rt.block_on(f(cx))
     }
 
-    fn write_archive_ahead_fixture() -> (PathBuf, PathBuf) {
+    fn write_archive_ahead_files() -> (PathBuf, PathBuf) {
         let config = Config::from_env();
         let storage_root = config.storage_root;
         let db_path = PathBuf::from(
@@ -4885,6 +4921,11 @@ mod resource_shape_tests {
         )
         .expect("write resource canonical message");
 
+        (storage_root, db_path)
+    }
+
+    fn write_archive_ahead_fixture() -> (PathBuf, PathBuf) {
+        let (storage_root, db_path) = write_archive_ahead_files();
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
             .expect("open resource live db");
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
@@ -7106,6 +7147,36 @@ mod resource_shape_tests {
     }
 
     #[test]
+    fn tooling_directory_marks_read_receipt_tools_as_write_capability() {
+        let directory = build_tool_directory();
+        let find_tool = |name: &str| {
+            directory
+                .clusters
+                .iter()
+                .flat_map(|cluster| cluster.tools.iter())
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("tool directory should include {name}"))
+        };
+
+        for tool in [find_tool("fetch_inbox"), find_tool("mark_message_read")] {
+            assert!(
+                tool.required_capabilities
+                    .iter()
+                    .any(|capability| capability == "write"),
+                "{} should advertise write capability because it records read state",
+                tool.name
+            );
+            assert!(
+                tool.capabilities
+                    .iter()
+                    .any(|capability| capability == "write"),
+                "{} should expose write capability because it records read state",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
     fn resources_use_archive_snapshot_when_live_db_is_stale() {
         with_serialized_resources(|| {
             run_async(|cx: Cx| async move {
@@ -7161,6 +7232,30 @@ mod resource_shape_tests {
                     .get_named::<i64>("agent_count")
                     .expect("resource agent count");
                 assert_eq!(agent_count, 0);
+            });
+        });
+    }
+
+    #[test]
+    fn resources_use_archive_snapshot_without_creating_missing_live_db() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let (_storage_root, db_path) = write_archive_ahead_files();
+                assert!(
+                    !db_path.exists(),
+                    "fixture must leave the live sqlite path absent before the resource read"
+                );
+
+                let projects = parse_json(&projects_list(&ctx).await.expect("projects list"));
+                let projects_array = projects.as_array().expect("projects array");
+                assert_eq!(projects_array.len(), 1, "expected archive-backed project");
+                assert_eq!(projects_array[0]["slug"], "ahead-project");
+
+                assert!(
+                    !db_path.exists(),
+                    "read-only resource probe created the missing live sqlite database"
+                );
             });
         });
     }

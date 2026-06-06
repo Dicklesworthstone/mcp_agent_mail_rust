@@ -1268,7 +1268,6 @@ impl Default for Config {
             http_rbac_default_role: "reader".to_string(),
             http_rbac_readonly_tools: vec![
                 "health_check".to_string(),
-                "fetch_inbox".to_string(),
                 "whois".to_string(),
                 "list_agents".to_string(),
                 "search_messages".to_string(),
@@ -4009,6 +4008,26 @@ mod tests {
         let config = make_filter(false, "full");
         assert!(config.should_expose_tool("send_message", "messaging"));
         assert!(config.should_expose_tool("obscure_tool", "unknown_cluster"));
+    }
+
+    #[test]
+    fn default_rbac_readonly_tools_exclude_state_mutating_inbox_fetch() {
+        let config = Config::default();
+
+        assert!(
+            !config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|tool| tool == "fetch_inbox"),
+            "fetch_inbox records read state and must require a writer role"
+        );
+        assert!(
+            config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|tool| tool == "fetch_inbox_product"),
+            "fetch_inbox_product is non-mutating and should remain reader-accessible"
+        );
     }
 
     #[test]

@@ -108,17 +108,27 @@ fn compat_rbac_readonly_tools_contract() {
     let config = Config::default();
     let expected = [
         "health_check",
-        "fetch_inbox",
         "whois",
         "search_messages",
         "summarize_thread",
+        "fetch_inbox_product",
     ];
     for tool in &expected {
         assert!(
-            config.http_rbac_readonly_tools.contains(&tool.to_string()),
+            config
+                .http_rbac_readonly_tools
+                .iter()
+                .any(|readonly_tool| readonly_tool.as_str() == *tool),
             "COMPAT LOCK: {tool} MUST be in readonly tools list"
         );
     }
+    assert!(
+        !config
+            .http_rbac_readonly_tools
+            .iter()
+            .any(|readonly_tool| readonly_tool == "fetch_inbox"),
+        "COMPAT LOCK: fetch_inbox records read state and MUST require a writer role"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
