@@ -7400,6 +7400,10 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         .with_strategy_config(strategy)
         .with_dirty_span_config(dirty_spans)
         .with_tile_diff_config(tiles)
+        // The TUI runs for days inside mux panes. If the visible terminal buffer
+        // is cleared or desynchronized outside the process, sparse diffs cannot
+        // reconstruct it, so force a bounded physical repaint.
+        .with_full_redraw_interval_frames(20)
 }
 
 const DASHBOARD_RENDER_COALESCE_WINDOW: Duration = Duration::from_millis(72);
@@ -15412,6 +15416,12 @@ mod tests {
         ) -> McpResult<Vec<Content>> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn stable_tui_diff_config_forces_periodic_terminal_resync() {
+        let config = stable_tui_diff_config();
+        assert_eq!(config.full_redraw_interval_frames, 20);
     }
 
     fn with_red_wbq_capacity_metrics<F>(f: F)
