@@ -3262,7 +3262,7 @@ pub async fn fetch_inbox(
     })?;
     phase.mark("sqlite_query");
 
-    let messages: Vec<InboxMessage> = inbox_rows
+    let mut messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
         .map(|row| {
             let attachments = parse_attachment_metadata_json(&row.message.attachments);
@@ -3339,20 +3339,28 @@ pub async fn fetch_inbox(
             .ok()
             .map(|live_pool| live_pool.sqlite_path().to_string());
         if let Some(ref live_sqlite_path) = write_path {
-            if let Err(e) = mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
+            match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
                 agent_id,
                 &ids,
             ) {
-                tracing::warn!(
-                    agent_id = agent_id,
-                    count = ids.len(),
-                    error = %e,
-                    "batch auto-mark-read on fetch_inbox failed"
-                );
-            } else {
-                mcp_agent_mail_db::read_cache()
-                    .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                Ok(Some(batch)) => {
+                    apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
+                    mcp_agent_mail_db::read_cache()
+                        .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                }
+                Ok(None) => {
+                    mcp_agent_mail_db::read_cache()
+                        .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = agent_id,
+                        count = ids.len(),
+                        error = %e,
+                        "batch auto-mark-read on fetch_inbox failed"
+                    );
+                }
             }
         } else {
             tracing::warn!(
@@ -3386,6 +3394,20 @@ pub async fn fetch_inbox(
     phase.mark("json_serialization");
     emit_tail_latency_evidence(&phase.finish("ok"));
     Ok(response)
+}
+
+fn apply_auto_read_timestamp(
+    messages: &mut [InboxMessage],
+    updated_message_ids: &[i64],
+    read_ts: i64,
+) {
+    let updated_ids = updated_message_ids.iter().copied().collect::<HashSet<_>>();
+    let read_at = micros_to_iso(read_ts);
+    for message in messages {
+        if updated_ids.contains(&message.id) && message.read_ts.is_none() {
+            message.read_ts = Some(read_at.clone());
+        }
+    }
 }
 
 /// Mark a message as read for the given agent.
@@ -4726,6 +4748,78 @@ mod tests {
         assert!(json.get("to").is_none());
         assert!(json.get("cc").is_none());
         assert!(json.get("bcc").is_none());
+    }
+
+    #[test]
+    fn apply_auto_read_timestamp_fills_only_updated_missing_read_receipts() {
+        let old_read_at = "2026-02-06T00:30:00Z".to_string();
+        let mut messages = vec![
+            InboxMessage {
+                id: 1,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "new".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                from: "BlueLake".into(),
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                created_ts: Some("2026-02-06T00:00:00Z".into()),
+                read_ts: None,
+                ack_ts: None,
+                kind: "to".into(),
+                attachments: vec![],
+                body_md: None,
+            },
+            InboxMessage {
+                id: 2,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "already-read".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                from: "BlueLake".into(),
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                created_ts: Some("2026-02-06T00:00:00Z".into()),
+                read_ts: Some(old_read_at.clone()),
+                ack_ts: None,
+                kind: "to".into(),
+                attachments: vec![],
+                body_md: None,
+            },
+            InboxMessage {
+                id: 3,
+                project_id: 1,
+                sender_id: 1,
+                thread_id: None,
+                subject: "not-updated".into(),
+                importance: "normal".into(),
+                ack_required: false,
+                from: "BlueLake".into(),
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                created_ts: Some("2026-02-06T00:00:00Z".into()),
+                read_ts: None,
+                ack_ts: None,
+                kind: "to".into(),
+                attachments: vec![],
+                body_md: None,
+            },
+        ];
+
+        let batch_read_ts = 1_770_354_000_000_000;
+        apply_auto_read_timestamp(&mut messages, &[1, 2], batch_read_ts);
+        let batch_read_at = micros_to_iso(batch_read_ts);
+
+        assert_eq!(messages[0].read_ts.as_deref(), Some(batch_read_at.as_str()));
+        assert_eq!(messages[1].read_ts.as_deref(), Some(old_read_at.as_str()));
+        assert_eq!(messages[2].read_ts, None);
     }
 
     #[test]
