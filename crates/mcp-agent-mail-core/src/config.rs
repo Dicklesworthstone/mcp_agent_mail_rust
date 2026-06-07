@@ -2713,18 +2713,22 @@ pub fn mask_secret(value: &str) -> String {
 /// Handles standard URL formats like `postgres://user:pass@host/db` and
 /// `SQLite` paths like `sqlite:///path/to/db.sqlite3`.
 fn redact_db_url(url: &str) -> String {
-    // If it contains `://` with a `@`, there may be embedded credentials.
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at_pos) = after_scheme.find('@') {
-            // Everything between `://` and `@` is userinfo — redact it.
-            let before = &url[..scheme_end + 3];
-            let after = &after_scheme[at_pos..];
-            return format!("{before}****{after}");
-        }
-    }
-    // No credentials detected; return as-is.
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    let authority = &url[authority_start..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}****{}",
+        &url[..authority_start],
+        &url[authority_start + at_pos..]
+    )
 }
 
 /// Detect which config source tier provided a given key.
@@ -4928,6 +4932,10 @@ mod tests {
             redact_db_url("postgres://admin:s3cret@host:5432/mydb?sslmode=require"),
             "postgres://****@host:5432/mydb?sslmode=require"
         );
+        assert_eq!(
+            redact_db_url("postgres://user:p@ss@localhost/db"),
+            "postgres://****@localhost/db"
+        );
     }
 
     #[test]
@@ -4935,6 +4943,14 @@ mod tests {
         assert_eq!(
             redact_db_url("sqlite:///path/to/db.sqlite3"),
             "sqlite:///path/to/db.sqlite3"
+        );
+        assert_eq!(
+            redact_db_url("sqlite:///tmp/mail@box.sqlite3"),
+            "sqlite:///tmp/mail@box.sqlite3"
+        );
+        assert_eq!(
+            redact_db_url("sqlite+aiosqlite:///tmp/mail@box.sqlite3?mode=rwc"),
+            "sqlite+aiosqlite:///tmp/mail@box.sqlite3?mode=rwc"
         );
         assert_eq!(redact_db_url("sqlite:///:memory:"), "sqlite:///:memory:");
     }

@@ -264,12 +264,22 @@ fn find_latest_forensic_bundle(
 }
 
 fn redact_database_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://")
-        && let Some((_creds, host)) = rest.rsplit_once('@')
-    {
-        return format!("{scheme}://****@{host}");
-    }
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    let authority = &url[authority_start..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}****{}",
+        &url[..authority_start],
+        &url[authority_start + at_pos..]
+    )
 }
 
 const fn us_to_ms_ceil(us: u64) -> u64 {
@@ -1947,6 +1957,10 @@ mod tests {
         assert_eq!(
             redact_database_url("sqlite:///data/agent_mail.db"),
             "sqlite:///data/agent_mail.db"
+        );
+        assert_eq!(
+            redact_database_url("sqlite:///data/agent@mail.db"),
+            "sqlite:///data/agent@mail.db"
         );
     }
 
