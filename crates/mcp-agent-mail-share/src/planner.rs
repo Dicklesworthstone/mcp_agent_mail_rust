@@ -150,12 +150,142 @@ pub fn validate_inputs(inputs: &WizardInputs) -> PlanResult<()> {
         ));
     }
 
+    validate_optional_input(
+        "--github-branch",
+        inputs.github_branch.as_deref(),
+        validate_git_branch_operand,
+        "Use a normal branch name such as main or docs/deploy; values cannot begin with '-' or '+'",
+    )?;
+    validate_optional_input(
+        "--cloudflare-project",
+        inputs.cloudflare_project.as_deref(),
+        validate_dns_label_operand,
+        "Use a Pages project slug containing only letters, numbers, and hyphens",
+    )?;
+    validate_optional_input(
+        "--netlify-site",
+        inputs.netlify_site.as_deref(),
+        validate_dns_label_operand,
+        "Use a Netlify site slug or ID containing only letters, numbers, and hyphens",
+    )?;
+    validate_optional_input(
+        "--s3-bucket",
+        inputs.s3_bucket.as_deref(),
+        validate_s3_bucket_operand,
+        "Use a valid S3 bucket name: 3-63 lowercase letters, numbers, dots, and hyphens",
+    )?;
+    validate_optional_input(
+        "--cloudfront-id",
+        inputs.cloudfront_id.as_deref(),
+        validate_cloudfront_distribution_id_operand,
+        "Use the CloudFront distribution ID only, not an AWS CLI option or full command",
+    )?;
+
     // Validate provider-specific options
     if let Some(provider) = inputs.provider {
         validate_provider_options(provider, inputs)?;
     }
 
     Ok(())
+}
+
+fn validate_optional_input(
+    flag: &str,
+    value: Option<&str>,
+    validator: fn(&str) -> bool,
+    hint: &'static str,
+) -> PlanResult<()> {
+    if let Some(value) = value
+        && !validator(value)
+    {
+        return Err(WizardError::new(
+            WizardErrorCode::InvalidOption,
+            format!("Invalid value for {flag}: {}", value.escape_debug()),
+        )
+        .with_hint(hint));
+    }
+    Ok(())
+}
+
+fn is_clean_cli_operand(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.starts_with('-')
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+fn validate_dns_label_operand(value: &str) -> bool {
+    let len = value.len();
+    (1..=63).contains(&len)
+        && is_clean_cli_operand(value)
+        && starts_with_ascii_alnum(value)
+        && ends_with_ascii_alnum(value)
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn validate_cloudfront_distribution_id_operand(value: &str) -> bool {
+    is_clean_cli_operand(value) && value.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+fn validate_s3_bucket_operand(value: &str) -> bool {
+    let len = value.len();
+    (3..=63).contains(&len)
+        && is_clean_cli_operand(value)
+        && starts_with_ascii_lower_or_digit(value)
+        && ends_with_ascii_lower_or_digit(value)
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && !value.contains("..")
+        && !value.contains(".-")
+        && !value.contains("-.")
+        && value.parse::<std::net::Ipv4Addr>().is_err()
+}
+
+fn validate_git_branch_operand(value: &str) -> bool {
+    is_clean_cli_operand(value)
+        && !value.starts_with('+')
+        && value != "@"
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.ends_with('.')
+        && !value.contains("//")
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value
+            .chars()
+            .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        && value.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+}
+
+fn starts_with_ascii_alnum(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn ends_with_ascii_alnum(value: &str) -> bool {
+    value
+        .as_bytes()
+        .last()
+        .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn starts_with_ascii_lower_or_digit(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+fn ends_with_ascii_lower_or_digit(value: &str) -> bool {
+    value
+        .as_bytes()
+        .last()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 // ── Provider Resolution ─────────────────────────────────────────────────
@@ -1255,6 +1385,89 @@ mod tests {
         let err = validate_inputs(&inputs).expect_err("invalid github repo should fail");
         assert_eq!(err.code, WizardErrorCode::InvalidOption);
         assert!(err.message.contains("Invalid GitHub repository identifier"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_github_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("--all".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("branch option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--github-branch"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_force_refspec_github_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("+main".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("force-push refspec should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--github-branch"));
+    }
+
+    #[test]
+    fn validate_inputs_accepts_nested_github_branch() {
+        let inputs = WizardInputs {
+            github_branch: Some("docs/deploy".to_string()),
+            ..Default::default()
+        };
+
+        validate_inputs(&inputs).expect("nested branch names should remain valid");
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_cloudflare_project() {
+        let inputs = WizardInputs {
+            cloudflare_project: Some("--help".to_string()),
+            ..Default::default()
+        };
+
+        let err =
+            validate_inputs(&inputs).expect_err("cloudflare project option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--cloudflare-project"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_netlify_site() {
+        let inputs = WizardInputs {
+            netlify_site: Some("--help".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("netlify site option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--netlify-site"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_invalid_s3_bucket_name() {
+        let inputs = WizardInputs {
+            s3_bucket: Some("bad bucket".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("invalid s3 bucket should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--s3-bucket"));
+    }
+
+    #[test]
+    fn validate_inputs_rejects_option_like_cloudfront_distribution_id() {
+        let inputs = WizardInputs {
+            cloudfront_id: Some("--profile".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("cloudfront id option injection should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("--cloudfront-id"));
     }
 
     #[test]
