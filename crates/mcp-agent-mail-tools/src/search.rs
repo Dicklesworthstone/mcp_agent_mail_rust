@@ -89,6 +89,21 @@ fn parse_search_messages_window(
     Ok((max_results, offset_val, planner_limit))
 }
 
+#[must_use]
+pub(crate) const fn sender_filter_direction(
+    sender_filter_present: bool,
+) -> Option<mcp_agent_mail_db::search_planner::Direction> {
+    if sender_filter_present {
+        Some(mcp_agent_mail_db::search_planner::Direction::Outbox)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn normalize_sender_filter(sender_filter: String) -> String {
+    mcp_agent_mail_core::models::normalize_agent_name(&sender_filter).unwrap_or(sender_filter)
+}
+
 /// Search result entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -895,7 +910,9 @@ pub async fn search_messages(
         "sender",
         sender,
         &[("from_agent", from_agent), ("sender_name", sender_name)],
-    )?;
+    )?
+    .map(normalize_sender_filter);
+    let sender_direction = sender_filter_direction(sender_filter.is_some());
 
     // Parse optional date range timestamps (ISO-8601 → microseconds)
     let time_range = parse_time_range_with_aliases(
@@ -917,7 +934,7 @@ pub async fn search_messages(
         project_id: Some(project_id),
         product_id: None,
         importance: importance_filter,
-        direction: None,
+        direction: sender_direction,
         agent_name: sender_filter,
         thread_id,
         ack_required: None,
@@ -1462,6 +1479,27 @@ mod tests {
         assert_eq!(limit, SEARCH_MESSAGES_RESULT_LIMIT_MAX);
         assert_eq!(offset, 0);
         assert_eq!(planner_limit, SEARCH_MESSAGES_RESULT_LIMIT_MAX);
+    }
+
+    #[test]
+    fn sender_filter_direction_maps_present_sender_to_outbox_filter() {
+        assert_eq!(
+            sender_filter_direction(true),
+            Some(mcp_agent_mail_db::search_planner::Direction::Outbox)
+        );
+        assert_eq!(sender_filter_direction(false), None);
+    }
+
+    #[test]
+    fn normalize_sender_filter_uses_canonical_agent_case_when_known() {
+        assert_eq!(
+            normalize_sender_filter("bluelake".to_string()),
+            "BlueLake".to_string()
+        );
+        assert_eq!(
+            normalize_sender_filter("BackendHarmonizer".to_string()),
+            "BackendHarmonizer".to_string()
+        );
     }
 
     fn make_msg(from: &str, body: &str) -> ThreadMessageRow {

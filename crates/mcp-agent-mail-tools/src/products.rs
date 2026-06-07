@@ -617,7 +617,8 @@ pub async fn search_messages_product(
         sender,
         &[("from_agent", from_agent), ("sender_name", sender_name)],
     )?
-    .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
+    .map(crate::search::normalize_sender_filter);
+    let sender_direction = crate::search::sender_filter_direction(sender_filter.is_some());
     let project_filter = crate::search::resolve_text_filter_alias(
         "project",
         project,
@@ -653,7 +654,7 @@ pub async fn search_messages_product(
         project_id: scoped_project_id,
         product_id: Some(product_id),
         importance: importance_filter,
-        direction: None,
+        direction: sender_direction,
         agent_name: sender_filter,
         thread_id,
         ack_required: None,
