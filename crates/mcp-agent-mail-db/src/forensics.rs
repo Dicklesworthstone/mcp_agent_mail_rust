@@ -154,10 +154,10 @@ fn read_sqlite_header_fields(db_path: &Path) -> Option<(u32, u32)> {
     }
 
     let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
-    let page_size: u32 = if raw_page_size == 1 {
-        65_536
-    } else {
-        u32::from(raw_page_size)
+    let page_size: u32 = match raw_page_size {
+        1 => 65_536,
+        512 | 1024 | 2048 | 4096 | 8192 | 16_384 | 32_768 => u32::from(raw_page_size),
+        _ => return None,
     };
     let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
     Some((page_size, page_count))
@@ -267,12 +267,22 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
 }
 
 fn redact_database_url(url: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://")
-        && let Some((_creds, host)) = rest.rsplit_once('@')
-    {
-        return format!("{scheme}://****@{host}");
-    }
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+    let authority = &url[authority_start..authority_end];
+    let Some(at_pos) = authority.rfind('@') else {
+        return url.to_string();
+    };
+    format!(
+        "{}****{}",
+        &url[..authority_start],
+        &url[authority_start + at_pos..]
+    )
 }
 
 fn forensics_root(storage_root: &Path, db_path: &Path) -> PathBuf {
@@ -1206,7 +1216,7 @@ mod tests {
     use super::{
         MailboxForensicCapture, build_archive_drift_reference, build_live_db_reference,
         capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot, parse_ps_output_value,
-        read_sqlite_header_fields,
+        read_sqlite_header_fields, redact_database_url,
     };
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -1222,6 +1232,30 @@ mod tests {
         assert_eq!(
             parsed.as_deref(),
             Some("/Applications/Agent Mail/bin/mcp-agent-mail --stdio")
+        );
+    }
+
+    #[test]
+    fn redact_database_url_masks_userinfo_inside_authority_only() {
+        assert_eq!(
+            redact_database_url("postgres://user:p@ss@host:5432/mail?sslmode=require"),
+            "postgres://****@host:5432/mail?sslmode=require"
+        );
+        assert_eq!(
+            redact_database_url("sqlite://admin:pass123@/data/test.db"),
+            "sqlite://****@/data/test.db"
+        );
+    }
+
+    #[test]
+    fn redact_database_url_preserves_at_signs_in_sqlite_paths() {
+        assert_eq!(
+            redact_database_url("sqlite:///tmp/mail@box.sqlite3"),
+            "sqlite:///tmp/mail@box.sqlite3"
+        );
+        assert_eq!(
+            redact_database_url("sqlite+aiosqlite:///tmp/mail@box.sqlite3?mode=rwc"),
+            "sqlite+aiosqlite:///tmp/mail@box.sqlite3?mode=rwc"
         );
     }
 
@@ -1718,7 +1752,7 @@ mod tests {
         std::fs::write(&db_path, b"short").expect("write");
 
         let snap = capture_pre_recovery_snapshot(&db_path, "env-test")
-            .with_environment(dir.path(), "sqlite:///secret@host/db.sqlite3");
+            .with_environment(dir.path(), "sqlite://user:secret@/db.sqlite3");
 
         assert_eq!(
             snap.storage_root.as_deref(),
@@ -1726,7 +1760,7 @@ mod tests {
         );
         assert_eq!(
             snap.database_url_redacted.as_deref(),
-            Some("sqlite://****@host/db.sqlite3")
+            Some("sqlite://****@/db.sqlite3")
         );
         // Verify JSON includes the environment fields.
         let json = serde_json::to_value(&snap).expect("serialize");
@@ -1800,5 +1834,25 @@ mod tests {
             read_sqlite_header_fields(&db_path).is_none(),
             "16-byte file should fail (need 32 bytes)"
         );
+    }
+
+    #[test]
+    fn read_sqlite_header_fields_rejects_invalid_page_sizes() {
+        for raw_page_size in [0_u16, 256, 513, 65_535] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir
+                .path()
+                .join(format!("page_size_{raw_page_size}.sqlite3"));
+            let mut header = vec![0u8; 100];
+            header[..16].copy_from_slice(b"SQLite format 3\0");
+            header[16..18].copy_from_slice(&raw_page_size.to_be_bytes());
+            header[31] = 1;
+            std::fs::write(&db_path, &header).expect("write");
+
+            assert!(
+                read_sqlite_header_fields(&db_path).is_none(),
+                "page size {raw_page_size} should be rejected"
+            );
+        }
     }
 }
