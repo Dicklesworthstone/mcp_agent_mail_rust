@@ -7288,25 +7288,20 @@ fn acquire_cli_mailbox_read_locks_for_paths(
 
 fn acquire_cli_mailbox_read_locks(
     database_url: &str,
-    storage_root_override: Option<&Path>,
+    _storage_root_override: Option<&Path>,
 ) -> CliResult<CliMailboxReadLocks> {
-    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    // A live Agent Mail server holds the storage-root activity lock
+    // exclusively for its lifetime to prevent a second runtime or mutating
+    // doctor operation from starting. Read-only DB probes only need the SQLite
+    // shared lock: it permits healthy server reads while still blocking against
+    // repair/reconstruct swaps, which take the SQLite lock exclusively.
     let sqlite_path = resolve_mailbox_activity_sqlite_path(database_url)?;
-    let storage_root_lock =
-        if should_lock_mailbox_storage_root(&sqlite_path, &storage_root, storage_root_override) {
-            acquire_cli_mailbox_activity_lock_for_storage_root(
-                &storage_root,
-                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
-            )?
-        } else {
-            None
-        };
     let sqlite_lock = acquire_cli_mailbox_activity_lock_for_sqlite_path(
         &sqlite_path,
         mcp_agent_mail_server::MailboxActivityLockMode::Shared,
     )?;
     Ok(CliMailboxReadLocks {
-        _storage_root_lock: storage_root_lock,
+        _storage_root_lock: None,
         _sqlite_lock: sqlite_lock,
     })
 }
@@ -21488,6 +21483,29 @@ fn doctor_database_inventory_failure_strategy(
     }
 }
 
+fn doctor_database_probe_failure_strategy(
+    probe: &str,
+    error: &CliError,
+    archive_reconstruct_available: bool,
+    archive_root: &Path,
+) -> DoctorDatabaseFixStrategy {
+    let detail = format!(
+        "{probe} failed: {}",
+        truncate_doctor_command(&error.to_string())
+    );
+    if archive_reconstruct_available {
+        DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "{detail}; reconstruct from archive {}",
+            archive_root.display()
+        ))
+    } else {
+        DoctorDatabaseFixStrategy::Repair(format!(
+            "{detail}; no authoritative archive data was found under {}, attempting in-place repair",
+            archive_root.display()
+        ))
+    }
+}
+
 fn doctor_database_fix_strategy_with_wal_cleanup(
     database_url: &str,
     storage_root: &Path,
@@ -21604,7 +21622,17 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         }
     };
 
-    let missing_tables = doctor_required_tables(&opened.conn)?;
+    let missing_tables = match doctor_required_tables(&opened.conn) {
+        Ok(missing_tables) => missing_tables,
+        Err(error) => {
+            return Ok(doctor_database_probe_failure_strategy(
+                "Required-table probe",
+                &error,
+                archive_reconstruct_available,
+                &archive_root,
+            ));
+        }
+    };
     if !missing_tables.is_empty() {
         return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -21689,8 +21717,28 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         });
     }
 
-    let fk_violations = doctor_foreign_key_violations(&opened.conn)?;
-    let orphaned_recipients = doctor_orphaned_message_recipients(&opened.conn)?;
+    let fk_violations = match doctor_foreign_key_violations(&opened.conn) {
+        Ok(violations) => violations,
+        Err(error) => {
+            return Ok(doctor_database_probe_failure_strategy(
+                "Foreign-key consistency probe",
+                &error,
+                archive_reconstruct_available,
+                &archive_root,
+            ));
+        }
+    };
+    let orphaned_recipients = match doctor_orphaned_message_recipients(&opened.conn) {
+        Ok(recipients) => recipients,
+        Err(error) => {
+            return Ok(doctor_database_probe_failure_strategy(
+                "Orphaned-recipient probe",
+                &error,
+                archive_reconstruct_available,
+                &archive_root,
+            ));
+        }
+    };
     let missing_message_recipients = doctor_missing_message_recipient_count(&orphaned_recipients);
     let missing_agent_only_recipients =
         doctor_missing_agent_only_recipient_count(&orphaned_recipients);
@@ -39994,6 +40042,48 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn relational_probe_failure_strategy_prefers_reconstruct_with_archive_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_root = dir.path().join("projects");
+        let error = CliError::Other(
+            "foreign key check failed: Query error: database disk image is malformed".to_string(),
+        );
+
+        let strategy = doctor_database_probe_failure_strategy(
+            "Foreign-key consistency probe",
+            &error,
+            true,
+            &archive_root,
+        );
+        match strategy {
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+                assert!(detail.contains("Foreign-key consistency probe failed"));
+                assert!(detail.contains("database disk image is malformed"));
+                assert!(detail.contains("reconstruct from archive"));
+            }
+            other => {
+                panic!("archive-backed relational probe failure should reconstruct: {other:?}")
+            }
+        }
+
+        let strategy = doctor_database_probe_failure_strategy(
+            "Foreign-key consistency probe",
+            &error,
+            false,
+            &archive_root,
+        );
+        match strategy {
+            DoctorDatabaseFixStrategy::Repair(detail) => {
+                assert!(detail.contains("Foreign-key consistency probe failed"));
+                assert!(detail.contains("no authoritative archive data"));
+            }
+            other => {
+                panic!("relational probe failure without archive data should repair: {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn doctor_database_fix_strategy_cleans_header_only_wal_before_open_probe() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header-only-wal.sqlite3");
@@ -45864,35 +45954,45 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn normal_runtime_crate_manifests_do_not_pull_experimental_sqlite_adapters() {
+    fn normal_runtime_crate_manifests_route_frankensqlite_through_sqlmodel_adapter() {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .expect("workspace root");
-        let normal_runtime_crates = [
+
+        let db_manifest_path = workspace_root
+            .join("crates")
+            .join("mcp-agent-mail-db")
+            .join("Cargo.toml");
+        let db_manifest = std::fs::read_to_string(&db_manifest_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", db_manifest_path.display()));
+        assert!(
+            db_manifest.contains("sqlmodel-frankensqlite.workspace = true"),
+            "{} must route normal mailbox DB traffic through SQLModel's FrankenSQLite adapter",
+            db_manifest_path.display()
+        );
+        assert!(
+            !db_manifest.contains("fsqlite.workspace")
+                && !db_manifest.contains("fsqlite-core.workspace"),
+            "{} must depend on FrankenSQLite through sqlmodel-frankensqlite, not direct fsqlite crates",
+            db_manifest_path.display()
+        );
+
+        for crate_name in [
             "mcp-agent-mail-cli",
-            "mcp-agent-mail-db",
             "mcp-agent-mail-server",
             "mcp-agent-mail-tools",
-        ];
-        let forbidden = [
-            "sqlmodel-frankensqlite",
-            "sqlmodel_frankensqlite",
-            "frankensqlite",
-            "fsqlite",
-        ];
-
-        for crate_name in normal_runtime_crates {
+        ] {
             let manifest_path = workspace_root
                 .join("crates")
                 .join(crate_name)
                 .join("Cargo.toml");
             let manifest = std::fs::read_to_string(&manifest_path)
                 .unwrap_or_else(|err| panic!("read {}: {err}", manifest_path.display()));
-            for forbidden_name in forbidden {
+            for forbidden_name in ["sqlmodel-frankensqlite", "fsqlite", "fsqlite-core"] {
                 assert!(
                     !manifest.contains(forbidden_name),
-                    "{} must not depend on experimental SQLite adapter `{}` on normal startup/health paths",
+                    "{} must use mcp-agent-mail-db as the SQLite boundary, not depend on `{}` directly",
                     manifest_path.display(),
                     forbidden_name
                 );
@@ -53064,6 +53164,40 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn open_db_sync_canonical_read_allows_live_runtime_storage_root_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = storage_root.join("storage.sqlite3");
+        seed_project_only_db(&db_path, "live-server-read", "/tmp/live-server-read");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let _runtime_storage_lock = acquire_cli_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire runtime storage-root lock")
+        .expect("storage-root lock guard");
+
+        let read_db = open_db_sync_canonical_read_with_database_url(
+            &db_url,
+            Some(&storage_root),
+            "list-projects under live server",
+        )
+        .expect("read-only canonical DB open should not conflict with live server lock");
+
+        let rows = read_db
+            .conn()
+            .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
+            .expect("count projects");
+        let project_count = rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or(0);
+        assert_eq!(project_count, 1);
+    }
+
+    #[test]
     fn open_db_sync_with_database_url_preserves_legacy_fixture_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("legacy_fixture.sqlite3");
@@ -58776,7 +58910,7 @@ fn handle_doctor_repair_with_options(
             storage_root_is_explicit,
         );
 
-    // 1. File sanity check via the canonical FrankenSQLite probe so doctor
+    // 1. File sanity check via the runtime probe plus canonical fallback so doctor
     // repair does not misclassify healthy databases as corrupt.
     let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
         sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?;
@@ -58955,15 +59089,68 @@ fn handle_doctor_repair_with_options(
     }
 
     drop(conn);
-    let cleanup_conn =
-        mcp_agent_mail_db::CanonicalDbConn::open_file(reconstruct_db_path.display().to_string())
-            .map_err(|e| {
-                CliError::Other(format!(
-                    "Failed to open DB for orphan-recipient cleanup: {e}"
-                ))
-            })?;
-    let recipient_cleanup =
-        doctor_cleanup_orphaned_message_recipients_canonical(&cleanup_conn, dry_run)?;
+    let cleanup_conn = match mcp_agent_mail_db::CanonicalDbConn::open_file(
+        reconstruct_db_path.display().to_string(),
+    ) {
+        Ok(conn) => conn,
+        Err(error) if archive_reconstruct_available => {
+            let detail = truncate_doctor_command(&error.to_string());
+            ftui_runtime::ftui_println!("  Orphan-recipient cleanup open: FAILED ({detail})");
+            if dry_run {
+                ftui_runtime::ftui_println!(
+                    "  Would fall back to archive reconstruction from {}",
+                    archive_projects_dir.display()
+                );
+                ftui_runtime::ftui_println!("Repair dry run complete.");
+                return Ok(());
+            }
+            ftui_runtime::ftui_eprintln!(
+                "  Orphan-recipient cleanup open failed ({detail}). Automatically falling back to archive reconstruction..."
+            );
+            return handle_doctor_reconstruct_with(
+                Some(&reconstruct_db_path),
+                Some(storage_root),
+                false,
+                yes,
+                false,
+            );
+        }
+        Err(error) => {
+            return Err(CliError::Other(format!(
+                "Failed to open DB for orphan-recipient cleanup: {error}"
+            )));
+        }
+    };
+    let recipient_cleanup = match doctor_cleanup_orphaned_message_recipients_canonical(
+        &cleanup_conn,
+        dry_run,
+    ) {
+        Ok(summary) => summary,
+        Err(error) if archive_reconstruct_available => {
+            let detail = truncate_doctor_command(&error.to_string());
+            ftui_runtime::ftui_println!("  Orphan-recipient cleanup: FAILED ({detail})");
+            if dry_run {
+                ftui_runtime::ftui_println!(
+                    "  Would fall back to archive reconstruction from {}",
+                    archive_projects_dir.display()
+                );
+                ftui_runtime::ftui_println!("Repair dry run complete.");
+                return Ok(());
+            }
+            drop(cleanup_conn);
+            ftui_runtime::ftui_eprintln!(
+                "  Orphan-recipient cleanup failed ({detail}). Automatically falling back to archive reconstruction..."
+            );
+            return handle_doctor_reconstruct_with(
+                Some(&reconstruct_db_path),
+                Some(storage_root),
+                false,
+                yes,
+                false,
+            );
+        }
+        Err(error) => return Err(error),
+    };
     if recipient_cleanup.deleted_rows > 0 {
         if dry_run {
             ftui_runtime::ftui_println!(

@@ -1,7 +1,7 @@
 //! Database layer for MCP Agent Mail
 //!
 //! This crate provides:
-//! - `SQLite` database operations via `sqlmodel` on canonical SQLite
+//! - SQLite database operations via `sqlmodel` on FrankenSQLite
 //! - Connection pooling
 //! - Schema migrations
 //! - Search V3 retrieval integration (frankensearch lexical/semantic/hybrid)
@@ -315,14 +315,15 @@ pub static QUERY_TRACKER: std::sync::LazyLock<QueryTracker> =
 pub use query_assistance::{QueryAssistance, parse_query_assistance};
 pub use sqlmodel;
 pub use sqlmodel_core;
+pub use sqlmodel_frankensqlite;
 pub use sqlmodel_sqlite;
 
 /// The connection type used by this crate's pool and queries.
 ///
-/// Runtime mailbox traffic uses canonical SQLite. FrankenSQLite is kept out of
-/// this crate's normal dependency graph so startup, recovery, and TUI polling
-/// cannot accidentally route live mailbox files through that engine.
-pub type DbConn = sqlmodel_sqlite::SqliteConnection;
+/// Runtime mailbox traffic uses SQLModel's FrankenSQLite driver. Recovery and
+/// verification paths that must inspect canonical SQLite metadata use the
+/// distinct `CanonicalDbConn` alias below.
+pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 
 /// The connection type used by canonical verification and recovery flows.
 ///
@@ -384,22 +385,25 @@ pub const fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn normal_mailbox_connection_aliases_use_canonical_sqlite() {
-        for (label, type_name) in [
-            ("DbConn", std::any::type_name::<super::DbConn>()),
-            (
-                "CanonicalDbConn",
-                std::any::type_name::<super::CanonicalDbConn>(),
-            ),
-        ] {
-            assert!(
-                type_name.contains("sqlmodel_sqlite"),
-                "{label} must stay on canonical sqlmodel_sqlite, got {type_name}"
-            );
-            assert!(
-                !type_name.contains("frankensqlite") && !type_name.contains("fsqlite"),
-                "{label} must not route normal mailbox traffic through experimental SQLite engines: {type_name}"
-            );
-        }
+    fn normal_mailbox_connection_aliases_use_frankensqlite_runtime() {
+        let runtime_type = std::any::type_name::<super::DbConn>();
+        assert!(
+            runtime_type.contains("sqlmodel_frankensqlite"),
+            "DbConn must route normal mailbox traffic through sqlmodel_frankensqlite, got {runtime_type}"
+        );
+        assert!(
+            runtime_type.contains("FrankenConnection"),
+            "DbConn must be the SQLModel FrankenSQLite connection, got {runtime_type}"
+        );
+
+        let canonical_type = std::any::type_name::<super::CanonicalDbConn>();
+        assert!(
+            canonical_type.contains("sqlmodel_sqlite"),
+            "CanonicalDbConn must stay on canonical sqlmodel_sqlite, got {canonical_type}"
+        );
+        assert!(
+            !canonical_type.contains("frankensqlite") && !canonical_type.contains("fsqlite"),
+            "CanonicalDbConn must not route verification/recovery through FrankenSQLite: {canonical_type}"
+        );
     }
 }

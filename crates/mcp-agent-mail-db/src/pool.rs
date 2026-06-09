@@ -2510,12 +2510,9 @@ impl DbPool {
             return Ok(None);
         }
 
-        let conn = crate::guard_db_conn(
-            open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
-                DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
-            })?,
-            "id_floor floor-advance connection",
-        );
+        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path).map_err(|e| {
+            DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
+        })?;
         crate::id_floor::advance_messages_id_floor(&conn, archive_max)
     }
 
@@ -4743,9 +4740,9 @@ where
         return Ok(false);
     }
 
-    // Confirm the primary verdict through a separate canonical connection too.
-    // Keeping this as an independent reopen/probe still catches sidecar and
-    // reopen-path issues even though the canonical path now uses FrankenSQLite.
+    // Confirm the primary FrankenSQLite verdict through a separate canonical
+    // connection too. Keeping this as an independent reopen/probe still catches
+    // sidecar and reopen-path issues.
     if !normalize_compatibility_probe_result(path, compatibility_probe(path))? {
         return Ok(false);
     }
