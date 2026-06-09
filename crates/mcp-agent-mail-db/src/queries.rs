@@ -37,6 +37,23 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
 
 static MESSAGE_WRITE_SERIALIZER: LazyLock<asupersync::sync::Mutex<()>> =
     LazyLock::new(|| asupersync::sync::Mutex::new(()));
+static FILE_RESERVATION_WRITE_SERIALIZER: LazyLock<asupersync::sync::Mutex<()>> =
+    LazyLock::new(|| asupersync::sync::Mutex::new(()));
+
+async fn acquire_file_reservation_write_serializer(
+    cx: &Cx,
+    operation: &'static str,
+) -> Outcome<asupersync::sync::MutexGuard<'static, ()>, DbError> {
+    match FILE_RESERVATION_WRITE_SERIALIZER.lock(cx).await {
+        Ok(guard) => Outcome::Ok(guard),
+        Err(asupersync::sync::LockError::Cancelled) => {
+            Outcome::Cancelled(CancelReason::user("file_reservation writer lock cancelled"))
+        }
+        Err(error) => Outcome::Err(DbError::Internal(format!(
+            "{operation} file_reservation writer lock failed: {error}"
+        ))),
+    }
+}
 
 // =============================================================================
 // ATC Leader Lease types
@@ -1458,6 +1475,18 @@ async fn rebuild_indexes(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<()
 /// Used for write paths that are sensitive to `BEGIN CONCURRENT` backend quirks.
 async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     map_sql_outcome(tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await).map(|_| ())
+}
+
+/// Begin the canonical file-reservation write transaction.
+///
+/// Reservation rows are coordination substrate for every agent. Keep their
+/// INSERT/UPDATE paths on single-writer `BEGIN IMMEDIATE` semantics instead of
+/// page-level `BEGIN CONCURRENT`.
+async fn begin_file_reservation_write_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+) -> Outcome<(), DbError> {
+    begin_immediate_tx(cx, tracked).await
 }
 
 /// Rollback the current transaction (best-effort, errors ignored).
@@ -8706,6 +8735,13 @@ pub async fn create_file_reservations(
     exclusive: bool,
     reason: &str,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    let _writer_guard =
+        match acquire_file_reservation_write_serializer(cx, "create_file_reservations").await {
+            Outcome::Ok(guard) => guard,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
     let now = now_micros();
     let expires = now.saturating_add(ttl_seconds.saturating_mul(1_000_000));
 
@@ -8719,8 +8755,11 @@ pub async fn create_file_reservations(
     let tracked = tracked(&*conn);
 
     // Batch all reservation inserts in a single transaction (1 fsync instead of N).
-    // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(
+        cx,
+        &tracked,
+        begin_file_reservation_write_tx(cx, &tracked).await
+    );
 
     let exclusive_filter = if exclusive {
         ""
@@ -9217,6 +9256,14 @@ async fn release_reservations_by_ids_with_expiry_constraint(
         return Outcome::Ok(Vec::new());
     }
 
+    let _writer_guard =
+        match acquire_file_reservation_write_serializer(cx, "release_file_reservations").await {
+            Outcome::Ok(guard) => guard,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
     run_with_mvcc_retry(cx, "release_reservations_by_ids", || async {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -9225,7 +9272,11 @@ async fn release_reservations_by_ids_with_expiry_constraint(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         let tracked = tracked(&*conn);
-        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            begin_file_reservation_write_tx(cx, &tracked).await
+        );
         try_in_tx!(
             cx,
             &tracked,
@@ -9333,6 +9384,13 @@ pub async fn renew_reservations(
     paths: Option<&[&str]>,
     reservation_ids: Option<&[i64]>,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    let _writer_guard =
+        match acquire_file_reservation_write_serializer(cx, "renew_reservations").await {
+            Outcome::Ok(guard) => guard,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
     let now = now_micros();
     let extend = extend_seconds.saturating_mul(1_000_000);
 
@@ -9348,7 +9406,11 @@ pub async fn renew_reservations(
     // Wrap entire read-modify-write in a transaction so partial renewals
     // cannot occur if the process crashes or is cancelled mid-loop.
     run_with_mvcc_retry(cx, "renew_reservations", || async {
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            begin_file_reservation_write_tx(cx, &tracked).await
+        );
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
         let mut sql = format!(

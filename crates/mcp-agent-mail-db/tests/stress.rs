@@ -585,6 +585,204 @@ fn stress_concurrent_file_reservations() {
     );
 }
 
+#[test]
+fn stress_concurrent_http_worker_file_reservation_write_lane_preserves_integrity() {
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/stress/http_reservation_lane_{suffix}");
+
+    let (project_id, agent_ids) = {
+        let p = pool.clone();
+        block_on(|cx| async move {
+            let proj = match queries::ensure_project(&cx, &p, &human_key).await {
+                Outcome::Ok(row) => row,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let project_id = proj.id.unwrap();
+            let names = [
+                "BoldCastle",
+                "CalmRiver",
+                "DarkForest",
+                "AmberPeak",
+                "FrostyLake",
+                "GoldCreek",
+                "MistyCave",
+                "CopperRidge",
+            ];
+            let mut ids = Vec::with_capacity(names.len());
+            for name in names {
+                match queries::register_agent(
+                    &cx,
+                    &p,
+                    project_id,
+                    name,
+                    "serve-http-worker",
+                    "test",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Outcome::Ok(row) => ids.push(row.id.unwrap()),
+                    other => panic!("register_agent {name} failed: {other:?}"),
+                }
+            }
+            (project_id, ids)
+        })
+    };
+
+    const ITERATIONS: usize = 16;
+    let worker_count = agent_ids.len();
+    let barrier = Arc::new(Barrier::new(worker_count));
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+    let handles: Vec<_> = agent_ids
+        .into_iter()
+        .enumerate()
+        .map(|(worker_idx, agent_id)| {
+            let pool = pool.clone();
+            let barrier = Arc::clone(&barrier);
+            let result_tx = result_tx.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for iter in 0..ITERATIONS {
+                    let path = format!("src/http-worker-{worker_idx}/reservation-{iter}.rs");
+                    let created = {
+                        let pool = pool.clone();
+                        let path = path.clone();
+                        block_on(|cx| async move {
+                            let paths = [path.as_str()];
+                            queries::create_file_reservations(
+                                &cx,
+                                &pool,
+                                project_id,
+                                agent_id,
+                                &paths,
+                                3600,
+                                true,
+                                "serve-http worker regression",
+                            )
+                            .await
+                        })
+                    };
+                    let created_rows = match created {
+                        Outcome::Ok(rows) if rows.len() == 1 => rows,
+                        other => {
+                            let _ = result_tx.send(Err(format!(
+                                "worker={worker_idx} iter={iter} create failed: {other:?}"
+                            )));
+                            return;
+                        }
+                    };
+                    let reservation_id = created_rows[0]
+                        .id
+                        .expect("created reservation should carry id");
+
+                    let renewed = {
+                        let pool = pool.clone();
+                        block_on(|cx| async move {
+                            let ids = [reservation_id];
+                            queries::renew_reservations(
+                                &cx,
+                                &pool,
+                                project_id,
+                                agent_id,
+                                60,
+                                None,
+                                Some(&ids),
+                            )
+                            .await
+                        })
+                    };
+                    match renewed {
+                        Outcome::Ok(rows) if rows.len() == 1 => {}
+                        other => {
+                            let _ = result_tx.send(Err(format!(
+                                "worker={worker_idx} iter={iter} renew failed: {other:?}"
+                            )));
+                            return;
+                        }
+                    }
+
+                    if iter % 2 == 0 {
+                        let released = {
+                            let pool = pool.clone();
+                            block_on(|cx| async move {
+                                let ids = [reservation_id];
+                                queries::release_reservations(
+                                    &cx,
+                                    &pool,
+                                    project_id,
+                                    agent_id,
+                                    None,
+                                    Some(&ids),
+                                )
+                                .await
+                            })
+                        };
+                        match released {
+                            Outcome::Ok(rows) if rows.len() == 1 => {}
+                            other => {
+                                let _ = result_tx.send(Err(format!(
+                                    "worker={worker_idx} iter={iter} release failed: {other:?}"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                }
+                let _ = result_tx.send(Ok(()));
+            })
+        })
+        .collect();
+    drop(result_tx);
+
+    let mut errors = Vec::new();
+    for _ in 0..worker_count {
+        match result_rx.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => {
+                errors.push(format!(
+                    "timed out waiting for reservation worker result: {error}"
+                ));
+                break;
+            }
+        }
+    }
+    for handle in handles {
+        if let Err(payload) = handle.join() {
+            let panic_msg = payload
+                .downcast_ref::<&str>()
+                .map_or_else(
+                    || {
+                        payload
+                            .downcast_ref::<String>()
+                            .map_or("unknown panic payload", String::as_str)
+                    },
+                    |msg| *msg,
+                )
+                .to_string();
+            errors.push(format!("reservation worker panicked: {panic_msg}"));
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "reservation workers failed:\n{}",
+        errors.join("\n")
+    );
+
+    let integrity = pool
+        .run_full_integrity_check()
+        .expect("full integrity_check should run after concurrent reservation writes");
+    assert!(
+        integrity.ok,
+        "full integrity_check failed after concurrent reservation writes: {:?}",
+        integrity.details
+    );
+}
+
 // =============================================================================
 // Test: Deferred touch batching under concurrent load
 // =============================================================================
