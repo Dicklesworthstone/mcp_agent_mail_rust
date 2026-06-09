@@ -9086,7 +9086,7 @@ pub fn release_reservations<'a>(
             return Outcome::Ok(released);
         }
 
-        let (reservations, target_ids) = {
+        let selected = run_with_mvcc_retry(cx, "release_reservations_select", || async {
             let conn = match acquire_conn(cx, pool).await {
                 Outcome::Ok(c) => c,
                 Outcome::Err(e) => return Outcome::Err(e),
@@ -9095,8 +9095,8 @@ pub fn release_reservations<'a>(
             };
 
             let tracked_conn = tracked(&*conn);
-            // Bulk release updates can touch many rows; use IMMEDIATE tx semantics
-            // for deterministic write visibility on FrankenSQLite.
+            // Bulk release scans use IMMEDIATE tx semantics for deterministic
+            // visibility on FrankenSQLite.
             try_in_tx!(
                 cx,
                 &tracked_conn,
@@ -9148,7 +9148,7 @@ pub fn release_reservations<'a>(
 
             if reservations.is_empty() {
                 try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-                return Outcome::Ok(reservations);
+                return Outcome::Ok((reservations, Vec::<i64>::new()));
             }
 
             let target_ids: Vec<i64> = reservations.iter().filter_map(|row| row.id).collect();
@@ -9164,8 +9164,20 @@ pub fn release_reservations<'a>(
             // Commit the read transaction first, then delegate writes to the
             // per-id release path which is more stable on FrankenSQLite.
             try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-            (reservations, target_ids)
+            Outcome::Ok((reservations, target_ids))
+        })
+        .await;
+
+        let (reservations, target_ids) = match selected {
+            Outcome::Ok(selected) => selected,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
+        if target_ids.is_empty() {
+            return Outcome::Ok(reservations);
+        }
+
         let released_markers =
             match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
                 Outcome::Ok(markers) => markers,
@@ -9205,106 +9217,109 @@ async fn release_reservations_by_ids_with_expiry_constraint(
         return Outcome::Ok(Vec::new());
     }
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(
-            traw_execute(
-                cx,
-                &tracked,
-                "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
-                    reservation_id INTEGER PRIMARY KEY,\
-                    released_ts INTEGER NOT NULL\
-                 )",
-                &[],
+    run_with_mvcc_retry(cx, "release_reservations_by_ids", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
+                        reservation_id INTEGER PRIMARY KEY,\
+                        released_ts INTEGER NOT NULL\
+                     )",
+                    &[],
+                )
+                .await
             )
-            .await
-        )
-    );
+        );
 
-    let mut release_marker = now_micros();
-    let mut released = Vec::with_capacity(ids.len());
+        let mut release_marker = now_micros();
+        let mut released = Vec::with_capacity(ids.len());
 
-    // Build the eligibility check: active reservation not already released.
-    // ACTIVE_RESERVATION_PREDICATE already includes the release-ledger
-    // exclusion, so no additional NOT IN clause is needed.
-    let mut check_sql = format!(
-        "SELECT 1 FROM file_reservations \
-         WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
-    );
-    match expiry_constraint {
-        ReleaseReservationExpiryConstraint::Any => {}
-        ReleaseReservationExpiryConstraint::OnOrBefore(_) => {
-            check_sql.push_str(" AND expires_ts <= ?");
-        }
-        ReleaseReservationExpiryConstraint::Exact(_) => {
-            check_sql.push_str(" AND expires_ts = ?");
-        }
-    }
-    check_sql.push_str(" LIMIT 1");
-
-    // Record the release in both the base row and the sidecar ledger. The
-    // sidecar remains the audit source, while the base row keeps active
-    // reservation predicates correct on same-process readers that have already
-    // materialized file_reservations.
-    let update_sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ?";
-    let insert_sql = "INSERT OR IGNORE INTO file_reservation_releases (reservation_id, released_ts) \
-         VALUES (?, ?)";
-
-    for id in ids {
-        let released_ts = release_marker;
-
-        // Step 1: Check eligibility.
-        let mut check_params: Vec<Value> = vec![Value::BigInt(*id)];
+        // Build the eligibility check: active reservation not already released.
+        // ACTIVE_RESERVATION_PREDICATE already includes the release-ledger
+        // exclusion, so no additional NOT IN clause is needed.
+        let mut check_sql = format!(
+            "SELECT 1 FROM file_reservations \
+             WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+        );
         match expiry_constraint {
             ReleaseReservationExpiryConstraint::Any => {}
-            ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
-            | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
-                check_params.push(Value::BigInt(expiry_cutoff));
+            ReleaseReservationExpiryConstraint::OnOrBefore(_) => {
+                check_sql.push_str(" AND expires_ts <= ?");
+            }
+            ReleaseReservationExpiryConstraint::Exact(_) => {
+                check_sql.push_str(" AND expires_ts = ?");
             }
         }
-        let eligible_rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &check_sql, &check_params).await)
-        );
-        if eligible_rows.is_empty() {
-            continue;
+        check_sql.push_str(" LIMIT 1");
+
+        // Record the release in both the base row and the sidecar ledger. The
+        // sidecar remains the audit source, while the base row keeps active
+        // reservation predicates correct on same-process readers that have
+        // already materialized file_reservations.
+        let update_sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ?";
+        let insert_sql = "INSERT OR IGNORE INTO file_reservation_releases (reservation_id, released_ts) \
+             VALUES (?, ?)";
+
+        for id in ids {
+            let released_ts = release_marker;
+
+            // Step 1: Check eligibility.
+            let mut check_params: Vec<Value> = vec![Value::BigInt(*id)];
+            match expiry_constraint {
+                ReleaseReservationExpiryConstraint::Any => {}
+                ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
+                | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
+                    check_params.push(Value::BigInt(expiry_cutoff));
+                }
+            }
+            let eligible_rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &check_sql, &check_params).await)
+            );
+            if eligible_rows.is_empty() {
+                continue;
+            }
+
+            // Step 2: Update the base reservation row first.
+            let update_params = [Value::BigInt(released_ts), Value::BigInt(*id)];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
+            );
+
+            // Step 3: Record the release in the sidecar ledger.
+            let insert_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            );
+
+            release_marker = release_marker.saturating_add(1);
+            released.push(ReleasedReservationMarker {
+                id: *id,
+                released_ts,
+            });
         }
 
-        // Step 2: Update the base reservation row first.
-        let update_params = [Value::BigInt(released_ts), Value::BigInt(*id)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
-        );
-
-        // Step 3: Record the release in the sidecar ledger.
-        let insert_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-        );
-
-        release_marker = release_marker.saturating_add(1);
-        released.push(ReleasedReservationMarker {
-            id: *id,
-            released_ts,
-        });
-    }
-
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(released)
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(released)
+    })
+    .await
 }
 
 /// Renew file reservations
