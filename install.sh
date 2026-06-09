@@ -4614,12 +4614,37 @@ verify_sigstore_bundle() {
     return 0
   fi
 
+  # Our releases ship the new standardized Sigstore protobuf bundle
+  # (.sigstore.json). cosign 2.x can verify it but only with an explicit
+  # --new-bundle-format; cosign 3.x enables that format by default. Passing the
+  # flag to a 3.x build is harmless (it still exists), but to avoid depending on
+  # the flag's continued presence we only add it for the 2.x line. For an
+  # unparseable version we add it: every cosign that can verify a .sigstore.json
+  # bundle at all (2.4+) accepts the flag, so this is the safe default.
+  local nbf_flag=""
+  case "$bundle_file" in
+    *.sigstore.json|*.sigstore)
+      local cosign_major
+      cosign_major="$(cosign version 2>/dev/null \
+        | sed -n 's/.*GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\).*/\1/p' \
+        | head -n1)"
+      # Add the flag unless cosign is a known v3+ (where the new format is the
+      # default). Empty/non-numeric version (e.g. "devel") falls through to the
+      # safe default of adding it.
+      if ! printf '%s' "$cosign_major" | grep -qE '^[0-9]+$' || [ "$cosign_major" -lt 3 ]; then
+        nbf_flag="--new-bundle-format"
+      fi
+      verbose "verify_sigstore_bundle:cosign_major=${cosign_major:-unknown} new_bundle_format=${nbf_flag:-off}"
+      ;;
+  esac
+
   if ! cosign verify-blob \
+    ${nbf_flag:+$nbf_flag} \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
     "$file"; then
-    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file}"
+    verbose "verify_sigstore_bundle:cosign_failed bundle=${bundle_file} new_bundle_format=${nbf_flag:-off}"
     return 1
   fi
 
