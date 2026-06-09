@@ -183,6 +183,18 @@ pub mod tool_util {
         message.contains("not visible after commit")
     }
 
+    fn resource_busy_message(message: &str) -> String {
+        if mcp_agent_mail_db::is_mailbox_ownership_contention(message) {
+            format!(
+                "Resource is temporarily busy: a running Agent Mail server owns this mailbox. \
+                 Route this operation through that server (or stop it) instead of writing \
+                 directly. Detail: {message}"
+            )
+        } else {
+            "Resource is temporarily busy. Wait a moment and try again.".to_string()
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
@@ -244,15 +256,9 @@ pub mod tool_util {
                 // hint differs from a transient SQLITE_BUSY: the caller should route
                 // the write through the running server rather than blindly retrying
                 // a direct write that will keep losing the ownership race.
-                let hint = if mcp_agent_mail_db::is_mailbox_ownership_contention(&message) {
-                    "Resource is temporarily busy: a running Agent Mail server owns this mailbox. \
-                     Route this operation through that server (or stop it) instead of writing directly."
-                } else {
-                    "Resource is temporarily busy. Wait a moment and try again."
-                };
                 legacy_tool_error(
                     "RESOURCE_BUSY",
-                    hint,
+                    resource_busy_message(&message),
                     true,
                     json!({ "error_detail": message }),
                 )
@@ -317,7 +323,7 @@ pub mod tool_util {
             ),
             DbError::ResourceBusy(message) => legacy_tool_error(
                 "RESOURCE_BUSY",
-                "Resource is temporarily busy. Wait a moment and try again.",
+                resource_busy_message(&message),
                 true,
                 json!({ "error_detail": message }),
             ),
@@ -1422,6 +1428,20 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
             assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_maps_mailbox_owner_resource_busy_with_actionable_detail() {
+            let detail = "mailbox activity lock is busy for storage root /tmp/mailbox \
+                (exclusive lock /tmp/mailbox/.mailbox.activity.lock): another Agent Mail runtime \
+                is already active; owner hint: pid=17 mode=exclusive";
+            let err = db_error_to_mcp_error(DbError::ResourceBusy(detail.into()));
+            let data = err.data.expect("expected data payload");
+            let message = data["error"]["message"].as_str().unwrap();
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert!(message.contains("Route this operation through that server"));
+            assert!(message.contains("mailbox activity lock is busy"));
+            assert!(message.contains("pid=17"));
         }
 
         #[test]

@@ -182,7 +182,7 @@ use mcp_agent_mail_tools::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Seek, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1158,6 +1158,89 @@ fn mailbox_activity_lock_path(sqlite_path: &Path) -> PathBuf {
     PathBuf::from(lock_os)
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct MailboxActivityLockMetadata {
+    schema_version: u8,
+    pid: u32,
+    mode: String,
+    subject_kind: String,
+    subject_path: String,
+    lock_path: String,
+    acquired_at_micros: i64,
+    executable_path: Option<String>,
+}
+
+const MAX_MAILBOX_ACTIVITY_LOCK_METADATA_BYTES: u64 = 16 * 1024;
+
+impl MailboxActivityLockMetadata {
+    fn new(
+        subject_path: &Path,
+        subject_kind: &str,
+        lock_path: &Path,
+        mode: MailboxActivityLockMode,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            pid: std::process::id(),
+            mode: mode.label().to_string(),
+            subject_kind: subject_kind.to_string(),
+            subject_path: subject_path.display().to_string(),
+            lock_path: lock_path.display().to_string(),
+            acquired_at_micros: mcp_agent_mail_core::timestamps::now_micros(),
+            executable_path: std::env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string()),
+        }
+    }
+
+    fn owner_hint(&self) -> String {
+        let acquired_at = mcp_agent_mail_core::timestamps::micros_to_iso(self.acquired_at_micros);
+        let executable = self.executable_path.as_deref().unwrap_or("<unknown>");
+        format!(
+            "pid={} mode={} subject={} {} acquired_at={} exe={}",
+            self.pid, self.mode, self.subject_kind, self.subject_path, acquired_at, executable
+        )
+    }
+}
+
+fn read_mailbox_activity_lock_owner_hint(lock_path: &Path) -> Option<String> {
+    let lock_file = fs::File::open(lock_path).ok()?;
+    if lock_file.metadata().ok()?.len() > MAX_MAILBOX_ACTIVITY_LOCK_METADATA_BYTES {
+        return None;
+    }
+    let mut body = String::new();
+    let mut reader = lock_file.take(MAX_MAILBOX_ACTIVITY_LOCK_METADATA_BYTES);
+    reader.read_to_string(&mut body).ok()?;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<MailboxActivityLockMetadata>(body)
+        .ok()
+        .map(|metadata| metadata.owner_hint())
+}
+
+fn write_mailbox_activity_lock_metadata(
+    lock_file: &mut fs::File,
+    subject_path: &Path,
+    subject_kind: &str,
+    lock_path: &Path,
+    mode: MailboxActivityLockMode,
+) -> std::io::Result<()> {
+    if mode != MailboxActivityLockMode::Exclusive {
+        return Ok(());
+    }
+
+    let metadata = MailboxActivityLockMetadata::new(subject_path, subject_kind, lock_path, mode);
+    let payload = serde_json::to_vec_pretty(&metadata)
+        .map_err(|err| std::io::Error::other(format!("serialize lock metadata: {err}")))?;
+    lock_file.set_len(0)?;
+    lock_file.rewind()?;
+    lock_file.write_all(&payload)?;
+    lock_file.write_all(b"\n")?;
+    lock_file.flush()
+}
+
 fn mailbox_activity_lock_contention_error(
     subject_path: &Path,
     subject_kind: &str,
@@ -1165,8 +1248,11 @@ fn mailbox_activity_lock_contention_error(
     mode: MailboxActivityLockMode,
     err: &std::io::Error,
 ) -> std::io::Error {
+    let owner_hint = read_mailbox_activity_lock_owner_hint(lock_path)
+        .map(|hint| format!("; owner hint: {hint}"))
+        .unwrap_or_default();
     let detail = format!(
-        "mailbox activity lock is busy for {subject_kind} {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active; stop it or wait for it to finish",
+        "mailbox activity lock is busy for {subject_kind} {} ({} lock {}): another Agent Mail runtime or mutating `am doctor` operation is already active; stop it or wait for it to finish{owner_hint}",
         subject_path.display(),
         mode.label(),
         lock_path.display()
@@ -1192,7 +1278,7 @@ fn acquire_mailbox_activity_lock_for_subject(
         fs::create_dir_all(parent)?;
     }
 
-    let lock_file = fs::OpenOptions::new()
+    let mut lock_file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -1211,6 +1297,19 @@ fn acquire_mailbox_activity_lock_for_subject(
             mode,
             &err,
         ));
+    }
+    if let Err(error) = write_mailbox_activity_lock_metadata(
+        &mut lock_file,
+        subject_path,
+        subject_kind,
+        &lock_path,
+        mode,
+    ) {
+        tracing::warn!(
+            lock_path = %lock_path.display(),
+            error = %error,
+            "failed to write advisory mailbox activity lock owner metadata"
+        );
     }
 
     Ok(Some(MailboxActivityLockGuard {
@@ -16979,6 +17078,38 @@ first body
         assert!(
             error.to_string().contains("mailbox activity lock is busy"),
             "unexpected contention error: {error}"
+        );
+    }
+
+    #[test]
+    fn mailbox_activity_lock_contention_error_includes_exclusive_owner_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("mailbox");
+
+        let _first = acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire first exclusive storage-root lock");
+
+        let error = acquire_mailbox_activity_lock_for_storage_root(
+            &storage_root,
+            MailboxActivityLockMode::Exclusive,
+        )
+        .expect_err("second exclusive storage-root lock should fail");
+        let text = error.to_string();
+
+        assert!(
+            text.contains("owner hint:"),
+            "contention error should include advisory owner metadata: {text}"
+        );
+        assert!(
+            text.contains(&format!("pid={}", std::process::id())),
+            "contention error should name the lock owner pid: {text}"
+        );
+        assert!(
+            text.contains("mode=exclusive"),
+            "contention error should name the owner lock mode: {text}"
         );
     }
 
