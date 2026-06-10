@@ -29,13 +29,15 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
-use mcp_agent_mail_core::{AtcCanaryReportSummary, Config, load_latest_atc_canary_report};
+use mcp_agent_mail_core::{
+    AtcCanaryReportSummary, Config, load_latest_atc_canary_report, metrics::HistogramSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::tui_bridge::{
-    BootArchivePreflightSnapshot, ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState,
-    query_params_explain_empty_state,
+    BootArchivePreflightSnapshot, ConfigSnapshot, ScreenDiagnosticSnapshot, TuiLoopHeartbeatKind,
+    TuiLoopHeartbeatSnapshot, TuiSharedState, query_params_explain_empty_state,
 };
 use crate::tui_events::MailEvent;
 use crate::tui_widgets::{
@@ -52,6 +54,9 @@ const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
 const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
 const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+const LOOP_HEARTBEAT_STALE_MICROS: i64 = 10 * 1_000_000;
+const LOOP_HEARTBEAT_RENDER_GAP_WARN_MICROS: u64 = 1_000_000;
+const LOOP_HEARTBEAT_DB_POLL_GAP_WARN_MICROS: u64 = 6_000_000;
 const RECOMMENDATION_EXPIRING_RESERVATION_US: i64 = 5 * 60 * 1_000_000;
 const GIT_REF_INTEGRITY_VISIBLE_PROJECTS: usize = 3;
 const HEALTH_SWEEP_DATA_DIR_NAME: &str = "mcp-agent-mail";
@@ -303,6 +308,128 @@ fn screen_diag_level(diag: &ScreenDiagnosticSnapshot) -> Level {
 fn format_diag_timestamp_micros(timestamp_micros: i64) -> String {
     DateTime::<Utc>::from_timestamp_micros(timestamp_micros)
         .map_or_else(|| timestamp_micros.to_string(), |ts| ts.to_rfc3339())
+}
+
+fn loop_heartbeat_age_micros(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> Option<i64> {
+    (snapshot.last_tick_micros > 0)
+        .then(|| now_micros.saturating_sub(snapshot.last_tick_micros).max(0))
+}
+
+const fn loop_heartbeat_is_periodic(kind: TuiLoopHeartbeatKind) -> bool {
+    matches!(
+        kind,
+        TuiLoopHeartbeatKind::Render | TuiLoopHeartbeatKind::DbPoll
+    )
+}
+
+const fn loop_heartbeat_gap_warn_micros(kind: TuiLoopHeartbeatKind) -> Option<u64> {
+    match kind {
+        TuiLoopHeartbeatKind::Render => Some(LOOP_HEARTBEAT_RENDER_GAP_WARN_MICROS),
+        TuiLoopHeartbeatKind::DbPoll => Some(LOOP_HEARTBEAT_DB_POLL_GAP_WARN_MICROS),
+        TuiLoopHeartbeatKind::Input
+        | TuiLoopHeartbeatKind::McpApi
+        | TuiLoopHeartbeatKind::CommitCoalescer => None,
+    }
+}
+
+fn loop_heartbeat_is_stale(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> bool {
+    loop_heartbeat_is_periodic(snapshot.kind)
+        && loop_heartbeat_age_micros(snapshot, now_micros)
+            .is_some_and(|age| age >= LOOP_HEARTBEAT_STALE_MICROS)
+}
+
+fn loop_heartbeat_level(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> Level {
+    if snapshot.consecutive_failures > 0 {
+        return Level::Fail;
+    }
+
+    if snapshot.ticks_total == 0 {
+        return if loop_heartbeat_is_periodic(snapshot.kind) {
+            Level::Warn
+        } else {
+            Level::Ok
+        };
+    }
+
+    let gap_warn = loop_heartbeat_gap_warn_micros(snapshot.kind)
+        .is_some_and(|threshold| snapshot.last_gap_micros >= threshold);
+    if loop_heartbeat_is_stale(snapshot, now_micros) || gap_warn {
+        return Level::Warn;
+    }
+
+    Level::Ok
+}
+
+fn format_loop_heartbeat_detail(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> String {
+    let age = loop_heartbeat_age_micros(snapshot, now_micros)
+        .map_or_else(|| "--".to_string(), |age| format!("{}s", age / 1_000_000));
+    let last_tick = if snapshot.last_tick_micros > 0 {
+        format_diag_timestamp_micros(snapshot.last_tick_micros)
+    } else {
+        "--".to_string()
+    };
+    let last_success = if snapshot.last_success_micros > 0 {
+        format_diag_timestamp_micros(snapshot.last_success_micros)
+    } else {
+        "--".to_string()
+    };
+
+    format!(
+        "ticks={} successes={} failures={} consecutive_failures={} age={} gap={}ms success_duration={}ms last_tick={} last_success={}",
+        snapshot.ticks_total,
+        snapshot.successes_total,
+        snapshot.failures_total,
+        snapshot.consecutive_failures,
+        age,
+        snapshot.last_gap_micros / 1_000,
+        snapshot.last_success_duration_micros / 1_000,
+        last_tick,
+        last_success,
+    )
+}
+
+fn loop_heartbeat_json(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> Value {
+    let age_micros = loop_heartbeat_age_micros(snapshot, now_micros);
+    let level = loop_heartbeat_level(snapshot, now_micros);
+    json!({
+        "kind": snapshot.kind.as_str(),
+        "level": level.label(),
+        "periodic": loop_heartbeat_is_periodic(snapshot.kind),
+        "observed": snapshot.ticks_total > 0,
+        "stale": loop_heartbeat_is_stale(snapshot, now_micros),
+        "age_micros": age_micros,
+        "last_tick_micros": snapshot.last_tick_micros,
+        "last_success_micros": snapshot.last_success_micros,
+        "last_failure_micros": snapshot.last_failure_micros,
+        "last_gap_micros": snapshot.last_gap_micros,
+        "last_success_duration_micros": snapshot.last_success_duration_micros,
+        "ticks_total": snapshot.ticks_total,
+        "successes_total": snapshot.successes_total,
+        "failures_total": snapshot.failures_total,
+        "consecutive_failures": snapshot.consecutive_failures,
+    })
+}
+
+fn histogram_snapshot_json(snapshot: &HistogramSnapshot) -> Value {
+    json!({
+        "count": snapshot.count,
+        "sum": snapshot.sum,
+        "min": snapshot.min,
+        "max": snapshot.max,
+        "p50": snapshot.p50,
+        "p95": snapshot.p95,
+        "p99": snapshot.p99,
+    })
+}
+
+fn format_latency_histogram(snapshot: &HistogramSnapshot) -> String {
+    if snapshot.count == 0 {
+        return "count=0".to_string();
+    }
+    format!(
+        "count={} p50={}us p95={}us p99={}us max={}us",
+        snapshot.count, snapshot.p50, snapshot.p95, snapshot.p99, snapshot.max,
+    )
 }
 
 fn atc_tick_age_secs(snapshot: &crate::AtcOperatorSnapshot) -> Option<i64> {
@@ -754,9 +881,21 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
         Utc::now(),
     );
     let boot_archive_preflight = state.boot_archive_preflight_snapshot();
+    let now_micros = mcp_agent_mail_db::now_micros();
+    let loop_heartbeats = state.loop_heartbeats_snapshot();
+    let query_tracker_snapshot = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
+    let metrics_snapshot = mcp_agent_mail_core::global_metrics().snapshot();
 
     json!({
         "boot_archive_preflight": boot_archive_preflight_json(boot_archive_preflight.as_ref()),
+        "loop_heartbeats": loop_heartbeats
+            .iter()
+            .map(|snapshot| loop_heartbeat_json(snapshot, now_micros))
+            .collect::<Vec<_>>(),
+        "db_latency_histograms": {
+            "query_latency_us": histogram_snapshot_json(&query_tracker_snapshot.latency_us),
+            "pool_acquire_latency_us": histogram_snapshot_json(&metrics_snapshot.db.pool_acquire_latency_us),
+        },
         "git_ref_integrity": {
             "enabled": sweep.enabled(),
             "interval_seconds": sweep.interval_seconds(),
@@ -1519,6 +1658,45 @@ impl SystemHealthScreen {
                 }
             }
         }
+
+        let loop_heartbeats = state.loop_heartbeats_snapshot();
+        if !loop_heartbeats.is_empty() {
+            let now_micros = mcp_agent_mail_db::now_micros();
+            lines.push(Line::raw(String::new()));
+            lines.push(Line::from_spans([Span::styled(
+                "\u{2500}\u{2500} Loop Heartbeats \u{2500}\u{2500}",
+                section_style,
+            )]));
+            for heartbeat in &loop_heartbeats {
+                let level = loop_heartbeat_level(heartbeat, now_micros);
+                lines.push(level_styled_line(
+                    level,
+                    &tp,
+                    heartbeat.kind.as_str().to_string(),
+                    format_loop_heartbeat_detail(heartbeat, now_micros),
+                ));
+            }
+        }
+
+        let query_tracker_snapshot = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
+        let metrics_snapshot = mcp_agent_mail_core::global_metrics().snapshot();
+        lines.push(Line::raw(String::new()));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} DB Query Latency \u{2500}\u{2500}",
+            section_style,
+        )]));
+        lines.push(level_styled_line(
+            Level::Ok,
+            &tp,
+            "queries".to_string(),
+            format_latency_histogram(&query_tracker_snapshot.latency_us),
+        ));
+        lines.push(level_styled_line(
+            Level::Ok,
+            &tp,
+            "pool_acquire".to_string(),
+            format_latency_histogram(&metrics_snapshot.db.pool_acquire_latency_us),
+        ));
 
         let recent_diagnostics =
             recent_system_health_diagnostics(state, SCREEN_DIAGNOSTIC_PREVIEW_LIMIT);
@@ -5461,6 +5639,120 @@ mod tests {
         assert_eq!(
             payload["boot_archive_preflight"]["findings"][0]["kind"].as_str(),
             Some("orphan_refs")
+        );
+    }
+
+    #[test]
+    fn ws_state_payload_includes_loop_heartbeats() {
+        let state = test_state();
+        state.mark_loop_tick(TuiLoopHeartbeatKind::Render);
+        state.mark_loop_success_with_duration(TuiLoopHeartbeatKind::Render, 12_000);
+        state.mark_loop_failure(TuiLoopHeartbeatKind::DbPoll);
+
+        let payload = ws_state_system_health_payload(&state);
+        let heartbeats = payload["loop_heartbeats"]
+            .as_array()
+            .expect("loop heartbeat array");
+        assert_eq!(heartbeats.len(), 5);
+
+        let render = heartbeats
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("render"))
+            .expect("render heartbeat");
+        assert_eq!(render["ticks_total"].as_u64(), Some(1));
+        assert_eq!(render["successes_total"].as_u64(), Some(1));
+        assert_eq!(
+            render["last_success_duration_micros"].as_u64(),
+            Some(12_000)
+        );
+        assert_eq!(render["level"].as_str(), Some("OK"));
+
+        let db_poll = heartbeats
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("db_poll"))
+            .expect("db poll heartbeat");
+        assert_eq!(db_poll["failures_total"].as_u64(), Some(1));
+        assert_eq!(db_poll["consecutive_failures"].as_u64(), Some(1));
+        assert_eq!(db_poll["level"].as_str(), Some("FAIL"));
+
+        let coalescer = heartbeats
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("commit_coalescer"))
+            .expect("coalescer heartbeat");
+        assert_eq!(coalescer["periodic"].as_bool(), Some(false));
+        assert_eq!(coalescer["stale"].as_bool(), Some(false));
+
+        let db_latency = payload["db_latency_histograms"]
+            .as_object()
+            .expect("db latency histogram object");
+        assert!(db_latency.get("query_latency_us").is_some());
+        assert!(db_latency.get("pool_acquire_latency_us").is_some());
+        assert!(
+            db_latency["query_latency_us"]["count"].is_u64(),
+            "expected query latency histogram count"
+        );
+    }
+
+    #[test]
+    fn db_poll_heartbeat_gap_allows_frankensqlite_poll_interval() {
+        let now_micros = mcp_agent_mail_db::now_micros();
+        let db_poll = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::DbPoll,
+            last_tick_micros: now_micros.saturating_sub(5_000_000),
+            last_success_micros: now_micros.saturating_sub(5_000_000),
+            last_failure_micros: 0,
+            last_gap_micros: 5_000_000,
+            last_success_duration_micros: 1_000,
+            ticks_total: 2,
+            successes_total: 2,
+            failures_total: 0,
+            consecutive_failures: 0,
+        };
+        assert_eq!(loop_heartbeat_level(&db_poll, now_micros), Level::Ok);
+
+        let render = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::Render,
+            ..db_poll
+        };
+        assert_eq!(loop_heartbeat_level(&render, now_micros), Level::Warn);
+    }
+
+    #[test]
+    fn system_health_text_view_renders_loop_heartbeats() {
+        let state = test_state();
+        state.mark_loop_tick(TuiLoopHeartbeatKind::Render);
+        state.mark_loop_success_with_duration(TuiLoopHeartbeatKind::Render, 12_000);
+        state.mark_loop_tick(TuiLoopHeartbeatKind::McpApi);
+
+        let screen = test_screen(DiagnosticsSnapshot {
+            checked_at: Some(Utc::now()),
+            ..Default::default()
+        });
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 80, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 120, 80), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Loop Heartbeats"),
+            "expected loop heartbeat section, got:\n{text}"
+        );
+        assert!(text.contains("render"), "expected render row, got:\n{text}");
+        assert!(
+            text.contains("successes=1"),
+            "expected success counter, got:\n{text}"
+        );
+        assert!(
+            text.contains("commit_coalescer"),
+            "expected coalescer row, got:\n{text}"
+        );
+        assert!(
+            text.contains("DB Query Latency"),
+            "expected DB query latency section, got:\n{text}"
+        );
+        assert!(
+            text.contains("pool_acquire"),
+            "expected pool acquire histogram row, got:\n{text}"
         );
     }
 

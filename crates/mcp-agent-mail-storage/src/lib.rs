@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 // `Stdio` is referenced fully-qualified in the two remaining sites
 // (lines ~1290); removed the bare `use` after bead C5 deleted the
 // read-tree shell-out.
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -211,6 +211,136 @@ fn now_micros_u64() -> u64 {
             .min(u128::from(u64::MAX)),
     )
     .unwrap_or(u64::MAX)
+}
+
+#[inline]
+fn now_micros_i64() -> i64 {
+    i64::try_from(now_micros_u64()).unwrap_or(i64::MAX)
+}
+
+#[inline]
+fn instant_elapsed_micros_u64(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitCoalescerHeartbeatSnapshot {
+    pub last_tick_micros: i64,
+    pub last_success_micros: i64,
+    pub last_failure_micros: i64,
+    pub last_gap_micros: u64,
+    pub last_success_duration_micros: u64,
+    pub ticks_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub consecutive_failures: u64,
+}
+
+#[derive(Debug)]
+struct CommitCoalescerHeartbeat {
+    last_tick_micros: AtomicI64,
+    last_tick_elapsed_micros: AtomicU64,
+    last_success_micros: AtomicI64,
+    last_failure_micros: AtomicI64,
+    last_gap_micros: AtomicU64,
+    last_success_duration_micros: AtomicU64,
+    ticks_total: AtomicU64,
+    successes_total: AtomicU64,
+    failures_total: AtomicU64,
+    consecutive_failures: AtomicU64,
+}
+
+impl CommitCoalescerHeartbeat {
+    fn new() -> Self {
+        Self {
+            last_tick_micros: AtomicI64::new(0),
+            last_tick_elapsed_micros: AtomicU64::new(0),
+            last_success_micros: AtomicI64::new(0),
+            last_failure_micros: AtomicI64::new(0),
+            last_gap_micros: AtomicU64::new(0),
+            last_success_duration_micros: AtomicU64::new(0),
+            ticks_total: AtomicU64::new(0),
+            successes_total: AtomicU64::new(0),
+            failures_total: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+
+    fn record_tick_at(&self, now_micros: i64, elapsed_micros: u64) {
+        let previous_elapsed = self
+            .last_tick_elapsed_micros
+            .swap(elapsed_micros, Ordering::Relaxed);
+        self.last_tick_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        if previous_elapsed > 0 {
+            self.last_gap_micros.store(
+                elapsed_micros.saturating_sub(previous_elapsed),
+                Ordering::Relaxed,
+            );
+        }
+        self.ticks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_success_at(&self, now_micros: i64, duration_micros: u64) {
+        self.last_success_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        self.last_success_duration_micros
+            .store(duration_micros, Ordering::Relaxed);
+        self.successes_total.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure_at(&self, now_micros: i64) {
+        self.last_failure_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        self.failures_total.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CommitCoalescerHeartbeatSnapshot {
+        CommitCoalescerHeartbeatSnapshot {
+            last_tick_micros: self.last_tick_micros.load(Ordering::Relaxed),
+            last_success_micros: self.last_success_micros.load(Ordering::Relaxed),
+            last_failure_micros: self.last_failure_micros.load(Ordering::Relaxed),
+            last_gap_micros: self.last_gap_micros.load(Ordering::Relaxed),
+            last_success_duration_micros: self.last_success_duration_micros.load(Ordering::Relaxed),
+            ticks_total: self.ticks_total.load(Ordering::Relaxed),
+            successes_total: self.successes_total.load(Ordering::Relaxed),
+            failures_total: self.failures_total.load(Ordering::Relaxed),
+            consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static COMMIT_COALESCER_HEARTBEAT: LazyLock<CommitCoalescerHeartbeat> =
+    LazyLock::new(CommitCoalescerHeartbeat::new);
+static COMMIT_COALESCER_HEARTBEAT_STARTED_AT: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn commit_coalescer_heartbeat_elapsed_micros() -> u64 {
+    instant_elapsed_micros_u64(*COMMIT_COALESCER_HEARTBEAT_STARTED_AT)
+}
+
+fn commit_coalescer_heartbeat_record_tick() {
+    COMMIT_COALESCER_HEARTBEAT.record_tick_at(
+        now_micros_i64(),
+        commit_coalescer_heartbeat_elapsed_micros(),
+    );
+}
+
+fn commit_coalescer_heartbeat_record_success(started_at: Instant) {
+    COMMIT_COALESCER_HEARTBEAT
+        .record_success_at(now_micros_i64(), instant_elapsed_micros_u64(started_at));
+}
+
+fn commit_coalescer_heartbeat_record_failure() {
+    COMMIT_COALESCER_HEARTBEAT.record_failure_at(now_micros_i64());
+}
+
+#[must_use]
+pub fn commit_coalescer_heartbeat_snapshot() -> Option<CommitCoalescerHeartbeatSnapshot> {
+    let snapshot = COMMIT_COALESCER_HEARTBEAT.snapshot();
+    (snapshot.ticks_total > 0 || snapshot.successes_total > 0 || snapshot.failures_total > 0)
+        .then_some(snapshot)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2309,6 +2439,7 @@ impl CommitCoalescer {
         if rel_paths.is_empty() {
             return;
         }
+        commit_coalescer_heartbeat_record_tick();
         let repo_root = normalize_repo_root_key(&repo_root);
 
         let metrics = mcp_agent_mail_core::global_metrics();
@@ -2575,6 +2706,40 @@ fn coalescer_wait_for_due_work(
     }
 }
 
+struct CoalescerHeartbeatCycle {
+    started_at: Instant,
+    finished: bool,
+}
+
+impl CoalescerHeartbeatCycle {
+    fn begin() -> Self {
+        let started_at = Instant::now();
+        commit_coalescer_heartbeat_record_tick();
+        Self {
+            started_at,
+            finished: false,
+        }
+    }
+
+    fn finish_success(mut self) {
+        commit_coalescer_heartbeat_record_success(self.started_at);
+        self.finished = true;
+    }
+
+    fn finish_failure(mut self) {
+        commit_coalescer_heartbeat_record_failure();
+        self.finished = true;
+    }
+}
+
+impl Drop for CoalescerHeartbeatCycle {
+    fn drop(&mut self) {
+        if !self.finished && !std::thread::panicking() {
+            commit_coalescer_heartbeat_record_success(self.started_at);
+        }
+    }
+}
+
 /// Worker thread for the per-repo commit coalescer pool.
 ///
 /// Strategy:
@@ -2605,6 +2770,7 @@ fn coalescer_pool_worker(
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
+        let heartbeat = CoalescerHeartbeatCycle::begin();
 
         // Phase 1: Wait for work
         {
@@ -2704,7 +2870,7 @@ fn coalescer_pool_worker(
             }
 
             // Successfully claimed repo.
-            self_process_repo(
+            let had_failure = self_process_repo(
                 &repo_root,
                 &rq,
                 &stats,
@@ -2714,6 +2880,11 @@ fn coalescer_pool_worker(
                 &repos,
                 &work_cv,
             );
+            if had_failure {
+                heartbeat.finish_failure();
+            } else {
+                heartbeat.finish_success();
+            }
             break;
         }
     }
@@ -2729,7 +2900,8 @@ fn self_process_repo(
     worker_count: usize,
     repos: &Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
     work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
-) {
+) -> bool {
+    let mut had_failure = false;
     let max_batch_size = configured_coalescer_batch_size();
 
     // RAII guard to ensure processing flag is cleared even on panic
@@ -2886,6 +3058,7 @@ fn self_process_repo(
                 coalescer_note_commit_success(rq);
             }
             if !failed_requests.is_empty() {
+                had_failure = true;
                 coalescer_note_commit_failure(rq);
                 coalescer_requeue_requests(rq, failed_requests);
             }
@@ -2899,6 +3072,7 @@ fn self_process_repo(
     if let Some(work) = panic_guard.inflight_spilled.as_ref() {
         let outcome = coalescer_commit_spilled_work(work, stats, batch_sizes);
         if let Some(failed_work) = outcome.failed_work {
+            had_failure = true;
             rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             coalescer_note_commit_failure(rq);
             coalescer_restore_spilled_work(rq, failed_work);
@@ -2957,6 +3131,8 @@ fn self_process_repo(
     if more_work {
         coalescer_signal_worker(work_cv, worker_count);
     }
+
+    had_failure
 }
 
 /// Update global pending_requests counter and 80% threshold metric.
@@ -9394,6 +9570,43 @@ mod tests {
     fn coalescer_flush_interval_preserves_reasonable_values() {
         let interval = Duration::from_millis(50);
         assert_eq!(clamp_coalescer_flush_interval(interval), interval);
+    }
+
+    #[test]
+    fn commit_coalescer_heartbeat_tracks_success_failure_and_recovery() {
+        let heartbeat = CommitCoalescerHeartbeat::new();
+
+        heartbeat.record_tick_at(100, 1_000);
+        heartbeat.record_success_at(125, 25);
+
+        let first = heartbeat.snapshot();
+        assert_eq!(first.last_tick_micros, 100);
+        assert_eq!(first.last_success_micros, 125);
+        assert_eq!(first.last_success_duration_micros, 25);
+        assert_eq!(first.last_gap_micros, 0);
+        assert_eq!(first.ticks_total, 1);
+        assert_eq!(first.successes_total, 1);
+        assert_eq!(first.failures_total, 0);
+        assert_eq!(first.consecutive_failures, 0);
+
+        heartbeat.record_tick_at(175, 1_150);
+        heartbeat.record_failure_at(200);
+
+        let failed = heartbeat.snapshot();
+        assert_eq!(failed.last_tick_micros, 175);
+        assert_eq!(failed.last_failure_micros, 200);
+        assert_eq!(failed.last_gap_micros, 150);
+        assert_eq!(failed.ticks_total, 2);
+        assert_eq!(failed.successes_total, 1);
+        assert_eq!(failed.failures_total, 1);
+        assert_eq!(failed.consecutive_failures, 1);
+
+        heartbeat.record_success_at(250, 30);
+
+        let recovered = heartbeat.snapshot();
+        assert_eq!(recovered.last_success_micros, 250);
+        assert_eq!(recovered.last_success_duration_micros, 30);
+        assert_eq!(recovered.consecutive_failures, 0);
     }
 
     #[test]

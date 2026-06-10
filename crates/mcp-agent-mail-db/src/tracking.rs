@@ -18,7 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use mcp_agent_mail_core::{LockLevel, OrderedMutex};
+use mcp_agent_mail_core::{
+    LockLevel, OrderedMutex,
+    metrics::{HistogramSnapshot, Log2Histogram},
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -334,6 +337,7 @@ pub struct QueryTracker {
     enabled: AtomicBool,
     total: AtomicU64,
     total_time_us: AtomicU64,
+    latency_us: Log2Histogram,
     slow_enabled: AtomicBool,
     slow_threshold_us: AtomicU64,
     /// Lock-free per-table counters indexed by `TableId`.
@@ -361,6 +365,7 @@ impl QueryTracker {
             enabled: AtomicBool::new(false),
             total: AtomicU64::new(0),
             total_time_us: AtomicU64::new(0),
+            latency_us: Log2Histogram::new(),
             slow_enabled: AtomicBool::new(true),
             slow_threshold_us: AtomicU64::new(250_000), // 250ms default
             per_table: new_atomic_array(),
@@ -411,6 +416,7 @@ impl QueryTracker {
         // Atomic counters — no locks
         self.total.fetch_add(1, Ordering::Relaxed);
         self.total_time_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.latency_us.record(duration_us);
 
         // Fast table ID extraction (no regex, no allocation)
         let table_id = extract_table_id(sql);
@@ -483,6 +489,7 @@ impl QueryTracker {
         QueryTrackerSnapshot {
             total: self.total.load(Ordering::Relaxed),
             total_time_ms: round_ms(self.total_time_us.load(Ordering::Relaxed)),
+            latency_us: self.latency_us.snapshot(),
             per_table,
             slow_query_ms: if self.slow_enabled.load(Ordering::Acquire) {
                 Some(self.slow_threshold_us.load(Ordering::Relaxed) as f64 / 1000.0)
@@ -497,6 +504,7 @@ impl QueryTracker {
     pub fn reset(&self) {
         self.total.store(0, Ordering::Relaxed);
         self.total_time_us.store(0, Ordering::Relaxed);
+        self.latency_us.reset();
         for counter in &self.per_table {
             counter.store(0, Ordering::Relaxed);
         }
@@ -511,6 +519,8 @@ impl QueryTracker {
 pub struct QueryTrackerSnapshot {
     pub total: u64,
     pub total_time_ms: f64,
+    #[serde(default)]
+    pub latency_us: HistogramSnapshot,
     pub per_table: std::collections::HashMap<String, u64>,
     pub slow_query_ms: Option<f64>,
     pub slow_queries: Vec<SlowQueryEntry>,
@@ -860,6 +870,7 @@ mod tests {
         tracker.record("SELECT 1 FROM projects", 100);
         let snap = tracker.snapshot();
         assert_eq!(snap.total, 0);
+        assert_eq!(snap.latency_us.count, 0);
     }
 
     #[test]
@@ -870,6 +881,9 @@ mod tests {
         tracker.record("INSERT INTO agents (name) VALUES ('x')", 200_000); // 200ms (slow)
         let snap = tracker.snapshot();
         assert_eq!(snap.total, 2);
+        assert_eq!(snap.latency_us.count, 2);
+        assert_eq!(snap.latency_us.sum, 250_000);
+        assert_eq!(snap.latency_us.max, 200_000);
         assert_eq!(snap.per_table.get("messages"), Some(&1));
         assert_eq!(snap.per_table.get("agents"), Some(&1));
         // 200ms >= 100ms threshold → slow
@@ -885,6 +899,7 @@ mod tests {
         tracker.reset();
         let snap = tracker.snapshot();
         assert_eq!(snap.total, 0);
+        assert_eq!(snap.latency_us.count, 0);
         assert!(snap.per_table.is_empty());
     }
 
@@ -1104,6 +1119,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["total"], 2);
         assert!(v["total_time_ms"].is_f64());
+        assert_eq!(v["latency_us"]["count"], 2);
     }
 
     #[test]
@@ -1565,6 +1581,7 @@ mod tests {
         assert_eq!(snap.per_table.get("agents"), Some(&2));
         assert_eq!(snap.slow_query_ms, Some(100.0));
         assert_eq!(snap.slow_queries.len(), 1);
+        assert_eq!(snap.latency_us.count, 0);
     }
 
     #[test]

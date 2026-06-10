@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -139,7 +139,7 @@ pub struct Log2Histogram {
     max: AtomicU64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HistogramSnapshot {
     pub count: u64,
     pub sum: u64,

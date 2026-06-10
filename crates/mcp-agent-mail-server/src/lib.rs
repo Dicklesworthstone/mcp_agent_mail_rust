@@ -26475,6 +26475,7 @@ first body
         let before = mcp_agent_mail_db::QueryTrackerSnapshot {
             total: 10,
             total_time_ms: 5.0,
+            latency_us: mcp_agent_mail_core::metrics::HistogramSnapshot::default(),
             per_table: [("messages".to_string(), 8), ("agents".to_string(), 2)]
                 .into_iter()
                 .collect(),
@@ -26484,6 +26485,7 @@ first body
         let after = mcp_agent_mail_db::QueryTrackerSnapshot {
             total: 15,
             total_time_ms: 8.5,
+            latency_us: mcp_agent_mail_core::metrics::HistogramSnapshot::default(),
             per_table: [
                 ("messages".to_string(), 12),
                 ("agents".to_string(), 2),

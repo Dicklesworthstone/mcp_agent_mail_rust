@@ -22,7 +22,7 @@ use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
 use mcp_agent_mail_db::timestamps::now_micros;
 
-use crate::tui_bridge::{DbWarmupState, TuiSharedState};
+use crate::tui_bridge::{DbWarmupState, TuiLoopHeartbeatKind, TuiSharedState};
 use crate::tui_events::{
     AgentSummary, ContactSummary, DbStatSnapshot, MailEvent, ProjectSummary, ReservationSnapshot,
 };
@@ -472,8 +472,11 @@ impl DbPoller {
             .unwrap_or(now);
 
         while !self.stop.load(Ordering::Relaxed) {
+            let poll_started = Instant::now();
+            self.state.mark_loop_tick(TuiLoopHeartbeatKind::DbPoll);
             let mut allow_poll = true;
             let mut warmup_wait_consumed_interval = false;
+            let mut poll_fetch_started = None;
             if connection_state.is_none() && prev.timestamp_micros == 0 {
                 match self.state.wait_for_db_warmup(self.interval) {
                     DbWarmupState::Ready => {}
@@ -500,6 +503,7 @@ impl DbPoller {
             }
             // Fetch fresh snapshot
             let snapshot_update = if allow_poll {
+                poll_fetch_started = Some(Instant::now());
                 if let Ok(snapshot) = catch_optional_panic(std::panic::AssertUnwindSafe(|| {
                     if connection_state.is_none() {
                         let config = self.state.config_snapshot();
@@ -534,6 +538,10 @@ impl DbPoller {
                 None
             };
             if let Some(update) = snapshot_update {
+                self.state.mark_loop_success(
+                    TuiLoopHeartbeatKind::DbPoll,
+                    poll_fetch_started.unwrap_or(poll_started),
+                );
                 self.state.mark_db_context_available();
                 self.state.mark_db_ready();
                 match update {
@@ -562,6 +570,7 @@ impl DbPoller {
                     .checked_sub(DB_WARMUP_FAILURE_RETRY_INTERVAL)
                     .unwrap_or_else(Instant::now);
             } else if allow_poll {
+                self.state.mark_loop_failure(TuiLoopHeartbeatKind::DbPoll);
                 self.state.mark_db_context_unavailable();
                 connection_state = None;
             }

@@ -10,7 +10,7 @@ use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REQUEST_SPARKLINE_CAPACITY: usize = 60;
 const REMOTE_TERMINAL_EVENT_QUEUE_CAPACITY: usize = 4096;
@@ -361,6 +361,169 @@ fn assert_screen_truth(snapshot: &ScreenDiagnosticSnapshot) {
     }
 }
 
+const TUI_LOOP_HEARTBEAT_KIND_COUNT: usize = 5;
+
+/// Long-running loops whose progress must stay visible to the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiLoopHeartbeatKind {
+    Render,
+    Input,
+    DbPoll,
+    McpApi,
+    CommitCoalescer,
+}
+
+impl TuiLoopHeartbeatKind {
+    pub const ALL: [Self; TUI_LOOP_HEARTBEAT_KIND_COUNT] = [
+        Self::Render,
+        Self::Input,
+        Self::DbPoll,
+        Self::McpApi,
+        Self::CommitCoalescer,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Render => 0,
+            Self::Input => 1,
+            Self::DbPoll => 2,
+            Self::McpApi => 3,
+            Self::CommitCoalescer => 4,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Render => "render",
+            Self::Input => "input",
+            Self::DbPoll => "db_poll",
+            Self::McpApi => "mcp_api",
+            Self::CommitCoalescer => "commit_coalescer",
+        }
+    }
+}
+
+/// Lock-free point-in-time progress snapshot for a long-running TUI loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiLoopHeartbeatSnapshot {
+    pub kind: TuiLoopHeartbeatKind,
+    pub last_tick_micros: i64,
+    pub last_success_micros: i64,
+    pub last_failure_micros: i64,
+    pub last_gap_micros: u64,
+    pub last_success_duration_micros: u64,
+    pub ticks_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub consecutive_failures: u64,
+}
+
+#[derive(Debug)]
+struct LoopHeartbeatSlot {
+    last_tick_micros: AtomicI64,
+    last_tick_elapsed_micros: AtomicU64,
+    last_success_micros: AtomicI64,
+    last_failure_micros: AtomicI64,
+    last_gap_micros: AtomicU64,
+    last_success_duration_micros: AtomicU64,
+    ticks_total: AtomicU64,
+    successes_total: AtomicU64,
+    failures_total: AtomicU64,
+    consecutive_failures: AtomicU64,
+}
+
+impl LoopHeartbeatSlot {
+    fn new() -> Self {
+        Self {
+            last_tick_micros: AtomicI64::new(0),
+            last_tick_elapsed_micros: AtomicU64::new(0),
+            last_success_micros: AtomicI64::new(0),
+            last_failure_micros: AtomicI64::new(0),
+            last_gap_micros: AtomicU64::new(0),
+            last_success_duration_micros: AtomicU64::new(0),
+            ticks_total: AtomicU64::new(0),
+            successes_total: AtomicU64::new(0),
+            failures_total: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoopHeartbeatSlots {
+    slots: [LoopHeartbeatSlot; TUI_LOOP_HEARTBEAT_KIND_COUNT],
+}
+
+impl LoopHeartbeatSlots {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| LoopHeartbeatSlot::new()),
+        }
+    }
+
+    fn record_tick_at(&self, kind: TuiLoopHeartbeatKind, now_micros: i64, elapsed_micros: u64) {
+        let slot = &self.slots[kind.index()];
+        let previous_elapsed = slot
+            .last_tick_elapsed_micros
+            .swap(elapsed_micros, Ordering::Relaxed);
+        slot.last_tick_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        if previous_elapsed > 0 {
+            slot.last_gap_micros.store(
+                elapsed_micros.saturating_sub(previous_elapsed),
+                Ordering::Relaxed,
+            );
+        }
+        slot.ticks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_success_at(&self, kind: TuiLoopHeartbeatKind, now_micros: i64, duration_micros: u64) {
+        let slot = &self.slots[kind.index()];
+        slot.last_success_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        slot.last_success_duration_micros
+            .store(duration_micros, Ordering::Relaxed);
+        slot.successes_total.fetch_add(1, Ordering::Relaxed);
+        slot.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure_at(&self, kind: TuiLoopHeartbeatKind, now_micros: i64) {
+        let slot = &self.slots[kind.index()];
+        slot.last_failure_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        slot.failures_total.fetch_add(1, Ordering::Relaxed);
+        slot.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, kind: TuiLoopHeartbeatKind) -> TuiLoopHeartbeatSnapshot {
+        let slot = &self.slots[kind.index()];
+        TuiLoopHeartbeatSnapshot {
+            kind,
+            last_tick_micros: slot.last_tick_micros.load(Ordering::Relaxed),
+            last_success_micros: slot.last_success_micros.load(Ordering::Relaxed),
+            last_failure_micros: slot.last_failure_micros.load(Ordering::Relaxed),
+            last_gap_micros: slot.last_gap_micros.load(Ordering::Relaxed),
+            last_success_duration_micros: slot.last_success_duration_micros.load(Ordering::Relaxed),
+            ticks_total: slot.ticks_total.load(Ordering::Relaxed),
+            successes_total: slot.successes_total.load(Ordering::Relaxed),
+            failures_total: slot.failures_total.load(Ordering::Relaxed),
+            consecutive_failures: slot.consecutive_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn loop_heartbeat_now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn elapsed_micros_u64(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteTerminalEvent {
     Key { key: String, modifiers: u8 },
@@ -468,6 +631,8 @@ pub struct TuiSharedState {
     next_active_reservation_expiry_micros: AtomicI64,
     /// Generation counter bumped on each `record_request` call.
     request_gen: AtomicU64,
+    /// Lock-free per-loop progress markers for freeze/stall diagnosis.
+    loop_heartbeats: LoopHeartbeatSlots,
     /// Startup latches used to stage heavyweight background work behind first
     /// paint and behind the initial DB readiness result.
     startup_signals: (Mutex<StartupSignalState>, Condvar),
@@ -518,6 +683,7 @@ impl TuiSharedState {
             urgent_ack_pending: AtomicBool::new(false),
             next_active_reservation_expiry_micros: AtomicI64::new(0),
             request_gen: AtomicU64::new(0),
+            loop_heartbeats: LoopHeartbeatSlots::new(),
             startup_signals: (Mutex::new(StartupSignalState::default()), Condvar::new()),
             web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore::new(),
         })
@@ -659,6 +825,15 @@ impl TuiSharedState {
     }
 
     pub fn record_request(&self, status: u16, duration_ms: u64) {
+        self.mark_loop_tick(TuiLoopHeartbeatKind::McpApi);
+        if (500..=599).contains(&status) {
+            self.mark_loop_failure(TuiLoopHeartbeatKind::McpApi);
+        } else {
+            self.mark_loop_success_with_duration(
+                TuiLoopHeartbeatKind::McpApi,
+                duration_ms.saturating_mul(1_000),
+            );
+        }
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.request_gen.fetch_add(1, Ordering::Relaxed);
         self.latency_total_ms
@@ -678,6 +853,61 @@ impl TuiSharedState {
 
         let duration_ms_f64 = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX));
         self.sparkline_data.push(duration_ms_f64);
+    }
+
+    pub fn mark_loop_tick(&self, kind: TuiLoopHeartbeatKind) {
+        self.loop_heartbeats.record_tick_at(
+            kind,
+            loop_heartbeat_now_micros(),
+            elapsed_micros_u64(self.started_at),
+        );
+    }
+
+    pub fn mark_loop_success(&self, kind: TuiLoopHeartbeatKind, started_at: Instant) {
+        self.mark_loop_success_with_duration(kind, elapsed_micros_u64(started_at));
+    }
+
+    pub fn mark_loop_success_with_duration(
+        &self,
+        kind: TuiLoopHeartbeatKind,
+        duration_micros: u64,
+    ) {
+        self.loop_heartbeats
+            .record_success_at(kind, loop_heartbeat_now_micros(), duration_micros);
+    }
+
+    pub fn mark_loop_failure(&self, kind: TuiLoopHeartbeatKind) {
+        self.loop_heartbeats
+            .record_failure_at(kind, loop_heartbeat_now_micros());
+    }
+
+    #[must_use]
+    pub fn loop_heartbeat_snapshot(&self, kind: TuiLoopHeartbeatKind) -> TuiLoopHeartbeatSnapshot {
+        if kind == TuiLoopHeartbeatKind::CommitCoalescer
+            && let Some(snapshot) = mcp_agent_mail_storage::commit_coalescer_heartbeat_snapshot()
+        {
+            return TuiLoopHeartbeatSnapshot {
+                kind,
+                last_tick_micros: snapshot.last_tick_micros,
+                last_success_micros: snapshot.last_success_micros,
+                last_failure_micros: snapshot.last_failure_micros,
+                last_gap_micros: snapshot.last_gap_micros,
+                last_success_duration_micros: snapshot.last_success_duration_micros,
+                ticks_total: snapshot.ticks_total,
+                successes_total: snapshot.successes_total,
+                failures_total: snapshot.failures_total,
+                consecutive_failures: snapshot.consecutive_failures,
+            };
+        }
+        self.loop_heartbeats.snapshot(kind)
+    }
+
+    #[must_use]
+    pub fn loop_heartbeats_snapshot(&self) -> Vec<TuiLoopHeartbeatSnapshot> {
+        TuiLoopHeartbeatKind::ALL
+            .iter()
+            .map(|kind| self.loop_heartbeat_snapshot(*kind))
+            .collect()
     }
 
     pub fn update_db_stats(&self, stats: DbStatSnapshot) {
@@ -1358,6 +1588,56 @@ mod tests {
         assert_eq!(counters.status_4xx, 1);
         assert_eq!(counters.status_5xx, 1);
         assert_eq!(state.avg_latency_ms(), 20);
+
+        let heartbeat = state.loop_heartbeat_snapshot(TuiLoopHeartbeatKind::McpApi);
+        assert_eq!(heartbeat.ticks_total, 3);
+        assert_eq!(heartbeat.successes_total, 2);
+        assert_eq!(heartbeat.failures_total, 1);
+        assert_eq!(heartbeat.consecutive_failures, 1);
+        assert_eq!(heartbeat.last_success_duration_micros, 30_000);
+        assert!(heartbeat.last_tick_micros > 0);
+        assert!(heartbeat.last_success_micros > 0);
+        assert!(heartbeat.last_failure_micros > 0);
+    }
+
+    #[test]
+    fn loop_heartbeat_slots_track_tick_success_and_failure() {
+        let heartbeats = LoopHeartbeatSlots::new();
+
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 100, 1_000);
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 75, 1_075);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Render, 190, 12);
+        heartbeats.record_failure_at(TuiLoopHeartbeatKind::Render, 210);
+
+        let render = heartbeats.snapshot(TuiLoopHeartbeatKind::Render);
+        assert_eq!(render.kind, TuiLoopHeartbeatKind::Render);
+        assert_eq!(render.last_tick_micros, 75);
+        assert_eq!(render.last_success_micros, 190);
+        assert_eq!(render.last_failure_micros, 210);
+        assert_eq!(render.last_gap_micros, 75);
+        assert_eq!(render.last_success_duration_micros, 12);
+        assert_eq!(render.ticks_total, 2);
+        assert_eq!(render.successes_total, 1);
+        assert_eq!(render.failures_total, 1);
+        assert_eq!(render.consecutive_failures, 1);
+
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Render, 230, 8);
+        assert_eq!(
+            heartbeats
+                .snapshot(TuiLoopHeartbeatKind::Render)
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[test]
+    fn loop_heartbeats_snapshot_covers_every_known_loop() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let snapshots = state.loop_heartbeats_snapshot();
+        let kinds: Vec<TuiLoopHeartbeatKind> =
+            snapshots.iter().map(|snapshot| snapshot.kind).collect();
+        assert_eq!(kinds, TuiLoopHeartbeatKind::ALL.as_slice());
     }
 
     #[test]

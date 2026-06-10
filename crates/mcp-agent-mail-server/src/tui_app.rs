@@ -39,7 +39,9 @@ use ftui_runtime::tick_strategy::ScreenTickDispatch;
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
-use crate::tui_bridge::{RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiSharedState};
+use crate::tui_bridge::{
+    RemoteTerminalEvent, ServerControlMsg, TransportBase, TuiLoopHeartbeatKind, TuiSharedState,
+};
 use crate::tui_compose::{ComposeAction, ComposePanel, ComposeState};
 use crate::tui_decision::{BayesianDiffStrategy, DiffAction, FrameState as TuiDiffFrameState};
 use crate::tui_events::{EventSeverity, MailEvent};
@@ -165,6 +167,31 @@ fn screen_id_from_tick_key(id: &str) -> Option<MailScreenId> {
         "archive_browser" => Some(MailScreenId::ArchiveBrowser),
         "atc" => Some(MailScreenId::Atc),
         _ => None,
+    }
+}
+
+struct LoopHeartbeatSuccessGuard {
+    state: Arc<TuiSharedState>,
+    kind: TuiLoopHeartbeatKind,
+    started_at: Instant,
+}
+
+impl LoopHeartbeatSuccessGuard {
+    fn new(state: Arc<TuiSharedState>, kind: TuiLoopHeartbeatKind) -> Self {
+        state.mark_loop_tick(kind);
+        Self {
+            state,
+            kind,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for LoopHeartbeatSuccessGuard {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.state.mark_loop_success(self.kind, self.started_at);
+        }
     }
 }
 
@@ -4388,6 +4415,10 @@ impl Model for MailAppModel {
 
             // ── Terminal events (key, mouse, resize, etc.) ─────────
             MailMsg::Terminal(ref event) => {
+                let _input_heartbeat = LoopHeartbeatSuccessGuard::new(
+                    Arc::clone(&self.state),
+                    TuiLoopHeartbeatKind::Input,
+                );
                 if let Event::Resize { width, height } = *event {
                     self.queue_resize_event(width, height);
                     return Cmd::none();
@@ -4922,7 +4953,9 @@ impl Model for MailAppModel {
         // The app renders its own caret/highlight treatment in widgets. Keep the
         // terminal cursor hidden to prevent visible cursor trails during refresh.
         frame.cursor_visible = false;
-        let diff_frame_started = Instant::now();
+        let render_started = Instant::now();
+        self.state.mark_loop_tick(TuiLoopHeartbeatKind::Render);
+        let diff_frame_started = render_started;
         let diff_decision = self.begin_diff_frame();
         self.apply_diff_frame_decision(diff_decision, frame);
 
@@ -5301,6 +5334,8 @@ impl Model for MailAppModel {
         // Signal first paint only after the full frame has rendered successfully.
         // Waking deferred workers at view-start lets heavy startup work contend
         // with the initial frame instead of staging behind it.
+        self.state
+            .mark_loop_success(TuiLoopHeartbeatKind::Render, render_started);
         self.state.mark_first_paint();
     }
 
