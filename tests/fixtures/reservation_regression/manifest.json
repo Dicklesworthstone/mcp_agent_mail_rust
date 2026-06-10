@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "corpus_id": "agent-mail-reservation-regression-corpus",
+  "generated_by": "br-bvq1x.6.4",
+  "fixtures": [
+    {
+      "id": "stale_agent_id_row",
+      "title": "DB reservation row points at a stale agent while archive JSON has the real holder",
+      "incident_anchor": "#112 196-reservation audit: stale agent_id rows after reservation drift",
+      "drift_mode": "db_stale_agent_id_archive_holder_mismatch",
+      "expected_detector": "reservation_db_archive_parity",
+      "consumers": ["br-bvq1x.6.1", "br-bvq1x.6.2"],
+      "expected_mismatches": [
+        "db_agent=StaleHolder",
+        "archive_agent=CorrectHolder",
+        "reservation_id=101"
+      ],
+      "artifacts": [
+        {
+          "path": "stale_agent_id_row/storage.sql",
+          "kind": "sqlite_seed_sql",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/stale_agent_id_row.sql"
+          }
+        },
+        {
+          "path": "stale_agent_id_row/projects/reservation-regression/file_reservations/id-101.json",
+          "kind": "archive_reservation_json",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/stale_agent_id_row_archive_id_101.json"
+          }
+        }
+      ]
+    },
+    {
+      "id": "stuck_null_released_ts",
+      "title": "Released archive reservation remains active in SQLite because released_ts is stuck NULL",
+      "incident_anchor": "#112 196-reservation audit: stuck-NULL released_ts rows kept reservations active",
+      "drift_mode": "db_released_ts_null_archive_released",
+      "expected_detector": "reservation_release_idempotency",
+      "consumers": ["br-bvq1x.6.2", "br-bvq1x.6.3"],
+      "expected_mismatches": [
+        "db_released_ts=NULL",
+        "archive_released_ts=1700002010000000",
+        "reservation_id=201"
+      ],
+      "artifacts": [
+        {
+          "path": "stuck_null_released_ts/storage.sql",
+          "kind": "sqlite_seed_sql",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/stuck_null_released_ts.sql"
+          }
+        },
+        {
+          "path": "stuck_null_released_ts/projects/reservation-regression/file_reservations/id-201.json",
+          "kind": "archive_reservation_json",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/stuck_null_released_ts_archive_id_201.json"
+          }
+        }
+      ]
+    },
+    {
+      "id": "db_archive_active_state_mismatch",
+      "title": "SQLite release ledger says released while archive JSON still says active",
+      "incident_anchor": "#112 196-reservation audit: active/released status mismatch between SQLite and archive JSON",
+      "drift_mode": "db_released_archive_active",
+      "expected_detector": "reservation_db_archive_parity",
+      "consumers": ["br-bvq1x.6.2", "br-bvq1x.6.3"],
+      "expected_mismatches": [
+        "db_release_ledger=1700003010000000",
+        "archive_released_ts=NULL",
+        "reservation_id=301"
+      ],
+      "artifacts": [
+        {
+          "path": "db_archive_active_state_mismatch/storage.sql",
+          "kind": "sqlite_seed_sql",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/db_archive_active_state_mismatch.sql"
+          }
+        },
+        {
+          "path": "db_archive_active_state_mismatch/projects/reservation-regression/file_reservations/id-301.json",
+          "kind": "archive_reservation_json",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/db_archive_active_state_mismatch_archive_id_301.json"
+          }
+        }
+      ]
+    },
+    {
+      "id": "btree_page_2288_release_malformed",
+      "title": "Release path encounters malformed B-tree page 2288",
+      "incident_anchor": "ts2 repair saga: malformed B-tree page 2288 during reservation release",
+      "drift_mode": "release_query_malformed_btree_page_2288",
+      "expected_detector": "reservation_release_corrupt_db_gate",
+      "consumers": ["br-bvq1x.6.1", "br-bvq1x.6.3", "br-bvq1x.12.1"],
+      "expected_mismatches": [
+        "operation=release_file_reservations",
+        "sqlite_signal=database disk image is malformed",
+        "btree_page=2288"
+      ],
+      "artifacts": [
+        {
+          "path": "btree_page_2288_release_malformed/storage.sqlite3",
+          "kind": "corruption_corpus_reference",
+          "recipe": {
+            "type": "corruption_corpus_fixture",
+            "corpus": "tests/fixtures/corruption_corpus/manifest.json",
+            "fixture_id": "btree_page_type_zero"
+          }
+        }
+      ]
+    }
+  ]
+}

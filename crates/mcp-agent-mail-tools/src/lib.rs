@@ -32,6 +32,7 @@ pub mod messaging;
 pub mod metrics;
 pub mod products;
 pub mod reservation_index;
+pub mod reservation_parity;
 pub mod reservations;
 pub mod resources;
 pub mod search;
@@ -48,6 +49,7 @@ pub use metrics::{
     slow_tools, tool_index, tool_meta, tool_metrics_snapshot, tool_metrics_snapshot_full,
 };
 pub use products::*;
+pub use reservation_parity::*;
 pub use reservations::*;
 pub use resources::*;
 pub use search::*;

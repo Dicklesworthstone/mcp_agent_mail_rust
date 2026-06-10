@@ -1,0 +1,11 @@
+{
+  "id": 201,
+  "project": "reservation-regression",
+  "agent": "ReleaseHolder",
+  "path_pattern": "src/stuck-null.rs",
+  "exclusive": true,
+  "reason": "br-bvq1x.6.4 stuck NULL released_ts fixture",
+  "created_ts": 1700002010000000,
+  "expires_ts": 1700005610000000,
+  "released_ts": 1700002010000000
+}

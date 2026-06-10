@@ -12,13 +12,15 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
-use mcp_agent_mail_db::micros_to_iso;
+use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::io::Write as IoWrite;
+use std::path::{Path, PathBuf};
 
 use crate::messaging::{
     enqueue_message_semantic_index, try_dispatch_archive_write, try_write_message_archive,
@@ -31,6 +33,13 @@ use crate::resources::{
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
+
+const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
+const RELEASE_INTENT_KIND: &str = "release_file_reservations_intent";
+const RELEASE_INTENT_REPLAY_KIND: &str = "release_file_reservations_replay";
+const RELEASE_INTENT_DIR: &str = "degraded_intents";
+const RELEASE_INTENT_LOG_FILE: &str = "release_file_reservations.jsonl";
+const RELEASE_INTENT_LOCK_FILE: &str = ".release_file_reservations.jsonl.lock";
 
 /// Granted reservation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +93,26 @@ pub struct ReservationResponse {
 pub struct ReleaseResult {
     pub released: i32,
     pub released_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseIntentReceipt {
+    intent_id: String,
+    intent_path: PathBuf,
+    content_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QueuedReleaseIntent {
+    kind: String,
+    intent_id: String,
+    content_sha256: String,
+    project_key: String,
+    agent_name: String,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    #[serde(default)]
+    file_reservation_ids: Option<Vec<i64>>,
 }
 
 /// Renewal result
@@ -288,6 +317,522 @@ fn released_ts_json_value(released_ts: Option<i64>) -> serde_json::Value {
     released_ts.map_or(serde_json::Value::Null, |ts| {
         serde_json::Value::String(micros_to_iso(ts))
     })
+}
+
+fn release_intent_log_path(config: &Config) -> PathBuf {
+    config
+        .storage_root
+        .join(RELEASE_INTENT_DIR)
+        .join(RELEASE_INTENT_LOG_FILE)
+}
+
+fn release_intent_lock_path(config: &Config) -> PathBuf {
+    config
+        .storage_root
+        .join(RELEASE_INTENT_DIR)
+        .join(RELEASE_INTENT_LOCK_FILE)
+}
+
+fn reject_existing_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "release intent path must not be a symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_release_intent_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::other("release intent log has no parent"));
+    };
+    reject_existing_symlink(parent)?;
+    std::fs::create_dir_all(parent)?;
+    reject_existing_symlink(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn hash_json_value(value: &Value) -> String {
+    let bytes = serde_json::to_vec(value).expect("serializing serde_json::Value should not fail");
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn release_intent_hash_payload(record: &Value) -> Value {
+    json!({
+        "schema_version": record["schema_version"].clone(),
+        "kind": record["kind"].clone(),
+        "created_ts": record["created_ts"].clone(),
+        "project_key": record["project_key"].clone(),
+        "agent_name": record["agent_name"].clone(),
+        "paths": record["paths"].clone(),
+        "file_reservation_ids": record["file_reservation_ids"].clone(),
+        "failure": record["failure"].clone(),
+    })
+}
+
+fn release_replay_hash_payload(record: &Value) -> Value {
+    json!({
+        "schema_version": record["schema_version"].clone(),
+        "kind": record["kind"].clone(),
+        "intent_id": record["intent_id"].clone(),
+        "intent_content_sha256": record["intent_content_sha256"].clone(),
+        "replayed_ts": record["replayed_ts"].clone(),
+        "status": record["status"].clone(),
+        "released": record["released"].clone(),
+        "error_detail": record["error_detail"].clone(),
+    })
+}
+
+fn release_intent_record_has_valid_hash(record: &Value) -> bool {
+    let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(intent_id) = record.get("intent_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let computed_hash = hash_json_value(&release_intent_hash_payload(record));
+    content_sha256.len() == 64
+        && intent_id.len() == 16
+        && content_sha256 == computed_hash
+        && content_sha256.starts_with(intent_id)
+}
+
+fn release_replay_record_has_valid_hash(record: &Value) -> bool {
+    let Some(content_sha256) = record.get("content_sha256").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(intent_id) = record.get("intent_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(intent_content_sha256) = record.get("intent_content_sha256").and_then(Value::as_str)
+    else {
+        return false;
+    };
+    content_sha256.len() == 64
+        && intent_id.len() == 16
+        && intent_content_sha256.len() == 64
+        && intent_content_sha256.starts_with(intent_id)
+        && content_sha256 == hash_json_value(&release_replay_hash_payload(record))
+}
+
+fn append_release_intent_jsonl(config: &Config, record: &Value) -> std::io::Result<PathBuf> {
+    let path = release_intent_log_path(config);
+    ensure_release_intent_parent(&path)?;
+    reject_existing_symlink(&path)?;
+    let lock_path = release_intent_lock_path(config);
+    reject_existing_symlink(&lock_path)?;
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        lock_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut line =
+        serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?;
+    line.push(b'\n');
+    file.write_all(&line)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(path)
+}
+
+fn append_release_intent(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    paths: Option<Vec<String>>,
+    file_reservation_ids: Option<Vec<i64>>,
+    failure_stage: &str,
+    error_detail: &str,
+) -> std::io::Result<ReleaseIntentReceipt> {
+    let created_ts = mcp_agent_mail_db::now_micros();
+    let payload = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_KIND,
+        "created_ts": created_ts,
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "paths": paths,
+        "file_reservation_ids": file_reservation_ids,
+        "failure": {
+            "stage": failure_stage,
+            "error_detail": error_detail,
+        },
+    });
+    let content_sha256 = hash_json_value(&payload);
+    let intent_id = content_sha256.chars().take(16).collect::<String>();
+    let record = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_KIND,
+        "intent_id": intent_id,
+        "content_sha256": content_sha256,
+        "created_ts": created_ts,
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "paths": payload["paths"].clone(),
+        "file_reservation_ids": payload["file_reservation_ids"].clone(),
+        "failure": payload["failure"].clone(),
+    });
+    let intent_path = append_release_intent_jsonl(config, &record)?;
+    Ok(ReleaseIntentReceipt {
+        intent_id,
+        intent_path,
+        content_sha256,
+    })
+}
+
+fn append_release_replay_record(
+    config: &Config,
+    intent_id: &str,
+    intent_content_sha256: &str,
+    status: &str,
+    released: usize,
+    error_detail: Option<&str>,
+) {
+    let replayed_ts = mcp_agent_mail_db::now_micros();
+    let payload = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_REPLAY_KIND,
+        "intent_id": intent_id,
+        "intent_content_sha256": intent_content_sha256,
+        "replayed_ts": replayed_ts,
+        "status": status,
+        "released": released,
+        "error_detail": error_detail,
+    });
+    let content_sha256 = hash_json_value(&payload);
+    let record = json!({
+        "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+        "kind": RELEASE_INTENT_REPLAY_KIND,
+        "intent_id": intent_id,
+        "content_sha256": content_sha256,
+        "intent_content_sha256": intent_content_sha256,
+        "replayed_ts": replayed_ts,
+        "status": status,
+        "released": released,
+        "error_detail": error_detail,
+    });
+    if let Err(error) = append_release_intent_jsonl(config, &record) {
+        tracing::warn!(
+            error = %error,
+            intent_id,
+            "failed to append release intent replay record"
+        );
+    }
+}
+
+fn queued_release_intent_response(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    paths: Option<Vec<String>>,
+    file_reservation_ids: Option<Vec<i64>>,
+    failure_stage: &str,
+    error_detail: &str,
+) -> McpResult<String> {
+    let receipt = append_release_intent(
+        config,
+        project_key,
+        agent_name,
+        paths,
+        file_reservation_ids,
+        failure_stage,
+        error_detail,
+    )
+    .map_err(|error| {
+        legacy_tool_error(
+            "RELEASE_INTENT_WRITE_FAILED",
+            format!(
+                "Could not release reservations because the database is unavailable, and writing \
+                 the local release-intent log also failed: {error}"
+            ),
+            false,
+            json!({ "error_detail": error.to_string() }),
+        )
+    })?;
+    serde_json::to_string(&json!({
+        "released": 0,
+        "released_at": micros_to_iso(mcp_agent_mail_db::now_micros()),
+        "status": "queued",
+        "queued": true,
+        "message": "lease release queued because DB unavailable",
+        "intent": {
+            "id": receipt.intent_id,
+            "path": receipt.intent_path.display().to_string(),
+            "content_sha256": receipt.content_sha256,
+            "replay": "automatic_on_next_successful_release_file_reservations_call",
+        },
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+const fn db_error_supports_release_intent(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Pool(_)
+            | DbError::Sqlite(_)
+            | DbError::Schema(_)
+            | DbError::ResourceBusy(_)
+            | DbError::PoolExhausted { .. }
+            | DbError::CircuitBreakerOpen { .. }
+            | DbError::IntegrityCorruption { .. }
+    )
+}
+
+fn mcp_error_supports_release_intent(error: &McpError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data["error"]["type"].as_str())
+        .is_some_and(|error_type| {
+            matches!(
+                error_type,
+                "DATABASE_CORRUPTION"
+                    | "DATABASE_ERROR"
+                    | "DATABASE_POOL_EXHAUSTED"
+                    | "RESOURCE_BUSY"
+            )
+        })
+}
+
+fn read_queued_release_intents(config: &Config) -> std::io::Result<Vec<QueuedReleaseIntent>> {
+    let path = release_intent_log_path(config);
+    reject_existing_symlink(&path)?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut replayed = HashSet::new();
+    let mut intents = Vec::new();
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("kind").and_then(Value::as_str) {
+            Some(RELEASE_INTENT_REPLAY_KIND)
+                if value.get("status").and_then(Value::as_str) == Some("replayed") =>
+            {
+                if !release_replay_record_has_valid_hash(&value) {
+                    tracing::warn!("skipping replay marker with invalid content hash");
+                    continue;
+                }
+                if let Some(intent_id) = value.get("intent_id").and_then(Value::as_str) {
+                    let Some(intent_content_sha256) =
+                        value.get("intent_content_sha256").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    replayed.insert((intent_id.to_string(), intent_content_sha256.to_string()));
+                }
+            }
+            Some(RELEASE_INTENT_KIND) => {
+                if !release_intent_record_has_valid_hash(&value) {
+                    tracing::warn!("skipping release intent with invalid content hash");
+                    continue;
+                }
+                if let Ok(intent) = serde_json::from_value::<QueuedReleaseIntent>(value) {
+                    intents.push(intent);
+                }
+            }
+            _ => {}
+        }
+    }
+    intents.retain(|intent| {
+        !replayed.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
+    });
+    Ok(intents)
+}
+
+fn dispatch_release_archive_write(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    released_rows: &[mcp_agent_mail_db::FileReservationRow],
+    config: &Config,
+) {
+    if released_rows.is_empty() {
+        return;
+    }
+    let res_jsons: Vec<Value> = released_rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id.unwrap_or(0),
+                "project": &project.human_key,
+                "agent": &agent.name,
+                "path_pattern": &r.path_pattern,
+                "exclusive": r.exclusive != 0,
+                "reason": &r.reason,
+                "created_ts": micros_to_iso(r.created_ts),
+                "expires_ts": micros_to_iso(r.expires_ts),
+                "released_ts": released_ts_json_value(r.released_ts),
+            })
+        })
+        .collect();
+
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: res_jsons,
+    };
+    dispatch_reservation_archive_write(
+        op,
+        &format!("reservation release archive write project={}", project.slug),
+    );
+}
+
+async fn replay_single_release_intent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+    intent: &QueuedReleaseIntent,
+) -> Result<usize, String> {
+    if intent.kind != RELEASE_INTENT_KIND {
+        return Ok(0);
+    }
+    let project = resolve_project(ctx, pool, &intent.project_key)
+        .await
+        .map_err(|error| error.to_string())?;
+    let project_id = project.id.unwrap_or(0);
+    let normalized_paths = normalize_filter_paths(&project.human_key, intent.paths.clone())
+        .map_err(|error| error.to_string())?;
+    let agent = resolve_agent(
+        ctx,
+        pool,
+        project_id,
+        &intent.agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let agent_id = agent.id.unwrap_or(0);
+    let ids_to_release = if normalized_paths.is_some() || intent.file_reservation_ids.is_some() {
+        let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
+            ctx.cx(),
+            pool,
+            project_id,
+        )
+        .await
+        {
+            asupersync::Outcome::Ok(rows) => rows,
+            asupersync::Outcome::Err(error) => return Err(error.to_string()),
+            asupersync::Outcome::Cancelled(reason) => return Err(format!("cancelled: {reason:?}")),
+            asupersync::Outcome::Panicked(panic) => {
+                return Err(format!("panicked: {}", panic.message()));
+            }
+        };
+        let mut ids = Vec::new();
+        for reservation in existing_rows {
+            if renewal_filter_matches(
+                &reservation,
+                agent_id,
+                normalized_paths.as_deref(),
+                intent.file_reservation_ids.as_deref(),
+            ) && let Some(id) = reservation.id
+            {
+                ids.push(id);
+            }
+        }
+        Some(ids)
+    } else {
+        None
+    };
+
+    let released_rows = match mcp_agent_mail_db::queries::release_reservations(
+        ctx.cx(),
+        pool,
+        project_id,
+        agent_id,
+        None,
+        ids_to_release.as_deref(),
+    )
+    .await
+    {
+        asupersync::Outcome::Ok(rows) => rows,
+        asupersync::Outcome::Err(error) => return Err(error.to_string()),
+        asupersync::Outcome::Cancelled(reason) => return Err(format!("cancelled: {reason:?}")),
+        asupersync::Outcome::Panicked(panic) => {
+            return Err(format!("panicked: {}", panic.message()));
+        }
+    };
+    dispatch_release_archive_write(&project, &agent, &released_rows, config);
+    Ok(released_rows.len())
+}
+
+async fn replay_queued_release_intents(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+) {
+    let intents = match read_queued_release_intents(config) {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read queued release intents");
+            return;
+        }
+    };
+    for intent in intents {
+        match replay_single_release_intent(ctx, pool, config, &intent).await {
+            Ok(released) => {
+                append_release_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    "replayed",
+                    released,
+                    None,
+                );
+            }
+            Err(error) => {
+                append_release_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    "failed",
+                    0,
+                    Some(&error),
+                );
+                tracing::warn!(
+                    intent_id = intent.intent_id,
+                    error = %error,
+                    "queued release intent replay failed"
+                );
+            }
+        }
+    }
 }
 
 fn normalize_repo_path(input: &str) -> McpResult<PathBuf> {
@@ -814,13 +1359,43 @@ pub async fn release_file_reservations(
 ) -> McpResult<String> {
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let config = Config::get();
+    let original_paths = paths.clone();
+    let original_file_reservation_ids = file_reservation_ids.clone();
 
-    let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let pool = match get_db_pool() {
+        Ok(pool) => pool,
+        Err(error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "get_db_pool",
+                &error.to_string(),
+            );
+        }
+    };
+    let project = match resolve_project(ctx, &pool, &project_key).await {
+        Ok(project) => project,
+        Err(error) if mcp_error_supports_release_intent(&error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "resolve_project",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let project_id = project.id.unwrap_or(0);
     let normalized_paths = normalize_filter_paths(&project.human_key, paths)?;
 
-    let agent = resolve_agent(
+    let agent = match resolve_agent(
         ctx,
         &pool,
         project_id,
@@ -828,18 +1403,46 @@ pub async fn release_file_reservations(
         &project.slug,
         &project.human_key,
     )
-    .await?;
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) if mcp_error_supports_release_intent(&error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "resolve_agent",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let agent_id = agent.id.unwrap_or(0);
 
     let ids_to_release = if normalized_paths.is_some() || file_reservation_ids.is_some() {
-        let existing_rows = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_unreleased_file_reservations(
-                ctx.cx(),
-                &pool,
-                project_id,
-            )
-            .await,
-        )?;
+        let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
+            ctx.cx(),
+            &pool,
+            project_id,
+        )
+        .await
+        {
+            asupersync::Outcome::Ok(rows) => rows,
+            asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
+                return queued_release_intent_response(
+                    &config,
+                    &project_key,
+                    &agent_name,
+                    original_paths,
+                    original_file_reservation_ids,
+                    "list_unreleased_file_reservations",
+                    &error.to_string(),
+                );
+            }
+            other => db_outcome_to_mcp_result(other)?,
+        };
         let mut ids = Vec::new();
         for res in existing_rows {
             if renewal_filter_matches(
@@ -858,47 +1461,34 @@ pub async fn release_file_reservations(
     };
 
     // Perform the DB release (returns the actual updated rows)
-    let released_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::release_reservations(
-            ctx.cx(),
-            &pool,
-            project_id,
-            agent_id,
-            None, // Pass resolved IDs only
-            ids_to_release.as_deref(),
-        )
-        .await,
-    )?;
+    let released_rows = match mcp_agent_mail_db::queries::release_reservations(
+        ctx.cx(),
+        &pool,
+        project_id,
+        agent_id,
+        None, // Pass resolved IDs only
+        ids_to_release.as_deref(),
+    )
+    .await
+    {
+        asupersync::Outcome::Ok(rows) => rows,
+        asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
+            return queued_release_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                original_paths,
+                original_file_reservation_ids,
+                "release_reservations",
+                &error.to_string(),
+            );
+        }
+        other => db_outcome_to_mcp_result(other)?,
+    };
 
     // Update archive artifacts for the released items
-    if !released_rows.is_empty() {
-        let res_jsons: Vec<serde_json::Value> = released_rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.id.unwrap_or(0),
-                    "project": &project.human_key,
-                    "agent": &agent.name,
-                    "path_pattern": &r.path_pattern,
-                    "exclusive": r.exclusive != 0,
-                    "reason": &r.reason,
-                    "created_ts": micros_to_iso(r.created_ts),
-                    "expires_ts": micros_to_iso(r.expires_ts),
-                    "released_ts": released_ts_json_value(r.released_ts),
-                })
-            })
-            .collect();
-
-        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
-            project_slug: project.slug.clone(),
-            config: Config::get(),
-            reservations: res_jsons,
-        };
-        dispatch_reservation_archive_write(
-            op,
-            &format!("reservation release archive write project={}", project.slug),
-        );
-    }
+    dispatch_release_archive_write(&project, &agent, &released_rows, &config);
+    replay_queued_release_intents(ctx, &pool, &config).await;
 
     let response = ReleaseResult {
         released: i32::try_from(released_rows.len()).unwrap_or(i32::MAX),
@@ -2235,6 +2825,404 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["released"], 0);
+    }
+
+    #[test]
+    fn release_intent_error_classifier_only_queues_database_failures() {
+        let corruption = legacy_tool_error(
+            "DATABASE_CORRUPTION",
+            "database is malformed",
+            false,
+            json!({}),
+        );
+        let busy = legacy_tool_error("RESOURCE_BUSY", "database is locked", true, json!({}));
+        let not_found = legacy_tool_error("NOT_FOUND", "agent not found", true, json!({}));
+        let invalid = McpError::new(McpErrorCode::InvalidParams, "invalid path");
+
+        assert!(mcp_error_supports_release_intent(&corruption));
+        assert!(mcp_error_supports_release_intent(&busy));
+        assert!(!mcp_error_supports_release_intent(&not_found));
+        assert!(!mcp_error_supports_release_intent(&invalid));
+    }
+
+    #[test]
+    fn release_intent_append_writes_hash_stamped_private_jsonl() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/release-intent-project",
+                "BlueLake",
+                Some(vec!["src/**".to_string()]),
+                Some(vec![7]),
+                "get_db_pool",
+                "database disk image is malformed",
+            )
+            .expect("append release intent");
+
+            assert_eq!(receipt.intent_path, release_intent_log_path(&config));
+            assert_eq!(receipt.content_sha256.len(), 64);
+            assert_eq!(&receipt.content_sha256[..16], receipt.intent_id);
+
+            let content =
+                std::fs::read_to_string(&receipt.intent_path).expect("read release intent log");
+            let value: Value = serde_json::from_str(content.trim()).expect("release intent JSON");
+            assert_eq!(
+                value["schema_version"].as_u64(),
+                Some(u64::from(RELEASE_INTENT_SCHEMA_VERSION))
+            );
+            assert_eq!(value["kind"].as_str(), Some(RELEASE_INTENT_KIND));
+            assert_eq!(
+                value["intent_id"].as_str(),
+                Some(receipt.intent_id.as_str())
+            );
+            assert_eq!(
+                value["content_sha256"].as_str(),
+                Some(receipt.content_sha256.as_str())
+            );
+            assert_eq!(
+                value["project_key"].as_str(),
+                Some("/tmp/release-intent-project")
+            );
+            assert_eq!(value["agent_name"].as_str(), Some("BlueLake"));
+            assert_eq!(value["paths"][0].as_str(), Some("src/**"));
+            assert_eq!(value["file_reservation_ids"][0].as_i64(), Some(7));
+            assert_eq!(value["failure"]["stage"].as_str(), Some("get_db_pool"));
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let log_mode = std::fs::metadata(&receipt.intent_path)
+                    .expect("release intent log metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(log_mode, 0o600);
+                let parent = receipt
+                    .intent_path
+                    .parent()
+                    .expect("release intent log parent");
+                let parent_mode = std::fs::metadata(parent)
+                    .expect("release intent parent metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(parent_mode, 0o700);
+
+                let lock_mode = std::fs::metadata(release_intent_lock_path(&config))
+                    .expect("release intent lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(lock_mode, 0o600);
+            }
+        });
+    }
+
+    #[test]
+    fn queued_release_intent_response_reports_queued_release() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let payload = queued_release_intent_response(
+                &config,
+                "/tmp/queued-release",
+                "BlueLake",
+                Some(vec!["src/main.rs".to_string()]),
+                None,
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("queued response");
+            let parsed: Value = serde_json::from_str(&payload).expect("queued JSON");
+            assert_eq!(parsed["released"].as_i64(), Some(0));
+            assert_eq!(parsed["status"].as_str(), Some("queued"));
+            assert_eq!(parsed["queued"].as_bool(), Some(true));
+            assert_eq!(
+                parsed["message"].as_str(),
+                Some("lease release queued because DB unavailable")
+            );
+            assert!(parsed["released_at"].as_str().is_some());
+            assert!(parsed["intent"]["id"].as_str().is_some());
+            assert!(parsed["intent"]["content_sha256"].as_str().is_some());
+            assert_eq!(
+                parsed["intent"]["path"].as_str(),
+                Some(release_intent_log_path(&config).to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                read_queued_release_intents(&config)
+                    .expect("read queued intents")
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_suppresses_replayed_intents() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/replayed-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "list_unreleased_file_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            assert_eq!(
+                read_queued_release_intents(&config)
+                    .expect("read pending release intent")
+                    .len(),
+                1
+            );
+            append_release_replay_record(
+                &config,
+                &receipt.intent_id,
+                &receipt.content_sha256,
+                "replayed",
+                1,
+                None,
+            );
+            assert!(
+                read_queued_release_intents(&config)
+                    .expect("read after replay")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_ignores_unhashed_replay_marker() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/unhashed-replay-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            let fake_replay = json!({
+                "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+                "kind": RELEASE_INTENT_REPLAY_KIND,
+                "intent_id": &receipt.intent_id,
+                "replayed_ts": mcp_agent_mail_db::now_micros(),
+                "status": "replayed",
+                "released": 1,
+                "error_detail": Value::Null,
+            });
+            append_release_intent_jsonl(&config, &fake_replay)
+                .expect("append unhashed replay marker");
+
+            let intents = read_queued_release_intents(&config).expect("read queued intents");
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, receipt.intent_id);
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_ignores_replay_marker_for_wrong_intent_hash() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/wrong-hash-replay-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            let mut wrong_intent_hash = format!("{}{}", receipt.intent_id, "0".repeat(48));
+            if wrong_intent_hash == receipt.content_sha256 {
+                wrong_intent_hash = format!("{}{}", receipt.intent_id, "f".repeat(48));
+            }
+            append_release_replay_record(
+                &config,
+                &receipt.intent_id,
+                &wrong_intent_hash,
+                "replayed",
+                1,
+                None,
+            );
+
+            let intents = read_queued_release_intents(&config).expect("read queued intents");
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, receipt.intent_id);
+            assert_eq!(intents[0].content_sha256, receipt.content_sha256);
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_skips_hash_mismatches() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/hash-mismatch-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            let content =
+                std::fs::read_to_string(&receipt.intent_path).expect("read release intent log");
+            let first_line = content.lines().next().expect("release intent line");
+            let mut tampered: Value =
+                serde_json::from_str(first_line).expect("release intent JSON");
+            tampered["agent_name"] = Value::String("RedLake".to_string());
+            append_release_intent_jsonl(&config, &tampered).expect("append tampered intent");
+
+            let intents = read_queued_release_intents(&config).expect("read queued intents");
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].intent_id, receipt.intent_id);
+            assert_eq!(intents[0].agent_name, "BlueLake");
+        });
+    }
+
+    #[test]
+    fn replay_queued_release_intent_releases_once() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/replay-release-intent-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "queued release replay regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    &agent.name,
+                    None,
+                    Some(vec![reservation_id]),
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("append release intent");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+
+                let rows =
+                    match queries::get_reservations_by_ids(&cx, &pool, &[reservation_id]).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("get_reservations_by_ids failed: {other:?}"),
+                    };
+                let released_ts = rows
+                    .iter()
+                    .find(|row| row.id == Some(reservation_id))
+                    .and_then(|row| row.released_ts);
+                assert!(
+                    released_ts.is_some(),
+                    "queued intent replay should release the reservation"
+                );
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("read queued release intents")
+                        .is_empty(),
+                    "successfully replayed intents should not be replayed again"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn release_intent_retry_reports_current_release_before_replay() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/release-intent-retry-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "queued release retry regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    &agent.name,
+                    None,
+                    Some(vec![reservation_id]),
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("append release intent");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = release_file_reservations(
+                    &ctx,
+                    project.human_key.clone(),
+                    agent.name.clone(),
+                    None,
+                    Some(vec![reservation_id]),
+                )
+                .await
+                .expect("release_file_reservations");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(
+                    parsed["released"].as_i64(),
+                    Some(1),
+                    "retrying the same release should report the caller's release, not a pre-call replay"
+                );
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("read queued release intents")
+                        .is_empty(),
+                    "successful retry should mark the prior intent replayed after the current release"
+                );
+            });
+        });
     }
 
     #[test]

@@ -4537,6 +4537,7 @@ dependencies = [
  "fastmcp-protocol",
  "fastmcp-rust",
  "fastmcp-server",
+ "fs2",
  "git2",
  "globset",
  "hex",

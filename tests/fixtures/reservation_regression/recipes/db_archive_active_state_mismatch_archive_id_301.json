@@ -1,0 +1,11 @@
+{
+  "id": 301,
+  "project": "reservation-regression",
+  "agent": "ArchiveActiveHolder",
+  "path_pattern": "src/archive-active.rs",
+  "exclusive": true,
+  "reason": "br-bvq1x.6.4 DB released/archive active fixture",
+  "created_ts": 1700003010000000,
+  "expires_ts": 1700006610000000,
+  "released_ts": null
+}
