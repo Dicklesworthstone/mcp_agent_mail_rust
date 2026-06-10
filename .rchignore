@@ -1,3 +1,10 @@
 .git/
+.beads/
+.codex-target/
+.doctor/
 target/
 .rch-target/
+beads_compliance_audit/
+test_logs/
+tests/artifacts/
+tests/artifacts_native/
