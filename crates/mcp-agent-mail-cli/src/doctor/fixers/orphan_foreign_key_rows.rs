@@ -65,7 +65,6 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
 use sqlmodel_core::Row;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -183,11 +182,7 @@ fn detect_one(db_path: &Path) -> Option<OrphanForeignKeyRowsFinding> {
     if !db_path.exists() {
         return None;
     }
-    let uri = super::sqlite_immutable_uri(db_path);
-    let mut flags = OpenFlags::read_only();
-    flags.uri = true;
-    let config = SqliteConfig::file(uri).flags(flags);
-    let conn = SqliteConnection::open(&config).ok()?;
+    let conn = super::open_immutable_sqlite(db_path).ok()?;
     // foreign_keys must be ON for the check pragma to walk the
     // FK constraints. The pragma is per-connection, so this is
     // safe on a shared DB.
@@ -399,6 +394,7 @@ COMMIT;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
     fn make_healthy_db_with_fks(td: &TempDir) -> PathBuf {

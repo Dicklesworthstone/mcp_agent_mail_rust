@@ -50,7 +50,6 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError};
 use mcp_agent_mail_db::schema::SCHEMA_VERSION;
 use serde::Serialize;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-schema-version-mismatch";
@@ -177,11 +176,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<SchemaVersionMismatchFinding>
     // Pass-35-review Gemini F1 (P1): URI + immutable=1 so the
     // read-only open cannot create -shm on a WAL-mode DB. See the
     // detailed rationale in text_timestamp_contamination.rs.
-    let uri = super::sqlite_immutable_uri(db_path);
-    let mut flags = OpenFlags::read_only();
-    flags.uri = true;
-    let config = SqliteConfig::file(uri).flags(flags);
-    let conn = SqliteConnection::open(&config).ok()?;
+    let conn = super::open_immutable_sqlite(db_path).ok()?;
     let rows = conn.query_sync("PRAGMA user_version", &[]).ok()?;
     let on_disk: i64 = rows.first()?.get_named::<i64>("user_version").ok()?;
     let on_disk = i32::try_from(on_disk).ok()?;
@@ -222,6 +217,7 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
     fn make_db_with_version(td: &TempDir, version: i32) -> PathBuf {

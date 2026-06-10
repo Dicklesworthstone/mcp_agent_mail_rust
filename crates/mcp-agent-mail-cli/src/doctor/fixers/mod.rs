@@ -51,6 +51,7 @@ pub mod orphan_foreign_key_rows;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
+pub mod reservation_db_archive_parity;
 pub mod retained_autocommit_leak;
 pub mod runtime_pid_hint_symlink_toctou;
 pub mod schema_version_mismatch;
@@ -178,6 +179,25 @@ pub(crate) fn sqlite_immutable_uri(db_path: &std::path::Path) -> String {
     }
     uri.push_str("?immutable=1");
     uri
+}
+
+/// Open a SQLite database for detector-only inspection without creating
+/// sidecars, replaying WAL/journals, taking writer locks, or creating a
+/// missing file.
+///
+/// SQLite's plain read-only mode can still create or require `-shm` files for
+/// WAL databases. The URI `immutable=1` flag tells SQLite the file cannot
+/// change under this connection, which is the contract doctor detectors need:
+/// observe bytes and schema, never perturb the state being diagnosed.
+#[allow(clippy::result_large_err)]
+pub(crate) fn open_immutable_sqlite(
+    db_path: &std::path::Path,
+) -> sqlmodel_core::Result<sqlmodel_sqlite::SqliteConnection> {
+    let uri = sqlite_immutable_uri(db_path);
+    let mut flags = sqlmodel_sqlite::OpenFlags::read_only();
+    flags.uri = true;
+    let config = sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
+    sqlmodel_sqlite::SqliteConnection::open(&config)
 }
 
 #[cfg(unix)]
@@ -442,6 +462,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "PRAGMA foreign_key_check reports orphan child rows (stale file_reservations/file_reservation_releases auto-fix via DbExec quarantine; message history preserved)",
             source_module: "doctor::fixers::orphan_foreign_key_rows",
+        },
+        FixerSpec {
+            id: reservation_db_archive_parity::FM_ID,
+            severity: "P1",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "File reservation SQLite rows and stable archive JSON artifacts disagree on holder, released_ts, active status, or thread provenance (pre-commit guard over/under-block risk; manual reconcile until per-field mutate repair is implemented)",
+            source_module: "doctor::fixers::reservation_db_archive_parity",
         },
         FixerSpec {
             id: retained_autocommit_leak::FM_ID,
@@ -1394,6 +1423,18 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == reservation_db_archive_parity::FM_ID {
+        let findings = reservation_db_archive_parity::detect(
+            inputs.storage_root.as_deref(),
+            &inputs.db_file_candidates,
+        );
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = reservation_db_archive_parity::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == retained_autocommit_leak::FM_ID {
         // Inspects mcp_agent_mail_db::schema constants; no
         // DispatchInputs field needed for production.
@@ -1918,6 +1959,14 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == reservation_db_archive_parity::FM_ID {
+        reservation_db_archive_parity::detect(
+            inputs.storage_root.as_deref(),
+            &inputs.db_file_candidates,
+        )
+        .iter()
+        .map(|f| f.to_finding())
+        .collect()
     } else if fm_id == retained_autocommit_leak::FM_ID {
         retained_autocommit_leak::detect(&retained_autocommit_leak::DetectInputs::default())
             .iter()
@@ -2151,6 +2200,9 @@ pub fn detect_all(inputs: &DispatchInputs) -> Result<DetectAllOutcome, DispatchE
 mod tests {
     use super::*;
     use nix::errno::Errno;
+    use sqlmodel_sqlite::SqliteConnection;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn sqlite_immutable_uri_escapes_uri_delimiters_in_paths() {
@@ -2159,6 +2211,62 @@ mod tests {
             uri,
             "file:/tmp/agent%20mail%3F%23%25/storage.sqlite3?immutable=1"
         );
+    }
+
+    #[test]
+    fn open_immutable_sqlite_does_not_create_wal_sidecars() {
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        let wal = td.path().join("storage.sqlite3-wal");
+        let shm = td.path().join("storage.sqlite3-shm");
+
+        let seed = SqliteConnection::open_file(db.to_string_lossy().into_owned()).unwrap();
+        seed.execute_raw("PRAGMA journal_mode=WAL;").unwrap();
+        seed.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        seed.execute_raw("INSERT INTO t (id) VALUES (1);").unwrap();
+        seed.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(seed);
+
+        let before_dir = sorted_dir_entries(td.path());
+        let before_wal = wal.exists();
+        let before_shm = shm.exists();
+        let conn = open_immutable_sqlite(&db).expect("immutable open");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS n FROM t", &[])
+            .expect("immutable read");
+        let n = rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("n").ok())
+            .expect("count row");
+        drop(conn);
+
+        assert_eq!(n, 1);
+        assert_eq!(
+            before_dir,
+            sorted_dir_entries(td.path()),
+            "immutable detector open must not create sibling files"
+        );
+        assert_eq!(
+            before_wal,
+            wal.exists(),
+            "immutable detector open must not create or remove WAL sidecars"
+        );
+        assert_eq!(
+            before_shm,
+            shm.exists(),
+            "immutable detector open must not create or remove SHM sidecars"
+        );
+    }
+
+    fn sorted_dir_entries(path: &std::path::Path) -> Vec<String> {
+        let mut entries: Vec<String> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        entries
     }
 
     #[test]

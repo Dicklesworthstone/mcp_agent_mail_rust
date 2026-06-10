@@ -60,7 +60,6 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError, Op, mutate};
 use serde::Serialize;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-inbox-stats-divergence";
@@ -167,11 +166,7 @@ pub fn detect(candidate_dbs: &[PathBuf]) -> Vec<InboxStatsDivergenceFinding> {
 
 fn detect_one(db_path: &std::path::Path) -> Option<InboxStatsDivergenceFinding> {
     // URI + immutable=1 — read-only, no -shm creation.
-    let uri = super::sqlite_immutable_uri(db_path);
-    let mut flags = OpenFlags::read_only();
-    flags.uri = true;
-    let config = SqliteConfig::file(uri).flags(flags);
-    let conn = SqliteConnection::open(&config).ok()?;
+    let conn = super::open_immutable_sqlite(db_path).ok()?;
 
     // Pass-35L review (Codex F1 + Gemini F1 P0): the pre-fix
     // detector drove from `inbox_stats LEFT JOIN aggregate`,
@@ -270,6 +265,7 @@ pub fn fix(
 mod tests {
     use super::*;
     use crate::doctor::mutate::Capabilities;
+    use sqlmodel_sqlite::SqliteConnection;
     use std::fs::OpenOptions;
     use std::sync::Mutex;
     use std::time::Instant;

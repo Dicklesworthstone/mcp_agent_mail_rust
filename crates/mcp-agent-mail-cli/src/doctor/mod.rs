@@ -27,6 +27,7 @@ pub mod undo;
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_tools::reservation_parity::check_reservation_parity_with_canonical_conn;
 use serde::Serialize;
 use std::fs;
 use std::io::Read;
@@ -2160,6 +2161,25 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
+    match crate::open_db_for_doctor_check_read_only_with_context(&cfg.database_url).and_then(
+        |opened| {
+            check_reservation_parity_with_canonical_conn(&opened.conn, &config.storage_root)
+                .map_err(|error| {
+                    CliError::Other(format!("reservation parity check failed: {error}"))
+                })
+        },
+    ) {
+        Ok(report) => {
+            println!("{}", report.health_line());
+            if !report.ok {
+                return Err(CliError::ExitCode(1));
+            }
+        }
+        Err(error) => {
+            println!("reservation_parity: not_run ({error})");
+        }
+    }
+
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
     let runs_dir = root.join("runs");
@@ -2359,6 +2379,18 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    static DOCTOR_HEALTH_STDIO_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn seed_healthy_live_mailbox(db_path: &std::path::Path) {
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open live db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize schema");
+    }
+
     #[test]
     fn default_write_scopes_includes_known_locations() {
         let scopes = default_write_scopes();
@@ -2379,13 +2411,7 @@ mod tests {
         let storage_root = tempfile::tempdir().unwrap();
         let db_path = storage_root.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open live db");
-        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
-            .expect("apply pragmas");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("initialize schema");
-        drop(conn);
+        seed_healthy_live_mailbox(&db_path);
 
         let storage_root_s = storage_root.path().display().to_string();
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
@@ -2396,6 +2422,36 @@ mod tests {
         assert!(
             result.is_ok(),
             "healthy live mailbox should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_health_prints_reservation_parity_line() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let target = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db_path = storage_root.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_healthy_live_mailbox(&db_path);
+
+        let storage_root_s = storage_root.path().display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            || handle_health(target.path()),
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+
+        assert!(
+            result.is_ok(),
+            "healthy live mailbox should pass: {result:?}\nstdout:\n{output}"
+        );
+        assert!(
+            output.contains("reservation_parity: ok db=0 archive=0 drift=0"),
+            "health output should include reservation parity line:\n{output}"
         );
     }
 

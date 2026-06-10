@@ -14,9 +14,10 @@
 //!
 //! ## Detection (pure function)
 //!
-//! Open the DB at `db_path`, run `PRAGMA journal_mode;`, parse
-//! the result. If the value is anything other than `wal` (case-
-//! insensitive), emit a finding.
+//! Open the DB at `db_path` read-only with URI `?immutable=1`
+//! (no WAL/SHM sidecar creation or journal replay), run
+//! `PRAGMA journal_mode;`, parse the result. If the value is
+//! anything other than `wal` (case-insensitive), emit a finding.
 //!
 //! ## Fix (`Op::DbExec` — new pattern)
 //!
@@ -96,13 +97,12 @@ impl WalModeDisabledFinding {
 /// Empty slice skips the FM. `:memory:` URLs should be filtered
 /// out by the caller (this detector tries to open a real file).
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WalModeDisabledFinding> {
-    use sqlmodel_sqlite::SqliteConnection;
     let mut out = Vec::new();
     for path in candidate_paths {
         if !path.is_file() {
             continue;
         }
-        let Ok(conn) = SqliteConnection::open_file(path.to_string_lossy().into_owned()) else {
+        let Ok(conn) = super::open_immutable_sqlite(path) else {
             continue;
         };
         let mode = match read_journal_mode(&conn) {

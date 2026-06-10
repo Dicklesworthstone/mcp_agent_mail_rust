@@ -62,7 +62,6 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError};
 use serde::Serialize;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-integrity-page-malformed";
@@ -161,11 +160,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<IntegrityPageMalformedFinding
     }
     // URI + immutable=1: read-only, no -shm creation, no
     // locking. Matches the pass-35H pattern.
-    let uri = super::sqlite_immutable_uri(db_path);
-    let mut flags = OpenFlags::read_only();
-    flags.uri = true;
-    let config = SqliteConfig::file(uri).flags(flags);
-    let conn = match SqliteConnection::open(&config) {
+    let conn = match super::open_immutable_sqlite(db_path) {
         Ok(conn) => conn,
         Err(error) => {
             let detail = error.to_string();
@@ -250,6 +245,7 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
     fn make_healthy_db(td: &TempDir) -> PathBuf {

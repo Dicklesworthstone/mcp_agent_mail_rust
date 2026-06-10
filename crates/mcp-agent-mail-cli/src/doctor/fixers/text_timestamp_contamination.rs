@@ -56,7 +56,6 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{MutateContext, MutateError};
 use mcp_agent_mail_db::migrate::TIMESTAMP_COLUMNS;
 use serde::Serialize;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-text-timestamp-contamination";
@@ -155,11 +154,7 @@ fn detect_one(db_path: &std::path::Path) -> Option<TextTimestampContaminationFin
     // treats the file as truly immutable: no locking, no -shm
     // creation, no journal/WAL replay. This preserves the pure-
     // detector contract.
-    let uri = super::sqlite_immutable_uri(db_path);
-    let mut flags = OpenFlags::read_only();
-    flags.uri = true;
-    let config = SqliteConfig::file(uri).flags(flags);
-    let conn = SqliteConnection::open(&config).ok()?;
+    let conn = super::open_immutable_sqlite(db_path).ok()?;
 
     let mut contaminated = Vec::new();
     let mut total: i64 = 0;
@@ -237,6 +232,7 @@ pub fn fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlmodel_sqlite::SqliteConnection;
     use tempfile::TempDir;
 
     /// Build a minimal `storage.sqlite3` with the relevant tables

@@ -14,7 +14,8 @@
 //!
 //! ## Detection (pure, on-disk state)
 //!
-//! 1. Open `storage.sqlite3` read-only.
+//! 1. Open `storage.sqlite3` read-only with URI `?immutable=1`
+//!    (no WAL/SHM sidecar creation or journal replay).
 //! 2. Verify Search V3 is active by probing the canonical marker
 //!    file: `<storage_root>/search_index/.managed.json`. If
 //!    absent, FTS5 IS the active backend and residue is normal —
@@ -165,7 +166,6 @@ impl LegacyFtsResidueFinding {
 /// - the DB can't be opened
 /// - the sqlite_master query fails
 pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
-    use sqlmodel_sqlite::SqliteConnection;
     let mut out = Vec::new();
     for db_path in candidate_paths {
         if !db_path.is_file() {
@@ -180,7 +180,7 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<LegacyFtsResidueFinding> {
             // expected.
             continue;
         }
-        let Ok(conn) = SqliteConnection::open_file(db_path.to_string_lossy().into_owned()) else {
+        let Ok(conn) = super::open_immutable_sqlite(db_path) else {
             continue;
         };
         let Some(residue) = read_fts_residue(&conn) else {
