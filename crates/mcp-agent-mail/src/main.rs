@@ -844,18 +844,60 @@ fn main() {
 /// Prints a clear error to stderr explaining that the command belongs in the
 /// CLI binary, with remediation hints.
 fn render_denial(command: &str) {
-    eprintln!(
-        "Error: \"{command}\" is not an MCP server command.\n\n\
-         Agent Mail is not a CLI.\n\
-         Agent Mail MCP server accepts: serve, config\n\
-         For operator CLI commands, use: am {command}\n\
-         Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ..."
-    );
+    eprintln!("Error: \"{command}\" is not an MCP server command.\n");
+    eprintln!("Agent Mail is not a CLI.");
+    eprintln!("Agent Mail MCP server accepts: serve, config");
+    if let Some(correction) = command_correction(command) {
+        eprintln!("Corrected command:");
+        eprintln!("  CLI: {}", correction.cli);
+        if let Some(mcp_tool) = correction.mcp_tool {
+            eprintln!("  MCP tool: {mcp_tool}");
+        }
+    } else {
+        eprintln!("For operator CLI commands, use: am {command}");
+    }
+    eprintln!("Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...");
 
     // Show tip only when a TTY is detected (human, not agent)
     let no_color = env::var_os("NO_COLOR").is_some();
     if std::io::stderr().is_terminal() && !no_color {
         eprintln!("\nTip: Run `am --help` for the full command list.");
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommandCorrection {
+    cli: &'static str,
+    mcp_tool: Option<&'static str>,
+}
+
+fn command_correction(command: &str) -> Option<CommandCorrection> {
+    match command {
+        "reserve" | "file-reserve" | "file_reservation_paths" => Some(CommandCorrection {
+            cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+            mcp_tool: Some("file_reservation_paths"),
+        }),
+        "macro_start_session" => Some(CommandCorrection {
+            cli: "am macros start-session --project <abs-path> --program <program> --model <model>",
+            mcp_tool: Some("macro_start_session"),
+        }),
+        "send" | "send_message" => Some(CommandCorrection {
+            cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
+            mcp_tool: Some("send_message"),
+        }),
+        "inbox" | "fetch_inbox" => Some(CommandCorrection {
+            cli: "am inbox --project <project> --agent <agent>",
+            mcp_tool: Some("fetch_inbox"),
+        }),
+        "reservations" => Some(CommandCorrection {
+            cli: "am reservations --project <project> --agent <agent>",
+            mcp_tool: None,
+        }),
+        "serve-http" | "serve-stdio" => Some(CommandCorrection {
+            cli: "am serve-http ...  OR  am serve-stdio ...",
+            mcp_tool: None,
+        }),
+        _ => None,
     }
 }
 
@@ -1343,6 +1385,73 @@ mod tests {
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["mcp-agent-mail"]).expect("should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn command_correction_covers_protocol_and_cli_mismatch_names() {
+        let cases = [
+            (
+                "reserve",
+                "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+                Some("file_reservation_paths"),
+            ),
+            (
+                "file-reserve",
+                "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+                Some("file_reservation_paths"),
+            ),
+            (
+                "file_reservation_paths",
+                "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+                Some("file_reservation_paths"),
+            ),
+            (
+                "macro_start_session",
+                "am macros start-session --project <abs-path> --program <program> --model <model>",
+                Some("macro_start_session"),
+            ),
+            (
+                "send_message",
+                "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
+                Some("send_message"),
+            ),
+            (
+                "send",
+                "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
+                Some("send_message"),
+            ),
+            (
+                "inbox",
+                "am inbox --project <project> --agent <agent>",
+                Some("fetch_inbox"),
+            ),
+            (
+                "fetch_inbox",
+                "am inbox --project <project> --agent <agent>",
+                Some("fetch_inbox"),
+            ),
+            (
+                "reservations",
+                "am reservations --project <project> --agent <agent>",
+                None,
+            ),
+            (
+                "serve-http",
+                "am serve-http ...  OR  am serve-stdio ...",
+                None,
+            ),
+            (
+                "serve-stdio",
+                "am serve-http ...  OR  am serve-stdio ...",
+                None,
+            ),
+        ];
+
+        for (input, expected_cli, expected_mcp_tool) in cases {
+            let correction = command_correction(input).expect("correction");
+            assert_eq!(correction.cli, expected_cli);
+            assert_eq!(correction.mcp_tool, expected_mcp_tool);
+        }
     }
 
     #[test]

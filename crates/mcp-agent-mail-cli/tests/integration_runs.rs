@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::hash::{Hash as _, Hasher as _};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -412,6 +414,141 @@ fn init_cli_schema(db_path: &Path) {
         .expect("open sqlite db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init schema");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    kind: &'static str,
+    len: Option<u64>,
+    content_hash: Option<u64>,
+    symlink_target: Option<PathBuf>,
+    mode: Option<u32>,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_snapshot(path: &Path) -> (u64, u64) {
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    (bytes.len() as u64, hasher.finish())
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
+    fn visit(root: &Path, current: &Path, out: &mut BTreeMap<PathBuf, TreeEntry>) {
+        let mut entries: Vec<_> = std::fs::read_dir(current)
+            .unwrap_or_else(|error| panic!("read_dir {}: {error}", current.display()))
+            .map(|entry| entry.expect("read dir entry"))
+            .collect();
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .expect("entry below snapshot root")
+                .to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path)
+                .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display()));
+            let file_type = metadata.file_type();
+            let mode = file_mode(&metadata);
+            let modified = metadata.modified().ok();
+
+            if file_type.is_dir() {
+                out.insert(
+                    rel,
+                    TreeEntry {
+                        kind: "dir",
+                        len: None,
+                        content_hash: None,
+                        symlink_target: None,
+                        mode,
+                        modified,
+                    },
+                );
+                visit(root, &path, out);
+            } else if file_type.is_file() {
+                let (len, content_hash) = file_snapshot(&path);
+                out.insert(
+                    rel,
+                    TreeEntry {
+                        kind: "file",
+                        len: Some(len),
+                        content_hash: Some(content_hash),
+                        symlink_target: None,
+                        mode,
+                        modified,
+                    },
+                );
+            } else if file_type.is_symlink() {
+                out.insert(
+                    rel,
+                    TreeEntry {
+                        kind: "symlink",
+                        len: None,
+                        content_hash: None,
+                        symlink_target: Some(std::fs::read_link(&path).unwrap_or_else(|error| {
+                            panic!("read_link {}: {error}", path.display())
+                        })),
+                        mode,
+                        modified,
+                    },
+                );
+            } else {
+                out.insert(
+                    rel,
+                    TreeEntry {
+                        kind: "other",
+                        len: None,
+                        content_hash: None,
+                        symlink_target: None,
+                        mode,
+                        modified,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn file_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut perms = std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("metadata {}: {error}", path.display()))
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) {}
+
+fn write_version_shim(path: &Path, binary: &str) {
+    let contents = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{binary} {}'\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(path, contents)
+        .unwrap_or_else(|error| panic!("write shim {}: {error}", path.display()));
+    set_executable(path);
 }
 
 fn insert_project(conn: &mcp_agent_mail_db::DbConn, id: i64, slug: &str, human_key: &str) {
@@ -1091,6 +1228,18 @@ fn capabilities_json_exposes_agent_contract() {
         value["primary_agent_surfaces"]["status"].as_str(),
         Some("am status --project /abs/path --agent AGENT_NAME --json")
     );
+    let exit_codes = value["exit_codes"]
+        .as_array()
+        .expect("exit_codes should be an array");
+    assert!(
+        exit_codes.iter().any(|entry| {
+            entry["code"].as_i64() == Some(i64::from(mcp_agent_mail_cli::LEGACY_AM_SERVE_EXIT_CODE))
+                && entry["meaning"]
+                    .as_str()
+                    .is_some_and(|meaning| meaning.contains("legacy CLI subcommand migration"))
+        }),
+        "capabilities should expose the legacy am serve migration exit code"
+    );
     let primary_surfaces = value["primary_agent_surfaces"]
         .as_object()
         .expect("primary_agent_surfaces should be an object");
@@ -1580,6 +1729,75 @@ fn agent_start_json_reports_stale_mcp_endpoint() {
     assert_eq!(
         value["runtime"]["http_url"].as_str(),
         Some(expected_url.as_str())
+    );
+}
+
+#[test]
+fn bare_am_no_args_noninteractive_emits_status_surface() {
+    let env = TestEnv::new();
+    let out = run_am(&env.isolated_env(), Some(env.tmp.path()), &[], None);
+    if !out.status.success() {
+        write_artifact("bare_am_no_args_status_surface", &[], &out);
+        panic!(
+            "expected bare am success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Missing command") && !stderr.contains("Usage:"),
+        "bare am must not emit generic usage/missing-command text; stderr:\n{stderr}"
+    );
+
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "bare am stdout must be JSON: {error}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(value["_meta"]["command"].as_str(), Some("am"));
+    assert_eq!(value["schema_version"].as_str(), Some("am.bare_status.v1"));
+    assert_eq!(value["mode"].as_str(), Some("cli"));
+    assert_eq!(value["binary"]["name"].as_str(), Some("am"));
+    assert_eq!(
+        value["binary"]["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(
+        value["binary"]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/am") || path.ends_with("\\am.exe")),
+        "binary path should identify the resolved am executable: {value}"
+    );
+    assert_eq!(
+        value["runtime"]["storage_root"].as_str(),
+        Some(env.storage_root.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        value["runtime"]["database_path"].as_str(),
+        Some(env.db_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        value["service"]["http_url"].as_str(),
+        Some("http://127.0.0.1:1/mcp/")
+    );
+    assert_eq!(
+        value["doctor_health"]["command"].as_str(),
+        Some("am doctor health")
+    );
+    assert!(
+        value["top_commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| command == "am status --json")),
+        "top commands should include the obvious status command: {value}"
+    );
+    assert!(
+        value["_actions"]
+            .as_array()
+            .is_some_and(|actions| actions.iter().any(|action| action == "am doctor health")),
+        "actions should include doctor health: {value}"
     );
 }
 
@@ -3644,6 +3862,56 @@ fn doctor_check_json_mode() {
 }
 
 #[test]
+fn doctor_read_only_commands_do_not_mutate_fixture_tree() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path)
+        .expect("checkpoint read-only doctor fixture");
+
+    let local_bin = env.home_dir.join(".local/bin");
+    std::fs::create_dir_all(&local_bin).expect("create local bin");
+    write_version_shim(&local_bin.join("am"), "am");
+    write_version_shim(&local_bin.join("mcp-agent-mail"), "mcp-agent-mail");
+
+    let mut env_vars = env.isolated_env();
+    env_vars.retain(|(key, _)| key != "PATH");
+    env_vars.push((
+        "PATH".to_string(),
+        format!("{}:/usr/local/bin:/usr/bin:/bin", local_bin.display()),
+    ));
+
+    let before = snapshot_tree(env.tmp.path());
+    for args in [
+        &["doctor", "health"][..],
+        &["doctor", "check"][..],
+        &["doctor", "check", "--json"][..],
+    ] {
+        let out = run_am_hermetic(&env_vars, Some(env.tmp.path()), args);
+        assert!(
+            out.status.success(),
+            "expected read-only doctor command to succeed for {args:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if args == &["doctor", "check", "--json"][..] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("valid doctor JSON");
+            assert_eq!(
+                value.get("healthy").and_then(|v| v.as_bool()),
+                Some(true),
+                "expected healthy=true in JSON"
+            );
+        }
+
+        let after = snapshot_tree(env.tmp.path());
+        assert_eq!(
+            before, after,
+            "read-only doctor command mutated the fixture tree: {args:?}"
+        );
+    }
+}
+
+#[test]
 fn doctor_check_verbose_shows_details() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
@@ -4472,6 +4740,40 @@ fn list_projects_with_agents_shows_agent_names() {
 }
 
 // ---- Serve commands (dry checks) ----
+
+#[test]
+fn legacy_am_serve_reports_migration_preflight() {
+    let env = TestEnv::new();
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &["serve"], None);
+
+    assert_eq!(
+        out.status.code(),
+        Some(mcp_agent_mail_cli::LEGACY_AM_SERVE_EXIT_CODE),
+        "legacy am serve should use the dedicated migration exit code\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "legacy am serve preflight must not write stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for fragment in [
+        "legacy `am serve` is retired",
+        "classification: legacy-subcommand-migration",
+        "retry_policy: do-not-retry-unchanged",
+        "am serve-http",
+        "am serve-stdio",
+        "mcp-agent-mail serve",
+    ] {
+        assert!(
+            stderr.contains(fragment),
+            "legacy am serve stderr missing {fragment:?}\nActual stderr:\n{stderr}"
+        );
+    }
+}
 
 #[test]
 fn serve_http_help_exits_zero() {

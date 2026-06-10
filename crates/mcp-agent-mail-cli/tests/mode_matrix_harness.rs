@@ -7,9 +7,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn am_bin() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_BIN_EXE_am").expect("CARGO_BIN_EXE_am must be set"))
+}
+
+fn explicit_mcp_bin_path() -> Option<PathBuf> {
+    std::env::var_os("MCP_AGENT_MAIL_BIN").map(PathBuf::from)
+}
+
+fn implicit_mcp_bin_path() -> PathBuf {
+    let am = am_bin();
+    am.parent().expect("target dir").join("mcp-agent-mail")
 }
 
 fn repo_root() -> PathBuf {
@@ -18,6 +28,135 @@ fn repo_root() -> PathBuf {
         .and_then(|p| p.parent())
         .expect("repo root")
         .to_path_buf()
+}
+
+fn mcp_binary_freshness_inputs() -> [PathBuf; 2] {
+    let root = repo_root();
+    [
+        root.join("crates/mcp-agent-mail/src/main.rs"),
+        root.join("crates/mcp-agent-mail/Cargo.toml"),
+    ]
+}
+
+fn path_modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn implicit_mcp_bin_stale_reason(binary: &Path) -> Option<String> {
+    let binary_modified = path_modified(binary)?;
+    for source in mcp_binary_freshness_inputs() {
+        let Some(source_modified) = path_modified(&source) else {
+            continue;
+        };
+        if source_modified > binary_modified {
+            return Some(format!(
+                "MCP binary at {} is older than {}; build it with `cargo build -p mcp-agent-mail` or set MCP_AGENT_MAIL_BIN to a current binary",
+                binary.display(),
+                source.display()
+            ));
+        }
+    }
+    None
+}
+
+fn rch_worker_mcp_bin_candidates() -> Vec<PathBuf> {
+    let implicit = implicit_mcp_bin_path();
+    let Some(debug_dir) = implicit.parent() else {
+        return Vec::new();
+    };
+    let Some(target_dir) = debug_dir.parent() else {
+        return Vec::new();
+    };
+    let Some(target_name) = target_dir.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let Some((worker_prefix, _job_suffix)) = target_name.split_once("-job-") else {
+        return Vec::new();
+    };
+    let rch_prefix = format!("{worker_prefix}-job-");
+
+    let mut candidates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo_root()) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&rch_prefix) {
+            continue;
+        }
+        let candidate = path.join("debug").join("mcp-agent-mail");
+        if !candidate.is_file() {
+            continue;
+        }
+        let modified = path_modified(&candidate).unwrap_or(UNIX_EPOCH);
+        candidates.push((modified, candidate));
+    }
+    candidates.sort_by(|(left, _), (right, _)| right.cmp(left));
+    candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+fn implicit_mcp_bin_candidates() -> Vec<PathBuf> {
+    std::iter::once(implicit_mcp_bin_path())
+        .chain(rch_worker_mcp_bin_candidates())
+        .collect()
+}
+
+fn resolve_mcp_bin_path() -> Result<PathBuf, String> {
+    if let Some(explicit) = explicit_mcp_bin_path() {
+        if explicit.is_file() {
+            return Ok(explicit);
+        }
+        return Err(format!(
+            "MCP binary not found at {}. Build with `cargo build -p mcp-agent-mail` or set MCP_AGENT_MAIL_BIN.",
+            explicit.display()
+        ));
+    }
+
+    let mut stale_reasons = Vec::new();
+    let candidates = implicit_mcp_bin_candidates();
+    for candidate in &candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        if let Some(reason) = implicit_mcp_bin_stale_reason(candidate) {
+            stale_reasons.push(reason);
+            continue;
+        }
+        return Ok(candidate.clone());
+    }
+
+    if let Some(reason) = stale_reasons.into_iter().next() {
+        return Err(reason);
+    }
+    let searched = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "MCP binary not found. Build with `cargo build -p mcp-agent-mail` or set MCP_AGENT_MAIL_BIN. Searched: {searched}"
+    ))
+}
+
+fn mcp_bin_unavailable_reason() -> Option<String> {
+    resolve_mcp_bin_path().err()
+}
+
+fn skip_if_mcp_bin_unavailable() -> bool {
+    if let Some(reason) = mcp_bin_unavailable_reason() {
+        eprintln!("SKIP: {reason}");
+        true
+    } else {
+        false
+    }
 }
 
 fn artifacts_dir() -> PathBuf {
@@ -69,19 +208,17 @@ fn run_cli(args: &[&str], env_pairs: &[(String, String)]) -> Output {
 /// Run the MCP server binary with given args and env.
 /// The binary rejects CLI-only commands with exit code 2.
 fn run_mcp(args: &[&str], env_pairs: &[(String, String)]) -> Output {
-    // Find the mcp-agent-mail binary in the same target dir as the am binary.
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
     // If the MCP binary isn't built yet, skip gracefully.
-    if !mcp_bin.exists() {
-        return Output {
-            status: std::process::ExitStatus::default(),
-            stdout: Vec::new(),
-            stderr: format!("MCP binary not found at {}", mcp_bin.display()).into_bytes(),
-        };
-    }
+    let mcp_bin = match resolve_mcp_bin_path() {
+        Ok(path) => path,
+        Err(reason) => {
+            return Output {
+                status: std::process::ExitStatus::default(),
+                stdout: Vec::new(),
+                stderr: reason.into_bytes(),
+            };
+        }
+    };
 
     let mut cmd = Command::new(&mcp_bin);
     cmd.args(args)
@@ -262,6 +399,70 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
 /// Commands that MCP binary should allow (not deny).
 const MCP_ALLOW_COMMANDS: &[&[&str]] = &[&["serve", "--help"], &["config"]];
 
+struct CommandCorrectionCase {
+    attempted: &'static str,
+    expected_cli: &'static str,
+    expected_mcp_tool: Option<&'static str>,
+}
+
+const MCP_NAME_MISMATCH_CORRECTION_CASES: &[CommandCorrectionCase] = &[
+    CommandCorrectionCase {
+        attempted: "reserve",
+        expected_cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+        expected_mcp_tool: Some("file_reservation_paths"),
+    },
+    CommandCorrectionCase {
+        attempted: "file-reserve",
+        expected_cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+        expected_mcp_tool: Some("file_reservation_paths"),
+    },
+    CommandCorrectionCase {
+        attempted: "file_reservation_paths",
+        expected_cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+        expected_mcp_tool: Some("file_reservation_paths"),
+    },
+    CommandCorrectionCase {
+        attempted: "macro_start_session",
+        expected_cli: "am macros start-session --project <abs-path> --program <program> --model <model>",
+        expected_mcp_tool: Some("macro_start_session"),
+    },
+    CommandCorrectionCase {
+        attempted: "send_message",
+        expected_cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
+        expected_mcp_tool: Some("send_message"),
+    },
+    CommandCorrectionCase {
+        attempted: "send",
+        expected_cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
+        expected_mcp_tool: Some("send_message"),
+    },
+    CommandCorrectionCase {
+        attempted: "inbox",
+        expected_cli: "am inbox --project <project> --agent <agent>",
+        expected_mcp_tool: Some("fetch_inbox"),
+    },
+    CommandCorrectionCase {
+        attempted: "fetch_inbox",
+        expected_cli: "am inbox --project <project> --agent <agent>",
+        expected_mcp_tool: Some("fetch_inbox"),
+    },
+    CommandCorrectionCase {
+        attempted: "reservations",
+        expected_cli: "am reservations --project <project> --agent <agent>",
+        expected_mcp_tool: None,
+    },
+    CommandCorrectionCase {
+        attempted: "serve-http",
+        expected_cli: "am serve-http ...  OR  am serve-stdio ...",
+        expected_mcp_tool: None,
+    },
+    CommandCorrectionCase {
+        attempted: "serve-stdio",
+        expected_cli: "am serve-http ...  OR  am serve-stdio ...",
+        expected_mcp_tool: None,
+    },
+];
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[test]
@@ -308,15 +509,7 @@ fn matrix_cli_binary_accepts_all_command_families() {
 #[test]
 fn matrix_mcp_binary_denies_cli_only_commands() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!(
-            "SKIP: MCP binary not found at {}. Build with `cargo build -p mcp-agent-mail`.",
-            mcp_bin.display()
-        );
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -381,12 +574,7 @@ fn matrix_mcp_binary_denies_cli_only_commands() {
 #[test]
 fn matrix_mcp_binary_allows_server_commands() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -431,12 +619,7 @@ fn matrix_mcp_binary_allows_server_commands() {
 #[test]
 fn matrix_mcp_denial_message_contains_remediation() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -454,6 +637,74 @@ fn matrix_mcp_denial_message_contains_remediation() {
             serr.contains("use: am "),
             "denial stderr for '{cmd}' should mention the CLI binary: {serr}"
         );
+    }
+}
+
+#[test]
+fn matrix_mcp_name_mismatch_denials_print_exact_corrections() {
+    let env = base_env();
+    if skip_if_mcp_bin_unavailable() {
+        return;
+    }
+
+    for case in MCP_NAME_MISMATCH_CORRECTION_CASES {
+        let out = run_mcp(&[case.attempted], &env);
+        let sout = stdout_str(&out);
+        let serr = stderr_str(&out);
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "MCP name-mismatch denial for `{}` must exit 2.\nstderr:\n{}",
+            case.attempted,
+            serr
+        );
+        assert!(
+            sout.is_empty(),
+            "MCP name-mismatch denial for `{}` must keep stdout empty.\nstdout:\n{}",
+            case.attempted,
+            sout
+        );
+        assert!(
+            serr.contains(&format!(
+                "Error: \"{}\" is not an MCP server command.",
+                case.attempted
+            )),
+            "denial must name attempted command `{}`.\nstderr:\n{}",
+            case.attempted,
+            serr
+        );
+        assert!(
+            serr.contains("Corrected command:"),
+            "denial for `{}` must include correction header.\nstderr:\n{}",
+            case.attempted,
+            serr
+        );
+        assert!(
+            serr.contains(case.expected_cli),
+            "denial for `{}` must include exact CLI correction `{}`.\nstderr:\n{}",
+            case.attempted,
+            case.expected_cli,
+            serr
+        );
+        if let Some(expected_mcp_tool) = case.expected_mcp_tool {
+            assert!(
+                serr.contains(&format!("MCP tool: {expected_mcp_tool}")),
+                "denial for `{}` must include MCP tool correction `{}`.\nstderr:\n{}",
+                case.attempted,
+                expected_mcp_tool,
+                serr
+            );
+        }
+
+        if case.expected_cli != format!("am {}", case.attempted) {
+            assert!(
+                !serr.contains(&format!("use: am {}", case.attempted)),
+                "denial for `{}` must not emit the old misleading generic hint.\nstderr:\n{}",
+                case.attempted,
+                serr
+            );
+        }
     }
 }
 
@@ -522,12 +773,7 @@ fn assert_snapshot_match(case_label: &str, expected: &str, actual: &str, update_
 #[test]
 fn golden_denial_message_format_contract() {
     let env = base_env();
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -590,12 +836,7 @@ fn golden_denial_message_format_contract() {
 fn golden_cli_mode_denial_for_mcp_only_serve() {
     let (root, mut env) = isolated_env_without_precreated_root("cli_deny_serve");
     env.push(("AM_INTERFACE_MODE".to_string(), "cli".to_string()));
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -657,12 +898,7 @@ fn golden_cli_mode_denial_for_mcp_only_serve() {
 #[test]
 fn golden_mcp_mode_denial_for_cli_only_doctor_has_no_side_effects() {
     let (root, env) = isolated_env_without_precreated_root("mcp_deny_doctor");
-    let am = am_bin();
-    let target_dir = am.parent().expect("target dir");
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return;
     }
 
@@ -715,14 +951,7 @@ fn golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects() -> Result<()
         ("setup", "mcp_deny_setup.txt"),
         ("robot", "mcp_deny_robot.txt"),
     ];
-    let am = am_bin();
-    let target_dir = am
-        .parent()
-        .ok_or_else(|| format!("target dir unavailable for am binary {}", am.display()))?;
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return Ok(());
     }
 
@@ -776,14 +1005,7 @@ fn golden_mcp_mode_denial_for_setup_and_robot_has_no_side_effects() -> Result<()
 
 #[test]
 fn cli_mode_opt_in_allows_cli_help_and_invalid_mode_is_side_effect_free() -> Result<(), String> {
-    let am = am_bin();
-    let target_dir = am
-        .parent()
-        .ok_or_else(|| format!("target dir unavailable for am binary {}", am.display()))?;
-    let mcp_bin = target_dir.join("mcp-agent-mail");
-
-    if !mcp_bin.exists() {
-        eprintln!("SKIP: MCP binary not found.");
+    if skip_if_mcp_bin_unavailable() {
         return Ok(());
     }
 

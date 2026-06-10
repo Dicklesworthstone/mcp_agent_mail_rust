@@ -19,7 +19,8 @@ SPEC-meta-command-allowlist.md), it prints the following to **stderr**:
 ```
 Error: "{command}" is not an MCP server command.
 
-Agent Mail MCP server accepts: serve, config, version, help
+Agent Mail is not a CLI.
+Agent Mail MCP server accepts: serve, config
 For operator CLI commands, use: am {command}
 Or enable CLI mode: AM_INTERFACE_MODE=cli mcp-agent-mail {command} ...
 
@@ -36,7 +37,7 @@ Tip: Run `am --help` for the full command list.
 
 1. First line: `Error: ` prefix + quoted command + explanation.
 2. Blank line separator.
-3. Remediation block: two lines showing what *is* accepted and how to fix.
+3. Remediation block: deterministic lines showing what *is* accepted and how to fix.
 4. Optional tip line.
 
 ## Exit Code Policy
@@ -47,9 +48,16 @@ Tip: Run `am --help` for the full command list.
 | 1 | Runtime error | Database unreachable, transport failure, etc. |
 | 2 | Usage error | Unknown subcommand, invalid flags, bad arguments |
 
-Exit code **2** is the standard POSIX convention for usage errors (`EX_USAGE`
-from `sysexits.h`). This allows shell scripts and CI to distinguish "user
-called the wrong binary" from "server crashed."
+Exit code **2** is this project's standard wrong-surface and generic usage
+code. This allows shell scripts and CI to distinguish "user called the wrong
+binary" from "server crashed."
+
+Exception: the `am` CLI binary's retired legacy `serve` subcommand exits `64`
+with classifier `legacy-subcommand-migration`. That path is a compatibility
+preflight for supervisors that previously retried `am serve`; exit `64` means
+"migrate command, do not retry unchanged." The MCP server binary command
+`mcp-agent-mail serve` is still valid, and the CLI-mode wrong-surface denial for
+`mcp-agent-mail serve` still exits `2`.
 
 ## Output Channel Policy
 
@@ -61,6 +69,19 @@ called the wrong binary" from "server crashed."
 The denial path must **never** write to stdout. In stdio mode, stdout is the
 MCP transport. Writing non-JSON-RPC content to stdout would corrupt the
 protocol stream.
+
+## MCP Tool-Name Correction Block
+
+For known MCP tool names and common shorthands, the server binary must not emit
+the misleading generic `am {command}` remediation. It must instead print a
+deterministic correction block with the nearest CLI command and, where
+applicable, the MCP tool name to call through an MCP client.
+
+Current covered inputs: `reserve`, `file-reserve`, `file_reservation_paths`,
+`macro_start_session`, `send_message`, `send`, `inbox`, `fetch_inbox`,
+`reservations`, `serve-http`, and `serve-stdio`.
+The `serve-http` and `serve-stdio` corrections intentionally omit the
+`MCP tool:` line because `serve` is an MCP server command, not a tool call.
 
 ## Tone and Verbosity
 

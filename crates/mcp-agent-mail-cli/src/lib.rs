@@ -75,6 +75,8 @@ pub enum CliError {
 pub type CliResult<T> = Result<T, CliError>;
 
 const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
+pub const LEGACY_AM_SERVE_EXIT_CODE: i32 = 64;
+const LEGACY_AM_SERVE_CLASSIFICATION: &str = "legacy-subcommand-migration";
 
 #[derive(Debug, Serialize)]
 struct CliCapabilities {
@@ -2321,6 +2323,22 @@ pub enum DoctorCommand {
     #[command(name = "health")]
     Health,
 
+    /// Inspect mailbox activity locks and live owners without mutating state.
+    ///
+    /// Reports the storage-root lock, SQLite activity lock, holder PIDs,
+    /// process commands, executable paths, open DB/WAL/SHM surfaces, known
+    /// waiters, and a recommended next action. This command is intentionally
+    /// read-only and does not acquire mailbox locks.
+    #[command(name = "locks")]
+    Locks {
+        /// Output format. JSON is recommended for agents.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Mega-command: returns `{summary, findings, actions_planned,
     /// recommended_command, capabilities_url}` in a single round-trip.
     ///
@@ -2851,6 +2869,9 @@ fn parse_with_invocation_name(invocation_name: &'static str) -> Result<Cli, i32>
     if let Some(first) = args.first_mut() {
         *first = OsString::from(invocation_name);
     }
+    if is_legacy_am_serve_invocation(invocation_name, &args) {
+        return Err(emit_legacy_am_serve_migration());
+    }
 
     let matches = match cmd.try_get_matches_from(args) {
         Ok(m) => m,
@@ -2867,6 +2888,25 @@ fn parse_with_invocation_name(invocation_name: &'static str) -> Result<Cli, i32>
             Err(err.exit_code())
         }
     }
+}
+
+fn is_legacy_am_serve_invocation(invocation_name: &str, args: &[OsString]) -> bool {
+    invocation_name == "am" && args.get(1).is_some_and(|arg| arg == OsStr::new("serve"))
+}
+
+fn emit_legacy_am_serve_migration() -> i32 {
+    ftui_runtime::ftui_eprintln!(
+        "Error: legacy `am serve` is retired; choose an explicit transport command.\n\n\
+         classification: {LEGACY_AM_SERVE_CLASSIFICATION}\n\
+         exit_code: {LEGACY_AM_SERVE_EXIT_CODE}\n\
+         retry_policy: do-not-retry-unchanged\n\n\
+         Migration map:\n\
+         - HTTP transport: am serve-http [--host 127.0.0.1] [--port 8765] [--path /mcp/]\n\
+         - stdio transport: am serve-stdio\n\n\
+         If you meant the MCP server binary:\n\
+         - mcp-agent-mail serve"
+    );
+    LEGACY_AM_SERVE_EXIT_CODE
 }
 
 fn err_exit_code(_err: &CliError) -> i32 {
@@ -2918,8 +2958,9 @@ fn command_is_read_only(command: &Commands) -> bool {
         Commands::Acks { action } => acks_command_is_read_only(action),
         Commands::FileReservations { action } => file_reservations_command_is_read_only(action),
         Commands::Contacts { action } => contacts_command_is_read_only(action),
+        Commands::Doctor { action } => doctor_command_is_read_only(action),
 
-        // Everything else (incl. Projects/Archive/Guard/Doctor/Service/Setup
+        // Everything else (incl. Projects/Archive/Guard/Service/Setup
         // /Macros/Beads/Atc/Release/Bench/Migrate/etc.) stays write-classified
         // and therefore still hits the mailbox-mutation refusal — that is the
         // pre-#126 status quo, which is safe.
@@ -2970,6 +3011,10 @@ fn contacts_command_is_read_only(action: &ContactsCommand) -> bool {
     // `Request`, `Respond`, and `Policy` mutate the contacts graph;
     // `ListContacts` is the only pure read.
     matches!(action, ContactsCommand::ListContacts { .. })
+}
+
+fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
+    matches!(action, DoctorCommand::Locks { .. })
 }
 
 fn execute(cli: Cli) -> CliResult<()> {
@@ -3206,20 +3251,186 @@ fn handle_default_launch() -> CliResult<()> {
     let is_interactive = crate::output::is_tty() && crate::output::is_stdin_tty();
 
     if !is_interactive {
-        return run_noninteractive_default_with(robot::handle_robot);
+        return handle_noninteractive_default_status();
     }
 
     // Interactive: full server launch experience (setup self-heal + port check + serve)
     handle_serve_http(None, None, None, false, false)
 }
 
-fn noninteractive_robot_args(command: robot::RobotSubcommand) -> robot::RobotArgs {
-    robot::RobotArgs {
-        format: Some(robot::OutputFormat::Json),
-        json: false,
-        project: None,
-        agent: None,
-        command,
+#[derive(Debug, Serialize)]
+struct BareAmStatusData {
+    schema_version: &'static str,
+    mode: &'static str,
+    binary: BareAmBinaryStatus,
+    runtime: BareAmRuntimeStatus,
+    service: BareAmServiceStatus,
+    doctor_health: BareAmDoctorHealthStatus,
+    top_commands: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct BareAmBinaryStatus {
+    name: &'static str,
+    version: &'static str,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BareAmRuntimeStatus {
+    interface_mode: String,
+    project: String,
+    agent: Option<String>,
+    database_url: String,
+    database_path: String,
+    storage_root: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BareAmServiceStatus {
+    manager: &'static str,
+    active: bool,
+    http_url: String,
+    listener: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BareAmDoctorHealthStatus {
+    status: &'static str,
+    detail: String,
+    command: &'static str,
+}
+
+fn handle_noninteractive_default_status() -> CliResult<()> {
+    let data = build_bare_am_status_data();
+    let health_status = data.doctor_health.status;
+    let mut env = robot::RobotEnvelope::new("am", robot::OutputFormat::Json, data)
+        .with_action("am status --json")
+        .with_action("am doctor health")
+        .with_action("am agent start --json")
+        .with_action("am capabilities --json");
+    if health_status != "ok" {
+        env = env.with_alert(
+            "warn",
+            format!("doctor health status is {health_status}"),
+            Some("am doctor health".to_string()),
+        );
+    }
+    let rendered = robot::format_output(&env, robot::OutputFormat::Json)?;
+    ftui_runtime::ftui_println!("{rendered}");
+    Ok(())
+}
+
+fn build_bare_am_status_data() -> BareAmStatusData {
+    let config = Config::from_env();
+    BareAmStatusData {
+        schema_version: "am.bare_status.v1",
+        mode: "cli",
+        binary: BareAmBinaryStatus {
+            name: "am",
+            version: env!("CARGO_PKG_VERSION"),
+            path: current_binary_path_for_status(),
+        },
+        runtime: BareAmRuntimeStatus {
+            interface_mode: std::env::var("AM_INTERFACE_MODE").unwrap_or_else(|_| "cli".into()),
+            project: std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| format!("<unknown: {error}>")),
+            agent: detect_agent_name(None).0,
+            database_url: config.database_url.clone(),
+            database_path: database_path_for_status(&config.database_url),
+            storage_root: config.storage_root.display().to_string(),
+        },
+        service: bare_am_service_status(&config),
+        doctor_health: bare_am_doctor_health_status(&config),
+        top_commands: vec![
+            "am status --json",
+            "am doctor health",
+            "am agent start --json",
+            "am inbox --urgent --json",
+            "am reservations --conflicts --json",
+            "am capabilities --json",
+        ],
+    }
+}
+
+fn current_binary_path_for_status() -> String {
+    match std::env::current_exe() {
+        Ok(path) => std::fs::canonicalize(&path)
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+        Err(error) => format!("<unknown: {error}>"),
+    }
+}
+
+fn database_path_for_status(database_url: &str) -> String {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return ":memory:".to_string();
+    }
+    sqlite_file_path_from_database_url(database_url).map_or_else(
+        || "<unparseable sqlite DATABASE_URL>".to_string(),
+        |path| resolve_sqlite_path_with_absolute_candidate(&path.display().to_string()),
+    )
+}
+
+fn bare_am_service_status(config: &Config) -> BareAmServiceStatus {
+    let manager = if is_systemd_service_active() {
+        "systemd"
+    } else if is_launchd_service_active() {
+        "launchd"
+    } else {
+        "none"
+    };
+    let listener = match mcp_agent_mail_server::startup_checks::check_port_status(
+        &config.http_host,
+        config.http_port,
+    ) {
+        mcp_agent_mail_server::startup_checks::PortStatus::Free => "free".to_string(),
+        mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer => {
+            "agent-mail-server".to_string()
+        }
+        mcp_agent_mail_server::startup_checks::PortStatus::OtherProcess { description } => {
+            format!("other-process: {description}")
+        }
+        mcp_agent_mail_server::startup_checks::PortStatus::Error { message, .. } => {
+            format!("probe-error: {message}")
+        }
+    };
+    BareAmServiceStatus {
+        manager,
+        active: manager != "none",
+        http_url: agent_start_http_url(
+            &config.http_host,
+            &config.http_port.to_string(),
+            &config.http_path,
+        ),
+        listener,
+    }
+}
+
+fn bare_am_doctor_health_status(config: &Config) -> BareAmDoctorHealthStatus {
+    match doctor_database_fix_strategy_read_only(&config.database_url, &config.storage_root) {
+        Ok(DoctorDatabaseFixStrategy::None(detail)) => BareAmDoctorHealthStatus {
+            status: "ok",
+            detail,
+            command: "am doctor health",
+        },
+        Ok(DoctorDatabaseFixStrategy::Repair(detail)) => BareAmDoctorHealthStatus {
+            status: "needs_repair",
+            detail,
+            command: "am doctor health",
+        },
+        Ok(DoctorDatabaseFixStrategy::Reconstruct(detail)) => BareAmDoctorHealthStatus {
+            status: "needs_reconstruct",
+            detail,
+            command: "am doctor health",
+        },
+        Err(error) => BareAmDoctorHealthStatus {
+            status: "error",
+            detail: error.to_string(),
+            command: "am doctor health",
+        },
     }
 }
 
@@ -3228,21 +3439,6 @@ fn is_project_not_found_error(err: &CliError) -> bool {
         err,
         CliError::InvalidArgument(message) if message.starts_with("project not found:")
     )
-}
-
-fn run_noninteractive_default_with<F>(mut run_robot: F) -> CliResult<()>
-where
-    F: FnMut(robot::RobotArgs) -> CliResult<()>,
-{
-    // Non-interactive: emit robot status as JSON so coding agents get useful output.
-    // If no project is registered yet for CWD, fall back to cross-project overview.
-    match run_robot(noninteractive_robot_args(robot::RobotSubcommand::Status)) {
-        Ok(()) => Ok(()),
-        Err(err) if is_project_not_found_error(&err) => {
-            run_robot(noninteractive_robot_args(robot::RobotSubcommand::Overview))
-        }
-        Err(err) => Err(err),
-    }
 }
 
 fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
@@ -3501,8 +3697,8 @@ fn systemd_unit_path() -> Option<PathBuf> {
 fn is_systemd_service_active() -> bool {
     std::process::Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME])
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -6176,6 +6372,7 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_health(&target)
         }
+        DoctorCommand::Locks { format, json } => handle_doctor_locks(format, json),
         DoctorCommand::Triage { quick } => {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             doctor::handle_triage(&target, quick)
@@ -6800,26 +6997,35 @@ fn path_is_self_update_binary_file(path: &Path) -> bool {
     true
 }
 
-fn doctor_legacy_fts_tables(conn: &mcp_agent_mail_db::DbConn) -> Vec<String> {
-    let mut names = conn
-        .query_sync(
-            "SELECT name \
-             FROM sqlite_master \
-             WHERE type='table' AND ( \
-                 name IN ('fts_messages', 'fts_agents', 'fts_projects', \
-                          'messages_fts', 'agents_fts', 'projects_fts') \
-                 OR lower(COALESCE(sql, '')) LIKE '%using fts5%' \
-             )",
-            &[],
-        )
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row.get_named::<String>("name").ok())
-        .collect::<Vec<_>>();
+fn doctor_legacy_fts_tables_from_query<F>(mut query: F) -> Vec<String>
+where
+    F: FnMut(&str) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, String>,
+{
+    let mut names = query(
+        "SELECT name \
+         FROM sqlite_master \
+         WHERE type='table' AND ( \
+             name IN ('fts_messages', 'fts_agents', 'fts_projects', \
+                      'messages_fts', 'agents_fts', 'projects_fts') \
+             OR lower(COALESCE(sql, '')) LIKE '%using fts5%' \
+         )",
+    )
+    .ok()
+    .into_iter()
+    .flatten()
+    .filter_map(|row| row.get_named::<String>("name").ok())
+    .collect::<Vec<_>>();
     names.sort();
     names.dedup();
     names
+}
+
+fn doctor_legacy_fts_tables(conn: &mcp_agent_mail_db::DbConn) -> Vec<String> {
+    doctor_legacy_fts_tables_from_query(|sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()))
+}
+
+fn doctor_legacy_fts_tables_canonical(conn: &mcp_agent_mail_db::CanonicalDbConn) -> Vec<String> {
+    doctor_legacy_fts_tables_from_query(|sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()))
 }
 
 fn guard_status_missing_repo(message: &str) -> bool {
@@ -7136,6 +7342,850 @@ fn sqlite_doctor_busy_error(path: &Path, detail: &str) -> CliError {
     ))
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DoctorProcLockRecord {
+    pid: u32,
+    mode: String,
+    waiting: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLockPathReport {
+    name: &'static str,
+    path: String,
+    exists: bool,
+    file_type: String,
+    age_seconds: Option<u64>,
+    mode: Option<String>,
+    holder_pids: Vec<u32>,
+    waiter_pids: Vec<u32>,
+    proc_records: Vec<DoctorProcLockRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLockSidecarReport {
+    name: &'static str,
+    path: String,
+    exists: bool,
+    open_by_pids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLockProcessReport {
+    pid: u32,
+    command: Option<String>,
+    executable_path: Option<String>,
+    executable_deleted: bool,
+    age_seconds: Option<u64>,
+    holds_storage_root_lock: bool,
+    holds_sqlite_lock: bool,
+    holds_database_file: bool,
+    holds_wal_file: bool,
+    holds_shm_file: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLockWaiterReport {
+    pid: u32,
+    lock_name: &'static str,
+    mode: String,
+    command: Option<String>,
+    executable_path: Option<String>,
+    age_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorLockOwnerClass {
+    Live,
+    Stale,
+    Wedged,
+    UnsafeToTouch,
+}
+
+impl DoctorLockOwnerClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Stale => "stale",
+            Self::Wedged => "wedged",
+            Self::UnsafeToTouch => "unsafe-to-touch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLockOwnerState {
+    class: DoctorLockOwnerClass,
+    reason: String,
+    safe_next_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLocksReport {
+    schema_version: &'static str,
+    inspected_at: String,
+    storage_root: String,
+    database_path: String,
+    memory_database: bool,
+    disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition,
+    owner_state: DoctorLockOwnerState,
+    detail: String,
+    supervised_restart_required: bool,
+    storage_root_lock: DoctorLockPathReport,
+    sqlite_lock: DoctorLockPathReport,
+    sidecars: Vec<DoctorLockSidecarReport>,
+    processes: Vec<DoctorLockProcessReport>,
+    waiters: Vec<DoctorLockWaiterReport>,
+    recommended_next_action: String,
+    read_only: bool,
+}
+
+fn handle_doctor_locks(format: Option<output::CliOutputFormat>, json: bool) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let report = build_doctor_locks_report()?;
+    output::emit_output(&report, fmt, || render_doctor_locks_report(&report));
+    Ok(())
+}
+
+fn build_doctor_locks_report() -> CliResult<DoctorLocksReport> {
+    let config = Config::from_env();
+    build_doctor_locks_report_with_config(&config)
+}
+
+fn build_doctor_locks_report_with_config(config: &Config) -> CliResult<DoctorLocksReport> {
+    let memory_database =
+        mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+    let database_path = if memory_database {
+        PathBuf::from(":memory:")
+    } else {
+        resolve_mailbox_activity_sqlite_path(&config.database_url)?
+    };
+    let ownership =
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&database_path, &config.storage_root);
+    let storage_root_lock_path = PathBuf::from(&ownership.storage_lock_path);
+    let sqlite_lock_path = PathBuf::from(&ownership.sqlite_lock_path);
+    let storage_root_lock = inspect_doctor_lock_path("storage_root", &storage_root_lock_path);
+    let (sqlite_lock, sidecars, sqlite_lock_path, wal_path, shm_path) = if memory_database {
+        (
+            synthetic_doctor_lock_path("sqlite", ":memory:", "memory_database"),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+    } else {
+        let wal_path = sqlite_sidecar_path(&database_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&database_path, "-shm");
+        (
+            inspect_doctor_lock_path("sqlite", &sqlite_lock_path),
+            vec![
+                inspect_doctor_sidecar("wal", &wal_path),
+                inspect_doctor_sidecar("shm", &shm_path),
+            ],
+            Some(sqlite_lock_path),
+            Some(wal_path),
+            Some(shm_path),
+        )
+    };
+    let processes = doctor_lock_process_reports(
+        &ownership.processes,
+        &storage_root_lock,
+        &sqlite_lock,
+        &storage_root_lock_path,
+        sqlite_lock_path.as_deref(),
+        (!memory_database).then_some(database_path.as_path()),
+        wal_path.as_deref(),
+        shm_path.as_deref(),
+    );
+    let waiters = doctor_lock_waiters(&storage_root_lock)
+        .into_iter()
+        .chain(doctor_lock_waiters(&sqlite_lock))
+        .collect::<Vec<_>>();
+    let owner_state = doctor_locks_owner_state(
+        &ownership,
+        &storage_root_lock,
+        &sqlite_lock,
+        &processes,
+        &waiters,
+    );
+    let recommended_next_action = doctor_locks_recommended_next_action(&owner_state, &waiters);
+
+    Ok(DoctorLocksReport {
+        schema_version: "doctor_locks.v1",
+        inspected_at: Utc::now().to_rfc3339(),
+        storage_root: config.storage_root.display().to_string(),
+        database_path: database_path.display().to_string(),
+        memory_database,
+        disposition: ownership.disposition,
+        owner_state,
+        detail: ownership.detail,
+        supervised_restart_required: ownership.supervised_restart_required,
+        storage_root_lock,
+        sqlite_lock,
+        sidecars,
+        processes,
+        waiters,
+        recommended_next_action,
+        read_only: true,
+    })
+}
+
+fn synthetic_doctor_lock_path(
+    name: &'static str,
+    path: impl Into<String>,
+    file_type: impl Into<String>,
+) -> DoctorLockPathReport {
+    DoctorLockPathReport {
+        name,
+        path: path.into(),
+        exists: false,
+        file_type: file_type.into(),
+        age_seconds: None,
+        mode: None,
+        holder_pids: Vec::new(),
+        waiter_pids: Vec::new(),
+        proc_records: Vec::new(),
+    }
+}
+
+fn doctor_lock_process_reports(
+    ownership_processes: &[mcp_agent_mail_db::pool::MailboxOwnershipProcess],
+    storage_root_lock: &DoctorLockPathReport,
+    sqlite_lock: &DoctorLockPathReport,
+    storage_root_lock_path: &Path,
+    sqlite_lock_path: Option<&Path>,
+    database_path: Option<&Path>,
+    wal_path: Option<&Path>,
+    shm_path: Option<&Path>,
+) -> Vec<DoctorLockProcessReport> {
+    let ownership_by_pid = ownership_processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<BTreeMap<_, _>>();
+    let storage_root_holder_pids = storage_root_lock
+        .holder_pids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let sqlite_holder_pids = sqlite_lock
+        .holder_pids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut pids = ownership_by_pid.keys().copied().collect::<BTreeSet<_>>();
+    pids.extend(storage_root_holder_pids.iter().copied());
+    pids.extend(sqlite_holder_pids.iter().copied());
+
+    pids.into_iter()
+        .map(|pid| {
+            let ownership_process = ownership_by_pid.get(&pid).copied();
+            let executable_path = ownership_process
+                .and_then(|process| process.executable_path.clone())
+                .or_else(|| {
+                    pid_executable_path_for_doctor_locks(pid)
+                        .map(|path| path.to_string_lossy().into_owned())
+                });
+            let executable_deleted = ownership_process.is_some_and(|process| {
+                process.executable_deleted
+                    || process
+                        .executable_path
+                        .as_deref()
+                        .is_some_and(|path| path.ends_with(" (deleted)"))
+            }) || executable_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with(" (deleted)"));
+            DoctorLockProcessReport {
+                pid,
+                command: ownership_process
+                    .and_then(|process| process.command.clone())
+                    .or_else(|| pid_command_line_for_doctor_locks(pid)),
+                executable_path,
+                executable_deleted,
+                age_seconds: process_age_seconds(pid),
+                holds_storage_root_lock: ownership_process
+                    .is_some_and(|process| process.holds_storage_root_lock)
+                    || storage_root_holder_pids.contains(&pid)
+                    || process_holds_path(pid, storage_root_lock_path),
+                holds_sqlite_lock: sqlite_lock_path.is_some_and(|path| {
+                    ownership_process.is_some_and(|process| process.holds_sqlite_lock)
+                        || sqlite_holder_pids.contains(&pid)
+                        || process_holds_path(pid, path)
+                }),
+                holds_database_file: database_path.is_some_and(|path| {
+                    ownership_process.is_some_and(|process| process.holds_database_file)
+                        || process_holds_path(pid, path)
+                }),
+                holds_wal_file: wal_path.is_some_and(|path| process_holds_path(pid, path)),
+                holds_shm_file: shm_path.is_some_and(|path| process_holds_path(pid, path)),
+            }
+        })
+        .collect()
+}
+
+fn render_doctor_locks_report(report: &DoctorLocksReport) {
+    ftui_runtime::ftui_println!("Doctor locks:");
+    ftui_runtime::ftui_println!("  storage_root: {}", report.storage_root);
+    ftui_runtime::ftui_println!("  database_path: {}", report.database_path);
+    ftui_runtime::ftui_println!("  disposition: {:?}", report.disposition);
+    ftui_runtime::ftui_println!("  owner_class: {}", report.owner_state.class.as_str());
+    ftui_runtime::ftui_println!(
+        "  safe_next_command: {}",
+        report.owner_state.safe_next_command
+    );
+    ftui_runtime::ftui_println!("  owner_reason: {}", report.owner_state.reason);
+    ftui_runtime::ftui_println!("  detail: {}", report.detail);
+    ftui_runtime::ftui_println!(
+        "  recommended_next_action: {}",
+        report.recommended_next_action
+    );
+    ftui_runtime::ftui_println!();
+    render_doctor_lock_path(&report.storage_root_lock);
+    render_doctor_lock_path(&report.sqlite_lock);
+    if report.processes.is_empty() {
+        ftui_runtime::ftui_println!("  processes: none");
+    } else {
+        ftui_runtime::ftui_println!("  processes:");
+        for process in &report.processes {
+            let command = process.command.as_deref().unwrap_or("<unknown>");
+            let exe = process.executable_path.as_deref().unwrap_or("<unknown>");
+            ftui_runtime::ftui_println!(
+                "    pid={} age={}s db_open={} wal_open={} shm_open={} storage_lock={} sqlite_lock={} cmd={} exe={}",
+                process.pid,
+                process.age_seconds.unwrap_or(0),
+                process.holds_database_file,
+                process.holds_wal_file,
+                process.holds_shm_file,
+                process.holds_storage_root_lock,
+                process.holds_sqlite_lock,
+                command,
+                exe,
+            );
+        }
+    }
+    if !report.waiters.is_empty() {
+        ftui_runtime::ftui_println!("  waiters:");
+        for waiter in &report.waiters {
+            let command = waiter.command.as_deref().unwrap_or("<unknown>");
+            ftui_runtime::ftui_println!(
+                "    pid={} lock={} mode={} age={}s cmd={}",
+                waiter.pid,
+                waiter.lock_name,
+                waiter.mode,
+                waiter.age_seconds.unwrap_or(0),
+                command,
+            );
+        }
+    }
+}
+
+fn render_doctor_lock_path(lock: &DoctorLockPathReport) {
+    ftui_runtime::ftui_println!(
+        "  {}_lock: path={} exists={} type={} mode={} holders={:?} waiters={:?} age={}s",
+        lock.name,
+        lock.path,
+        lock.exists,
+        lock.file_type,
+        lock.mode.as_deref().unwrap_or("none"),
+        lock.holder_pids,
+        lock.waiter_pids,
+        lock.age_seconds.unwrap_or(0),
+    );
+}
+
+fn inspect_doctor_lock_path(name: &'static str, path: &Path) -> DoctorLockPathReport {
+    let metadata = std::fs::symlink_metadata(path).ok();
+    let exists = metadata.is_some();
+    let file_type = metadata
+        .as_ref()
+        .map_or_else(|| "missing".to_string(), file_type_label);
+    let age_seconds = metadata
+        .as_ref()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(system_time_age_seconds);
+    let is_regular_file = metadata
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_file());
+    let proc_records = if is_regular_file {
+        proc_lock_records_for_path(path)
+    } else {
+        Vec::new()
+    };
+    let open_pids = if is_regular_file {
+        pids_holding_path(path)
+    } else {
+        Vec::new()
+    };
+    let inferred_mode = if is_regular_file {
+        infer_lock_mode_by_try_lock(path)
+    } else {
+        None
+    };
+    let mut holder_pids = unique_proc_lock_pids(&proc_records, false);
+    if holder_pids.is_empty() && inferred_mode.is_some() {
+        holder_pids = open_pids;
+    }
+    let waiter_pids = unique_proc_lock_pids(&proc_records, true);
+    let mode = summarize_proc_lock_modes(&proc_records).or(inferred_mode);
+    DoctorLockPathReport {
+        name,
+        path: path.display().to_string(),
+        exists,
+        file_type,
+        age_seconds,
+        mode,
+        holder_pids,
+        waiter_pids,
+        proc_records,
+    }
+}
+
+fn infer_lock_mode_by_try_lock(path: &Path) -> Option<String> {
+    use fs2::FileExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    if file.try_lock_exclusive().is_ok() {
+        let _ = FileExt::unlock(&file);
+        return None;
+    }
+    if file.try_lock_shared().is_ok() {
+        let _ = FileExt::unlock(&file);
+        return Some("shared".to_string());
+    }
+    Some("exclusive".to_string())
+}
+
+fn inspect_doctor_sidecar(name: &'static str, path: &Path) -> DoctorLockSidecarReport {
+    DoctorLockSidecarReport {
+        name,
+        path: path.display().to_string(),
+        exists: path.exists(),
+        open_by_pids: pids_holding_path(path),
+    }
+}
+
+fn doctor_lock_waiters(lock: &DoctorLockPathReport) -> Vec<DoctorLockWaiterReport> {
+    lock.proc_records
+        .iter()
+        .filter(|record| record.waiting)
+        .map(|record| DoctorLockWaiterReport {
+            pid: record.pid,
+            lock_name: lock.name,
+            mode: record.mode.clone(),
+            command: pid_command_line_for_doctor_locks(record.pid),
+            executable_path: pid_executable_path_for_doctor_locks(record.pid)
+                .map(|path| path.to_string_lossy().into_owned()),
+            age_seconds: process_age_seconds(record.pid),
+        })
+        .collect()
+}
+
+fn unique_proc_lock_pids(records: &[DoctorProcLockRecord], waiting: bool) -> Vec<u32> {
+    records
+        .iter()
+        .filter(|record| record.waiting == waiting)
+        .map(|record| record.pid)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn summarize_proc_lock_modes(records: &[DoctorProcLockRecord]) -> Option<String> {
+    let modes = records
+        .iter()
+        .filter(|record| !record.waiting)
+        .map(|record| record.mode.as_str())
+        .collect::<BTreeSet<_>>();
+    match modes.len() {
+        0 => None,
+        1 => modes.first().map(|mode| (*mode).to_string()),
+        _ => Some("mixed".to_string()),
+    }
+}
+
+fn file_type_label(metadata: &std::fs::Metadata) -> String {
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        "file".to_string()
+    } else if file_type.is_dir() {
+        "directory".to_string()
+    } else if file_type.is_symlink() {
+        "symlink".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn system_time_age_seconds(time: std::time::SystemTime) -> Option<u64> {
+    time.elapsed().ok().map(|duration| duration.as_secs())
+}
+
+fn doctor_locks_owner_state(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+    storage_root_lock: &DoctorLockPathReport,
+    sqlite_lock: &DoctorLockPathReport,
+    processes: &[DoctorLockProcessReport],
+    waiters: &[DoctorLockWaiterReport],
+) -> DoctorLockOwnerState {
+    use mcp_agent_mail_db::pool::MailboxOwnershipDisposition::{
+        ActiveOtherOwner, DeletedExecutable, SplitBrain, StaleLiveProcess, Unowned,
+    };
+
+    if !waiters.is_empty() {
+        return doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::UnsafeToTouch,
+            "one or more processes are already waiting on mailbox activity locks".to_string(),
+            doctor_locks_process_inspection_command(waiters.iter().map(|waiter| waiter.pid)),
+        );
+    }
+
+    if let Some(lock) = [storage_root_lock, sqlite_lock]
+        .into_iter()
+        .find(|lock| doctor_lock_path_is_unsafe_to_touch(lock))
+    {
+        return doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::UnsafeToTouch,
+            format!(
+                "{} activity lock path exists but is a {}; repair planning must inspect it first",
+                lock.name, lock.file_type
+            ),
+            "am doctor fix --list --json".to_string(),
+        );
+    }
+
+    if ownership.disposition == SplitBrain {
+        return doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::UnsafeToTouch,
+            "multiple Agent Mail owners are visible for the same mailbox".to_string(),
+            doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
+        );
+    }
+
+    let live_without_activity_locks = processes
+        .iter()
+        .filter(|process| {
+            process.holds_database_file
+                && !process.holds_storage_root_lock
+                && !process.holds_sqlite_lock
+        })
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
+    if !live_without_activity_locks.is_empty() {
+        return doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::Wedged,
+            "a live Agent Mail-looking PID owns storage.sqlite3 but no activity lock is visible"
+                .to_string(),
+            doctor_locks_process_inspection_command(live_without_activity_locks),
+        );
+    }
+
+    match ownership.disposition {
+        Unowned => {
+            let stale_artifact_count = [storage_root_lock, sqlite_lock]
+                .into_iter()
+                .filter(|lock| lock.exists && lock.holder_pids.is_empty())
+                .count();
+            let reason = if stale_artifact_count == 0 {
+                "no competing Agent Mail owner or activity-lock holder is visible".to_string()
+            } else {
+                format!(
+                    "{stale_artifact_count} activity lock artifact(s) exist without a live holder"
+                )
+            };
+            doctor_lock_owner_state_value(
+                DoctorLockOwnerClass::Stale,
+                reason,
+                "am doctor --dry-run --fix".to_string(),
+            )
+        }
+        ActiveOtherOwner => doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::Live,
+            "a single live Agent Mail owner is visible with normal ownership evidence".to_string(),
+            "am doctor health".to_string(),
+        ),
+        StaleLiveProcess => doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::Wedged,
+            "a live Agent Mail-looking process holds mailbox state without expected lock evidence"
+                .to_string(),
+            doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
+        ),
+        DeletedExecutable => doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::Wedged,
+            "a live Agent Mail owner is running from a deleted executable".to_string(),
+            doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
+        ),
+        SplitBrain => doctor_lock_owner_state_value(
+            DoctorLockOwnerClass::UnsafeToTouch,
+            "multiple Agent Mail owners are visible for the same mailbox".to_string(),
+            doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
+        ),
+    }
+}
+
+fn doctor_lock_owner_state_value(
+    class: DoctorLockOwnerClass,
+    reason: String,
+    safe_next_command: String,
+) -> DoctorLockOwnerState {
+    DoctorLockOwnerState {
+        class,
+        reason,
+        safe_next_command,
+    }
+}
+
+fn doctor_lock_path_is_unsafe_to_touch(lock: &DoctorLockPathReport) -> bool {
+    lock.exists && lock.file_type != "file"
+}
+
+fn doctor_locks_process_inspection_command(pids: impl IntoIterator<Item = u32>) -> String {
+    let pids = pids.into_iter().collect::<BTreeSet<_>>();
+    if pids.is_empty() {
+        return "am doctor locks --json".to_string();
+    }
+    let pid_list = pids
+        .into_iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("ps -p {pid_list} -o pid,ppid,stat,lstart,cmd")
+}
+
+fn doctor_locks_recommended_next_action(
+    owner_state: &DoctorLockOwnerState,
+    waiters: &[DoctorLockWaiterReport],
+) -> String {
+    let waiter_prefix = if waiters.is_empty() {
+        ""
+    } else {
+        "Lock waiters are present; avoid starting additional mutating doctor operations. "
+    };
+    match owner_state.class {
+        DoctorLockOwnerClass::Live => format!(
+            "{waiter_prefix}Owner class live: use the running server for normal reads and do not run mutating doctor work while it owns the mailbox. Safe next command: `{}`.",
+            owner_state.safe_next_command
+        ),
+        DoctorLockOwnerClass::Stale => format!(
+            "{waiter_prefix}Owner class stale: no live owner is visible; preview non-destructive doctor remediation before changing anything. Safe next command: `{}`.",
+            owner_state.safe_next_command
+        ),
+        DoctorLockOwnerClass::Wedged => format!(
+            "{waiter_prefix}Owner class wedged: inspect the reported process and use only a supervisor-managed drain/restart path after operator confirmation; do not terminate `am` directly. Safe next command: `{}`.",
+            owner_state.safe_next_command
+        ),
+        DoctorLockOwnerClass::UnsafeToTouch => format!(
+            "{waiter_prefix}Owner class unsafe-to-touch: do not run repair, reconstruct, or other mutating doctor work until the ownership evidence is reconciled. Safe next command: `{}`.",
+            owner_state.safe_next_command
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_lock_records_for_path(path: &Path) -> Vec<DoctorProcLockRecord> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let target_ino = meta.ino();
+    let target_dev = meta.dev();
+    let (target_major, target_minor) = linux_device_numbers_for_doctor_locks(target_dev);
+    let Ok(locks_content) = std::fs::read_to_string("/proc/locks") else {
+        return Vec::new();
+    };
+
+    let mut records = Vec::new();
+    for line in locks_content.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 8 {
+            continue;
+        }
+        let waiting = fields.get(1).is_some_and(|field| *field == "->");
+        let lock_type_index = if waiting { 2 } else { 1 };
+        let mode_index = if waiting { 4 } else { 3 };
+        let pid_index = if waiting { 5 } else { 4 };
+        let lock_id_index = if waiting { 6 } else { 5 };
+        if fields.get(lock_type_index) != Some(&"FLOCK") {
+            continue;
+        }
+        let Some(lock_id) = fields.get(lock_id_index) else {
+            continue;
+        };
+        let parts = lock_id.split(':').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            continue;
+        }
+        let Ok(major) = u32::from_str_radix(parts[0], 16) else {
+            continue;
+        };
+        let Ok(minor) = u32::from_str_radix(parts[1], 16) else {
+            continue;
+        };
+        let Ok(ino) = parts[2].parse::<u64>() else {
+            continue;
+        };
+        if ino != target_ino || major != target_major || minor != target_minor {
+            continue;
+        }
+        let Some(raw_mode) = fields.get(mode_index) else {
+            continue;
+        };
+        let Some(raw_pid) = fields.get(pid_index) else {
+            continue;
+        };
+        let Ok(pid) = raw_pid.parse::<u32>() else {
+            continue;
+        };
+        records.push(DoctorProcLockRecord {
+            pid,
+            mode: normalize_proc_lock_mode(raw_mode),
+            waiting,
+        });
+    }
+    records
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_lock_records_for_path(_path: &Path) -> Vec<DoctorProcLockRecord> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_device_numbers_for_doctor_locks(dev: u64) -> (u32, u32) {
+    let major = u32::try_from((dev >> 8) & 0xfff).unwrap_or(u32::MAX);
+    let minor = u32::try_from((dev & 0xff) | ((dev >> 12) & 0xfff00)).unwrap_or(u32::MAX);
+    (major, minor)
+}
+
+fn normalize_proc_lock_mode(raw: &str) -> String {
+    match raw {
+        "READ" => "shared".to_string(),
+        "WRITE" => "exclusive".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pids_holding_path(path: &Path) -> Vec<u32> {
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut holders = BTreeSet::new();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if process_holds_path(pid, path) {
+            holders.insert(pid);
+        }
+    }
+    holders.into_iter().collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pids_holding_path(_path: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn process_holds_path(pid: u32, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(target_meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for fd_entry in fds.flatten() {
+        if let Ok(link_meta) = std::fs::metadata(fd_entry.path())
+            && link_meta.ino() == target_meta.ino()
+            && link_meta.dev() == target_meta.dev()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_holds_path(_pid: u32, _path: &Path) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn process_age_seconds(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let start_ticks = parse_proc_stat_start_ticks_for_doctor_locks(&stat)?;
+    let uptime_seconds = read_proc_uptime_seconds_for_doctor_locks()?;
+    let ticks_per_second = clock_ticks_per_second_for_doctor_locks()?;
+    let started_after_boot = start_ticks as f64 / ticks_per_second as f64;
+    (uptime_seconds >= started_after_boot)
+        .then(|| (uptime_seconds - started_after_boot).floor() as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_age_seconds(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_start_ticks_for_doctor_locks(stat: &str) -> Option<u64> {
+    let close_paren = stat.rfind(')')?;
+    let rest = stat.get(close_paren + 2..)?;
+    // Fields after `comm` begin at field 3 (`state`), so starttime (field 22)
+    // is offset 19 in this tail segment.
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_uptime_seconds_for_doctor_locks() -> Option<f64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    uptime.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second_for_doctor_locks() -> Option<u64> {
+    use nix::unistd::{SysconfVar, sysconf};
+
+    let ticks = sysconf(SysconfVar::CLK_TCK).ok()??;
+    u64::try_from(ticks).ok().filter(|ticks| *ticks > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_command_line_for_doctor_locks(pid: u32) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let segments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then(|| segments.join(" "))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_command_line_for_doctor_locks(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn pid_executable_path_for_doctor_locks(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_executable_path_for_doctor_locks(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
     if err.kind() == std::io::ErrorKind::WouldBlock
         || mcp_agent_mail_db::is_lock_error(&err.to_string())
@@ -7282,6 +8332,19 @@ fn acquire_cli_mailbox_read_locks_for_paths(
     )?;
     Ok(CliMailboxReadLocks {
         _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    })
+}
+
+fn acquire_cli_mailbox_read_locks_for_sqlite_path(
+    sqlite_path: &Path,
+) -> CliResult<CliMailboxReadLocks> {
+    let sqlite_lock = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+        sqlite_path,
+        mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+    )?;
+    Ok(CliMailboxReadLocks {
+        _storage_root_lock: None,
         _sqlite_lock: sqlite_lock,
     })
 }
@@ -7433,6 +8496,18 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
     sqlite_file_is_healthy_with_compat_probe(path, sqlite_file_is_healthy_canonical)
 }
 
+fn sqlite_file_is_healthy_read_only(path: &Path) -> CliResult<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+
+    let conn = doctor_open_canonical_readonly_db_for_diagnostic(path, "health_check")?;
+    if !sqlite_conn_quick_check_ok_canonical(&conn)? {
+        return Ok(false);
+    }
+    sqlite_conn_incremental_check_ok_canonical(&conn)
+}
+
 fn sqlite_doctor_sanity_with_health_probe<F>(
     db_path: &str,
     mut health_probe: F,
@@ -7562,6 +8637,10 @@ where
 
 fn sqlite_doctor_file_sanity(db_path: &str) -> CliResult<(bool, String, bool, bool)> {
     sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy)
+}
+
+fn sqlite_doctor_file_sanity_read_only(db_path: &str) -> CliResult<(bool, String, bool, bool)> {
+    sqlite_doctor_sanity_with_health_probe(db_path, sqlite_file_is_healthy_read_only)
 }
 
 fn os_string_with_suffix(value: &OsStr, suffix: &str) -> OsString {
@@ -7971,6 +9050,109 @@ fn open_sqlite_read_only_with_fallback(
     path: &str,
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     open_sqlite_with_fallback_internal(path, None, false)
+}
+
+const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
+
+fn require_existing_regular_sqlite_source(path: &Path, context: &str) -> CliResult<()> {
+    if path == Path::new(":memory:") {
+        return Err(CliError::Other(format!(
+            "{context} requires an existing file-backed SQLite database; :memory: cannot be snapshotted"
+        )));
+    }
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CliError::Other(format!(
+                "{context} requires an existing file-backed SQLite database; not found: {}",
+                path.display()
+            ))
+        } else {
+            CliError::Other(format!(
+                "{context} failed to inspect SQLite source {}: {error}",
+                path.display()
+            ))
+        }
+    })?;
+
+    if !metadata.file_type().is_file() {
+        return Err(CliError::Other(format!(
+            "{context} live snapshot source must be a regular SQLite file; refusing {}",
+            path.display()
+        )));
+    }
+
+    if metadata.len() < SQLITE_DATABASE_HEADER_BYTES as u64 {
+        return Err(CliError::Other(format!(
+            "{context} requires an existing valid SQLite database; {} is too small to contain a SQLite header",
+            path.display()
+        )));
+    }
+
+    let mut header = [0_u8; SQLITE_DATABASE_HEADER_BYTES];
+    let mut file = doctor::platform::open_regular_file_no_follow(path).map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to read SQLite source header {}: {error}",
+            path.display()
+        ))
+    })?;
+    let open_metadata = file.metadata().map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to inspect opened SQLite source {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !open_metadata.file_type().is_file() {
+        return Err(CliError::Other(format!(
+            "{context} opened live snapshot source must be a regular SQLite file; refusing {}",
+            path.display()
+        )));
+    }
+    if open_metadata.len() < SQLITE_DATABASE_HEADER_BYTES as u64 {
+        return Err(CliError::Other(format!(
+            "{context} requires an existing valid SQLite database; {} is too small to contain a SQLite header",
+            path.display()
+        )));
+    }
+    std::io::Read::read_exact(&mut file, &mut header).map_err(|error| {
+        CliError::Other(format!(
+            "{context} failed to read SQLite source header {}: {error}",
+            path.display()
+        ))
+    })?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(CliError::Other(format!(
+            "{context} requires an existing valid SQLite database; {} has an invalid SQLite header",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn resolve_existing_sqlite_source_candidate_with_database_url(
+    database_url: &str,
+    context: &str,
+) -> CliResult<PathBuf> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|error| CliError::Other(format!("bad database URL: {error}")))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let source_candidate = PathBuf::from(path);
+    require_existing_regular_sqlite_source(&source_candidate, context)?;
+    Ok(source_candidate)
+}
+
+fn validated_live_sqlite_snapshot_source_path_from_candidate(
+    source_candidate: &Path,
+    context: &str,
+) -> CliResult<PathBuf> {
+    require_existing_regular_sqlite_source(source_candidate, context)?;
+    Ok(source_candidate.to_path_buf())
 }
 
 fn open_sqlite_with_fallback_and_storage_root(
@@ -8924,13 +10106,16 @@ fn open_atc_simulate_read_pool_with_database_url(
     storage_root_override: Option<&Path>,
 ) -> CliResult<CanonicalReadDbPool> {
     let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
-    let source_candidate = resolve_read_only_sqlite_source_path_with_database_url(database_url)?;
-    let (probe_conn, opened_path) =
-        open_sqlite_read_only_with_fallback(&source_candidate.display().to_string())?;
-    drop(probe_conn);
+    let source_candidate =
+        resolve_existing_sqlite_source_candidate_with_database_url(database_url, "ATC simulate")?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_sqlite_path(&source_candidate)?;
+    let opened_path = validated_live_sqlite_snapshot_source_path_from_candidate(
+        &source_candidate,
+        "ATC simulate",
+    )?;
     let source = CanonicalSnapshotSource::live_full_sqlite_snapshot(
-        PathBuf::from(&opened_path),
-        Path::new(&opened_path),
+        opened_path.clone(),
+        &opened_path,
         "ATC simulate",
     )?;
     let source_path = source.actual_path().display().to_string();
@@ -8946,10 +10131,29 @@ fn open_atc_simulate_read_pool_with_database_url(
         conn,
         pool,
         _source: source,
-        _mailbox_read_locks: CliMailboxReadLocks {
-            _storage_root_lock: None,
-            _sqlite_lock: None,
-        },
+        _mailbox_read_locks: mailbox_read_locks,
+    })
+}
+
+fn open_atc_explain_read_db_with_database_url(database_url: &str) -> CliResult<CanonicalReadDb> {
+    let source_candidate =
+        resolve_existing_sqlite_source_candidate_with_database_url(database_url, "ATC explain")?;
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks_for_sqlite_path(&source_candidate)?;
+    let opened_path = validated_live_sqlite_snapshot_source_path_from_candidate(
+        &source_candidate,
+        "ATC explain",
+    )?;
+    let source = CanonicalSnapshotSource::live_full_sqlite_snapshot(
+        opened_path.clone(),
+        &opened_path,
+        "ATC explain",
+    )?;
+    let source_path = source.actual_path().display().to_string();
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    Ok(CanonicalReadDb {
+        conn,
+        _source: source,
+        _mailbox_read_locks: mailbox_read_locks,
     })
 }
 
@@ -11577,12 +12781,8 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
     match action {
         AtcCommand::Explain { decision_id, json } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-            let config = Config::from_env();
-            let conn = open_db_sync_with_database_url_and_storage_root_locked(
-                &cfg.database_url,
-                Some(&config.storage_root),
-            )?;
-            let rows = query_atc_decision_rows(&conn, decision_id)?;
+            let opened = open_atc_explain_read_db_with_database_url(&cfg.database_url)?;
+            let rows = query_atc_decision_rows(opened.conn(), decision_id)?;
             if rows.is_empty() {
                 let payload = serde_json::json!({
                     "decision_id": decision_id,
@@ -17060,6 +18260,11 @@ fn handle_doctor_check(
 
 struct DoctorOpenContext {
     conn: mcp_agent_mail_db::DbConn,
+    opened_path: String,
+}
+
+struct DoctorReadOnlyOpenContext {
+    conn: mcp_agent_mail_db::CanonicalDbConn,
     configured_path: String,
     opened_path: String,
     used_absolute_fallback: bool,
@@ -17079,12 +18284,122 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
             .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")))?;
         return Ok(DoctorOpenContext {
             conn,
+            opened_path: path,
+        });
+    }
+    let mut candidate_path = path.clone();
+    if !Path::new(&candidate_path).exists() {
+        if let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path) {
+            candidate_path = absolute_candidate;
+        } else {
+            return Err(CliError::Other(format!(
+                "database file does not exist: {path}"
+            )));
+        }
+    }
+
+    if doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).is_some()
+        && let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path)
+    {
+        candidate_path = absolute_candidate;
+    }
+
+    if let Some(detail) = doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)) {
+        return Err(CliError::Other(format!(
+            "{detail}; refusing non-mutating doctor probe; run `am doctor repair` to quarantine it before opening the database"
+        )));
+    }
+
+    match mcp_agent_mail_db::DbConn::open_file(&candidate_path) {
+        Ok(conn) => match conn.query_sync("SELECT 1 AS one", &[]) {
+            Ok(_) => Ok(DoctorOpenContext {
+                conn,
+                opened_path: candidate_path,
+            }),
+            Err(probe_err) => {
+                let probe_err_text = probe_err.to_string();
+                if let Some(fallback_path) =
+                    sqlite_absolute_fallback_path(&candidate_path, &probe_err_text)
+                {
+                    let fallback_conn =
+                        mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
+                            CliError::Other(format!(
+                                "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
+                            ))
+                        })?;
+                    fallback_conn
+                        .query_sync("SELECT 1 AS one", &[])
+                        .map_err(|e| {
+                            CliError::Other(format!(
+                                "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} probe failed: {e}"
+                            ))
+                    })?;
+                    return Ok(DoctorOpenContext {
+                        conn: fallback_conn,
+                        opened_path: fallback_path,
+                    });
+                }
+                Err(CliError::Other(format!(
+                    "database probe failed at {candidate_path}: {probe_err}"
+                )))
+            }
+        },
+        Err(primary_err) => {
+            let primary_err_text = primary_err.to_string();
+            if let Some(fallback_path) =
+                sqlite_absolute_fallback_path(&candidate_path, &primary_err_text)
+            {
+                let fallback_conn =
+                    mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
+                        CliError::Other(format!(
+                            "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
+                        ))
+                    })?;
+                fallback_conn
+                    .query_sync("SELECT 1 AS one", &[])
+                    .map_err(|e| {
+                        CliError::Other(format!(
+                            "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} probe failed: {e}"
+                        ))
+                })?;
+                return Ok(DoctorOpenContext {
+                    conn: fallback_conn,
+                    opened_path: fallback_path,
+                });
+            }
+            Err(CliError::Other(format!(
+                "cannot open database at {candidate_path}: {primary_err}"
+            )))
+        }
+    }
+}
+
+fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
+    open_db_for_doctor_check_with_context(database_url).map(|opened| opened.conn)
+}
+
+fn open_db_for_doctor_check_read_only_with_context(
+    database_url: &str,
+) -> CliResult<DoctorReadOnlyOpenContext> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    if path == ":memory:" {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_memory()
+            .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")))?;
+        return Ok(DoctorReadOnlyOpenContext {
+            conn,
             configured_path: path.clone(),
             opened_path: path,
             used_absolute_fallback: false,
             fallback_due_to_missing_configured_path: false,
         });
     }
+
     let mut candidate_path = path.clone();
     let mut used_absolute_fallback = false;
     let mut fallback_due_to_missing_configured_path = false;
@@ -17113,12 +18428,15 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
         )));
     }
 
-    match mcp_agent_mail_db::DbConn::open_file(&candidate_path) {
+    match doctor_open_canonical_readonly_db_for_diagnostic(
+        Path::new(&candidate_path),
+        "doctor_check",
+    ) {
         Ok(conn) => match conn.query_sync("SELECT 1 AS one", &[]) {
-            Ok(_) => Ok(DoctorOpenContext {
+            Ok(_) => Ok(DoctorReadOnlyOpenContext {
                 conn,
-                configured_path: path,
-                opened_path: candidate_path,
+                configured_path: path.clone(),
+                opened_path: candidate_path.clone(),
                 used_absolute_fallback,
                 fallback_due_to_missing_configured_path,
             }),
@@ -17127,23 +18445,26 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
                 if let Some(fallback_path) =
                     sqlite_absolute_fallback_path(&candidate_path, &probe_err_text)
                 {
-                    let fallback_conn =
-                        mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
-                            CliError::Other(format!(
-                                "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
-                            ))
-                        })?;
+                    let fallback_conn = doctor_open_canonical_readonly_db_for_diagnostic(
+                        Path::new(&fallback_path),
+                        "doctor_check",
+                    )
+                    .map_err(|e| {
+                        CliError::Other(format!(
+                            "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
+                        ))
+                    })?;
                     fallback_conn
                         .query_sync("SELECT 1 AS one", &[])
                         .map_err(|e| {
                             CliError::Other(format!(
                                 "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} probe failed: {e}"
                             ))
-                        })?;
-                    return Ok(DoctorOpenContext {
+                    })?;
+                    return Ok(DoctorReadOnlyOpenContext {
                         conn: fallback_conn,
-                        configured_path: path,
-                        opened_path: fallback_path,
+                        configured_path: path.clone(),
+                        opened_path: fallback_path.clone(),
                         used_absolute_fallback: true,
                         fallback_due_to_missing_configured_path,
                     });
@@ -17158,23 +18479,26 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
             if let Some(fallback_path) =
                 sqlite_absolute_fallback_path(&candidate_path, &primary_err_text)
             {
-                let fallback_conn =
-                    mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
-                        CliError::Other(format!(
-                            "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
-                        ))
-                    })?;
+                let fallback_conn = doctor_open_canonical_readonly_db_for_diagnostic(
+                    Path::new(&fallback_path),
+                    "doctor_check",
+                )
+                .map_err(|e| {
+                    CliError::Other(format!(
+                        "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
+                    ))
+                })?;
                 fallback_conn
                     .query_sync("SELECT 1 AS one", &[])
                     .map_err(|e| {
                         CliError::Other(format!(
                             "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} probe failed: {e}"
                         ))
-                    })?;
-                return Ok(DoctorOpenContext {
+                })?;
+                return Ok(DoctorReadOnlyOpenContext {
                     conn: fallback_conn,
-                    configured_path: path,
-                    opened_path: fallback_path,
+                    configured_path: path.clone(),
+                    opened_path: fallback_path.clone(),
                     used_absolute_fallback: true,
                     fallback_due_to_missing_configured_path,
                 });
@@ -17184,10 +18508,6 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
             )))
         }
     }
-}
-
-fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
-    open_db_for_doctor_check_with_context(database_url).map(|opened| opened.conn)
 }
 
 const FORENSIC_TIMELINE_SCHEMA: &str = "forensic-timeline.v1";
@@ -17977,30 +19297,256 @@ fn doctor_repairable_foreign_key_violation_count(
         .count()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorDiagnosticEngine {
+    FrankenSqlite,
+    CanonicalSqlite,
+}
+
+impl DoctorDiagnosticEngine {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FrankenSqlite => "frankensqlite",
+            Self::CanonicalSqlite => "canonical_sqlite",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorDiagnosticAuthority {
+    Authoritative,
+    DiagnosticEngineLimitation,
+}
+
+impl DoctorDiagnosticAuthority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Authoritative => "authoritative",
+            Self::DiagnosticEngineLimitation => "diagnostic_engine_limitation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DoctorDiagnosticCapability {
+    operation: &'static str,
+    primary_engine: DoctorDiagnosticEngine,
+    fallback_engine: DoctorDiagnosticEngine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorDiagnosticEvidence {
+    operation: &'static str,
+    engine: DoctorDiagnosticEngine,
+    authority: DoctorDiagnosticAuthority,
+    primary_engine: DoctorDiagnosticEngine,
+    primary_error_class: Option<&'static str>,
+}
+
+impl DoctorDiagnosticEvidence {
+    fn detail_fragment(&self) -> String {
+        let mut detail = format!(
+            "{} engine={} authority={}",
+            self.operation,
+            self.engine.as_str(),
+            self.authority.as_str()
+        );
+        if let Some(primary_error_class) = self.primary_error_class {
+            detail.push_str(&format!(
+                "; diagnostic engine limitation: {} returned {primary_error_class}, \
+                 so its diagnostic verdict was not used as authoritative",
+                self.primary_engine.as_str()
+            ));
+        }
+        detail
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorDiagnosticProbe<T> {
+    value: T,
+    evidence: DoctorDiagnosticEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorRelationalIntegrityDiagnostics {
+    foreign_key_violations: Vec<DoctorForeignKeyViolation>,
+    orphaned_recipients: Vec<DoctorOrphanedMessageRecipient>,
+    evidence: Vec<DoctorDiagnosticEvidence>,
+}
+
+const DOCTOR_FOREIGN_KEY_CHECK_CAPABILITY: DoctorDiagnosticCapability =
+    DoctorDiagnosticCapability {
+        operation: "foreign_key_check",
+        primary_engine: DoctorDiagnosticEngine::FrankenSqlite,
+        fallback_engine: DoctorDiagnosticEngine::CanonicalSqlite,
+    };
+
+const DOCTOR_ORPHANED_RECIPIENT_QUERY_CAPABILITY: DoctorDiagnosticCapability =
+    DoctorDiagnosticCapability {
+        operation: "orphaned_recipient_query",
+        primary_engine: DoctorDiagnosticEngine::FrankenSqlite,
+        fallback_engine: DoctorDiagnosticEngine::CanonicalSqlite,
+    };
+
+fn doctor_diagnostic_error_class(error: &CliError) -> &'static str {
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
+    if mcp_agent_mail_db::is_lock_error(&text) {
+        "sqlite_lock_error"
+    } else if lower.contains("wal sidecar") || lower.contains("wal file") {
+        "sqlite_wal_sidecar_blocker"
+    } else if is_sqlite_recovery_error_message(&text) {
+        "sqlite_recovery_error"
+    } else if lower.contains("unsupported")
+        || lower.contains("not implemented")
+        || lower.contains("unknown pragma")
+    {
+        "unsupported_operation"
+    } else {
+        "probe_error"
+    }
+}
+
+fn doctor_diagnostic_error_allows_canonical_fallback(error: &CliError) -> bool {
+    !mcp_agent_mail_db::is_lock_error(&error.to_string())
+}
+
+fn doctor_probe_with_canonical_fallback<T, P, C>(
+    capability: DoctorDiagnosticCapability,
+    primary: P,
+    canonical: C,
+) -> CliResult<DoctorDiagnosticProbe<T>>
+where
+    P: FnOnce() -> CliResult<T>,
+    C: FnOnce() -> CliResult<T>,
+{
+    match primary() {
+        Ok(value) => Ok(DoctorDiagnosticProbe {
+            value,
+            evidence: DoctorDiagnosticEvidence {
+                operation: capability.operation,
+                engine: capability.primary_engine,
+                authority: DoctorDiagnosticAuthority::Authoritative,
+                primary_engine: capability.primary_engine,
+                primary_error_class: None,
+            },
+        }),
+        Err(primary_error) => {
+            let primary_error_class = doctor_diagnostic_error_class(&primary_error);
+            if !doctor_diagnostic_error_allows_canonical_fallback(&primary_error) {
+                return Err(primary_error);
+            }
+
+            match canonical() {
+                Ok(value) => Ok(DoctorDiagnosticProbe {
+                    value,
+                    evidence: DoctorDiagnosticEvidence {
+                        operation: capability.operation,
+                        engine: capability.fallback_engine,
+                        authority: DoctorDiagnosticAuthority::DiagnosticEngineLimitation,
+                        primary_engine: capability.primary_engine,
+                        primary_error_class: Some(primary_error_class),
+                    },
+                }),
+                Err(canonical_error) => Err(CliError::Other(format!(
+                    "{} via {} failed authoritatively: {}; diagnostic engine limitation: {} returned {primary_error_class}, so that verdict was not used",
+                    capability.operation,
+                    capability.fallback_engine.as_str(),
+                    truncate_doctor_command(&canonical_error.to_string()),
+                    capability.primary_engine.as_str()
+                ))),
+            }
+        }
+    }
+}
+
+fn doctor_open_canonical_readonly_db_for_diagnostic(
+    db_path: &Path,
+    operation: &str,
+) -> CliResult<mcp_agent_mail_db::CanonicalDbConn> {
+    if db_path.as_os_str() == ":memory:" {
+        return Err(CliError::Other(format!(
+            "{operation} canonical fallback is unavailable for in-memory databases"
+        )));
+    }
+    let uri = doctor::fixers::sqlite_immutable_uri(db_path);
+    let mut flags = sqlmodel_sqlite::OpenFlags::read_only();
+    flags.uri = true;
+    let config = sqlmodel_sqlite::SqliteConfig::file(uri).flags(flags);
+    sqlmodel_sqlite::SqliteConnection::open(&config).map_err(|error| {
+        CliError::Other(format!(
+            "cannot open sqlite file {} for canonical {operation}: {error}",
+            db_path.display()
+        ))
+    })
+}
+
+fn doctor_foreign_key_violation_from_row(
+    row: &mcp_agent_mail_db::sqlmodel_core::Row,
+) -> CliResult<DoctorForeignKeyViolation> {
+    Ok(DoctorForeignKeyViolation {
+        table: row
+            .get_as(0)
+            .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+        rowid: row
+            .get_as(1)
+            .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+        parent: row
+            .get_as(2)
+            .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+        fkid: row
+            .get_as(3)
+            .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+    })
+}
+
+fn doctor_foreign_key_violations_from_rows(
+    rows: Vec<mcp_agent_mail_db::sqlmodel_core::Row>,
+) -> CliResult<Vec<DoctorForeignKeyViolation>> {
+    let mut violations = Vec::with_capacity(rows.len());
+    for row in rows {
+        violations.push(doctor_foreign_key_violation_from_row(&row)?);
+    }
+    Ok(violations)
+}
+
 fn doctor_foreign_key_violations(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> CliResult<Vec<DoctorForeignKeyViolation>> {
     let rows = conn
         .query_sync("PRAGMA foreign_key_check", &[])
         .map_err(|e| CliError::Other(format!("foreign key check failed: {e}")))?;
-    let mut violations = Vec::with_capacity(rows.len());
-    for row in rows {
-        violations.push(DoctorForeignKeyViolation {
-            table: row
-                .get_as(0)
-                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
-            rowid: row
-                .get_as(1)
-                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
-            parent: row
-                .get_as(2)
-                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
-            fkid: row
-                .get_as(3)
-                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
-        });
-    }
-    Ok(violations)
+    doctor_foreign_key_violations_from_rows(rows)
+}
+
+fn doctor_foreign_key_violations_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> CliResult<Vec<DoctorForeignKeyViolation>> {
+    conn.execute_raw("PRAGMA foreign_keys = ON")
+        .map_err(|e| CliError::Other(format!("foreign key pragma setup failed: {e}")))?;
+    let rows = conn
+        .query_sync("PRAGMA foreign_key_check", &[])
+        .map_err(|e| CliError::Other(format!("foreign key check failed: {e}")))?;
+    doctor_foreign_key_violations_from_rows(rows)
+}
+
+fn doctor_foreign_key_violations_canonical_file(
+    db_path: &Path,
+) -> CliResult<Vec<DoctorForeignKeyViolation>> {
+    let conn = doctor_open_canonical_readonly_db_for_diagnostic(db_path, "foreign_key_check")?;
+    doctor_foreign_key_violations_canonical(&conn)
+}
+
+fn doctor_foreign_key_violations_with_diagnostic_fallback(
+    conn: &mcp_agent_mail_db::DbConn,
+    db_path: &Path,
+) -> CliResult<DoctorDiagnosticProbe<Vec<DoctorForeignKeyViolation>>> {
+    doctor_probe_with_canonical_fallback(
+        DOCTOR_FOREIGN_KEY_CHECK_CAPABILITY,
+        || doctor_foreign_key_violations(conn),
+        || doctor_foreign_key_violations_canonical_file(db_path),
+    )
 }
 
 fn doctor_row_i64_lenient(
@@ -18099,6 +19645,94 @@ fn doctor_orphaned_message_recipients_canonical(
         recipients.push(doctor_orphaned_message_recipient_from_row(&row)?);
     }
     Ok(recipients)
+}
+
+fn doctor_orphaned_message_recipients_canonical_file(
+    db_path: &Path,
+) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
+    let conn =
+        doctor_open_canonical_readonly_db_for_diagnostic(db_path, "orphaned_recipient_query")?;
+    doctor_orphaned_message_recipients_canonical(&conn)
+}
+
+fn doctor_orphaned_message_recipients_with_diagnostic_fallback(
+    conn: &mcp_agent_mail_db::DbConn,
+    db_path: &Path,
+) -> CliResult<DoctorDiagnosticProbe<Vec<DoctorOrphanedMessageRecipient>>> {
+    doctor_probe_with_canonical_fallback(
+        DOCTOR_ORPHANED_RECIPIENT_QUERY_CAPABILITY,
+        || doctor_orphaned_message_recipients(conn),
+        || doctor_orphaned_message_recipients_canonical_file(db_path),
+    )
+}
+
+fn doctor_relational_integrity_diagnostics(
+    conn: &mcp_agent_mail_db::DbConn,
+    db_path: &Path,
+) -> CliResult<DoctorRelationalIntegrityDiagnostics> {
+    let foreign_key = doctor_foreign_key_violations_with_diagnostic_fallback(conn, db_path)?;
+    let orphaned = doctor_orphaned_message_recipients_with_diagnostic_fallback(conn, db_path)?;
+    Ok(DoctorRelationalIntegrityDiagnostics {
+        foreign_key_violations: foreign_key.value,
+        orphaned_recipients: orphaned.value,
+        evidence: vec![foreign_key.evidence, orphaned.evidence],
+    })
+}
+
+fn doctor_relational_integrity_diagnostics_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> CliResult<DoctorRelationalIntegrityDiagnostics> {
+    let foreign_key_violations = doctor_foreign_key_violations_canonical(conn)?;
+    let orphaned_recipients = doctor_orphaned_message_recipients_canonical(conn)?;
+    Ok(DoctorRelationalIntegrityDiagnostics {
+        foreign_key_violations,
+        orphaned_recipients,
+        evidence: vec![
+            DoctorDiagnosticEvidence {
+                operation: DOCTOR_FOREIGN_KEY_CHECK_CAPABILITY.operation,
+                engine: DoctorDiagnosticEngine::CanonicalSqlite,
+                authority: DoctorDiagnosticAuthority::Authoritative,
+                primary_engine: DoctorDiagnosticEngine::CanonicalSqlite,
+                primary_error_class: None,
+            },
+            DoctorDiagnosticEvidence {
+                operation: DOCTOR_ORPHANED_RECIPIENT_QUERY_CAPABILITY.operation,
+                engine: DoctorDiagnosticEngine::CanonicalSqlite,
+                authority: DoctorDiagnosticAuthority::Authoritative,
+                primary_engine: DoctorDiagnosticEngine::CanonicalSqlite,
+                primary_error_class: None,
+            },
+        ],
+    })
+}
+
+fn doctor_relational_integrity_detail_prefix(
+    diagnostics: &DoctorRelationalIntegrityDiagnostics,
+) -> String {
+    diagnostics
+        .evidence
+        .iter()
+        .map(DoctorDiagnosticEvidence::detail_fragment)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn doctor_relational_integrity_evidence_json(
+    diagnostics: &DoctorRelationalIntegrityDiagnostics,
+) -> Vec<serde_json::Value> {
+    diagnostics
+        .evidence
+        .iter()
+        .map(|evidence| {
+            serde_json::json!({
+                "operation": evidence.operation,
+                "engine": evidence.engine.as_str(),
+                "authority": evidence.authority.as_str(),
+                "primary_engine": evidence.primary_engine.as_str(),
+                "primary_error_class": evidence.primary_error_class,
+            })
+        })
+        .collect()
 }
 
 fn doctor_rebuild_inbox_stats_for_agents_canonical(
@@ -20681,14 +22315,14 @@ fn sample_agent_mail_process_cpu(pids: &[u32]) -> (Vec<DoctorProcessSample>, Opt
     }
 }
 
-fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<String>> {
+fn doctor_required_tables_from_query<F>(mut query: F) -> CliResult<Vec<String>>
+where
+    F: FnMut(&str) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, String>,
+{
     let required = ["projects", "agents", "messages", "message_recipients"];
-    let rows = conn
-        .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-            &[],
-        )
-        .map_err(|e| CliError::Other(format!("failed to inspect sqlite schema: {e}")))?;
+    let rows =
+        query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            .map_err(|e| CliError::Other(format!("failed to inspect sqlite schema: {e}")))?;
     let present = rows
         .into_iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
@@ -20699,6 +22333,16 @@ fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<Str
         .filter(|name| !present.contains(*name))
         .map(str::to_string)
         .collect())
+}
+
+fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<String>> {
+    doctor_required_tables_from_query(|sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()))
+}
+
+fn doctor_required_tables_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> CliResult<Vec<String>> {
+    doctor_required_tables_from_query(|sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()))
 }
 
 fn doctor_archive_frontmatter_bounds(content: &str) -> Option<(usize, usize)> {
@@ -21269,11 +22913,16 @@ fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
     report
 }
 
-fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<DoctorDbInventory> {
-    fn count_rows(conn: &mcp_agent_mail_db::DbConn, table: &str) -> CliResult<u64> {
+fn collect_doctor_db_inventory_from_query<F>(mut query: F) -> CliResult<DoctorDbInventory>
+where
+    F: FnMut(&str) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, String>,
+{
+    fn count_rows<F>(query: &mut F, table: &str) -> CliResult<u64>
+    where
+        F: FnMut(&str) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, String>,
+    {
         let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
-        let rows = conn
-            .query_sync(&sql, &[])
+        let rows = query(&sql)
             .map_err(|e| CliError::Other(format!("failed to count rows in {table}: {e}")))?;
         Ok(rows
             .first()
@@ -21283,8 +22932,7 @@ fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Do
     }
 
     let mut project_identities = std::collections::BTreeSet::new();
-    let project_rows = conn
-        .query_sync("SELECT slug, human_key FROM projects", &[])
+    let project_rows = query("SELECT slug, human_key FROM projects")
         .map_err(|e| CliError::Other(format!("failed to inspect project identities: {e}")))?;
     for row in project_rows {
         let slug = row.get_named::<String>("slug").ok();
@@ -21294,12 +22942,9 @@ fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Do
         }
     }
 
-    let message_rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
-            &[],
-        )
-        .map_err(|e| CliError::Other(format!("failed to inspect message inventory: {e}")))?;
+    let message_rows =
+        query("SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages")
+            .map_err(|e| CliError::Other(format!("failed to inspect message inventory: {e}")))?;
     let (message_count, max_message_id) = message_rows
         .first()
         .map(|row| {
@@ -21312,12 +22957,26 @@ fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Do
 
     Ok(DoctorDbInventory {
         counts: DoctorInventoryCounts {
-            projects: count_rows(conn, "projects")?,
-            agents: count_rows(conn, "agents")?,
+            projects: count_rows(&mut query, "projects")?,
+            agents: count_rows(&mut query, "agents")?,
             messages: message_count,
         },
         max_message_id,
         project_identities,
+    })
+}
+
+fn collect_doctor_db_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<DoctorDbInventory> {
+    collect_doctor_db_inventory_from_query(|sql| {
+        conn.query_sync(sql, &[]).map_err(|e| e.to_string())
+    })
+}
+
+fn collect_doctor_db_inventory_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> CliResult<DoctorDbInventory> {
+    collect_doctor_db_inventory_from_query(|sql| {
+        conn.query_sync(sql, &[]).map_err(|e| e.to_string())
     })
 }
 
@@ -21506,6 +23165,191 @@ fn doctor_database_probe_failure_strategy(
     }
 }
 
+fn doctor_database_fix_strategy_read_only_probes(
+    database_url: &str,
+    storage_root: &Path,
+    storage_root_is_explicit: bool,
+    archive_root: &Path,
+    archive_available: bool,
+    archive_inventory: Option<DoctorArchiveInventory>,
+    archive_reconstruct_available: bool,
+) -> CliResult<DoctorDatabaseFixStrategy> {
+    let opened = match open_db_for_doctor_check_read_only_with_context(database_url) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Ok(if archive_reconstruct_available {
+                DoctorDatabaseFixStrategy::Reconstruct(format!(
+                    "Database open probe failed: {}; archive recovery is available under {}",
+                    truncate_doctor_command(&error.to_string()),
+                    archive_root.display()
+                ))
+            } else {
+                DoctorDatabaseFixStrategy::Repair(format!(
+                    "Database open probe failed: {}",
+                    truncate_doctor_command(&error.to_string())
+                ))
+            });
+        }
+    };
+
+    let missing_tables = match doctor_required_tables_canonical(&opened.conn) {
+        Ok(missing_tables) => missing_tables,
+        Err(error) => {
+            return Ok(doctor_database_probe_failure_strategy(
+                "Required-table probe",
+                &error,
+                archive_reconstruct_available,
+                archive_root,
+            ));
+        }
+    };
+    if !missing_tables.is_empty() {
+        return Ok(if archive_reconstruct_available {
+            DoctorDatabaseFixStrategy::Reconstruct(format!(
+                "Core tables missing from {}: {}; reconstruct from archive {}",
+                opened.opened_path,
+                missing_tables.join(", "),
+                archive_root.display()
+            ))
+        } else {
+            DoctorDatabaseFixStrategy::Repair(format!(
+                "Core tables missing from {}: {}",
+                opened.opened_path,
+                missing_tables.join(", ")
+            ))
+        });
+    }
+
+    if archive_available {
+        let archive = archive_inventory.clone().unwrap_or_default();
+        let db = match collect_doctor_db_inventory_canonical(&opened.conn) {
+            Ok(db) => db,
+            Err(error) => {
+                return Ok(doctor_database_inventory_failure_strategy(
+                    &error,
+                    archive_reconstruct_available,
+                    archive_root,
+                ));
+            }
+        };
+        if doctor_archive_is_authoritative_for_db(
+            &archive,
+            &db,
+            Path::new(&opened.opened_path),
+            storage_root,
+            storage_root_is_explicit,
+        ) && let Some(detail) = doctor_archive_db_drift_detail(&archive, &db)
+        {
+            return Ok(DoctorDatabaseFixStrategy::Reconstruct(format!(
+                "{detail}; reconstruct from archive {}",
+                archive_root.display()
+            )));
+        }
+    }
+
+    let integrity_ok =
+        match sqlite_conn_check_ok_canonical(&opened.conn, mcp_agent_mail_db::CheckKind::Full) {
+            Ok(ok) => ok,
+            Err(error) => {
+                let detail = format!(
+                    "PRAGMA integrity_check failed for {}: {error}",
+                    opened.opened_path
+                );
+                if is_sqlite_recovery_error_message(&error.to_string()) {
+                    return Ok(if archive_reconstruct_available {
+                        DoctorDatabaseFixStrategy::Reconstruct(format!(
+                            "{detail}; reconstruct from archive {}",
+                            archive_root.display()
+                        ))
+                    } else {
+                        DoctorDatabaseFixStrategy::Repair(detail)
+                    });
+                }
+                return Err(CliError::Other(detail));
+            }
+        };
+    if !integrity_ok {
+        return Ok(if archive_reconstruct_available {
+            DoctorDatabaseFixStrategy::Reconstruct(format!(
+                "PRAGMA integrity_check failed for {}; reconstruct from archive {}",
+                opened.opened_path,
+                archive_root.display()
+            ))
+        } else {
+            DoctorDatabaseFixStrategy::Repair(format!(
+                "PRAGMA integrity_check failed for {}",
+                opened.opened_path
+            ))
+        });
+    }
+
+    let relational_diagnostics =
+        match doctor_relational_integrity_diagnostics_canonical(&opened.conn) {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                return Ok(doctor_database_probe_failure_strategy(
+                    "Relational consistency probe",
+                    &error,
+                    archive_reconstruct_available,
+                    archive_root,
+                ));
+            }
+        };
+    let relational_diagnostic_detail =
+        doctor_relational_integrity_detail_prefix(&relational_diagnostics);
+    let fk_violations = relational_diagnostics.foreign_key_violations;
+    let orphaned_recipients = relational_diagnostics.orphaned_recipients;
+    let missing_message_recipients = doctor_missing_message_recipient_count(&orphaned_recipients);
+    let missing_agent_only_recipients =
+        doctor_missing_agent_only_recipient_count(&orphaned_recipients);
+    let missing_agent_only_recipient_rowids =
+        doctor_missing_agent_only_recipient_rowids(&orphaned_recipients);
+    let repairable_fk_violations = doctor_repairable_foreign_key_violation_count(
+        &fk_violations,
+        &missing_agent_only_recipient_rowids,
+    );
+    if repairable_fk_violations > 0 || missing_message_recipients > 0 {
+        let mut details = Vec::new();
+        if repairable_fk_violations > 0 {
+            details.push(format!(
+                "{} repairable foreign-key violation(s)",
+                repairable_fk_violations
+            ));
+        }
+        if missing_message_recipients > 0 {
+            details.push(format!(
+                "{} orphaned message recipient row(s)",
+                missing_message_recipients
+            ));
+        }
+        if missing_agent_only_recipients > 0 {
+            details.push(format!(
+                "{} preserved missing-agent recipient row(s)",
+                missing_agent_only_recipients
+            ));
+        }
+        return Ok(DoctorDatabaseFixStrategy::Repair(format!(
+            "Database consistency issues detected in {} ({}): {}",
+            opened.opened_path,
+            relational_diagnostic_detail,
+            details.join(", ")
+        )));
+    }
+    if missing_agent_only_recipients > 0 {
+        return Ok(DoctorDatabaseFixStrategy::None(format!(
+            "Database at {} passed file, integrity, and relational consistency probes; \
+             preserved {} recipient row(s) with missing agent metadata \
+             (run `am doctor repair --prune-orphan-recipients` to delete them); diagnostics: {}",
+            opened.opened_path, missing_agent_only_recipients, relational_diagnostic_detail
+        )));
+    }
+
+    Ok(DoctorDatabaseFixStrategy::None(format!(
+        "Database at {} passed file, integrity, and relational consistency probes ({})",
+        opened.opened_path, relational_diagnostic_detail
+    )))
+}
+
 fn doctor_database_fix_strategy_with_wal_cleanup(
     database_url: &str,
     storage_root: &Path,
@@ -21572,7 +23416,13 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         )));
     }
 
-    match sqlite_doctor_file_sanity(&resolved_path) {
+    let file_sanity = if cleanup_truncated_wal {
+        sqlite_doctor_file_sanity(&resolved_path)
+    } else {
+        sqlite_doctor_file_sanity_read_only(&resolved_path)
+    };
+
+    match file_sanity {
         Ok((false, detail, _, _)) => {
             return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -21602,6 +23452,18 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             });
         }
         Ok((true, _, _, _)) => {}
+    }
+
+    if !cleanup_truncated_wal {
+        return doctor_database_fix_strategy_read_only_probes(
+            database_url,
+            storage_root,
+            storage_root_is_explicit,
+            &archive_root,
+            archive_available,
+            archive_inventory,
+            archive_reconstruct_available,
+        );
     }
 
     let opened = match open_db_for_doctor_check_with_context(database_url) {
@@ -21717,28 +23579,23 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         });
     }
 
-    let fk_violations = match doctor_foreign_key_violations(&opened.conn) {
-        Ok(violations) => violations,
-        Err(error) => {
-            return Ok(doctor_database_probe_failure_strategy(
-                "Foreign-key consistency probe",
-                &error,
-                archive_reconstruct_available,
-                &archive_root,
-            ));
-        }
-    };
-    let orphaned_recipients = match doctor_orphaned_message_recipients(&opened.conn) {
-        Ok(recipients) => recipients,
-        Err(error) => {
-            return Ok(doctor_database_probe_failure_strategy(
-                "Orphaned-recipient probe",
-                &error,
-                archive_reconstruct_available,
-                &archive_root,
-            ));
-        }
-    };
+    let relational_diagnostics =
+        match doctor_relational_integrity_diagnostics(&opened.conn, Path::new(&opened.opened_path))
+        {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => {
+                return Ok(doctor_database_probe_failure_strategy(
+                    "Relational consistency probe",
+                    &error,
+                    archive_reconstruct_available,
+                    &archive_root,
+                ));
+            }
+        };
+    let relational_diagnostic_detail =
+        doctor_relational_integrity_detail_prefix(&relational_diagnostics);
+    let fk_violations = relational_diagnostics.foreign_key_violations;
+    let orphaned_recipients = relational_diagnostics.orphaned_recipients;
     let missing_message_recipients = doctor_missing_message_recipient_count(&orphaned_recipients);
     let missing_agent_only_recipients =
         doctor_missing_agent_only_recipient_count(&orphaned_recipients);
@@ -21769,8 +23626,9 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             ));
         }
         return Ok(DoctorDatabaseFixStrategy::Repair(format!(
-            "Database consistency issues detected in {}: {}",
+            "Database consistency issues detected in {} ({}): {}",
             opened.opened_path,
+            relational_diagnostic_detail,
             details.join(", ")
         )));
     }
@@ -21778,14 +23636,14 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         return Ok(DoctorDatabaseFixStrategy::None(format!(
             "Database at {} passed file, integrity, and relational consistency probes; \
              preserved {} recipient row(s) with missing agent metadata \
-             (run `am doctor repair --prune-orphan-recipients` to delete them)",
-            opened.opened_path, missing_agent_only_recipients
+             (run `am doctor repair --prune-orphan-recipients` to delete them); diagnostics: {}",
+            opened.opened_path, missing_agent_only_recipients, relational_diagnostic_detail
         )));
     }
 
     Ok(DoctorDatabaseFixStrategy::None(format!(
-        "Database at {} passed file, integrity, and relational consistency probes",
-        opened.opened_path
+        "Database at {} passed file, integrity, and relational consistency probes ({})",
+        opened.opened_path, relational_diagnostic_detail
     )))
 }
 
@@ -22543,7 +24401,7 @@ fn handle_doctor_check_with(
     let (db_status, db_detail) = if let Some(detail) = database_probe_blocker.as_ref() {
         ("fail".to_string(), detail.clone())
     } else {
-        match open_db_for_doctor_check_with_context(database_url).and_then(|opened| {
+        match open_db_for_doctor_check_read_only_with_context(database_url).and_then(|opened| {
             opened
                 .conn
                 .query_sync("SELECT 1 AS one", &[])
@@ -22600,7 +24458,7 @@ fn handle_doctor_check_with(
             match cfg.sqlite_path() {
                 Ok(db_path) => {
                     if db_path != ":memory:" {
-                        match sqlite_doctor_file_sanity(&db_path) {
+                        match sqlite_doctor_file_sanity_read_only(&db_path) {
                             Ok((
                                 qc_ok,
                                 detail,
@@ -22694,9 +24552,11 @@ fn handle_doctor_check_with(
                 "detail": "Skipped because db_file_sanity failed (potential corruption)",
             }));
         } else {
-            let reopen_ok = open_db_for_doctor_check(database_url)
-                .and_then(|conn| {
-                    conn.query_sync("SELECT name FROM sqlite_master LIMIT 1", &[])
+            let reopen_ok = open_db_for_doctor_check_read_only_with_context(database_url)
+                .and_then(|opened| {
+                    opened
+                        .conn
+                        .query_sync("SELECT name FROM sqlite_master LIMIT 1", &[])
                         .map(|_| ())
                         .map_err(|e| CliError::Other(format!("reopen probe failed: {e}")))
                 })
@@ -22728,18 +24588,22 @@ fn handle_doctor_check_with(
                 "detail": "Skipped because db_file_sanity failed (potential corruption)",
             }));
         } else {
-            match open_db_for_doctor_check(database_url).and_then(|conn| {
-                let violations = doctor_foreign_key_violations(&conn)?;
-                let orphaned = doctor_orphaned_message_recipients(&conn)?;
-                Ok((violations, orphaned))
-            }) {
-                Ok((violations, orphaned)) => {
+            match open_db_for_doctor_check_read_only_with_context(database_url)
+                .and_then(|opened| doctor_relational_integrity_diagnostics_canonical(&opened.conn))
+            {
+                Ok(relational_diagnostics) => {
+                    let diagnostic_evidence =
+                        doctor_relational_integrity_evidence_json(&relational_diagnostics);
+                    let diagnostic_detail =
+                        doctor_relational_integrity_detail_prefix(&relational_diagnostics);
+                    let violations = &relational_diagnostics.foreign_key_violations;
+                    let orphaned = &relational_diagnostics.orphaned_recipients;
                     let missing_message_recipients =
-                        doctor_missing_message_recipient_count(&orphaned);
+                        doctor_missing_message_recipient_count(orphaned);
                     let missing_agent_only_recipients =
-                        doctor_missing_agent_only_recipient_count(&orphaned);
+                        doctor_missing_agent_only_recipient_count(orphaned);
                     let missing_agent_only_recipient_rowids =
-                        doctor_missing_agent_only_recipient_rowids(&orphaned);
+                        doctor_missing_agent_only_recipient_rowids(orphaned);
                     let repairable_violations = violations
                         .iter()
                         .filter(|violation| {
@@ -22757,7 +24621,10 @@ fn handle_doctor_check_with(
                         checks.push(serde_json::json!({
                             "check": "foreign_key_integrity",
                             "status": "ok",
-                            "detail": "No foreign key violations detected",
+                            "detail": format!(
+                                "No foreign key violations detected ({diagnostic_detail})"
+                            ),
+                            "diagnostic_evidence": diagnostic_evidence,
                         }));
                     } else if repairable_violations.is_empty() && missing_message_recipients == 0 {
                         let orphan_examples = orphaned
@@ -22778,10 +24645,12 @@ fn handle_doctor_check_with(
                             "detail": format!(
                                 "Preserved {} recipient row(s) with missing agent metadata; \
                                  run `am doctor repair --prune-orphan-recipients` to delete them; \
-                                 examples: {}",
+                                 examples: {}; diagnostics: {}",
                                 missing_agent_only_recipients,
-                                orphan_examples
+                                orphan_examples,
+                                diagnostic_detail
                             ),
+                            "diagnostic_evidence": diagnostic_evidence,
                         }));
                     } else {
                         let violation_examples = if repairable_violations.is_empty() {
@@ -22837,11 +24706,13 @@ fn handle_doctor_check_with(
                             "check": "foreign_key_integrity",
                             "status": "fail",
                             "detail": format!(
-                                "{} repairable foreign key violation(s){}; examples: {}",
+                                "{} repairable foreign key violation(s){}; examples: {}; diagnostics: {}",
                                 repairable_violations.len(),
                                 orphan_detail,
-                                violation_examples
+                                violation_examples,
+                                diagnostic_detail
                             ),
+                            "diagnostic_evidence": diagnostic_evidence,
                         }));
                     }
                 }
@@ -22868,22 +24739,11 @@ fn handle_doctor_check_with(
             "detail": "Skipped because db_file_sanity failed",
         }));
     } else {
-        match open_db_for_doctor_check(database_url).and_then(|conn| {
-            mcp_agent_mail_db::query_plan_diagnostics::summarize_hot_query_plans(&conn)
-                .map_err(|error| CliError::Other(error.to_string()))
-        }) {
-            Ok(summary) => checks.push(serde_json::json!({
-                "check": "query_plan_hot_paths",
-                "status": summary.status,
-                "detail": summary.detail,
-                "summary": summary,
-            })),
-            Err(error) => checks.push(serde_json::json!({
-                "check": "query_plan_hot_paths",
-                "status": "warn",
-                "detail": format!("Skipped hot query-plan diagnostics: {error}"),
-            })),
-        }
+        checks.push(serde_json::json!({
+            "check": "query_plan_hot_paths",
+            "status": "warn",
+            "detail": "Skipped hot query-plan diagnostics: read-only doctor check avoids WAL-capable DB opens",
+        }));
     }
 
     // Check 1d: Git binary version — flag known-bad versions (br-8ujfs.1.2 / A2).
@@ -22964,7 +24824,7 @@ fn handle_doctor_check_with(
         }));
     } else {
         let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
-        match open_db_for_doctor_check_with_context(database_url).and_then(|opened| {
+        match open_db_for_doctor_check_read_only_with_context(database_url).and_then(|opened| {
             let archive = archive_audit
                 .as_ref()
                 .map(|report| report.inventory.clone())
@@ -22973,7 +24833,7 @@ fn handle_doctor_check_with(
                         "archive audit unexpectedly missing during parity probe".to_string(),
                     )
                 })?;
-            let db = collect_doctor_db_inventory(&opened.conn)?;
+            let db = collect_doctor_db_inventory_canonical(&opened.conn)?;
             let drift = if doctor_archive_is_authoritative_for_db(
                 &archive,
                 &db,
@@ -23805,48 +25665,31 @@ fn handle_doctor_check_with(
 
     // Check 4h: Database format and health (br-28mgh.7.4)
     {
-        use mcp_agent_mail_db::migrate;
         let conn_result = if database_probe_blocker.is_some() {
             None
         } else {
-            Some(open_db_for_doctor_check(database_url))
+            Some(open_db_for_doctor_check_read_only_with_context(
+                database_url,
+            ))
         };
 
         // 4d-i: Timestamp format
-        let ts_check = conn_result
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .and_then(|conn| migrate::detect_timestamp_format(conn).ok());
-        match ts_check {
-            Some(fmt) if fmt.needs_migration() => {
-                checks.push(serde_json::json!({
-                    "check": "timestamp_format",
-                    "status": "warn",
-                    "detail": format!("{fmt} — run `am migrate` to convert"),
-                }));
-            }
-            Some(fmt) => {
-                checks.push(serde_json::json!({
-                    "check": "timestamp_format",
-                    "status": "ok",
-                    "detail": format!("{fmt}"),
-                }));
-            }
-            None => {
-                checks.push(serde_json::json!({
-                    "check": "timestamp_format",
-                    "status": "warn",
-                    "detail": database_probe_blocker
-                        .as_ref()
-                        .map(|detail| format!("Skipped timestamp format probe: {detail}"))
-                        .unwrap_or_else(|| "Could not detect timestamp format".to_string()),
-                }));
-            }
-        }
+        checks.push(serde_json::json!({
+            "check": "timestamp_format",
+            "status": "warn",
+            "detail": database_probe_blocker
+                .as_ref()
+                .map(|detail| format!("Skipped timestamp format probe: {detail}"))
+                .unwrap_or_else(|| {
+                    "Skipped timestamp format probe: read-only doctor check avoids WAL-capable DB opens"
+                        .to_string()
+                }),
+        }));
 
         // 4d-ii: WAL mode
-        if let Some(Ok(ref conn)) = conn_result {
-            let wal_ok = conn
+        if let Some(Ok(ref opened)) = conn_result {
+            let wal_ok = opened
+                .conn
                 .query_sync("PRAGMA journal_mode", &[])
                 .ok()
                 .and_then(|rows| {
@@ -23867,8 +25710,9 @@ fn handle_doctor_check_with(
         }
 
         // 4d-iii: Schema version (user_version PRAGMA)
-        if let Some(Ok(ref conn)) = conn_result {
-            let version = conn
+        if let Some(Ok(ref opened)) = conn_result {
+            let version = opened
+                .conn
                 .query_sync("PRAGMA user_version", &[])
                 .ok()
                 .and_then(|rows| {
@@ -23884,8 +25728,8 @@ fn handle_doctor_check_with(
         }
 
         // 4d-iv: FTS5 virtual tables
-        if let Some(Ok(ref conn)) = conn_result {
-            let legacy_fts_tables = doctor_legacy_fts_tables(conn);
+        if let Some(Ok(ref opened)) = conn_result {
+            let legacy_fts_tables = doctor_legacy_fts_tables_canonical(&opened.conn);
             let (fts_status, fts_detail) = if legacy_fts_tables.is_empty() {
                 (
                     "ok",
@@ -23909,11 +25753,12 @@ fn handle_doctor_check_with(
         }
 
         // 4d-v: Row counts (sanity check)
-        if verbose && let Some(Ok(ref conn)) = conn_result {
+        if verbose && let Some(Ok(ref opened)) = conn_result {
             let tables = ["projects", "agents", "messages", "file_reservations"];
             let mut counts: Vec<String> = Vec::new();
             for table in &tables {
-                let count: i64 = conn
+                let count: i64 = opened
+                    .conn
                     .query_sync(&format!("SELECT COUNT(*) AS cnt FROM {table}"), &[])
                     .ok()
                     .and_then(|rows| rows.first().and_then(|r| r.get_named("cnt").ok()))
@@ -23947,38 +25792,79 @@ fn handle_doctor_check_with(
     }
 
     // Check 5: Project-specific checks
-    if let Some(ref slug) = project
-        && database_probe_blocker.is_none()
-        && let Ok(conn) = open_db_for_doctor_check(database_url)
-    {
-        let resolved_project = crate::context::resolve_project(&conn, slug);
-        let project_exists = resolved_project.is_ok();
-        let project_detail = match &resolved_project {
-            Ok(project) => format!("project '{}'", project.slug),
-            Err(_) => format!("project '{slug}'"),
-        };
-        checks.push(serde_json::json!({
-            "check": "project_exists",
-            "status": if project_exists { "ok" } else { "fail" },
-            "detail": project_detail,
-        }));
-
-        if let Ok(project) = resolved_project {
-            let agent_rows = conn
-                .query_sync(
-                    "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ?",
-                    &[sqlmodel_core::Value::BigInt(project.id)],
-                )
-                .unwrap_or_default();
-            let agent_count: i64 = agent_rows
-                .first()
-                .and_then(|r| r.get_named("cnt").ok())
-                .unwrap_or(0);
+    if let Some(ref slug) = project {
+        if let Some(detail) = database_probe_blocker.as_ref() {
             checks.push(serde_json::json!({
-                "check": "agents_registered",
-                "status": "ok",
-                "detail": format!("{agent_count} agent(s)"),
+                "check": "project_exists",
+                "status": "fail",
+                "detail": format!("Skipped project lookup: {detail}"),
             }));
+        } else {
+            match open_db_for_doctor_check_read_only_with_context(database_url) {
+                Ok(opened) => {
+                    let key = slug.trim();
+                    let identity = Path::new(key)
+                        .is_absolute()
+                        .then(|| resolve_project_identity(key));
+                    let slug_lookup = identity
+                        .as_ref()
+                        .map_or_else(|| key.to_string(), |identity| identity.slug.clone());
+                    let human_lookup = identity
+                        .as_ref()
+                        .map_or_else(|| key.to_string(), |identity| identity.human_key.clone());
+                    let project_rows = opened
+                        .conn
+                        .query_sync(
+                            "SELECT id, slug FROM projects \
+                             WHERE slug = ? OR human_key = ? \
+                             ORDER BY id LIMIT 1",
+                            &[
+                                sqlmodel_core::Value::Text(slug_lookup),
+                                sqlmodel_core::Value::Text(human_lookup),
+                            ],
+                        )
+                        .unwrap_or_default();
+                    let resolved_project = project_rows.first().and_then(|row| {
+                        Some((
+                            row.get_named::<i64>("id").ok()?,
+                            row.get_named::<String>("slug").ok()?,
+                        ))
+                    });
+                    checks.push(serde_json::json!({
+                        "check": "project_exists",
+                        "status": if resolved_project.is_some() { "ok" } else { "fail" },
+                        "detail": resolved_project
+                            .as_ref()
+                            .map_or_else(|| format!("project '{slug}'"), |(_, slug)| {
+                                format!("project '{slug}'")
+                            }),
+                    }));
+
+                    if let Some((project_id, _)) = resolved_project {
+                        let agent_rows = opened
+                            .conn
+                            .query_sync(
+                                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ?",
+                                &[sqlmodel_core::Value::BigInt(project_id)],
+                            )
+                            .unwrap_or_default();
+                        let agent_count: i64 = agent_rows
+                            .first()
+                            .and_then(|r| r.get_named("cnt").ok())
+                            .unwrap_or(0);
+                        checks.push(serde_json::json!({
+                            "check": "agents_registered",
+                            "status": "ok",
+                            "detail": format!("{agent_count} agent(s)"),
+                        }));
+                    }
+                }
+                Err(error) => checks.push(serde_json::json!({
+                    "check": "project_exists",
+                    "status": "fail",
+                    "detail": format!("Project lookup failed: {error}"),
+                })),
+            }
         }
     }
 
@@ -29980,6 +31866,24 @@ mod tests {
         blocks
     }
 
+    #[test]
+    fn legacy_am_serve_preflight_is_scoped_to_am_binary() {
+        let legacy_args = vec![OsString::from("am"), OsString::from("serve")];
+        assert!(is_legacy_am_serve_invocation("am", &legacy_args));
+
+        let server_args = vec![OsString::from("mcp-agent-mail"), OsString::from("serve")];
+        assert!(!is_legacy_am_serve_invocation(
+            "mcp-agent-mail",
+            &server_args
+        ));
+
+        let explicit_transport_args = vec![OsString::from("am"), OsString::from("serve-http")];
+        assert!(!is_legacy_am_serve_invocation(
+            "am",
+            &explicit_transport_args
+        ));
+    }
+
     /// Extract the first top-level JSON array `[...]` from a string.
     fn extract_json_array(s: &str) -> Option<&str> {
         extract_json_delimited(s, '[', ']')
@@ -30899,50 +32803,6 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         let directives = noisy_dependency_log_clamp_directives();
         assert!(directives.contains(&"jit_compile=error"));
         assert!(directives.contains(&"execute_statement_dispatch=error"));
-    }
-
-    #[test]
-    fn noninteractive_default_falls_back_to_overview_when_project_missing() {
-        let calls = std::sync::Mutex::new(Vec::<String>::new());
-        let result = run_noninteractive_default_with(|args| {
-            let command_name = args.command.name().to_string();
-            calls
-                .lock()
-                .expect("calls mutex poisoned")
-                .push(command_name);
-
-            match args.command {
-                robot::RobotSubcommand::Status => Err(CliError::InvalidArgument(
-                    "project not found: /tmp/proj".to_string(),
-                )),
-                robot::RobotSubcommand::Overview => Ok(()),
-                other => panic!("unexpected command in fallback test: {other:?}"),
-            }
-        });
-
-        assert!(result.is_ok(), "fallback should recover missing project");
-        assert_eq!(
-            calls.into_inner().expect("calls mutex poisoned"),
-            vec!["robot status".to_string(), "robot overview".to_string()]
-        );
-    }
-
-    #[test]
-    fn noninteractive_default_returns_non_project_errors_without_fallback() {
-        let calls = std::sync::Mutex::new(0usize);
-        let result = run_noninteractive_default_with(|args| {
-            *calls.lock().expect("calls mutex poisoned") += 1;
-            match args.command {
-                robot::RobotSubcommand::Status => Err(CliError::Other("status failed".to_string())),
-                other => panic!("unexpected command without fallback: {other:?}"),
-            }
-        });
-
-        assert_eq!(*calls.lock().expect("calls mutex poisoned"), 1);
-        match result {
-            Err(CliError::Other(message)) => assert_eq!(message, "status failed"),
-            other => panic!("expected passthrough error, got: {other:?}"),
-        }
     }
 
     #[test]
@@ -39367,6 +41227,540 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn clap_parses_doctor_locks_json() {
+        let cli = Cli::try_parse_from(["am", "doctor", "locks", "--json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Doctor {
+                action: DoctorCommand::Locks { format, json },
+            } => {
+                assert!(format.is_none());
+                assert!(json);
+            }
+            other => panic!("expected Doctor Locks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_locks_is_read_only_but_doctor_fix_is_not() {
+        let locks = Commands::Doctor {
+            action: DoctorCommand::Locks {
+                format: None,
+                json: false,
+            },
+        };
+        assert!(command_is_read_only(&locks));
+
+        let fix = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: false,
+                json: false,
+                only: None,
+                list: false,
+            },
+        };
+        assert!(!command_is_read_only(&fix));
+    }
+
+    fn doctor_locks_test_ownership(
+        disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition,
+        competing_pids: Vec<u32>,
+    ) -> mcp_agent_mail_db::pool::MailboxOwnershipState {
+        mcp_agent_mail_db::pool::MailboxOwnershipState {
+            disposition,
+            storage_lock_path: "/tmp/storage/.mailbox.activity.lock".to_string(),
+            sqlite_lock_path: "/tmp/storage/storage.sqlite3.activity.lock".to_string(),
+            processes: Vec::new(),
+            competing_pids,
+            supervised_restart_required: false,
+            detail: "test ownership".to_string(),
+        }
+    }
+
+    fn doctor_locks_test_lock(
+        name: &'static str,
+        exists: bool,
+        holder_pids: Vec<u32>,
+    ) -> DoctorLockPathReport {
+        DoctorLockPathReport {
+            name,
+            path: format!("/tmp/{name}.activity.lock"),
+            exists,
+            file_type: if exists { "file" } else { "missing" }.to_string(),
+            age_seconds: exists.then_some(30),
+            mode: (!holder_pids.is_empty()).then(|| "exclusive".to_string()),
+            holder_pids,
+            waiter_pids: Vec::new(),
+            proc_records: Vec::new(),
+        }
+    }
+
+    fn doctor_locks_test_process(
+        pid: u32,
+        holds_storage_root_lock: bool,
+        holds_sqlite_lock: bool,
+        holds_database_file: bool,
+    ) -> DoctorLockProcessReport {
+        DoctorLockProcessReport {
+            pid,
+            command: Some("am serve-http --no-tui".to_string()),
+            executable_path: Some("/usr/bin/am".to_string()),
+            executable_deleted: false,
+            age_seconds: Some(60),
+            holds_storage_root_lock,
+            holds_sqlite_lock,
+            holds_database_file,
+            holds_wal_file: false,
+            holds_shm_file: false,
+        }
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_classifies_live_owner() {
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            vec![7],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![7]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", true, vec![7]);
+        let processes = vec![doctor_locks_test_process(7, true, true, true)];
+
+        let state =
+            doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &processes, &[]);
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Live);
+        assert_eq!(state.safe_next_command, "am doctor health");
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_classifies_stale_unowned_locks() {
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned,
+            Vec::new(),
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, Vec::new());
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+
+        let state = doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &[], &[]);
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Stale);
+        assert_eq!(state.safe_next_command, "am doctor --dry-run --fix");
+        assert!(state.reason.contains("activity lock artifact"));
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_classifies_live_pid_no_locks_as_wedged() {
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            vec![17],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", false, Vec::new());
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let processes = vec![doctor_locks_test_process(17, false, false, true)];
+
+        let state =
+            doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &processes, &[]);
+        let action = doctor_locks_recommended_next_action(&state, &[]);
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Wedged);
+        assert_eq!(
+            state.safe_next_command,
+            "ps -p 17 -o pid,ppid,stat,lstart,cmd"
+        );
+        assert!(state.reason.contains("no activity lock is visible"));
+        assert!(action.contains("Owner class wedged"));
+        assert!(!action.contains("kill"));
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_classifies_split_brain_as_unsafe_to_touch() {
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::SplitBrain,
+            vec![17, 23],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![23]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let processes = vec![
+            doctor_locks_test_process(17, false, false, true),
+            doctor_locks_test_process(23, true, false, true),
+        ];
+
+        let state =
+            doctor_locks_owner_state(&ownership, &storage_lock, &sqlite_lock, &processes, &[]);
+
+        assert_eq!(state.class, DoctorLockOwnerClass::UnsafeToTouch);
+        assert_eq!(
+            state.safe_next_command,
+            "ps -p 17,23 -o pid,ppid,stat,lstart,cmd"
+        );
+    }
+
+    #[test]
+    fn doctor_locks_recommendation_surfaces_waiters() {
+        let ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            vec![123],
+        );
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![123]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", false, Vec::new());
+        let processes = vec![doctor_locks_test_process(123, true, false, true)];
+        let waiters = vec![DoctorLockWaiterReport {
+            pid: 456,
+            lock_name: "storage_root",
+            mode: "exclusive".to_string(),
+            command: None,
+            executable_path: None,
+            age_seconds: Some(10),
+        }];
+        let owner_state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &processes,
+            &waiters,
+        );
+        let action = doctor_locks_recommended_next_action(&owner_state, &waiters);
+
+        assert_eq!(owner_state.class, DoctorLockOwnerClass::UnsafeToTouch);
+        assert!(action.contains("Lock waiters are present"));
+        assert!(action.contains("Owner class unsafe-to-touch"));
+    }
+
+    #[test]
+    fn doctor_locks_report_json_shape_is_stable() {
+        let report = DoctorLocksReport {
+            schema_version: "doctor_locks.v1",
+            inspected_at: "2026-06-10T00:00:00Z".to_string(),
+            storage_root: "/storage".to_string(),
+            database_path: "/storage/storage.sqlite3".to_string(),
+            memory_database: false,
+            disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            owner_state: DoctorLockOwnerState {
+                class: DoctorLockOwnerClass::Live,
+                reason: "test live owner".to_string(),
+                safe_next_command: "am doctor health".to_string(),
+            },
+            detail: "owner pid 7".to_string(),
+            supervised_restart_required: false,
+            storage_root_lock: DoctorLockPathReport {
+                name: "storage_root",
+                path: "/storage/.mailbox.activity.lock".to_string(),
+                exists: true,
+                file_type: "file".to_string(),
+                age_seconds: Some(5),
+                mode: Some("exclusive".to_string()),
+                holder_pids: vec![7],
+                waiter_pids: vec![9],
+                proc_records: vec![DoctorProcLockRecord {
+                    pid: 7,
+                    mode: "exclusive".to_string(),
+                    waiting: false,
+                }],
+            },
+            sqlite_lock: DoctorLockPathReport {
+                name: "sqlite",
+                path: "/storage/storage.sqlite3.activity.lock".to_string(),
+                exists: true,
+                file_type: "file".to_string(),
+                age_seconds: Some(4),
+                mode: Some("shared".to_string()),
+                holder_pids: vec![7],
+                waiter_pids: Vec::new(),
+                proc_records: Vec::new(),
+            },
+            sidecars: vec![DoctorLockSidecarReport {
+                name: "wal",
+                path: "/storage/storage.sqlite3-wal".to_string(),
+                exists: true,
+                open_by_pids: vec![7],
+            }],
+            processes: vec![DoctorLockProcessReport {
+                pid: 7,
+                command: Some("am serve-http".to_string()),
+                executable_path: Some("/usr/bin/am".to_string()),
+                executable_deleted: false,
+                age_seconds: Some(60),
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: true,
+                holds_database_file: true,
+                holds_wal_file: true,
+                holds_shm_file: false,
+            }],
+            waiters: vec![DoctorLockWaiterReport {
+                pid: 9,
+                lock_name: "storage_root",
+                mode: "exclusive".to_string(),
+                command: Some("am doctor repair".to_string()),
+                executable_path: Some("/usr/bin/am".to_string()),
+                age_seconds: Some(3),
+            }],
+            recommended_next_action: "Owner class live: use the running server for normal reads."
+                .to_string(),
+            read_only: true,
+        };
+
+        let value = serde_json::to_value(report).expect("serialize doctor locks report");
+        assert_eq!(value["schema_version"], "doctor_locks.v1");
+        assert_eq!(value["read_only"], true);
+        assert_eq!(value["disposition"], "active_other_owner");
+        assert_eq!(value["owner_state"]["class"], "live");
+        assert_eq!(
+            value["owner_state"]["safe_next_command"],
+            "am doctor health"
+        );
+        assert_eq!(value["storage_root_lock"]["mode"], "exclusive");
+        assert_eq!(
+            value["storage_root_lock"]["holder_pids"],
+            serde_json::json!([7])
+        );
+        assert_eq!(
+            value["storage_root_lock"]["waiter_pids"],
+            serde_json::json!([9])
+        );
+        assert_eq!(
+            value["storage_root_lock"]["proc_records"][0]["waiting"],
+            false
+        );
+        assert_eq!(value["sqlite_lock"]["mode"], "shared");
+        assert_eq!(value["sidecars"][0]["open_by_pids"], serde_json::json!([7]));
+        assert_eq!(value["processes"][0]["holds_wal_file"], true);
+        assert_eq!(value["waiters"][0]["command"], "am doctor repair");
+    }
+
+    #[test]
+    fn doctor_locks_process_rows_merge_lock_holder_evidence() {
+        let ownership_processes = vec![mcp_agent_mail_db::pool::MailboxOwnershipProcess {
+            pid: 7,
+            command: Some("am serve-http".to_string()),
+            executable_path: Some("/usr/bin/am".to_string()),
+            executable_deleted: false,
+            holds_storage_root_lock: false,
+            holds_sqlite_lock: false,
+            holds_database_file: true,
+        }];
+        let storage_root_lock = DoctorLockPathReport {
+            name: "storage_root",
+            path: "/missing/storage.lock".to_string(),
+            exists: true,
+            file_type: "file".to_string(),
+            age_seconds: None,
+            mode: Some("exclusive".to_string()),
+            holder_pids: vec![7],
+            waiter_pids: Vec::new(),
+            proc_records: Vec::new(),
+        };
+        let sqlite_lock = DoctorLockPathReport {
+            name: "sqlite",
+            path: "/missing/sqlite.lock".to_string(),
+            exists: true,
+            file_type: "file".to_string(),
+            age_seconds: None,
+            mode: Some("shared".to_string()),
+            holder_pids: vec![9],
+            waiter_pids: Vec::new(),
+            proc_records: Vec::new(),
+        };
+
+        let reports = doctor_lock_process_reports(
+            &ownership_processes,
+            &storage_root_lock,
+            &sqlite_lock,
+            Path::new("/missing/storage.lock"),
+            Some(Path::new("/missing/sqlite.lock")),
+            Some(Path::new("/missing/storage.sqlite3")),
+            Some(Path::new("/missing/storage.sqlite3-wal")),
+            Some(Path::new("/missing/storage.sqlite3-shm")),
+        );
+
+        let service = reports
+            .iter()
+            .find(|report| report.pid == 7)
+            .expect("ownership process row");
+        assert!(service.holds_storage_root_lock);
+        assert!(!service.holds_sqlite_lock);
+        assert!(service.holds_database_file);
+
+        let sqlite_holder = reports
+            .iter()
+            .find(|report| report.pid == 9)
+            .expect("lock-only sqlite holder row");
+        assert!(sqlite_holder.holds_sqlite_lock);
+        assert!(!sqlite_holder.holds_storage_root_lock);
+        assert!(sqlite_holder.command.is_none());
+    }
+
+    #[test]
+    fn doctor_locks_memory_database_reports_no_sqlite_sidecars() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let report =
+            build_doctor_locks_report_with_config(&config).expect("build doctor locks report");
+
+        assert!(report.memory_database);
+        assert_eq!(report.database_path, ":memory:");
+        assert_eq!(report.sqlite_lock.path, ":memory:");
+        assert_eq!(report.sqlite_lock.file_type, "memory_database");
+        assert!(!report.sqlite_lock.exists);
+        assert!(report.sqlite_lock.mode.is_none());
+        assert!(report.sidecars.is_empty());
+        assert!(
+            report
+                .processes
+                .iter()
+                .all(|process| !process.holds_database_file
+                    && !process.holds_wal_file
+                    && !process.holds_shm_file)
+        );
+    }
+
+    #[test]
+    fn doctor_locks_process_rows_mask_file_surfaces_when_paths_absent() {
+        let ownership_processes = vec![mcp_agent_mail_db::pool::MailboxOwnershipProcess {
+            pid: 7,
+            command: None,
+            executable_path: None,
+            executable_deleted: false,
+            holds_storage_root_lock: true,
+            holds_sqlite_lock: true,
+            holds_database_file: true,
+        }];
+        let storage_root_lock = DoctorLockPathReport {
+            name: "storage_root",
+            path: "/missing/storage.lock".to_string(),
+            exists: false,
+            file_type: "missing".to_string(),
+            age_seconds: None,
+            mode: None,
+            holder_pids: Vec::new(),
+            waiter_pids: Vec::new(),
+            proc_records: Vec::new(),
+        };
+        let sqlite_lock = synthetic_doctor_lock_path("sqlite", ":memory:", "memory_database");
+
+        let reports = doctor_lock_process_reports(
+            &ownership_processes,
+            &storage_root_lock,
+            &sqlite_lock,
+            Path::new("/missing/storage.lock"),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let report = reports.first().expect("process row");
+        assert!(report.holds_storage_root_lock);
+        assert!(!report.holds_sqlite_lock);
+        assert!(!report.holds_database_file);
+        assert!(!report.holds_wal_file);
+        assert!(!report.holds_shm_file);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_locks_parses_proc_stat_start_ticks_with_parens_in_command() {
+        let stat =
+            "42 (agent mail (probe)) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 20 21";
+        assert_eq!(
+            parse_proc_stat_start_ticks_for_doctor_locks(stat),
+            Some(987_654)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_locks_inspects_held_flock_mode_and_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join(".mailbox.activity.lock");
+        let _lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let mut child = match std::process::Command::new("flock")
+            .arg("-x")
+            .arg(&lock_path)
+            .arg("sleep")
+            .arg("5")
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let mut observed = None;
+        for _ in 0..50 {
+            let report = inspect_doctor_lock_path("storage_root", &lock_path);
+            if report.mode.as_deref() == Some("exclusive")
+                && report.holder_pids.contains(&child_pid)
+            {
+                observed = Some(report);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let report = observed.expect("held flock should be visible");
+        assert!(report.waiter_pids.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_locks_does_not_follow_symlink_lock_path_for_mode_or_holders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_path = tmp.path().join("target.lock");
+        std::fs::write(&target_path, "target").unwrap();
+        let lock_path = tmp.path().join(".mailbox.activity.lock");
+        std::os::unix::fs::symlink(&target_path, &lock_path).unwrap();
+
+        let mut child = match std::process::Command::new("flock")
+            .arg("-x")
+            .arg(&target_path)
+            .arg("sleep")
+            .arg("5")
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let child_pid = child.id();
+        let mut target_lock_visible = false;
+        for _ in 0..50 {
+            let report = inspect_doctor_lock_path("target", &target_path);
+            if report.mode.as_deref() == Some("exclusive")
+                && report.holder_pids.contains(&child_pid)
+            {
+                target_lock_visible = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let symlink_report = inspect_doctor_lock_path("storage_root", &lock_path);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            target_lock_visible,
+            "test setup should hold the target lock"
+        );
+        assert_eq!(symlink_report.file_type, "symlink");
+        assert!(symlink_report.mode.is_none());
+        assert!(symlink_report.holder_pids.is_empty());
+        assert!(symlink_report.proc_records.is_empty());
+        assert!(doctor_lock_path_is_unsafe_to_touch(&symlink_report));
+    }
+
+    #[test]
     fn clap_parses_doctor_artifacts() {
         let cli = Cli::try_parse_from([
             "am",
@@ -40084,6 +42478,42 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn diagnostic_probe_fallback_suppresses_primary_malformed_verdict() {
+        let probe = doctor_probe_with_canonical_fallback(
+            DOCTOR_FOREIGN_KEY_CHECK_CAPABILITY,
+            || {
+                Err(CliError::Other(
+                    "foreign key check failed: Query error: database disk image is malformed"
+                        .to_string(),
+                ))
+            },
+            || Ok(Vec::<DoctorForeignKeyViolation>::new()),
+        )
+        .expect("canonical fallback should turn a primary diagnostic failure into a verdict");
+
+        assert!(probe.value.is_empty());
+        assert_eq!(
+            probe.evidence.engine,
+            DoctorDiagnosticEngine::CanonicalSqlite
+        );
+        assert_eq!(
+            probe.evidence.authority,
+            DoctorDiagnosticAuthority::DiagnosticEngineLimitation
+        );
+        let detail = probe.evidence.detail_fragment();
+        assert!(
+            detail.contains("diagnostic engine limitation")
+                && detail.contains("canonical_sqlite")
+                && detail.contains("sqlite_recovery_error"),
+            "fallback detail should classify the primary failure: {detail}"
+        );
+        assert!(
+            !detail.contains("database disk image is malformed"),
+            "fallback detail must not repeat an unqualified primary malformed verdict: {detail}"
+        );
+    }
+
+    #[test]
     fn doctor_database_fix_strategy_cleans_header_only_wal_before_open_probe() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header-only-wal.sqlite3");
@@ -40667,13 +43097,15 @@ startup_timeout_sec = 42
             !reconstruct_called.get(),
             "reconstruct runner should not be used for FK-only repair"
         );
-        assert!(
-            matches!(
-                doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy after repair"),
-                DoctorDatabaseFixStrategy::None(_)
-            ),
-            "post-repair strategy should be clean"
-        );
+        match doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy after repair") {
+            DoctorDatabaseFixStrategy::None(detail) => {
+                assert!(
+                    detail.contains("foreign_key_check engine=") && detail.contains("authority="),
+                    "post-repair clean strategy should include diagnostic engine evidence: {detail}"
+                );
+            }
+            other => panic!("post-repair strategy should be clean: {other:?}"),
+        }
     }
 
     #[test]
@@ -42570,7 +45002,11 @@ startup_timeout_sec = 42
 
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         let shm_path = sqlite_sidecar_path(&db_path, "-shm");
-        std::fs::write(&wal_path, b"").expect("write zero-byte wal");
+        std::fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
         std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
 
         let db_url = format!("sqlite:///{}", db_path.display());
@@ -42590,11 +45026,145 @@ startup_timeout_sec = 42
             "dry-run output should explain the WAL quarantine plan: {output}"
         );
         assert!(
+            output.contains("sidecar_sanity_ok: false"),
+            "dry-run output should scope the sidecar failure: {output}"
+        );
+        assert!(
+            output.contains("full_integrity_check_not_run: true (blocked by sidecar_sanity)"),
+            "dry-run output should explain that the full check did not run: {output}"
+        );
+        assert!(
             output.contains("Skipping live SQLite probes"),
             "dry-run output should explain why DB probes were skipped: {output}"
         );
         assert!(wal_path.exists(), "dry-run must not move the WAL sidecar");
         assert!(shm_path.exists(), "dry-run must not move the SHM sidecar");
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_uses_scoped_integrity_labels() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("scoped-integrity.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = tmp.path().join("storage");
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        handle_migrate_with_database_url(&db_url).expect("migrate scoped-label fixture");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("checkpoint scoped-label fixture");
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
+        let result =
+            handle_doctor_repair_with(&db_url, &storage_root, &backup_dir, None, true, true);
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "doctor repair dry-run should succeed on a healthy fixture: {output}"
+        );
+        for fragment in [
+            "sidecar_sanity_ok: true",
+            "quick_check_ok: true",
+            "archive_db_parity_check_not_run: true",
+            "full_integrity_check_ok: true",
+            "foreign_key_check_ok: true",
+        ] {
+            assert!(
+                output.contains(fragment),
+                "doctor repair output missing scoped label {fragment:?}: {output}"
+            );
+        }
+        for old_label in ["  Integrity: OK", "  Full integrity_check: OK"] {
+            assert!(
+                !output.contains(old_label),
+                "doctor repair output should not contain old global label {old_label:?}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_reports_full_integrity_not_run_after_failed_quick_check() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("quick-check-fails.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = tmp.path().join("storage");
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+
+        let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
+        let result =
+            handle_doctor_repair_with(&db_url, &storage_root, &backup_dir, None, true, true);
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "doctor repair dry-run should report the planned action for a corrupt fixture: {output}"
+        );
+        assert!(
+            output.contains("quick_check_ok: false"),
+            "quick-check failure should be scoped: {output}"
+        );
+        assert!(
+            output.contains("full_integrity_check_not_run: true (quick_check_ok=false)"),
+            "skipped full check should be explicit: {output}"
+        );
+        assert!(
+            !output.contains("full_integrity_check_ok"),
+            "corrupt fixture must not emit full_integrity_check_ok: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_dry_run_never_reports_full_integrity_ok_for_malformed_page() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("malformed-page.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = tmp.path().join("storage");
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        handle_migrate_with_database_url(&db_url).expect("migrate malformed-page fixture");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("checkpoint malformed-page fixture");
+        mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
+
+        let mut bytes = std::fs::read(&db_path).expect("read malformed-page fixture");
+        let page_size = 4096;
+        assert!(
+            bytes.len() > page_size,
+            "fixture DB should include a second page"
+        );
+        bytes[page_size] ^= 0x7f;
+        std::fs::write(&db_path, bytes).expect("write malformed-page fixture");
+
+        let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
+        let result =
+            handle_doctor_repair_with(&db_url, &storage_root, &backup_dir, None, true, true);
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "doctor repair dry-run should report a scoped plan for malformed pages: {output}"
+        );
+        assert!(
+            output.contains("full_integrity_check_not_run")
+                || output.contains("full_integrity_check_failed"),
+            "malformed-page output should report a full-check failure or skipped full check: {output}"
+        );
+        assert!(
+            !output.contains("full_integrity_check_ok"),
+            "malformed-page fixture must not emit full_integrity_check_ok: {output}"
+        );
     }
 
     #[test]
@@ -45659,6 +48229,226 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_atc_explain_reads_live_atc_rows_without_reconciling_archive_drift() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-explain-stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        )
+        .expect("migrate stale sqlite db");
+        seed_atc_explain_db(&db_path, &storage_root);
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive-ahead message",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "archive-only message body",
+        );
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_atc(AtcCommand::Explain {
+                    decision_id: 77,
+                    json: true,
+                })
+            },
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "atc explain should succeed: {result:?}");
+        let json_str = extract_json_block(&output).expect("expected JSON output");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("parse atc explain json");
+        assert_eq!(parsed["decision_id"], 77);
+        assert_eq!(parsed["latest_experience_id"], 1);
+        assert_eq!(parsed["inputs"]["subject"], "BlueLake");
+        assert_eq!(
+            sqlite_message_count(&db_path),
+            0,
+            "ATC explain must not reconcile archive drift into the live SQLite file"
+        );
+    }
+
+    #[test]
+    fn atc_live_snapshot_helpers_do_not_create_missing_sqlite_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing-atc.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let sqlite_activity_lock = PathBuf::from(format!("{}.activity.lock", db_path.display()));
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let explain_error = match open_atc_explain_read_db_with_database_url(&db_url) {
+            Ok(_) => panic!("missing ATC explain source should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            explain_error
+                .to_string()
+                .contains("existing file-backed SQLite database"),
+            "unexpected ATC explain error: {explain_error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "ATC explain must not create a missing live SQLite source"
+        );
+        assert!(
+            !sqlite_activity_lock.exists(),
+            "ATC explain must not create a SQLite activity lock for a missing live source"
+        );
+
+        let simulate_error =
+            match open_atc_simulate_read_pool_with_database_url(&db_url, Some(&storage_root)) {
+                Ok(_) => panic!("missing ATC simulate source should fail"),
+                Err(error) => error,
+            };
+        assert!(
+            simulate_error
+                .to_string()
+                .contains("existing file-backed SQLite database"),
+            "unexpected ATC simulate error: {simulate_error}"
+        );
+        assert!(
+            !db_path.exists(),
+            "ATC simulate must not create a missing live SQLite source"
+        );
+        assert!(
+            !sqlite_activity_lock.exists(),
+            "ATC simulate must not create a SQLite activity lock for a missing live source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atc_live_snapshot_helpers_reject_symlinked_sqlite_source_without_locking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target_path = dir.path().join("target.sqlite3");
+        let db_path = dir.path().join("linked-atc.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let sqlite_activity_lock = PathBuf::from(format!("{}.activity.lock", db_path.display()));
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let target_url = format!("sqlite:///{}", target_path.display());
+        handle_migrate_with_database_url(&target_url).expect("create valid sqlite target");
+        std::os::unix::fs::symlink(&target_path, &db_path).expect("create sqlite source symlink");
+
+        let explain_error = match open_atc_explain_read_db_with_database_url(&db_url) {
+            Ok(_) => panic!("symlinked ATC explain source should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            explain_error.to_string().contains("regular SQLite file"),
+            "unexpected ATC explain error: {explain_error}"
+        );
+        assert!(
+            !sqlite_activity_lock.exists(),
+            "ATC explain must not create a SQLite activity lock for a symlinked source"
+        );
+
+        let simulate_error =
+            match open_atc_simulate_read_pool_with_database_url(&db_url, Some(&storage_root)) {
+                Ok(_) => panic!("symlinked ATC simulate source should fail"),
+                Err(error) => error,
+            };
+        assert!(
+            simulate_error.to_string().contains("regular SQLite file"),
+            "unexpected ATC simulate error: {simulate_error}"
+        );
+        assert!(
+            !sqlite_activity_lock.exists(),
+            "ATC simulate must not create a SQLite activity lock for a symlinked source"
+        );
+    }
+
+    #[test]
+    fn atc_live_snapshot_helpers_reject_invalid_sqlite_file_without_mutating() {
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("zero", Vec::new(), "too small to contain a SQLite header"),
+            (
+                "magic-only",
+                b"SQLite format 3\0".to_vec(),
+                "too small to contain a SQLite header",
+            ),
+            (
+                "garbage",
+                vec![b'x'; SQLITE_DATABASE_HEADER_BYTES],
+                "invalid SQLite header",
+            ),
+        ];
+
+        for (name, bytes, expected_detail) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("{name}-atc.sqlite3"));
+            let db_url = format!("sqlite:///{}", db_path.display());
+            let sqlite_activity_lock =
+                PathBuf::from(format!("{}.activity.lock", db_path.display()));
+            let storage_root = dir.path().join("storage-root");
+            std::fs::create_dir_all(&storage_root).expect("create storage root");
+            std::fs::write(&db_path, &bytes).expect("write invalid sqlite source");
+
+            let explain_error = match open_atc_explain_read_db_with_database_url(&db_url) {
+                Ok(_) => panic!("invalid ATC explain source should fail"),
+                Err(error) => error,
+            };
+            assert!(
+                explain_error.to_string().contains(expected_detail),
+                "unexpected ATC explain error for {name}: {explain_error}"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).expect("read invalid sqlite source"),
+                bytes,
+                "ATC explain must not mutate an invalid live SQLite source"
+            );
+            assert!(
+                !sqlite_activity_lock.exists(),
+                "ATC explain must not create a SQLite activity lock for an invalid live source"
+            );
+
+            let simulate_error =
+                match open_atc_simulate_read_pool_with_database_url(&db_url, Some(&storage_root)) {
+                    Ok(_) => panic!("invalid ATC simulate source should fail"),
+                    Err(error) => error,
+                };
+            assert!(
+                simulate_error.to_string().contains(expected_detail),
+                "unexpected ATC simulate error for {name}: {simulate_error}"
+            );
+            assert_eq!(
+                std::fs::read(&db_path).expect("read invalid sqlite source"),
+                bytes,
+                "ATC simulate must not mutate an invalid live SQLite source"
+            );
+            assert!(
+                !sqlite_activity_lock.exists(),
+                "ATC simulate must not create a SQLite activity lock for an invalid live source"
+            );
+        }
+    }
+
+    #[test]
     fn integration_doctor_check_on_fresh_db() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -45672,6 +48462,9 @@ startup_timeout_sec = 42
                 let db_url = format!("sqlite:///{}", db_path.display());
 
                 handle_migrate_with_database_url(&db_url).expect("migrate");
+                mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+                    .expect("checkpoint fresh DB fixture before doctor check");
+                mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
 
                 // Doctor check should succeed on a fresh DB
                 let capture = ftui_runtime::StdioCapture::install().unwrap();
@@ -45684,6 +48477,24 @@ startup_timeout_sec = 42
                 if let Some(json_str) = extract_json_block(&output) {
                     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
                     assert!(parsed["healthy"].is_boolean());
+                    let fk_check = parsed["checks"]
+                        .as_array()
+                        .and_then(|checks| {
+                            checks.iter().find(|check| {
+                                check["check"].as_str() == Some("foreign_key_integrity")
+                            })
+                        })
+                        .expect("foreign_key_integrity check should be present");
+                    let detail = fk_check["detail"].as_str().unwrap_or_default();
+                    assert!(
+                        detail.contains("foreign_key_check engine=")
+                            && detail.contains("authority="),
+                        "fresh DB doctor output should name the diagnostic engine: {detail}"
+                    );
+                    assert!(
+                        !detail.contains("database disk image is malformed"),
+                        "fresh DB doctor output must not report an unqualified malformed verdict: {detail}"
+                    );
                 }
             },
         );
@@ -58867,6 +61678,10 @@ fn handle_doctor_repair_with_options(
     }
 
     if dry_run && let Some(detail) = doctor_truncated_wal_sidecar_detail(&reconstruct_db_path) {
+        ftui_runtime::ftui_println!("  sidecar_sanity_ok: false ({detail})");
+        ftui_runtime::ftui_println!(
+            "  full_integrity_check_not_run: true (blocked by sidecar_sanity)"
+        );
         ftui_runtime::ftui_println!("  Would quarantine: {detail}");
         let shm_path = sqlite_sidecar_path(&reconstruct_db_path, "-shm");
         if std::fs::symlink_metadata(&shm_path).is_ok() {
@@ -58882,6 +61697,7 @@ fn handle_doctor_repair_with_options(
     if !dry_run {
         doctor_quarantine_header_only_wal_sidecars(&reconstruct_db_path)?;
     }
+    ftui_runtime::ftui_println!("  sidecar_sanity_ok: true");
 
     if !dry_run
         && let Some(bundle_dir) = capture_doctor_forensic_bundle(
@@ -58916,13 +61732,17 @@ fn handle_doctor_repair_with_options(
         sqlite_doctor_file_sanity(&reconstruct_db_path.display().to_string())?;
 
     ftui_runtime::ftui_println!(
-        "  Integrity: {}",
-        if integrity_ok { "OK" } else { "FAILED" }
+        "  quick_check_ok: {} ({})",
+        integrity_ok,
+        truncate_doctor_command(&integrity_detail)
     );
 
     if !integrity_ok {
         if archive_reconstruct_available {
             if dry_run {
+                ftui_runtime::ftui_println!(
+                    "  full_integrity_check_not_run: true (quick_check_ok=false)"
+                );
                 ftui_runtime::ftui_println!(
                     "  Would fall back to archive reconstruction from {}",
                     archive_projects_dir.display()
@@ -58930,6 +61750,9 @@ fn handle_doctor_repair_with_options(
                 ftui_runtime::ftui_println!("Repair dry run complete.");
                 return Ok(());
             }
+            ftui_runtime::ftui_println!(
+                "  full_integrity_check_not_run: true (quick_check_ok=false)"
+            );
             ftui_runtime::ftui_eprintln!(
                 "  Database corruption detected ({integrity_detail}). Automatically falling back to archive reconstruction..."
             );
@@ -58942,6 +61765,9 @@ fn handle_doctor_repair_with_options(
             );
         }
         if dry_run {
+            ftui_runtime::ftui_println!(
+                "  full_integrity_check_not_run: true (quick_check_ok=false)"
+            );
             ftui_runtime::ftui_println!(
                 "  Would attempt in-place repair because no authoritative archive data was found under {}",
                 archive_projects_dir.display()
@@ -58961,12 +61787,18 @@ fn handle_doctor_repair_with_options(
         open_db_sync_with_database_url_and_storage_root_locked(database_url, Some(storage_root))?
     };
 
-    match collect_doctor_db_inventory(&conn) {
-        Ok(_) => {}
+    let db_inventory = match collect_doctor_db_inventory(&conn) {
+        Ok(inventory) => inventory,
         Err(error) => {
             if archive_reconstruct_available {
                 let detail = truncate_doctor_command(&error.to_string());
                 ftui_runtime::ftui_println!("  Database inventory: FAILED ({detail})");
+                ftui_runtime::ftui_println!(
+                    "  archive_db_parity_check_not_run: true (database_inventory_failed)"
+                );
+                ftui_runtime::ftui_println!(
+                    "  full_integrity_check_not_run: true (database_inventory_failed)"
+                );
                 if dry_run {
                     ftui_runtime::ftui_println!(
                         "  Would fall back to archive reconstruction from {}",
@@ -58993,6 +61825,38 @@ fn handle_doctor_repair_with_options(
                 archive_projects_dir.display()
             )));
         }
+    };
+    if archive_available {
+        if let Some(archive) = archive_inventory.as_ref() {
+            if doctor_archive_is_authoritative_for_db(
+                archive,
+                &db_inventory,
+                &reconstruct_db_path,
+                storage_root,
+                storage_root_is_explicit,
+            ) {
+                if let Some(detail) = doctor_archive_db_drift_detail(archive, &db_inventory) {
+                    ftui_runtime::ftui_println!(
+                        "  archive_db_parity_ok: false ({})",
+                        truncate_doctor_command(&detail)
+                    );
+                } else {
+                    ftui_runtime::ftui_println!("  archive_db_parity_ok: true");
+                }
+            } else {
+                ftui_runtime::ftui_println!(
+                    "  archive_db_parity_check_not_run: true (archive_not_authoritative_for_db)"
+                );
+            }
+        } else {
+            ftui_runtime::ftui_println!(
+                "  archive_db_parity_check_not_run: true (archive_inventory_unavailable)"
+            );
+        }
+    } else {
+        ftui_runtime::ftui_println!(
+            "  archive_db_parity_check_not_run: true (archive_projects_dir_missing)"
+        );
     }
 
     // 1b. Run a full PRAGMA integrity_check (not just quick_check) to catch
@@ -59000,42 +61864,72 @@ fn handle_doctor_repair_with_options(
     // state, reconstruction is safer than trying to guess which in-place repair
     // operation can recover a malformed b-tree or index.
     {
-        let full_ok = sqlite_conn_check_ok_with_canonical_file_fallback(
+        let full_check = sqlite_conn_check_ok_with_canonical_file_fallback(
             &conn,
             &reconstruct_db_path,
             mcp_agent_mail_db::CheckKind::Full,
-        )
-        .unwrap_or(false);
-        if !full_ok {
-            if archive_reconstruct_available {
-                ftui_runtime::ftui_println!(
-                    "  Full integrity_check: FAILED (archive reconstruction recommended)"
-                );
-                if dry_run {
-                    ftui_runtime::ftui_println!(
-                        "  Would fall back to archive reconstruction from {}",
-                        archive_projects_dir.display()
+        );
+        match full_check {
+            Ok(true) => {
+                ftui_runtime::ftui_println!("  full_integrity_check_ok: true");
+            }
+            Ok(false) => {
+                ftui_runtime::ftui_println!("  full_integrity_check_failed: true");
+                if archive_reconstruct_available {
+                    ftui_runtime::ftui_println!("  archive_reconstruction_recommended: true");
+                    if dry_run {
+                        ftui_runtime::ftui_println!(
+                            "  Would fall back to archive reconstruction from {}",
+                            archive_projects_dir.display()
+                        );
+                        ftui_runtime::ftui_println!("Repair dry run complete.");
+                        return Ok(());
+                    }
+                    drop(conn);
+                    ftui_runtime::ftui_eprintln!(
+                        "  full_integrity_check_failed: archive reconstruction will run"
                     );
-                    ftui_runtime::ftui_println!("Repair dry run complete.");
-                    return Ok(());
+                    return handle_doctor_reconstruct_with(
+                        Some(&reconstruct_db_path),
+                        Some(storage_root),
+                        false,
+                        yes,
+                        false,
+                    );
                 }
-                drop(conn);
-                ftui_runtime::ftui_eprintln!(
-                    "  Full integrity_check failed. Automatically falling back to archive reconstruction..."
-                );
-                return handle_doctor_reconstruct_with(
-                    Some(&reconstruct_db_path),
-                    Some(storage_root),
-                    false,
-                    yes,
-                    false,
+                ftui_runtime::ftui_println!(
+                    "  archive_reconstruction_recommended: false (no authoritative archive data found; attempting in-place repair)"
                 );
             }
-            ftui_runtime::ftui_println!(
-                "  Full integrity_check: FAILED (no authoritative archive data found; attempting in-place repair)"
-            );
-        } else {
-            ftui_runtime::ftui_println!("  Full integrity_check: OK");
+            Err(error) => {
+                let detail = truncate_doctor_command(&error.to_string());
+                ftui_runtime::ftui_println!("  full_integrity_check_not_run: true ({detail})");
+                if archive_reconstruct_available {
+                    ftui_runtime::ftui_println!("  archive_reconstruction_recommended: true");
+                    if dry_run {
+                        ftui_runtime::ftui_println!(
+                            "  Would fall back to archive reconstruction from {}",
+                            archive_projects_dir.display()
+                        );
+                        ftui_runtime::ftui_println!("Repair dry run complete.");
+                        return Ok(());
+                    }
+                    drop(conn);
+                    ftui_runtime::ftui_eprintln!(
+                        "  full_integrity_check_not_run: archive reconstruction will run ({detail})"
+                    );
+                    return handle_doctor_reconstruct_with(
+                        Some(&reconstruct_db_path),
+                        Some(storage_root),
+                        false,
+                        yes,
+                        false,
+                    );
+                }
+                ftui_runtime::ftui_println!(
+                    "  archive_reconstruction_recommended: false (no authoritative archive data found; attempting in-place repair)"
+                );
+            }
         }
     }
 
@@ -59121,6 +62015,21 @@ fn handle_doctor_repair_with_options(
             )));
         }
     };
+    match doctor_relational_integrity_diagnostics_canonical(&cleanup_conn) {
+        Ok(diagnostics) => {
+            let diagnostic_detail = doctor_relational_integrity_detail_prefix(&diagnostics);
+            ftui_runtime::ftui_println!(
+                "  foreign_key_check_ok: {} ({diagnostic_detail})",
+                diagnostics.foreign_key_violations.is_empty()
+            );
+        }
+        Err(error) => {
+            ftui_runtime::ftui_println!(
+                "  foreign_key_check_not_run: true ({})",
+                truncate_doctor_command(&error.to_string())
+            );
+        }
+    }
     let recipient_cleanup = match doctor_cleanup_orphaned_message_recipients_canonical(
         &cleanup_conn,
         dry_run,
@@ -64756,6 +67665,10 @@ fn build_cli_capabilities() -> CliCapabilities {
             ExitCodeCapability {
                 code: 2,
                 meaning: "usage error or wrong interface mode",
+            },
+            ExitCodeCapability {
+                code: LEGACY_AM_SERVE_EXIT_CODE,
+                meaning: "legacy CLI subcommand migration required; do not retry unchanged",
             },
         ],
         environment: vec![
