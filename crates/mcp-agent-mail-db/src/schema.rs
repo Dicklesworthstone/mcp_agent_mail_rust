@@ -232,7 +232,11 @@ PRAGMA threads = 4;
 PRAGMA journal_size_limit = 268435456;
 ";
 
-/// Database-wide initialization PRAGMAs (applied once per sqlite file).
+/// Runtime startup PRAGMAs for file-backed mailboxes.
+///
+/// These are issued by the single startup init path before pooled connections
+/// are exposed. The same bundle may run on migration, canonical follow-up, and
+/// runtime init connections so every phase agrees on lock and journal mode.
 pub const PRAGMA_DB_INIT_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
@@ -240,10 +244,11 @@ PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 ";
 
-/// Base-mode DB init PRAGMAs for files later opened by `FrankenConnection`.
+/// Base-only DB init PRAGMAs for isolated recovery/export paths.
 ///
-/// WAL mode is intentionally avoided here to prevent mixed-runtime corruption
-/// and malformed-image scenarios when the server process is terminated abruptly.
+/// Runtime startup must use [`PRAGMA_DB_INIT_SQL`] so Agent Mail always opens
+/// file-backed mailboxes in WAL mode. This rollback-journal variant is reserved
+/// for one-shot paths that intentionally avoid the normal pooled runtime.
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
@@ -327,8 +332,8 @@ pub fn init_schema_sql() -> String {
 /// Safe for databases that will be opened by `FrankenConnection` (pure-Rust `SQLite`).
 /// PRAGMAs are intentionally excluded because:
 /// - The pool applies per-connection PRAGMAs separately via [`build_conn_pragmas`]
-/// - The pool's init gate applies base-safe DB init pragmas via
-///   [`PRAGMA_DB_INIT_BASE_SQL`] before pooled connections open
+/// - The pool's init gate applies runtime DB init pragmas via
+///   [`PRAGMA_DB_INIT_SQL`] before pooled connections open
 ///
 /// Search queries automatically fall back to LIKE-based search when FTS5 tables are absent.
 #[must_use]
@@ -2113,10 +2118,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     migrations
 }
 
-/// Returns `true` if a migration creates or manipulates FTS5 virtual tables.
-///
-/// Trigger DDL is supported by `FrankenConnection`; base mode only excludes
-/// FTS virtual table migrations.
+/// Returns `true` if a migration creates, backfills, or drops FTS5 objects.
 fn is_fts_migration(id: &str) -> bool {
     let id_lower = id.to_ascii_lowercase();
     id_lower.contains("fts")
@@ -2140,16 +2142,32 @@ fn is_obsolete_message_fts_trigger_migration(id: &str) -> bool {
     )
 }
 
+fn is_fts_decommission_trigger_migration(id: &str) -> bool {
+    matches!(
+        id,
+        "v11_drop_trigger_messages_ai"
+            | "v11_drop_trigger_messages_ad"
+            | "v11_drop_trigger_messages_au"
+            | "v11_drop_trigger_agents_ai"
+            | "v11_drop_trigger_agents_ad"
+            | "v11_drop_trigger_agents_au"
+            | "v11_drop_trigger_projects_ai"
+            | "v11_drop_trigger_projects_ad"
+            | "v11_drop_trigger_projects_au"
+    )
+}
+
 /// Migrations that use SQL features unsupported by `FrankenConnection`.
 ///
-/// Includes FTS5 virtual tables, queries with aggregate functions over JOINs,
-/// CREATE INDEX with expressions (COLLATE NOCASE), and message triggers that
-/// depend on `fts_messages`. The obsolete message FTS triggers are skipped in
-/// both startup lanes; Search V3 decommissions FTS, and reintroducing those
-/// triggers before later table migrations makes SQLite reparse trigger bodies
-/// that reference missing `fts_messages`. ANALYZE migrations are also excluded
-/// because their `sqlite_stat1` table can make FrankenSQLite reenter schema
-/// refresh while query planning.
+/// Includes FTS5 object DDL/backfills, official v11 FTS trigger-drop ledger IDs,
+/// queries with aggregate functions over JOINs, CREATE INDEX with expressions
+/// (COLLATE NOCASE), and message triggers that depend on `fts_messages`.
+/// Search V3 decommissions FTS, and base mode uses separate cleanup migration
+/// IDs for FTS trigger/table cleanup. That lets the later canonical full-ledger
+/// pass replay historical v7 FTS creation followed by the official v11 drops in
+/// authored order instead of seeing the v11 trigger-drop IDs already recorded.
+/// ANALYZE migrations are also excluded because their `sqlite_stat1` table can
+/// make FrankenSQLite reenter schema refresh while query planning.
 ///
 /// `v15_add_recipients_json_to_messages` is also excluded from base mode.
 /// The base-mode startup path and compatibility probes do not require the
@@ -2159,6 +2177,7 @@ fn is_obsolete_message_fts_trigger_migration(id: &str) -> bool {
 fn is_unsupported_by_franken(id: &str) -> bool {
     is_fts_migration(id)
         || is_obsolete_message_fts_trigger_migration(id)
+        || is_fts_decommission_trigger_migration(id)
         || is_analyze_migration(id)
         || is_runtime_canonical_followup_migration(id)
 }
@@ -2356,11 +2375,13 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
     Ok(())
 }
 
-/// Migrations excluding FTS5 virtual tables and FTS backfill inserts.
+/// Migrations excluding FTS5 object migrations, canonical-only cleanup ledger
+/// IDs, and runtime-canonical follow-ups.
 ///
 /// Safe for databases that will be opened by `FrankenConnection`. The migration
-/// runner records core schema migrations plus base cleanup drops in the
-/// migrations table.
+/// runner records core schema migrations plus base-specific cleanup drops in the
+/// migrations table; it intentionally leaves the official canonical cleanup IDs
+/// for the later full-ledger pass.
 #[must_use]
 pub fn schema_migrations_base() -> Vec<Migration> {
     // NOTE: We intentionally do NOT filter out ADD COLUMN migrations here.
@@ -2577,6 +2598,387 @@ async fn migration_set_is_complete<C: Connection>(
             .iter()
             .all(|migration| applied_ids.contains(&migration.id)),
     )
+}
+
+async fn read_user_version<C: Connection>(cx: &Cx, conn: &C) -> Outcome<i64, SqlError> {
+    let rows = match conn.query(cx, "PRAGMA user_version", &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(SqlError::Custom(
+            "schema gate failed: PRAGMA user_version returned no rows".to_string(),
+        ));
+    };
+    match row
+        .get_named::<i64>("user_version")
+        .or_else(|_| row.get_as(0))
+    {
+        Ok(version) => Outcome::Ok(version),
+        Err(err) => Outcome::Err(SqlError::Custom(format!(
+            "schema gate failed: PRAGMA user_version did not return an integer: {err}"
+        ))),
+    }
+}
+
+/// Refuse databases written by a newer binary before startup migrations mutate them.
+pub async fn refuse_newer_schema_version<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    db_label: &str,
+) -> Outcome<(), SqlError> {
+    let on_disk = match read_user_version(cx, conn).await {
+        Outcome::Ok(version) => version,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let compiled = i64::from(SCHEMA_VERSION);
+    if on_disk > compiled {
+        return Outcome::Err(SqlError::Custom(format!(
+            "schema gate refused {db_label}: database user_version={on_disk} was written by a newer Agent Mail schema than this binary supports ({compiled}); upgrade binary before opening this mailbox"
+        )));
+    }
+    Outcome::Ok(())
+}
+
+async fn sqlite_master_names<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    object_type: &str,
+) -> Outcome<std::collections::BTreeSet<String>, SqlError> {
+    let params = [Value::Text(object_type.to_string())];
+    let rows = match conn
+        .query(
+            cx,
+            "SELECT name FROM sqlite_master WHERE type = $1 ORDER BY name",
+            &params,
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect(),
+    )
+}
+
+async fn table_column_names<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    table: &str,
+) -> Outcome<std::collections::BTreeSet<String>, SqlError> {
+    let rows = match conn
+        .query(cx, &format!("PRAGMA table_info({table})"), &[])
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect(),
+    )
+}
+
+async fn applied_migration_ids<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<std::collections::BTreeSet<String>, SqlError> {
+    let sql = format!("SELECT id FROM {MIGRATIONS_TABLE_NAME}");
+    let rows = match conn.query(cx, &sql, &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    Outcome::Ok(
+        rows.into_iter()
+            .filter_map(|row| row.get_named::<String>("id").ok())
+            .collect(),
+    )
+}
+
+fn missing_required(
+    required: &[&str],
+    present: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    required
+        .iter()
+        .filter(|name| !present.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn format_schema_gate_failure(problems: &[String]) -> SqlError {
+    SqlError::Custom(format!(
+        "schema gate failed: {}; run `am migrate` or restart `am serve` so the single startup migration path can repair the mailbox before retrying",
+        problems.join("; ")
+    ))
+}
+
+/// Validate the post-migration schema surface before normal runtime traffic starts.
+///
+/// This is intentionally a compact gate over critical tables, columns, indexes,
+/// triggers, legacy FTS residue, and the migration ledger. It turns schema drift
+/// into an explicit startup action instead of letting later queries fail with
+/// ambiguous `no such column` or corruption-like messages.
+pub async fn validate_startup_schema_gate<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    const REQUIRED_TABLES: &[&str] = &[
+        MIGRATIONS_TABLE_NAME,
+        "projects",
+        "products",
+        "product_project_links",
+        "agents",
+        "messages",
+        "message_recipients",
+        "file_reservations",
+        "file_reservation_releases",
+        "agent_links",
+        "inbox_stats",
+    ];
+    const REQUIRED_INDEXES: &[&str] = &[
+        "idx_projects_slug",
+        "idx_agents_project_name_nocase",
+        "idx_messages_ack_required_id",
+        "idx_mr_ack_message",
+        "idx_file_reservations_released_expires_id",
+        "idx_file_reservation_releases_ts",
+    ];
+    const REQUIRED_TRIGGERS: &[&str] = &[
+        "trg_inbox_stats_insert",
+        "trg_inbox_stats_mark_read",
+        "trg_inbox_stats_ack",
+        "trg_messages_default_recipients_json",
+    ];
+    const FORBIDDEN_FTS_TABLES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
+    const FORBIDDEN_FTS_TRIGGERS: &[&str] = &[
+        "messages_ai",
+        "messages_ad",
+        "messages_au",
+        "agents_ai",
+        "agents_ad",
+        "agents_au",
+        "projects_ai",
+        "projects_ad",
+        "projects_au",
+        "fts_messages_ai",
+        "fts_messages_ad",
+        "fts_messages_au",
+    ];
+    const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+        ("projects", &["id", "slug", "human_key", "created_at"]),
+        (
+            "agents",
+            &[
+                "id",
+                "project_id",
+                "name",
+                "program",
+                "model",
+                "inception_ts",
+                "last_active_ts",
+                "contact_policy",
+                "reaper_exempt",
+                "registration_token",
+            ],
+        ),
+        (
+            "messages",
+            &[
+                "id",
+                "project_id",
+                "sender_id",
+                "thread_id",
+                "subject",
+                "body_md",
+                "ack_required",
+                "created_ts",
+                "recipients_json",
+                "attachments",
+            ],
+        ),
+        (
+            "message_recipients",
+            &["message_id", "agent_id", "kind", "read_ts", "ack_ts"],
+        ),
+        (
+            "file_reservations",
+            &[
+                "id",
+                "project_id",
+                "agent_id",
+                "path_pattern",
+                "expires_ts",
+                "released_ts",
+            ],
+        ),
+        (
+            "file_reservation_releases",
+            &["reservation_id", "released_ts"],
+        ),
+        (
+            "agent_links",
+            &[
+                "id",
+                "a_project_id",
+                "a_agent_id",
+                "b_project_id",
+                "b_agent_id",
+                "status",
+                "created_ts",
+                "updated_ts",
+                "expires_ts",
+            ],
+        ),
+        (
+            "inbox_stats",
+            &[
+                "agent_id",
+                "total_count",
+                "unread_count",
+                "ack_pending_count",
+                "last_message_ts",
+            ],
+        ),
+        ("products", &["id", "product_uid", "name", "created_at"]),
+        (
+            "product_project_links",
+            &["id", "product_id", "project_id", "created_at"],
+        ),
+    ];
+
+    let tables = match sqlite_master_names(cx, conn, "table").await {
+        Outcome::Ok(tables) => tables,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let indexes = match sqlite_master_names(cx, conn, "index").await {
+        Outcome::Ok(indexes) => indexes,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let triggers = match sqlite_master_names(cx, conn, "trigger").await {
+        Outcome::Ok(triggers) => triggers,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut problems = Vec::new();
+    let missing_tables = missing_required(REQUIRED_TABLES, &tables);
+    if !missing_tables.is_empty() {
+        problems.push(format!(
+            "missing required table(s): {}",
+            missing_tables.join(", ")
+        ));
+    }
+
+    for (table, columns) in REQUIRED_COLUMNS {
+        if missing_tables.iter().any(|missing| missing == table) {
+            continue;
+        }
+        let present_columns = match table_column_names(cx, conn, table).await {
+            Outcome::Ok(columns) => columns,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let missing_columns = missing_required(columns, &present_columns)
+            .into_iter()
+            .map(|column| format!("{table}.{column}"))
+            .collect::<Vec<_>>();
+        if !missing_columns.is_empty() {
+            problems.push(format!(
+                "missing required column(s): {}",
+                missing_columns.join(", ")
+            ));
+        }
+    }
+
+    let missing_indexes = missing_required(REQUIRED_INDEXES, &indexes);
+    if !missing_indexes.is_empty() {
+        problems.push(format!(
+            "missing critical index(es): {}",
+            missing_indexes.join(", ")
+        ));
+    }
+
+    let missing_triggers = missing_required(REQUIRED_TRIGGERS, &triggers);
+    if !missing_triggers.is_empty() {
+        problems.push(format!(
+            "missing critical trigger(s): {}",
+            missing_triggers.join(", ")
+        ));
+    }
+
+    let present_fts_tables = FORBIDDEN_FTS_TABLES
+        .iter()
+        .filter(|name| tables.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    if !present_fts_tables.is_empty() {
+        problems.push(format!(
+            "unexpected legacy FTS table(s): {}",
+            present_fts_tables.join(", ")
+        ));
+    }
+
+    let present_fts_triggers = FORBIDDEN_FTS_TRIGGERS
+        .iter()
+        .filter(|name| triggers.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    if !present_fts_triggers.is_empty() {
+        problems.push(format!(
+            "unexpected legacy FTS trigger(s): {}",
+            present_fts_triggers.join(", ")
+        ));
+    }
+
+    if !missing_tables
+        .iter()
+        .any(|table| table == MIGRATIONS_TABLE_NAME)
+    {
+        let applied_ids = match applied_migration_ids(cx, conn).await {
+            Outcome::Ok(ids) => ids,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let missing_migration_ids = schema_migrations()
+            .into_iter()
+            .filter_map(|migration| (!applied_ids.contains(&migration.id)).then_some(migration.id))
+            .take(12)
+            .collect::<Vec<_>>();
+        if !missing_migration_ids.is_empty() {
+            problems.push(format!(
+                "migration ledger incomplete, missing id(s): {}",
+                missing_migration_ids.join(", ")
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        Outcome::Ok(())
+    } else {
+        Outcome::Err(format_schema_gate_failure(&problems))
+    }
 }
 
 async fn run_migrations<C: Connection>(
@@ -3808,13 +4210,28 @@ mod tests {
         assert!(ids.contains("base_v2_drop_fts_agents_table"));
         assert!(ids.contains("base_v2_drop_fts_projects_table"));
 
-        // FTS table creation must still be excluded from base migrations.
+        // FTS table/trigger ledger entries must still be excluded from base
+        // migrations. Base mode uses its own cleanup IDs above so canonical
+        // startup can later run the official v11 drop IDs after any pending v7
+        // FTS creation IDs.
         assert!(!ids.contains("v1_create_trigger_messages_ai"));
         assert!(!ids.contains("v1_create_trigger_messages_ad"));
         assert!(!ids.contains("v1_create_trigger_messages_au"));
         assert!(!ids.contains("v5_create_fts_with_porter"));
         assert!(!ids.contains("v7_create_fts_agents"));
         assert!(!ids.contains("v7_create_fts_projects"));
+        assert!(!ids.contains("v11_drop_trigger_messages_ai"));
+        assert!(!ids.contains("v11_drop_trigger_messages_ad"));
+        assert!(!ids.contains("v11_drop_trigger_messages_au"));
+        assert!(!ids.contains("v11_drop_fts_messages_table"));
+        assert!(!ids.contains("v11_drop_trigger_agents_ai"));
+        assert!(!ids.contains("v11_drop_trigger_agents_ad"));
+        assert!(!ids.contains("v11_drop_trigger_agents_au"));
+        assert!(!ids.contains("v11_drop_fts_agents_table"));
+        assert!(!ids.contains("v11_drop_trigger_projects_ai"));
+        assert!(!ids.contains("v11_drop_trigger_projects_ad"));
+        assert!(!ids.contains("v11_drop_trigger_projects_au"));
+        assert!(!ids.contains("v11_drop_fts_projects_table"));
         // ANALYZE creates sqlite_stat1, which currently trips FrankenSQLite's
         // planner/schema-refresh path after startup.
         assert!(!ids.contains("v4_analyze_after_indexes"));
@@ -3987,6 +4404,127 @@ mod tests {
         assert!(
             !is_complete,
             "migration completeness must fail when any expected migration id is missing"
+        );
+    }
+
+    #[test]
+    fn schema_gate_refuses_newer_user_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("future_schema.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+            .expect("set future user_version");
+
+        let err = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                refuse_newer_schema_version(&cx, conn, "future_schema.db")
+                    .await
+                    .into_result()
+                    .expect_err("newer schema must be refused")
+            }
+        });
+        let message = err.to_string();
+        assert!(
+            message.contains("upgrade binary"),
+            "future-schema refusal should tell the operator to upgrade binary: {message}"
+        );
+        assert!(
+            message.contains(&format!("user_version={}", SCHEMA_VERSION + 1)),
+            "future-schema refusal should include the on-disk version: {message}"
+        );
+    }
+
+    #[test]
+    fn startup_schema_gate_accepts_latest_migrated_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("latest_gate.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("migrate latest schema");
+                enforce_runtime_fts_cleanup(conn).expect("runtime fts cleanup");
+                validate_startup_schema_gate(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("latest schema should pass startup gate");
+            }
+        });
+    }
+
+    #[test]
+    fn startup_schema_gate_reports_missing_recipients_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_recipients_json.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY,\
+                project_id INTEGER NOT NULL,\
+                sender_id INTEGER NOT NULL,\
+                thread_id TEXT,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                importance TEXT NOT NULL DEFAULT 'normal',\
+                ack_required INTEGER NOT NULL DEFAULT 0,\
+                created_ts INTEGER NOT NULL,\
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            )",
+        )
+        .expect("create legacy messages table");
+
+        let err = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                validate_startup_schema_gate(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect_err("missing recipients_json should fail schema gate")
+            }
+        });
+        let message = err.to_string();
+        assert!(
+            message.contains("messages.recipients_json"),
+            "schema gate should name the missing column: {message}"
+        );
+        assert!(
+            message.contains("am migrate"),
+            "schema gate should provide the exact migration command: {message}"
+        );
+    }
+
+    #[test]
+    fn startup_schema_gate_reports_missing_required_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("missing_required_tables.db");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_raw("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .expect("create unrelated metadata table");
+
+        let err = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                validate_startup_schema_gate(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect_err("missing required tables should fail schema gate")
+            }
+        });
+        let message = err.to_string();
+        for expected in ["projects", "agents", "messages", "message_recipients"] {
+            assert!(
+                message.contains(expected),
+                "schema gate should name missing table {expected}: {message}"
+            );
+        }
+        assert!(
+            message.contains("am migrate"),
+            "schema gate should provide the exact migration command: {message}"
         );
     }
 

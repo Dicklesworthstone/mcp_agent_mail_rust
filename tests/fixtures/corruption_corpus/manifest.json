@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "corpus_id": "agent-mail-corrupted-db-corpus",
+  "generated_by": "br-bvq1x.12.1",
+  "fixtures": [
+    {
+      "id": "fk_false_positive_valid_db",
+      "title": "Valid FK graph that previously tripped frankensqlite foreign_key_check",
+      "incident_anchor": "ts2 malformed-DB saga: `foreign key check failed` reported before canonical corruption classification",
+      "track_a_classification": "valid_db_frankensqlite_fk_false_positive",
+      "canonical_sqlite_verdict": "ok",
+      "frankensqlite_expected_signal": "foreign_key_check_false_positive",
+      "tags": ["foreign_keys", "frankensqlite", "canonical-ok"],
+      "artifacts": [
+        {
+          "path": "fk_false_positive_valid_db/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/valid_fk_graph.sql"
+          }
+        }
+      ]
+    },
+    {
+      "id": "zero_byte_wal",
+      "title": "Healthy DB with 0-byte WAL sidecar",
+      "incident_anchor": "startup quarantine logs: 0-byte storage.sqlite3-wal sidecars",
+      "track_a_classification": "wal_sidecar_empty_header_or_zero_len",
+      "canonical_sqlite_verdict": "ok_after_sidecar_quarantine",
+      "frankensqlite_expected_signal": "wal_sidecar_zero_len",
+      "tags": ["wal", "sidecar", "startup-quarantine"],
+      "artifacts": [
+        {
+          "path": "zero_byte_wal/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/minimal_mailbox_schema.sql"
+          }
+        },
+        {
+          "path": "zero_byte_wal/storage.sqlite3-wal",
+          "kind": "sqlite_sidecar",
+          "recipe": {
+            "type": "empty_file"
+          }
+        }
+      ]
+    },
+    {
+      "id": "short_corrupt_wal_header",
+      "title": "Non-empty WAL shorter than SQLite WAL header",
+      "incident_anchor": "repair log: `too small for header during rebuild: read 0, need 32`",
+      "track_a_classification": "wal_sidecar_short_header",
+      "canonical_sqlite_verdict": "corrupt_sidecar",
+      "frankensqlite_expected_signal": "wal_rebuild_short_header",
+      "tags": ["wal", "sidecar", "short-read"],
+      "artifacts": [
+        {
+          "path": "short_corrupt_wal_header/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/minimal_mailbox_schema.sql"
+          }
+        },
+        {
+          "path": "short_corrupt_wal_header/storage.sqlite3-wal",
+          "kind": "sqlite_sidecar",
+          "recipe": {
+            "type": "deterministic_bytes",
+            "len": 16,
+            "fill": 171,
+            "sqlite_header": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "btree_page_type_zero",
+      "title": "Malformed B-tree page with invalid page-type flag 0x00",
+      "incident_anchor": "integrity reports around pages 6008, 7811, 30, and 27",
+      "track_a_classification": "sqlite_btree_page_type_zero",
+      "canonical_sqlite_verdict": "malformed_page",
+      "frankensqlite_expected_signal": "btree_page_type_zero",
+      "tags": ["btree", "page-corruption", "integrity-check"],
+      "artifacts": [
+        {
+          "path": "btree_page_type_zero/storage.sqlite3",
+          "kind": "sqlite_db_bytes",
+          "recipe": {
+            "type": "sqlite_header_with_page_count",
+            "len": 8192,
+            "page_size": 4096,
+            "page_count": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "freelist_leaf_exceeds_db_size",
+      "title": "Freelist leaf page points past db_size",
+      "incident_anchor": "doctor/integrity text: `freelist leaf page exceeds db_size`",
+      "track_a_classification": "sqlite_freelist_leaf_exceeds_db_size",
+      "canonical_sqlite_verdict": "malformed_freelist",
+      "frankensqlite_expected_signal": "freelist_leaf_exceeds_db_size",
+      "tags": ["freelist", "page-corruption", "integrity-check"],
+      "artifacts": [
+        {
+          "path": "freelist_leaf_exceeds_db_size/storage.sqlite3",
+          "kind": "sqlite_db_bytes",
+          "recipe": {
+            "type": "sqlite_header_with_freelist",
+            "len": 4096,
+            "first_freelist_trunk_page": 9,
+            "freelist_page_count": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "short_read_fetching_page",
+      "title": "DB ends before the page requested by the header",
+      "incident_anchor": "integrity text: `short read fetching page (got 0 of 4096)`",
+      "track_a_classification": "sqlite_short_read_fetching_page",
+      "canonical_sqlite_verdict": "short_read",
+      "frankensqlite_expected_signal": "short_read_page_fetch",
+      "tags": ["short-read", "page-corruption"],
+      "artifacts": [
+        {
+          "path": "short_read_fetching_page/storage.sqlite3",
+          "kind": "sqlite_db_bytes",
+          "recipe": {
+            "type": "sqlite_header_with_page_count",
+            "len": 2048,
+            "page_size": 4096,
+            "page_count": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "recover_text_recipient_id",
+      "title": ".recover output with TEXT recipient id",
+      "incident_anchor": "`am doctor fix` crash: `expected i64, found TEXT` while reading recovered recipient rows",
+      "track_a_classification": "recover_output_text_recipient_id",
+      "canonical_sqlite_verdict": "recover_text_artifact",
+      "frankensqlite_expected_signal": "recovered_row_type_mismatch",
+      "tags": ["recover", "type-mismatch", "message_recipients"],
+      "artifacts": [
+        {
+          "path": "recover_text_recipient_id/recover.sql",
+          "kind": "recover_sql",
+          "recipe": {
+            "type": "text_file",
+            "file": "recipes/recover_text_recipient_id.sql"
+          }
+        }
+      ]
+    },
+    {
+      "id": "missing_messages_recipients_json",
+      "title": "Messages table missing recipients_json",
+      "incident_anchor": "startup failure after base-only migrations skipped v15 recipients_json fragments",
+      "track_a_classification": "schema_missing_messages_recipients_json",
+      "canonical_sqlite_verdict": "valid_sqlite_wrong_schema",
+      "frankensqlite_expected_signal": "schema_gate_missing_recipients_json",
+      "tags": ["schema", "migration", "recipients_json"],
+      "artifacts": [
+        {
+          "path": "missing_messages_recipients_json/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/missing_recipients_json.sql"
+          }
+        }
+      ]
+    },
+    {
+      "id": "missing_required_tables",
+      "title": "DB missing required Agent Mail tables",
+      "incident_anchor": "db corruption E2E case: wrong schema missing projects/agents/messages/message_recipients",
+      "track_a_classification": "schema_missing_required_tables",
+      "canonical_sqlite_verdict": "valid_sqlite_wrong_schema",
+      "frankensqlite_expected_signal": "schema_gate_missing_required_tables",
+      "tags": ["schema", "missing-tables"],
+      "artifacts": [
+        {
+          "path": "missing_required_tables/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/missing_required_tables.sql"
+          }
+        }
+      ]
+    },
+    {
+      "id": "legacy_text_timestamps",
+      "title": "Legacy Python ISO-8601 TEXT timestamps in integer timestamp columns",
+      "incident_anchor": "legacy Python timestamp migration path in `am migrate`",
+      "track_a_classification": "legacy_text_timestamp_contamination",
+      "canonical_sqlite_verdict": "valid_sqlite_legacy_data",
+      "frankensqlite_expected_signal": "text_timestamp_contamination",
+      "tags": ["legacy-python", "timestamps", "migration"],
+      "artifacts": [
+        {
+          "path": "legacy_text_timestamps/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/legacy_text_timestamps.sql"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sqlite_sidecar_symlink",
+      "title": "SQLite WAL sidecar is a symlink",
+      "incident_anchor": "doctor FM `fm-db-state-files-sqlite-sidecar-symlink`",
+      "track_a_classification": "sqlite_sidecar_symlink",
+      "canonical_sqlite_verdict": "unsafe_sidecar",
+      "frankensqlite_expected_signal": "sidecar_symlink_detected",
+      "tags": ["sidecar", "symlink", "security"],
+      "artifacts": [
+        {
+          "path": "sqlite_sidecar_symlink/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/minimal_mailbox_schema.sql"
+          }
+        },
+        {
+          "path": "sqlite_sidecar_symlink/storage.sqlite3-wal",
+          "kind": "sqlite_sidecar_symlink",
+          "recipe": {
+            "type": "symlink",
+            "target": "redirected-wal-target"
+          }
+        }
+      ]
+    },
+    {
+      "id": "analyze_reindex_busy_or_corrupt",
+      "title": "DB prepared for ANALYZE/REINDEX busy/corrupt failure injection",
+      "incident_anchor": "doctor repair partially cleaned rows, then failed REINDEX or ANALYZE busy/corrupt",
+      "track_a_classification": "repair_phase_analyze_reindex_failure",
+      "canonical_sqlite_verdict": "requires_injected_lock_or_corrupt_index",
+      "frankensqlite_expected_signal": "repair_phase_failure_after_cleanup",
+      "tags": ["repair", "analyze", "reindex", "busy"],
+      "artifacts": [
+        {
+          "path": "analyze_reindex_busy_or_corrupt/storage.sqlite3",
+          "kind": "sqlite_db",
+          "recipe": {
+            "type": "sqlite_sql",
+            "file": "recipes/analyze_reindex_busy_seed.sql"
+          }
+        }
+      ]
+    }
+  ]
+}

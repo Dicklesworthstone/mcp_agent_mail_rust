@@ -3276,6 +3276,25 @@ async fn run_sqlite_init_once(
     // state and is left attached.
     if sqlite_path != ":memory:" {
         cleanup_empty_wal_sidecar(sqlite_path);
+        let version_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=open_canonical_for_schema_version failed: {err}"
+                )));
+            }
+        };
+        match schema::refuse_newer_schema_version(cx, &version_conn, sqlite_path).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=refuse_newer_schema_version_canonical failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        drop(version_conn);
     }
 
     if run_migrations {
@@ -3291,14 +3310,25 @@ async fn run_sqlite_init_once(
             "sqlite init migration connection",
         );
 
+        match schema::refuse_newer_schema_version(cx, &*mig_conn, sqlite_path).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=refuse_newer_schema_version failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
         if let Err(err) = execute_sql_with_lock_retry(
             &mig_conn,
             sqlite_path,
-            schema::PRAGMA_DB_INIT_BASE_SQL,
-            "sqlite init base pragmas",
+            schema::PRAGMA_DB_INIT_SQL,
+            "sqlite init migration pragmas",
         ) {
             return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=base_pragmas failed: {err}"
+                "sqlite init stage=migration_pragmas failed: {err}"
             )));
         }
 
@@ -3315,40 +3345,40 @@ async fn run_sqlite_init_once(
 
         drop(mig_conn);
 
-        // Apply canonical-only follow-up migrations after the base
-        // FrankenConnection-safe schema has landed. This owns the remaining
-        // runtime-only schema family, including ATC tables and indexes that
-        // file-backed runtimes already access through canonical SQLite.
+        // Apply the complete canonical migration ledger after the base
+        // FrankenConnection-safe bootstrap pass has landed. The base pass
+        // keeps legacy/partial files openable by the normal Franken runtime;
+        // the canonical pass records and applies every remaining migration
+        // instead of relying on a manually-curated follow-up subset.
         let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
             Ok(conn) => conn,
             Err(err) => {
                 return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=open_canonical_for_runtime_followup failed: {err}"
+                    "sqlite init stage=open_canonical_for_full_migrations failed: {err}"
                 )));
             }
         };
 
-        if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
+        if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_SQL) {
             return Outcome::Err(SqlError::Custom(format!(
                 "sqlite init stage=canonical_pragmas failed: {err}"
             )));
         }
 
-        let followup_applied =
-            match schema::migrate_runtime_canonical_followup(cx, &canonical_conn).await {
-                Outcome::Ok(applied) => applied,
-                Outcome::Err(err) => {
-                    return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=migrate_runtime_canonical_followup failed: {err}"
-                    )));
-                }
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            };
+        let full_applied = match schema::migrate_to_latest(cx, &canonical_conn).await {
+            Outcome::Ok(applied) => applied,
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=migrate_to_latest failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
 
         drop(canonical_conn);
 
-        if followup_applied
+        if full_applied
             .iter()
             .any(|id| schema::is_atc_runtime_canonical_migration(id))
             && let Err(err) = wal_checkpoint_truncate_path(Path::new(sqlite_path))
@@ -3371,16 +3401,31 @@ async fn run_sqlite_init_once(
         "sqlite init runtime connection",
     );
 
-    if !run_migrations
-        && let Err(err) = execute_sql_with_lock_retry(
-            &runtime_conn,
-            sqlite_path,
-            schema::PRAGMA_DB_INIT_BASE_SQL,
-            "sqlite init runtime base pragmas",
-        )
-    {
+    match schema::refuse_newer_schema_version(cx, &*runtime_conn, sqlite_path).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(err) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=refuse_newer_schema_version_runtime failed: {err}"
+            )));
+        }
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    if let Err(err) = execute_sql_with_lock_retry(
+        &runtime_conn,
+        sqlite_path,
+        schema::PRAGMA_DB_INIT_SQL,
+        "sqlite init runtime pragmas",
+    ) {
         return Outcome::Err(SqlError::Custom(format!(
-            "sqlite init stage=base_pragmas_runtime failed: {err}"
+            "sqlite init stage=runtime_pragmas failed: {err}"
+        )));
+    }
+
+    if let Err(err) = assert_required_startup_pragmas(&runtime_conn, sqlite_path) {
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite init stage=verify_startup_pragmas failed: {err}"
         )));
     }
 
@@ -3391,6 +3436,17 @@ async fn run_sqlite_init_once(
         return Outcome::Err(SqlError::Custom(format!(
             "sqlite init stage=enforce_runtime_fts_cleanup failed: {err}"
         )));
+    }
+
+    match schema::validate_startup_schema_gate(cx, &*runtime_conn).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(err) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=schema_gate failed: {err}"
+            )));
+        }
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     }
 
     if let Err(err) = execute_sql_with_lock_retry(
@@ -3404,27 +3460,6 @@ async fn run_sqlite_init_once(
             error = %err,
             "failed to synchronize PRAGMA user_version after init"
         );
-    }
-
-    // Switch to WAL journal mode AFTER migrations complete.
-    //
-    // Migrations run in DELETE (rollback) mode for safety. Runtime connections
-    // intentionally do not reissue `journal_mode=WAL`, because that database-
-    // wide transition amplifies lock contention on pool acquire and durability
-    // probes. Set WAL once here before pooled connections open.
-    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/13
-    if let Err(err) = execute_sql_with_lock_retry(
-        &runtime_conn,
-        sqlite_path,
-        "PRAGMA journal_mode = WAL;",
-        "sqlite init switch journal_mode=WAL",
-    ) {
-        tracing::warn!(
-            path = %sqlite_path,
-            error = %err,
-            "failed to switch journal_mode to WAL after init; runtime will continue in rollback-journal mode until a later init succeeds"
-        );
-        // Non-fatal: reads/writes can still proceed, but concurrency may degrade.
     }
 
     // Rebuild inbox_stats from ground truth, drop legacy triggers, and fix
@@ -4060,6 +4095,121 @@ fn execute_sql_with_lock_retry(
         || conn.execute_raw(sql),
         std::thread::sleep,
     )
+}
+
+const REQUIRED_STARTUP_BUSY_TIMEOUT_MS: i64 = 60_000;
+
+fn pragma_integer_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::TinyInt(value) => Some(i64::from(*value)),
+        Value::SmallInt(value) => Some(i64::from(*value)),
+        Value::Int(value) => Some(i64::from(*value)),
+        Value::BigInt(value) => Some(*value),
+        _ => None,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn read_pragma_i64_from_row(
+    row: &sqlmodel_core::Row,
+    sql: &str,
+    column: &str,
+) -> Result<i64, SqlError> {
+    if let Some(value) = row.get_by_name(column) {
+        if let Some(value) = pragma_integer_i64(value) {
+            return Ok(value);
+        }
+        let columns = row
+            .iter()
+            .map(|(name, value)| format!("{name}:{}", value.type_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SqlError::Custom(format!(
+            "PRAGMA query column {column:?} for sql={sql:?} was present but not an integer; columns=[{columns}]"
+        )));
+    }
+
+    let mut integer_values = row
+        .iter()
+        .filter_map(|(name, value)| pragma_integer_i64(value).map(|integer| (name, integer)));
+    let Some((candidate_column, value)) = integer_values.next() else {
+        let columns = row
+            .iter()
+            .map(|(name, value)| format!("{name}:{}", value.type_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SqlError::Custom(format!(
+            "PRAGMA query did not expose integer column {column:?} for sql={sql:?}; columns=[{columns}]"
+        )));
+    };
+    if let Some((other_column, _)) = integer_values.next() {
+        return Err(SqlError::Custom(format!(
+            "PRAGMA query exposed multiple integer columns for sql={sql:?}; expected {column:?}, got at least {candidate_column:?} and {other_column:?}"
+        )));
+    }
+
+    Ok(value)
+}
+
+#[allow(clippy::result_large_err)]
+fn read_pragma_i64(conn: &DbConn, sql: &str, column: &str) -> Result<i64, SqlError> {
+    let rows = conn.query_sync(sql, &[])?;
+    let row = rows.first().ok_or_else(|| {
+        SqlError::Custom(format!(
+            "PRAGMA query returned no rows: sql={sql:?}, column={column:?}"
+        ))
+    })?;
+    read_pragma_i64_from_row(row, sql, column)
+}
+
+#[allow(clippy::result_large_err)]
+fn read_canonical_journal_mode(sqlite_path: &str) -> Result<String, SqlError> {
+    if sqlite_path == ":memory:" {
+        return Err(SqlError::Custom(
+            "canonical journal_mode probe is unavailable for in-memory databases".to_string(),
+        ));
+    }
+
+    let conn = open_sqlite_file_with_lock_retry_canonical(sqlite_path)?;
+    let rows = conn.query_sync("PRAGMA journal_mode;", &[])?;
+    let row = rows.first().ok_or_else(|| {
+        SqlError::Custom(format!(
+            "canonical PRAGMA journal_mode returned no rows for {sqlite_path}"
+        ))
+    })?;
+    row.get_named::<String>("journal_mode")
+        .or_else(|_| row.get_as(0))
+        .map_err(|err| {
+            SqlError::Custom(format!(
+                "canonical PRAGMA journal_mode did not expose a string value for {sqlite_path}: {err}"
+            ))
+        })
+}
+
+#[allow(clippy::result_large_err)]
+fn assert_required_startup_pragmas(conn: &DbConn, sqlite_path: &str) -> Result<(), SqlError> {
+    if sqlite_path == ":memory:" {
+        return Err(SqlError::Custom(
+            "file-backed startup PRAGMA invariant cannot be checked for in-memory databases"
+                .to_string(),
+        ));
+    }
+
+    let journal_mode = read_canonical_journal_mode(sqlite_path)?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(SqlError::Custom(format!(
+            "sqlite startup invariant failed for {sqlite_path}: journal_mode='{journal_mode}', expected 'wal'; WAL mode is required for Agent Mail concurrency"
+        )));
+    }
+
+    let busy_timeout = read_pragma_i64(conn, "PRAGMA busy_timeout;", "timeout")?;
+    if busy_timeout != REQUIRED_STARTUP_BUSY_TIMEOUT_MS {
+        return Err(SqlError::Custom(format!(
+            "sqlite startup invariant failed for {sqlite_path}: busy_timeout={busy_timeout}, expected {REQUIRED_STARTUP_BUSY_TIMEOUT_MS}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Open a file-backed sqlite connection and automatically recover from
@@ -7577,6 +7727,65 @@ mod tests {
         }
     }
 
+    fn table_column_names(conn: &DbConn, table: &str) -> Vec<String> {
+        assert!(
+            matches!(table, "agents" | "messages"),
+            "test helper only accepts known static table names"
+        );
+        conn.query_sync(&format!("PRAGMA table_info({table})"), &[])
+            .expect("query table info")
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect()
+    }
+
+    fn assert_full_migration_ledger_applied(sqlite_path: &str) {
+        let conn = open_sqlite_file_with_lock_retry_canonical(sqlite_path)
+            .expect("open canonical sqlite file");
+        let applied = conn
+            .query_sync(
+                &format!("SELECT id FROM {}", schema::MIGRATIONS_TABLE_NAME),
+                &[],
+            )
+            .expect("query migration ledger")
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("id").ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing = schema::schema_migrations()
+            .into_iter()
+            .filter_map(|migration| (!applied.contains(&migration.id)).then_some(migration.id))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "normal startup did not record the complete canonical migration ledger; missing={missing:?}"
+        );
+    }
+
+    fn assert_messages_recipients_json_runtime_schema(conn: &DbConn) {
+        let message_columns = table_column_names(conn, "messages");
+        assert_eq!(
+            message_columns
+                .iter()
+                .filter(|name| name.as_str() == "recipients_json")
+                .count(),
+            1,
+            "normal startup should leave exactly one messages.recipients_json column"
+        );
+
+        let trigger_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'trigger' AND name = 'trg_messages_default_recipients_json'",
+                &[],
+            )
+            .expect("query recipients_json default trigger");
+        assert_eq!(
+            trigger_rows.len(),
+            1,
+            "normal startup should install the recipients_json default trigger"
+        );
+    }
+
     fn write_id_floor_canonical_message(storage_root: &Path, project: &str, id: i64) {
         let dir = storage_root
             .join("projects")
@@ -8144,6 +8353,22 @@ mod tests {
             sql.contains("journal_mode = WAL"),
             "WAL mode is required for concurrent access"
         );
+
+        let init_sql = schema::PRAGMA_DB_INIT_SQL;
+        let init_busy_idx = init_sql
+            .find("busy_timeout = 60000")
+            .expect("startup init SQL must contain busy_timeout");
+        let init_wal_idx = init_sql
+            .find("journal_mode = WAL")
+            .expect("startup init SQL must contain journal_mode=WAL");
+        assert!(
+            init_busy_idx < init_wal_idx,
+            "startup init must set busy_timeout before switching journal_mode"
+        );
+        assert!(
+            !init_sql.contains("DELETE"),
+            "runtime startup init must not force rollback-journal mode"
+        );
     }
 
     /// Verify warmup opens the requested number of connections.
@@ -8286,6 +8511,88 @@ mod tests {
         assert!(
             sql.contains("autocommit_retain = OFF"),
             "pool connection init must disable retained autocommit: {sql}"
+        );
+    }
+
+    #[test]
+    fn startup_invariant_rejects_delete_mode_database() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("delete_mode.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        let conn = open_sqlite_file_with_lock_retry(db_path_str)
+            .expect("runtime sqlite should open before invariant check");
+        conn.execute_raw("PRAGMA busy_timeout = 60000;")
+            .expect("set required runtime busy_timeout");
+
+        let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
+            .expect("open canonical sqlite file");
+        canonical
+            .execute_raw("PRAGMA journal_mode=DELETE;")
+            .expect("force rollback journal mode");
+        drop(canonical);
+
+        let err = assert_required_startup_pragmas(&conn, db_path_str)
+            .expect_err("DELETE-mode databases must fail the WAL startup invariant");
+        let message = err.to_string();
+        assert!(
+            message.contains("journal_mode='delete'"),
+            "error should include the actual rollback journal mode: {message}"
+        );
+        assert!(
+            message.contains("WAL mode is required"),
+            "error should explain the required runtime mode: {message}"
+        );
+    }
+
+    #[test]
+    fn read_pragma_i64_uses_named_column_when_available() {
+        let row = sqlmodel_core::Row::new(
+            vec!["timeout".to_string()],
+            vec![Value::BigInt(REQUIRED_STARTUP_BUSY_TIMEOUT_MS)],
+        );
+        let value = read_pragma_i64_from_row(&row, "PRAGMA busy_timeout;", "timeout")
+            .expect("read named busy_timeout column");
+        assert_eq!(value, REQUIRED_STARTUP_BUSY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn read_pragma_i64_accepts_single_integer_column_with_backend_specific_name() {
+        let row = sqlmodel_core::Row::new(
+            vec!["busy_timeout".to_string()],
+            vec![Value::BigInt(REQUIRED_STARTUP_BUSY_TIMEOUT_MS)],
+        );
+        let value = read_pragma_i64_from_row(&row, "PRAGMA busy_timeout;", "timeout")
+            .expect("read backend-specific busy_timeout column");
+        assert_eq!(value, REQUIRED_STARTUP_BUSY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn read_pragma_i64_rejects_wrong_type_named_column() {
+        let row = sqlmodel_core::Row::new(
+            vec!["timeout".to_string(), "fallback".to_string()],
+            vec![
+                Value::Text("60000".to_string()),
+                Value::BigInt(REQUIRED_STARTUP_BUSY_TIMEOUT_MS),
+            ],
+        );
+        let err = read_pragma_i64_from_row(&row, "PRAGMA busy_timeout;", "timeout")
+            .expect_err("wrongly typed named column must not fall back to another integer");
+        assert!(
+            err.to_string().contains("present but not an integer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_pragma_i64_rejects_boolean_column() {
+        let row =
+            sqlmodel_core::Row::new(vec!["busy_timeout".to_string()], vec![Value::Bool(true)]);
+        let err = read_pragma_i64_from_row(&row, "PRAGMA busy_timeout;", "timeout")
+            .expect_err("boolean values must not satisfy integer PRAGMA invariants");
+        assert!(
+            err.to_string().contains("did not expose integer column"),
+            "unexpected error: {err}"
         );
     }
 
@@ -9017,6 +9324,18 @@ mod tests {
                 .expect("projects.created_at typeof"),
             "integer",
             "timestamp migration should convert TEXT project timestamp to INTEGER"
+        );
+        assert_full_migration_ledger_applied(db_path_str.as_ref());
+        assert_messages_recipients_json_runtime_schema(&verify_conn);
+        let recipients_rows = verify_conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .expect("query migrated recipients_json");
+        assert_eq!(
+            recipients_rows[0]
+                .get_named::<String>("recipients_json")
+                .expect("recipients_json value"),
+            "{}",
+            "normal pool startup should backfill recipients_json for legacy rows"
         );
     }
 
@@ -13078,7 +13397,7 @@ mod tests {
             "fresh bootstrap should leave a healthy sqlite file"
         );
 
-        let conn = open_sqlite_file_with_lock_retry(db_path_str)
+        let conn = open_sqlite_file_with_recovery(db_path_str)
             .expect("runtime sqlite should open after fresh bootstrap");
         let rows = conn
             .query_sync(
@@ -13088,6 +13407,10 @@ mod tests {
             )
             .expect("query sqlite_master");
         assert_eq!(rows.len(), 1, "fresh bootstrap should apply migrations");
+        assert_required_startup_pragmas(&conn, db_path_str)
+            .expect("fresh bootstrap must leave runtime startup pragmas in force");
+        assert_full_migration_ledger_applied(db_path_str);
+        assert_messages_recipients_json_runtime_schema(&conn);
 
         let mut recovery_artifacts = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
@@ -13165,8 +13488,138 @@ mod tests {
                     .expect("acquire initialized pool connection");
                 conn.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
                     .expect("projects table should exist after acquire");
+                assert_required_startup_pragmas(&conn, db_path.to_str().expect("utf8 db path"))
+                    .expect("pooled connection must keep WAL and busy_timeout startup invariants");
             },
         );
+    }
+
+    #[test]
+    fn sqlite_init_repairs_delete_mode_and_sets_startup_pragmas() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("delete_to_wal.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
+            .expect("open canonical sqlite file");
+        canonical
+            .execute_raw("PRAGMA journal_mode=DELETE;")
+            .expect("force rollback journal mode");
+        drop(canonical);
+
+        match rt.block_on(run_sqlite_init_once(&cx, db_path_str, true)) {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => panic!("sqlite init should repair DELETE journal mode: {err}"),
+            Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                std::panic::panic_any(payload);
+            }
+        }
+
+        let conn = open_sqlite_file_with_recovery(db_path_str)
+            .expect("runtime sqlite should open after DELETE-to-WAL repair");
+        assert_required_startup_pragmas(&conn, db_path_str)
+            .expect("startup init must leave DELETE-mode files in WAL with busy_timeout set");
+    }
+
+    #[test]
+    fn sqlite_init_refuses_future_schema_before_resetting_user_version() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("future_schema.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        let seed = open_sqlite_file_with_lock_retry(db_path_str).expect("open seed sqlite file");
+        seed.execute_raw(&format!(
+            "PRAGMA user_version = {}",
+            schema::SCHEMA_VERSION + 1
+        ))
+        .expect("set future user_version");
+        drop(seed);
+
+        let err = match rt.block_on(run_sqlite_init_once(&cx, db_path_str, true)) {
+            Outcome::Ok(()) => panic!("future schema must not initialize successfully"),
+            Outcome::Err(err) => err,
+            Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                std::panic::panic_any(payload);
+            }
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("upgrade binary"),
+            "future-schema startup refusal should tell the operator to upgrade: {message}"
+        );
+
+        let verify = open_sqlite_file_with_lock_retry(db_path_str)
+            .expect("reopen future schema sqlite file");
+        let version = read_pragma_i64(&verify, "PRAGMA user_version;", "user_version")
+            .expect("read user_version after refused startup");
+        assert_eq!(
+            version,
+            i64::from(schema::SCHEMA_VERSION + 1),
+            "startup must refuse before rewriting a newer on-disk user_version"
+        );
+    }
+
+    #[test]
+    fn sqlite_init_without_migrations_sets_startup_pragmas() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("no_migrations.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        let canonical = open_sqlite_file_with_lock_retry_canonical(db_path_str)
+            .expect("open canonical sqlite file");
+        match rt.block_on(schema::migrate_to_latest(&cx, &canonical)) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => panic!("seed latest schema before no-migration init: {err}"),
+            Outcome::Cancelled(reason) => {
+                panic!("seed migration cancelled unexpectedly: {reason:?}")
+            }
+            Outcome::Panicked(payload) => {
+                std::panic::panic_any(payload);
+            }
+        }
+        canonical
+            .execute_raw("PRAGMA journal_mode=DELETE;")
+            .expect("force rollback journal mode");
+        drop(canonical);
+
+        match rt.block_on(run_sqlite_init_once(&cx, db_path_str, false)) {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => {
+                panic!("sqlite init without migrations should set runtime pragmas: {err}")
+            }
+            Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                std::panic::panic_any(payload);
+            }
+        }
+
+        let conn = open_sqlite_file_with_recovery(db_path_str)
+            .expect("runtime sqlite should open after no-migration init");
+        assert_required_startup_pragmas(&conn, db_path_str)
+            .expect("no-migration init must leave files in WAL with busy_timeout set");
     }
 
     #[test]
@@ -13197,8 +13650,10 @@ mod tests {
             "zero-byte bootstrap should leave a healthy sqlite file"
         );
 
-        let conn = open_sqlite_file_with_lock_retry(db_path_str)
+        let conn = open_sqlite_file_with_recovery(db_path_str)
             .expect("runtime sqlite should open after zero-byte bootstrap");
+        assert_required_startup_pragmas(&conn, db_path_str)
+            .expect("zero-byte bootstrap must leave runtime startup pragmas in force");
         let agent_columns = conn
             .query_sync("PRAGMA table_info(agents)", &[])
             .expect("query agents table info")
