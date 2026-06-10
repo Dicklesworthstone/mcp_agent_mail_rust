@@ -2383,7 +2383,7 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn seed_healthy_live_mailbox(db_path: &std::path::Path) {
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
             .expect("open live db");
         conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
             .expect("apply pragmas");
