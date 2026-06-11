@@ -480,8 +480,16 @@ def get_push_files():
 
             for sha in commits:
                 diff_res = _run_git_with_retry(
+                    # `--cc` (not `-m`): on a merge commit `-m` explodes the diff
+                    # into one section PER PARENT, flagging every file merely
+                    # carried in from origin as a "pushed change" (false positive,
+                    # issue #238). `--cc` reports only the files the merge itself
+                    # changed relative to ALL parents, preserving the fail-closed
+                    # check for real conflict-resolution edits while dropping
+                    # carried files. On a regular (single-parent) commit `--cc`
+                    # and `-m` produce identical --name-status output (no FN).
                     ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
-                     "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "-m", sha],
+                     "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "--cc", sha],
                     capture_output=True
                 )
                 if diff_res.returncode != 0:
@@ -1766,6 +1774,15 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                 .filter(|s| !s.is_empty())
             {
                 let mut diff_tree_cmd = Command::new("git");
+                // `--cc` (not `-m`): on a merge commit `-m` explodes the diff
+                // into one section PER PARENT, flagging every file merely carried
+                // in from origin as a "pushed change" (false positive, issue
+                // #238). `--cc` reports only the files the merge itself changed
+                // relative to ALL parents — preserving the fail-closed check for
+                // genuine conflict-resolution edits to reserved paths while
+                // dropping carried files. On a regular (single-parent) commit
+                // `--cc` and `-m` produce identical --name-status output, so
+                // there is no false negative on normal commits.
                 diff_tree_cmd.current_dir(repo_root).args([
                     "diff-tree",
                     "--root",
@@ -1776,7 +1793,7 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                     "--no-ext-diff",
                     "--diff-filter=ACMRDTU",
                     "-z",
-                    "-m",
+                    "--cc",
                     sha,
                 ]);
                 let output = guard_run_git_with_retry(diff_tree_cmd)?;
@@ -2966,6 +2983,116 @@ mod tests {
         assert!(
             paths.contains(&"new_name.py".to_string()),
             "expected new_name.py in push paths, got: {paths:?}"
+        );
+    }
+
+    /// Issue #238: a merge commit that merely CARRIES a file from the origin
+    /// side (the merge itself does not change it) must NOT flag that file. The
+    /// old `-m` exploded the merge per-parent and false-flagged carried files;
+    /// `--cc` reports only files the merge changed vs ALL parents.
+    #[test]
+    fn push_paths_merge_does_not_flag_carried_origin_files() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        // Base commit (this is what's already on the remote).
+        std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write base");
+        run_git(&repo_dir, &["add", "base.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        // Feature branch adds carried.txt (an origin-side change being merged).
+        run_git(&repo_dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo_dir.join("carried.txt"), "from feature\n").expect("write carried");
+        run_git(&repo_dir, &["add", "carried.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "add carried"]);
+
+        // main modifies a different file so the branches diverge.
+        run_git(&repo_dir, &["checkout", "-q", "main"]);
+        std::fs::write(repo_dir.join("main_only.txt"), "main\n").expect("write main_only");
+        run_git(&repo_dir, &["add", "main_only.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "main change"]);
+
+        // Merge feature into main with no conflict — the merge commit only
+        // CARRIES carried.txt; it does not itself modify it.
+        run_git(
+            &repo_dir,
+            &["merge", "--no-ff", "-q", "-m", "merge feature", "feature"],
+        );
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        // carried.txt was introduced on the feature side and merged unchanged:
+        // the merge commit itself does not touch it, so --cc must omit it.
+        assert!(
+            !paths.contains(&"carried.txt".to_string()),
+            "merge-carried origin file must NOT be flagged (issue #238), got: {paths:?}"
+        );
+        // main_only.txt was changed by a real (non-merge) pushed commit and must
+        // still be flagged — the range still covers it.
+        assert!(
+            paths.contains(&"main_only.txt".to_string()),
+            "non-merge pushed change must still be flagged, got: {paths:?}"
+        );
+    }
+
+    /// Issue #238 (other half): a merge that ACTUALLY modifies a file relative
+    /// to all parents (conflict resolution / evil merge) MUST still be flagged —
+    /// `--cc` preserves the fail-closed check for real merge edits.
+    #[test]
+    fn push_paths_merge_flags_files_modified_by_the_merge_itself() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        // Base with shared.txt that both sides will edit (to force a conflict).
+        std::fs::write(repo_dir.join("shared.txt"), "base line\n").expect("write shared");
+        run_git(&repo_dir, &["add", "shared.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "base"]);
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        // Feature edits shared.txt one way.
+        run_git(&repo_dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo_dir.join("shared.txt"), "feature edit\n").expect("write feature");
+        run_git(&repo_dir, &["add", "shared.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "feature edit"]);
+
+        // main edits shared.txt a conflicting way.
+        run_git(&repo_dir, &["checkout", "-q", "main"]);
+        std::fs::write(repo_dir.join("shared.txt"), "main edit\n").expect("write main");
+        run_git(&repo_dir, &["add", "shared.txt"]);
+        run_git(&repo_dir, &["commit", "-qm", "main edit"]);
+
+        // Merge conflicts; resolve to a value that differs from BOTH parents so
+        // the merge commit itself genuinely changes shared.txt.
+        let merge = Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["merge", "--no-ff", "-q", "-m", "merge", "feature"])
+            .output()
+            .expect("git merge runs");
+        assert!(
+            !merge.status.success(),
+            "expected a merge conflict on shared.txt"
+        );
+        std::fs::write(repo_dir.join("shared.txt"), "merged resolution\n").expect("resolve");
+        run_git(&repo_dir, &["add", "shared.txt"]);
+        run_git(&repo_dir, &["commit", "-q", "--no-edit"]);
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        assert!(
+            paths.contains(&"shared.txt".to_string()),
+            "a file genuinely modified by the merge resolution must be flagged \
+             (fail-closed preserved), got: {paths:?}"
         );
     }
 
