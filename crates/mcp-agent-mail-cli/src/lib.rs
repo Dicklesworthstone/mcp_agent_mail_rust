@@ -5681,8 +5681,19 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("mcp-agent-mail")
         .join("config.env");
-    let resolved_token = setup::resolve_token(None, &config_env_file)
-        .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?;
+    // Under `--no-auth` the server runs with no bearer gate
+    // (`config.http_bearer_token` is `None`). Do NOT re-resolve and embed the
+    // persistent token from `config.env` into the project-local MCP client
+    // configs — that would silently bypass the cleared in-config value and
+    // write a live credential into the project dir (security issue #148).
+    // With an empty token the config writers omit the Authorization header
+    // entirely, and the env-file token is left untouched.
+    let resolved_token = if config.http_bearer_token.is_none() {
+        String::new()
+    } else {
+        setup::resolve_token(None, &config_env_file)
+            .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?
+    };
     let agent_name = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
     let skip_hooks = agent_name.is_empty();
 
@@ -5776,8 +5787,11 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         return Ok(());
     }
 
-    setup::save_token_to_env_file(&config_env_file, &resolved_token)
-        .map_err(|e| CliError::Other(format!("setup self-heal token save failed: {e}")))?;
+    // Never persist an empty token (would clobber a real one under `--no-auth`).
+    if !resolved_token.is_empty() {
+        setup::save_token_to_env_file(&config_env_file, &resolved_token)
+            .map_err(|e| CliError::Other(format!("setup self-heal token save failed: {e}")))?;
+    }
 
     let results = setup::run_setup(&params);
     let failed: Vec<String> = results

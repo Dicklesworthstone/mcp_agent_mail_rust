@@ -115,6 +115,31 @@ impl AgentPlatform {
             Self::GithubCopilot => "GitHub Copilot",
         }
     }
+
+    /// Project-relative config files this platform writes into `project_dir`
+    /// that may embed the bearer token (security issue #148: these MUST be
+    /// covered by the auto-generated `.gitignore` so `git add -A` never commits
+    /// a live credential). User-level files (e.g. `~/.codex/config.toml`,
+    /// `~/.claude/settings.json`) are not project-tracked and excluded here.
+    #[must_use]
+    pub const fn project_local_secret_files(self) -> &'static [&'static str] {
+        match self {
+            // `.claude/settings.local.json` is the token-bearing project file;
+            // `.claude/settings.json` (hooks) carries no token but is also
+            // gitignored separately for parity with the historical behavior.
+            Self::Claude => &[".claude/settings.local.json"],
+            // Codex only writes the user-level `~/.codex/config.toml`; nothing
+            // token-bearing lands in the project dir.
+            Self::Codex => &[],
+            Self::Cursor => &["cursor.mcp.json"],
+            Self::Gemini => &["gemini.mcp.json"],
+            Self::OpenCode => &["opencode.json"],
+            Self::FactoryDroid => &["factory.mcp.json"],
+            Self::Cline => &["cline.mcp.json"],
+            Self::Windsurf => &["windsurf.mcp.json"],
+            Self::GithubCopilot => &[".vscode/mcp.json"],
+        }
+    }
 }
 
 impl fmt::Display for AgentPlatform {
@@ -812,14 +837,35 @@ fn parse_toml_section_header(line: &str) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 /// Build the standard MCP server JSON value for HTTP agents.
+///
+/// When `token` is empty (e.g. `am serve-http --no-auth`), no `Authorization`
+/// header is emitted at all — never write a `Bearer ` header with no/blank
+/// credential into a project-tracked config (security issue #148).
 fn standard_http_server_value(url: &str, token: &str) -> Value {
-    json!({
-        "type": "http",
-        "url": url,
-        "headers": {
-            "Authorization": format!("Bearer {token}")
-        }
-    })
+    if token.is_empty() {
+        json!({
+            "type": "http",
+            "url": url
+        })
+    } else {
+        json!({
+            "type": "http",
+            "url": url,
+            "headers": {
+                "Authorization": format!("Bearer {token}")
+            }
+        })
+    }
+}
+
+/// Build the `headers` object for an MCP server entry, omitting the
+/// `Authorization` header entirely when `token` is empty (issue #148).
+fn auth_headers_value(token: &str) -> Value {
+    if token.is_empty() {
+        json!({})
+    } else {
+        json!({ "Authorization": format!("Bearer {token}") })
+    }
 }
 
 const CODEX_STATUS_STARTUP_TIMEOUT_SECS: u64 = 30;
@@ -915,7 +961,7 @@ impl AgentPlatform {
                 json!({
                     "type": "remote",
                     "url": url,
-                    "headers": { "Authorization": format!("Bearer {token}") },
+                    "headers": auth_headers_value(token),
                     "enabled": true
                 }),
                 "OpenCode project-local MCP config",
@@ -1036,7 +1082,7 @@ impl AgentPlatform {
             "mcpServers",
             json!({
                 "httpUrl": url,
-                "headers": { "Authorization": format!("Bearer {token}") }
+                "headers": auth_headers_value(token)
             }),
             "Gemini CLI project-local MCP config",
         )];
@@ -1072,7 +1118,7 @@ impl AgentPlatform {
             "mcpServers",
             json!({
                 "url": url,
-                "headers": { "Authorization": format!("Bearer {token}") }
+                "headers": auth_headers_value(token)
             }),
             "Factory Droid project-local MCP config",
         )];
@@ -1380,16 +1426,27 @@ pub fn run_setup(params: &SetupParams) -> Vec<SetupResult> {
         });
     }
 
-    // Ensure .gitignore has entries for secret files
+    // Ensure .gitignore has entries for secret files (security issue #148).
+    // Cover EVERY project-local token-bearing file that any configured platform
+    // can emit — not just `.env` + the Claude file — so an unsuspecting
+    // `git add -A` can never commit a live bearer credential. The previous
+    // hardcoded list left `cursor.mcp.json`, `gemini.mcp.json`,
+    // `factory.mcp.json`, `windsurf.mcp.json`, `cline.mcp.json`,
+    // `opencode.json`, and `.vscode/mcp.json` tracked.
     if !params.dry_run {
         let gitignore = params.project_dir.join(".gitignore");
-        // .env contains the bearer token — always gitignore it
-        let mut entries = vec![".env"];
-        // .claude/settings.local.json only exists for Claude
-        if platforms.contains(&AgentPlatform::Claude) {
-            entries.push(".claude/settings.local.json");
+        // .env contains the bearer token — always gitignore it.
+        let mut entries = vec![".env".to_string()];
+        for platform in &platforms {
+            for file in platform.project_local_secret_files() {
+                let entry = (*file).to_string();
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
         }
-        let _ = ensure_gitignore_entries(&gitignore, &entries);
+        let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let _ = ensure_gitignore_entries(&gitignore, &entry_refs);
     }
 
     results
@@ -2582,6 +2639,166 @@ mod tests {
             }
             _ => panic!("expected JsonMerge"),
         }
+    }
+
+    // ---- security issue #148: bearer token in *.mcp.json must be gitignored ----
+
+    /// Every project-local config file a platform writes that can embed a token
+    /// must be covered by the gitignore `run_setup` generates.
+    #[test]
+    fn run_setup_gitignore_covers_every_emitted_token_bearing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = SetupParams {
+            host: "127.0.0.1".into(),
+            port: 8765,
+            path: "/mcp/".into(),
+            token: "live-secret-token".into(),
+            project_dir: tmp.path().to_path_buf(),
+            home_dir_override: Some(tmp.path().join("home")),
+            agents: Some(AgentPlatform::ALL.to_vec()),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let _ = run_setup(&params);
+
+        let gitignore = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        let lines: Vec<&str> = gitignore.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(&".env"),
+            "gitignore must cover .env: {gitignore}"
+        );
+
+        // For every platform, every project-local token-bearing file it writes
+        // must appear in the generated .gitignore.
+        for platform in AgentPlatform::ALL {
+            for file in platform.project_local_secret_files() {
+                assert!(
+                    lines.contains(file),
+                    "gitignore is missing {file} (platform {platform}); contents:\n{gitignore}"
+                );
+            }
+        }
+        // Spot-check the high-risk filenames the old hardcoded list missed.
+        for expected in [
+            "cursor.mcp.json",
+            "gemini.mcp.json",
+            "factory.mcp.json",
+            "windsurf.mcp.json",
+            "cline.mcp.json",
+            "opencode.json",
+            ".vscode/mcp.json",
+            ".claude/settings.local.json",
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "gitignore must cover {expected}: {gitignore}"
+            );
+        }
+    }
+
+    /// `project_local_secret_files()` must list exactly the project-dir files
+    /// each platform's `config_actions` actually writes (keep them in sync so a
+    /// new client doesn't leak a token). User-level (home) files are excluded.
+    #[test]
+    fn project_local_secret_files_matches_emitted_project_dir_actions() {
+        // home_dir MUST be outside project_dir, otherwise user-level configs
+        // (e.g. ~/.claude/settings.json) would appear nested under the project.
+        let proj_tmp = tempfile::tempdir().unwrap();
+        let home_tmp = tempfile::tempdir().unwrap();
+        let pdir = proj_tmp.path();
+        let home = home_tmp.path().to_path_buf();
+        for platform in AgentPlatform::ALL {
+            let params = SetupParams {
+                token: "tok".into(),
+                project_dir: pdir.to_path_buf(),
+                home_dir_override: Some(home.clone()),
+                agents: Some(vec![*platform]),
+                skip_user_config: false,
+                skip_hooks: false,
+                ..Default::default()
+            };
+            // Project-dir-relative file paths this platform writes.
+            let emitted: Vec<String> = platform
+                .config_actions(&params)
+                .iter()
+                .filter(|a| a.file_path.starts_with(pdir))
+                .filter_map(|a| {
+                    a.file_path
+                        .strip_prefix(pdir)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                })
+                // Claude's hooks file (.claude/settings.json) is project-local
+                // but carries no token; the secret file is settings.local.json.
+                .filter(|rel| rel != ".claude/settings.json")
+                .collect();
+            let declared: Vec<String> = platform
+                .project_local_secret_files()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for rel in &emitted {
+                assert!(
+                    declared.contains(rel),
+                    "{platform}: project-local file {rel} is written but not declared in \
+                     project_local_secret_files() (would leak under git add -A)"
+                );
+            }
+        }
+    }
+
+    /// Under `--no-auth` (empty token), no `Authorization` header is written
+    /// into any project-local config — never a live or blank bearer credential.
+    #[test]
+    fn empty_token_writes_no_authorization_header() {
+        for platform in AgentPlatform::ALL {
+            let params = SetupParams {
+                token: String::new(),
+                project_dir: PathBuf::from("/tmp/p"),
+                home_dir_override: Some(PathBuf::from("/tmp/home")),
+                skip_user_config: true,
+                skip_hooks: true,
+                ..Default::default()
+            };
+            for action in platform.config_actions(&params) {
+                let serialized = match &action.content {
+                    ConfigContent::JsonMerge { server_value, .. } => {
+                        serde_json::to_string(server_value).unwrap()
+                    }
+                    ConfigContent::JsonFull(v) => serde_json::to_string(v).unwrap(),
+                    ConfigContent::TomlSection { key_values, .. } => key_values
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    ConfigContent::HooksMerge { .. } => String::new(),
+                };
+                assert!(
+                    !serialized.contains("Bearer") && !serialized.contains("Authorization"),
+                    "{platform} emitted an Authorization header with an empty token: {serialized}"
+                );
+            }
+        }
+    }
+
+    /// With a real token, the Authorization header IS present (regression guard
+    /// so the empty-token suppression doesn't strip auth from authed runs).
+    #[test]
+    fn nonempty_token_writes_authorization_header() {
+        let params = SetupParams {
+            token: "real-token".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            skip_user_config: true,
+            skip_hooks: true,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Cursor.config_actions(&params);
+        let value = match &actions[0].content {
+            ConfigContent::JsonMerge { server_value, .. } => server_value,
+            _ => panic!("expected JsonMerge"),
+        };
+        assert_eq!(value["headers"]["Authorization"], "Bearer real-token");
     }
 
     #[test]
