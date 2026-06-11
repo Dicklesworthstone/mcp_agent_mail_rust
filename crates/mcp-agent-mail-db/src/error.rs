@@ -84,6 +84,210 @@ pub enum DbError {
 /// Result type alias for database operations
 pub type DbResult<T> = std::result::Result<T, DbError>;
 
+/// Coarse, stable class for database and database-adjacent operational errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbErrorClass {
+    /// Authoritative main database B-tree/header/page corruption.
+    MainDbBtreeCorruption,
+    /// WAL/SHM sidecar corruption or truncation, distinct from main DB damage.
+    WalSidecarCorruption,
+    /// Schema drift, missing tables/columns, or migration shape mismatch.
+    SchemaDriftOrMissingTables,
+    /// The engine/probe failed in a way that is not enough to diagnose DB damage.
+    EngineProbeLimitation,
+    /// Foreign-key graph inconsistency or orphaned rows.
+    ForeignKeyInconsistency,
+    /// FTS/search index corruption that can be rebuilt from canonical rows.
+    FtsIndexCorruption,
+    /// Connection, path, permission, or configuration error.
+    ConnectionOrConfigError,
+    /// Retryable busy/lock/MVCC contention.
+    BusyRetryable,
+    /// Process file-descriptor exhaustion.
+    FdExhaustion,
+    /// Connection pool exhaustion.
+    PoolExhaustion,
+    /// A live mailbox owner refused a direct write.
+    LiveOwnerNoActivityLock,
+    /// Host resource pressure such as disk-full or read-only filesystem.
+    HostPressure,
+}
+
+impl DbErrorClass {
+    /// Stable machine string for JSON/error payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MainDbBtreeCorruption => "main_db_btree_corruption",
+            Self::WalSidecarCorruption => "wal_sidecar_corruption",
+            Self::SchemaDriftOrMissingTables => "schema_drift_or_missing_tables",
+            Self::EngineProbeLimitation => "engine_probe_limitation",
+            Self::ForeignKeyInconsistency => "foreign_key_inconsistency",
+            Self::FtsIndexCorruption => "fts_index_corruption",
+            Self::ConnectionOrConfigError => "connection_or_config_error",
+            Self::BusyRetryable => "busy_retryable",
+            Self::FdExhaustion => "fd_exhaustion",
+            Self::PoolExhaustion => "pool_exhaustion",
+            Self::LiveOwnerNoActivityLock => "live_owner_no_activity_lock",
+            Self::HostPressure => "host_pressure",
+        }
+    }
+}
+
+/// Severity attached to a [`DbErrorClass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbErrorSeverity {
+    /// Data-loss or edit-blocking condition.
+    P0,
+    /// Serious operational outage or direct-write safety issue.
+    P1,
+    /// Degraded but bounded condition.
+    P2,
+    /// Local configuration/operator issue.
+    P3,
+}
+
+impl DbErrorSeverity {
+    /// Stable machine string for JSON/error payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::P0 => "P0",
+            Self::P1 => "P1",
+            Self::P2 => "P2",
+            Self::P3 => "P3",
+        }
+    }
+}
+
+/// Policy metadata for a classified database failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbErrorClassification {
+    pub class: DbErrorClass,
+    pub severity: DbErrorSeverity,
+    pub repairable: bool,
+    pub safe_to_retry: bool,
+    pub safe_to_continue_read_only: bool,
+    pub blocks_edits: bool,
+    pub recommended_command: &'static str,
+}
+
+impl DbErrorClassification {
+    #[must_use]
+    pub const fn for_class(class: DbErrorClass) -> Self {
+        match class {
+            DbErrorClass::MainDbBtreeCorruption => Self {
+                class,
+                severity: DbErrorSeverity::P0,
+                repairable: true,
+                safe_to_retry: false,
+                safe_to_continue_read_only: false,
+                blocks_edits: true,
+                recommended_command: "am doctor --json",
+            },
+            DbErrorClass::WalSidecarCorruption => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                repairable: true,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "am doctor health",
+            },
+            DbErrorClass::SchemaDriftOrMissingTables => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                repairable: true,
+                safe_to_retry: false,
+                safe_to_continue_read_only: false,
+                blocks_edits: true,
+                recommended_command: "am doctor migrate --check",
+            },
+            DbErrorClass::EngineProbeLimitation => Self {
+                class,
+                severity: DbErrorSeverity::P2,
+                repairable: false,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: false,
+                recommended_command: "am doctor health",
+            },
+            DbErrorClass::ForeignKeyInconsistency => Self {
+                class,
+                severity: DbErrorSeverity::P0,
+                repairable: true,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "am doctor --json",
+            },
+            DbErrorClass::FtsIndexCorruption => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                repairable: true,
+                safe_to_retry: false,
+                safe_to_continue_read_only: true,
+                blocks_edits: false,
+                recommended_command: "am doctor fix --list --json",
+            },
+            DbErrorClass::ConnectionOrConfigError => Self {
+                class,
+                severity: DbErrorSeverity::P3,
+                repairable: false,
+                safe_to_retry: false,
+                safe_to_continue_read_only: false,
+                blocks_edits: true,
+                recommended_command: "am doctor health",
+            },
+            DbErrorClass::BusyRetryable => Self {
+                class,
+                severity: DbErrorSeverity::P2,
+                repairable: false,
+                safe_to_retry: true,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "am doctor locks",
+            },
+            DbErrorClass::FdExhaustion => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                repairable: false,
+                safe_to_retry: true,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "am doctor health",
+            },
+            DbErrorClass::PoolExhaustion => Self {
+                class,
+                severity: DbErrorSeverity::P2,
+                repairable: false,
+                safe_to_retry: true,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "am doctor health",
+            },
+            DbErrorClass::LiveOwnerNoActivityLock => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                repairable: false,
+                safe_to_retry: true,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "route the write through the running Agent Mail server",
+            },
+            DbErrorClass::HostPressure => Self {
+                class,
+                severity: DbErrorSeverity::P1,
+                repairable: false,
+                safe_to_retry: true,
+                safe_to_continue_read_only: true,
+                blocks_edits: true,
+                recommended_command: "am doctor health",
+            },
+        }
+    }
+}
+
 impl DbError {
     /// Create a not found error
     pub fn not_found(entity: &'static str, identifier: impl Into<String>) -> Self {
@@ -113,7 +317,9 @@ impl DbError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Sqlite(msg) | Self::Pool(msg) => is_lock_error(msg),
+            Self::Sqlite(msg) | Self::Pool(msg) | Self::Schema(msg) | Self::Internal(msg) => {
+                classify_db_error_message(msg).safe_to_retry
+            }
             Self::ResourceBusy(_) | Self::PoolExhausted { .. } => true,
             _ => false,
         }
@@ -127,6 +333,57 @@ impl DbError {
             Self::Sqlite(msg) | Self::Pool(msg) | Self::Schema(msg) => is_corruption_error(msg),
             Self::IntegrityCorruption { .. } => true,
             _ => false,
+        }
+    }
+
+    /// Typed classification and policy metadata for this database error.
+    #[must_use]
+    pub fn classification(&self) -> DbErrorClassification {
+        match self {
+            Self::PoolExhausted { .. } => {
+                DbErrorClassification::for_class(DbErrorClass::PoolExhaustion)
+            }
+            Self::ResourceBusy(message) | Self::CircuitBreakerOpen { message, .. } => {
+                let class = if is_mailbox_ownership_contention(message) {
+                    DbErrorClass::LiveOwnerNoActivityLock
+                } else {
+                    DbErrorClass::BusyRetryable
+                };
+                DbErrorClassification::for_class(class)
+            }
+            Self::IntegrityCorruption { message, details } => {
+                let joined_details = details.join("\n");
+                let class = if contains_fts_index_corruption(message)
+                    || contains_fts_index_corruption(&joined_details)
+                {
+                    DbErrorClass::FtsIndexCorruption
+                } else if contains_foreign_key_inconsistency(message)
+                    || contains_foreign_key_inconsistency(&joined_details)
+                {
+                    DbErrorClass::ForeignKeyInconsistency
+                } else {
+                    DbErrorClass::MainDbBtreeCorruption
+                };
+                DbErrorClassification::for_class(class)
+            }
+            Self::Pool(message) => {
+                let classification = classify_db_error_message(message);
+                if classification.class == DbErrorClass::ConnectionOrConfigError
+                    && message.trim().eq_ignore_ascii_case("timeout")
+                {
+                    DbErrorClassification::for_class(DbErrorClass::PoolExhaustion)
+                } else {
+                    classification
+                }
+            }
+            Self::Sqlite(message) | Self::Schema(message) => classify_db_error_message(message),
+            Self::Internal(message) => classify_db_error_message(message),
+            Self::NotFound { .. }
+            | Self::Duplicate { .. }
+            | Self::InvalidArgument { .. }
+            | Self::Serialization(_) => {
+                DbErrorClassification::for_class(DbErrorClass::ConnectionOrConfigError)
+            }
         }
     }
 
@@ -160,16 +417,10 @@ impl DbError {
 /// Check whether an error message indicates a database lock/busy condition.
 #[must_use]
 pub fn is_lock_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("database is locked")
-        || lower.contains("database table is locked")
-        || lower.contains("database schema is locked")
-        || lower.contains("database is busy")
-        || lower.contains("locked by another process")
-        || lower.contains("unable to open database")
-        || lower.contains("disk i/o error")
-        || is_mvcc_conflict(msg)
-        || is_mailbox_ownership_contention(msg)
+    matches!(
+        classify_db_error_message(msg).class,
+        DbErrorClass::BusyRetryable | DbErrorClass::LiveOwnerNoActivityLock
+    )
 }
 
 /// Check whether a direct mutation was refused because a live mailbox owner is
@@ -205,6 +456,90 @@ pub fn is_mailbox_ownership_contention(msg: &str) -> bool {
 /// (frankensqlite `BEGIN CONCURRENT` page-level collision).
 #[must_use]
 pub fn is_mvcc_conflict(msg: &str) -> bool {
+    contains_mvcc_conflict(msg)
+}
+
+/// Check whether an error message indicates database corruption
+/// (malformed image, corrupt schema, etc.) that may be recoverable
+/// via backup restore or archive reconstruction.
+#[must_use]
+pub fn is_corruption_error(msg: &str) -> bool {
+    matches!(
+        classify_db_error_message(msg).class,
+        DbErrorClass::MainDbBtreeCorruption
+    )
+}
+
+/// Check whether an error message indicates pool exhaustion.
+#[must_use]
+pub fn is_pool_exhausted_error(msg: &str) -> bool {
+    classify_db_error_message(msg).class == DbErrorClass::PoolExhaustion
+}
+
+/// Check whether an error message indicates process file-descriptor exhaustion.
+#[must_use]
+pub fn is_fd_exhaustion_error(msg: &str) -> bool {
+    classify_db_error_message(msg).class == DbErrorClass::FdExhaustion
+}
+
+/// Classify a raw database/IO/probe error message into a typed failure class.
+#[must_use]
+pub fn classify_db_error_message(msg: &str) -> DbErrorClassification {
+    let class = classify_db_error_message_class(msg);
+    DbErrorClassification::for_class(class)
+}
+
+fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
+    if is_mailbox_ownership_contention(msg) {
+        return DbErrorClass::LiveOwnerNoActivityLock;
+    }
+    if contains_fd_exhaustion(msg) {
+        return DbErrorClass::FdExhaustion;
+    }
+    if contains_pool_exhaustion(msg) {
+        return DbErrorClass::PoolExhaustion;
+    }
+    if contains_host_pressure(msg) {
+        return DbErrorClass::HostPressure;
+    }
+    if contains_mvcc_conflict(msg) || contains_lock_or_busy(msg) {
+        return DbErrorClass::BusyRetryable;
+    }
+    if contains_wal_sidecar_corruption(msg) {
+        return DbErrorClass::WalSidecarCorruption;
+    }
+    if contains_fts_index_corruption(msg) {
+        return DbErrorClass::FtsIndexCorruption;
+    }
+    if contains_foreign_key_inconsistency(msg) {
+        return DbErrorClass::ForeignKeyInconsistency;
+    }
+    if contains_schema_drift(msg) {
+        return DbErrorClass::SchemaDriftOrMissingTables;
+    }
+    if contains_main_db_corruption(msg) {
+        return DbErrorClass::MainDbBtreeCorruption;
+    }
+    if contains_engine_probe_limitation(msg) {
+        return DbErrorClass::EngineProbeLimitation;
+    }
+    DbErrorClass::ConnectionOrConfigError
+}
+
+fn contains_lock_or_busy(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("database is locked")
+        || lower.contains("database table is locked")
+        || lower.contains("database schema is locked")
+        || lower.contains("database is busy")
+        || lower.contains("resource temporarily busy")
+        || lower.contains("sqlite_busy")
+        || lower.contains("locked by another process")
+        || lower.contains("unable to open database")
+        || lower.contains("disk i/o error")
+}
+
+fn contains_mvcc_conflict(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("write conflict on page")
         || lower.contains("snapshot conflict on pages")
@@ -213,11 +548,7 @@ pub fn is_mvcc_conflict(msg: &str) -> bool {
         || lower.contains("snapshot too old")
 }
 
-/// Check whether an error message indicates database corruption
-/// (malformed image, corrupt schema, etc.) that may be recoverable
-/// via backup restore or archive reconstruction.
-#[must_use]
-pub fn is_corruption_error(msg: &str) -> bool {
+fn contains_main_db_corruption(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("database disk image is malformed")
         || lower.contains("malformed database schema")
@@ -232,12 +563,102 @@ pub fn is_corruption_error(msg: &str) -> bool {
         || lower.contains("header checksum mismatch")
 }
 
-/// Check whether an error message indicates pool exhaustion.
-#[must_use]
-pub fn is_pool_exhausted_error(msg: &str) -> bool {
+fn contains_wal_sidecar_corruption(msg: &str) -> bool {
     let lower = msg.to_lowercase();
+    (lower.contains("wal")
+        || lower.contains("-wal")
+        || lower.contains("shm")
+        || lower.contains("-shm"))
+        && (lower.contains("too small")
+            || lower.contains("malformed")
+            || lower.contains("invalid")
+            || lower.contains("checksum")
+            || lower.contains("sidecar")
+            || lower.contains("header"))
+}
+
+fn contains_schema_drift(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("no such table")
+        || lower.contains("no such column")
+        || lower.contains("missing table")
+        || lower.contains("missing column")
+        || lower.contains("schema version mismatch")
+        || lower.contains("schema drift")
+}
+
+fn contains_engine_probe_limitation(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("cursor stack is empty")
+        || lower.contains("called `option::unwrap()` on a `none` value")
+        || lower.contains("cursor must be on a leaf")
+        || (lower.contains("internal error") && !contains_main_db_corruption(msg))
+}
+
+fn contains_foreign_key_inconsistency(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("foreign key check")
+        || lower.contains("foreign_key_check")
+        || lower.contains("foreign key mismatch")
+        || lower.contains("foreign key inconsistency")
+        || lower.contains("orphan foreign key")
+        || lower.contains("orphaned foreign key")
+        || lower.contains("orphaned recipient")
+}
+
+fn contains_fts_index_corruption(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    (lower.contains("fts") || lower.contains("search index"))
+        && (lower.contains("corrupt")
+            || lower.contains("malformed")
+            || lower.contains("integrity")
+            || lower.contains("checksum")
+            || lower.contains("missing"))
+}
+
+fn contains_pool_exhaustion(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    let lower = lower.trim();
     (lower.contains("pool") && (lower.contains("timeout") || lower.contains("exhausted")))
         || lower.contains("queuepool")
+        || lower == "timeout"
+        || lower.contains("timed out waiting for connection")
+        || lower.contains("timeout waiting for connection")
+}
+
+fn contains_fd_exhaustion(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    let canonical_open_file_limit = lower.contains("too many open files")
+        || lower.contains("emfile")
+        || lower.contains("os error 24");
+    let descriptor_limit = lower.contains("file descriptor")
+        && (lower.contains("limit")
+            || lower.contains("exhaust")
+            || lower.contains("out of")
+            || lower.contains("too many")
+            || lower.contains("table full"));
+    let explicit_open_file_limit = lower.contains("open file limit")
+        || lower.contains("open-file limit")
+        || lower.contains("open files limit");
+    let open_file_limit = explicit_open_file_limit
+        || (lower.contains("open files")
+            && (lower.contains("limit")
+                || lower.contains("exhaust")
+                || lower.contains("maximum")
+                || lower.contains("exceeded")
+                || lower.contains("out of")));
+    canonical_open_file_limit || descriptor_limit || open_file_limit
+}
+
+fn contains_host_pressure(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("no space left on device")
+        || lower.contains("disk full")
+        || lower.contains("database or disk is full")
+        || lower.contains("readonly database")
+        || lower.contains("read-only file system")
+        || lower.contains("input/output error")
 }
 
 impl From<serde_json::Error> for DbError {
@@ -283,6 +704,151 @@ mod tests {
         let e = DbError::invalid("name", "must be adjective+noun");
         assert!(matches!(e, DbError::InvalidArgument { field: "name", .. }));
         assert!(e.to_string().contains("must be adjective+noun"));
+    }
+
+    #[test]
+    fn fd_exhaustion_is_retryable_host_pressure_not_corruption() {
+        let message = "send_message failed: Too many open files. Freed 0 cached repos";
+        assert!(is_fd_exhaustion_error(message));
+        assert!(!is_corruption_error(message));
+        assert!(DbError::Sqlite(message.to_string()).is_retryable());
+        assert!(DbError::Pool(message.to_string()).is_retryable());
+        assert!(DbError::Schema(message.to_string()).is_retryable());
+        assert!(DbError::Internal(message.to_string()).is_retryable());
+    }
+
+    #[test]
+    fn fd_exhaustion_detector_requires_limit_or_exhaustion_signal() {
+        assert!(is_fd_exhaustion_error(
+            "open failed: Too many open files (os error 24)"
+        ));
+        assert!(is_fd_exhaustion_error(
+            "EMFILE while opening storage database"
+        ));
+        assert!(is_fd_exhaustion_error(
+            "file descriptor limit exhausted for process"
+        ));
+        assert!(is_fd_exhaustion_error("open-file limit reached"));
+        assert!(is_fd_exhaustion_error("out of file descriptors"));
+        assert!(!is_fd_exhaustion_error("bad file descriptor"));
+        assert!(!is_fd_exhaustion_error("invalid file descriptor"));
+        assert!(!is_fd_exhaustion_error(
+            "poll failed because the file descriptor was closed"
+        ));
+        assert!(!is_fd_exhaustion_error("Freed 0 cached repos"));
+        assert!(!DbError::Internal("bad file descriptor".into()).is_retryable());
+    }
+
+    fn assert_class(message: &str, expected: DbErrorClass) -> DbErrorClassification {
+        let classification = classify_db_error_message(message);
+        assert_eq!(
+            classification.class, expected,
+            "unexpected classification for {message:?}: {classification:?}"
+        );
+        classification
+    }
+
+    #[test]
+    fn typed_classifier_covers_historical_a1_error_families() {
+        assert_class(
+            "database disk image is malformed",
+            DbErrorClass::MainDbBtreeCorruption,
+        );
+        assert_class(
+            "WAL file too small for header during rebuild: read 0, need 32",
+            DbErrorClass::WalSidecarCorruption,
+        );
+        assert_class(
+            "no such column: messages.thread_id",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+        assert_class(
+            "frankensqlite internal error: cursor stack is empty",
+            DbErrorClass::EngineProbeLimitation,
+        );
+        assert_class(
+            "PRAGMA foreign_key_check reported orphaned recipient rows",
+            DbErrorClass::ForeignKeyInconsistency,
+        );
+        assert_class(
+            "fts5 search index integrity check failed",
+            DbErrorClass::FtsIndexCorruption,
+        );
+        assert!(!is_corruption_error(
+            "fts5 search index integrity check failed"
+        ));
+        assert_class("unable to open database file", DbErrorClass::BusyRetryable);
+        assert_class("database is locked", DbErrorClass::BusyRetryable);
+        assert_class(
+            "Too many open files (os error 24)",
+            DbErrorClass::FdExhaustion,
+        );
+        assert_class("QueuePool limit reached", DbErrorClass::PoolExhaustion);
+        assert_class(
+            "mailbox mutation refused: another Agent Mail server owns this mailbox",
+            DbErrorClass::LiveOwnerNoActivityLock,
+        );
+        assert_class("database or disk is full", DbErrorClass::HostPressure);
+        assert_class("connection refused", DbErrorClass::ConnectionOrConfigError);
+    }
+
+    #[test]
+    fn typed_classifier_policy_metadata_matches_retry_and_edit_safety() {
+        let busy = assert_class("snapshot conflict on pages: 7", DbErrorClass::BusyRetryable);
+        assert!(busy.safe_to_retry);
+        assert!(busy.safe_to_continue_read_only);
+        assert!(busy.blocks_edits);
+        assert_eq!(busy.recommended_command, "am doctor locks");
+
+        let corruption = assert_class(
+            "page 12: xxh3 page checksum mismatch",
+            DbErrorClass::MainDbBtreeCorruption,
+        );
+        assert_eq!(corruption.severity, DbErrorSeverity::P0);
+        assert!(corruption.repairable);
+        assert!(!corruption.safe_to_retry);
+        assert!(!corruption.safe_to_continue_read_only);
+        assert!(corruption.blocks_edits);
+
+        let schema = assert_class(
+            "no such table: inbox_stats",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+        assert!(!schema.safe_to_retry);
+        assert!(schema.blocks_edits);
+        assert_eq!(schema.recommended_command, "am doctor migrate --check");
+    }
+
+    #[test]
+    fn db_error_variant_classification_overrides_raw_detail_when_needed() {
+        let integrity = DbError::IntegrityCorruption {
+            message: "integrity failed".into(),
+            details: vec!["fts5 search index malformed".into()],
+        };
+        assert_eq!(
+            integrity.classification().class,
+            DbErrorClass::FtsIndexCorruption
+        );
+
+        let pool = DbError::PoolExhausted {
+            message: "all connections in use".into(),
+            pool_size: 4,
+            max_overflow: 2,
+        };
+        assert_eq!(pool.classification().class, DbErrorClass::PoolExhaustion);
+
+        let plain_pool_timeout = DbError::Pool("timeout".into());
+        assert_eq!(
+            plain_pool_timeout.classification().class,
+            DbErrorClass::PoolExhaustion
+        );
+
+        let owner =
+            DbError::ResourceBusy("route writes through that process; it owns this mailbox".into());
+        assert_eq!(
+            owner.classification().class,
+            DbErrorClass::LiveOwnerNoActivityLock
+        );
     }
 
     // ── error_code ──────────────────────────────────────────────────

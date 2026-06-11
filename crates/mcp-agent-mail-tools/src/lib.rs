@@ -197,9 +197,24 @@ pub mod tool_util {
         }
     }
 
+    fn db_error_classification_data(
+        classification: mcp_agent_mail_db::DbErrorClassification,
+    ) -> serde_json::Value {
+        json!({
+            "class": classification.class.as_str(),
+            "severity": classification.severity.as_str(),
+            "repairable": classification.repairable,
+            "safe_to_retry": classification.safe_to_retry,
+            "safe_to_continue_read_only": classification.safe_to_continue_read_only,
+            "blocks_edits": classification.blocks_edits,
+            "recommended_command": classification.recommended_command,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
+        let classification = e.classification();
         match e {
             DbError::InvalidArgument { field, message } => legacy_tool_error(
                 "INVALID_ARGUMENT",
@@ -243,7 +258,29 @@ pub mod tool_util {
                          Run 'am doctor repair' or 'am doctor reconstruct' to recover."
                     ),
                     false,
-                    json!({ "error_detail": message }),
+                    json!({
+                        "error_detail": message,
+                        "db_error_classification": db_error_classification_data(classification),
+                    }),
+                )
+            }
+            DbError::Sqlite(ref message)
+            | DbError::Schema(ref message)
+            | DbError::Pool(ref message)
+            | DbError::Internal(ref message)
+                if mcp_agent_mail_db::is_fd_exhaustion_error(message) =>
+            {
+                let message = message.clone();
+                legacy_tool_error(
+                    "RESOURCE_BUSY",
+                    "File descriptor limit exhausted. Close stale Agent Mail processes or raise the open-file limit, then retry.",
+                    true,
+                    json!({
+                        "error_detail": message,
+                        "resource_class": "file_descriptors",
+                        "recommended_action": "close stale Agent Mail processes or raise the open-file limit, then retry",
+                        "db_error_classification": db_error_classification_data(classification),
+                    }),
                 )
             }
             DbError::Sqlite(ref message)
@@ -262,20 +299,29 @@ pub mod tool_util {
                     "RESOURCE_BUSY",
                     resource_busy_message(&message),
                     true,
-                    json!({ "error_detail": message }),
+                    json!({
+                        "error_detail": message,
+                        "db_error_classification": db_error_classification_data(classification),
+                    }),
                 )
             }
             DbError::Pool(message) => legacy_tool_error(
                 "DATABASE_POOL_EXHAUSTED",
                 "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
                 true,
-                json!({ "error_detail": message }),
+                json!({
+                    "error_detail": message,
+                    "db_error_classification": db_error_classification_data(classification),
+                }),
             ),
             DbError::Sqlite(message) | DbError::Schema(message) => legacy_tool_error(
                 "DATABASE_ERROR",
                 "A database error occurred. This may be a transient issue - try again.",
                 true,
-                json!({ "error_detail": message }),
+                json!({
+                    "error_detail": message,
+                    "db_error_classification": db_error_classification_data(classification),
+                }),
             ),
             DbError::Serialization(message) => {
                 // Python-parity hint selection based on error content
@@ -300,14 +346,20 @@ pub mod tool_util {
                     "RESOURCE_BUSY",
                     "Resource is temporarily busy. Wait a moment and try again.",
                     true,
-                    json!({ "error_detail": message }),
+                    json!({
+                        "error_detail": message,
+                        "db_error_classification": db_error_classification_data(classification),
+                    }),
                 )
             }
             DbError::Internal(message) => legacy_tool_error(
                 "UNHANDLED_EXCEPTION",
                 format!("Unexpected error (DbError): {message}"),
                 false,
-                json!({ "error_detail": message }),
+                json!({
+                    "error_detail": message,
+                    "db_error_classification": db_error_classification_data(classification),
+                }),
             ),
             DbError::PoolExhausted {
                 message,
@@ -321,13 +373,17 @@ pub mod tool_util {
                     "error_detail": message,
                     "pool_size": pool_size,
                     "max_overflow": max_overflow,
+                    "db_error_classification": db_error_classification_data(classification),
                 }),
             ),
             DbError::ResourceBusy(message) => legacy_tool_error(
                 "RESOURCE_BUSY",
                 resource_busy_message(&message),
                 true,
-                json!({ "error_detail": message }),
+                json!({
+                    "error_detail": message,
+                    "db_error_classification": db_error_classification_data(classification),
+                }),
             ),
             DbError::CircuitBreakerOpen {
                 message,
@@ -344,8 +400,26 @@ pub mod tool_util {
                     "error_detail": message,
                     "failures": failures,
                     "reset_after_secs": reset_after_secs,
+                    "db_error_classification": db_error_classification_data(classification),
                 }),
             ),
+            DbError::IntegrityCorruption { message, details }
+                if classification.class == mcp_agent_mail_db::DbErrorClass::FtsIndexCorruption =>
+            {
+                legacy_tool_error(
+                    "DATABASE_ERROR",
+                    format!(
+                        "Search index corruption detected: {message}. \
+                         Run 'am doctor fix --list --json' to inspect repair options."
+                    ),
+                    true,
+                    json!({
+                        "error_detail": message,
+                        "corruption_details": details,
+                        "db_error_classification": db_error_classification_data(classification),
+                    }),
+                )
+            }
             DbError::IntegrityCorruption { message, details } => legacy_tool_error(
                 "DATABASE_CORRUPTION",
                 format!(
@@ -356,6 +430,7 @@ pub mod tool_util {
                 json!({
                     "error_detail": message,
                     "corruption_details": details,
+                    "db_error_classification": db_error_classification_data(classification),
                 }),
             ),
         }
@@ -1222,6 +1297,10 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
             assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "pool_exhaustion"
+            );
         }
 
         #[test]
@@ -1349,10 +1428,47 @@ pub mod tool_util {
         }
 
         #[test]
+        fn db_error_to_mcp_error_maps_fd_exhaustion_as_resource_busy() {
+            let err = db_error_to_mcp_error(DbError::Internal(
+                "send_message retry failed: Too many open files. Freed 0 cached repos".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["data"]["resource_class"], "file_descriptors");
+            assert!(
+                data["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("File descriptor limit exhausted")
+            );
+            let classification = &data["error"]["data"]["db_error_classification"];
+            assert_eq!(classification["class"], "fd_exhaustion");
+            assert_eq!(classification["safe_to_retry"], true);
+            assert_eq!(classification["blocks_edits"], true);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_does_not_map_bad_fd_as_exhaustion() {
+            let err = db_error_to_mcp_error(DbError::Internal("bad file descriptor".into()));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "UNHANDLED_EXCEPTION");
+            assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
         fn db_error_to_mcp_error_maps_schema() {
-            let err = db_error_to_mcp_error(DbError::Schema("migration v4 failed".into()));
+            let err = db_error_to_mcp_error(DbError::Schema("no such table: messages".into()));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["class"],
+                "schema_drift_or_missing_tables"
+            );
+            assert_eq!(
+                data["error"]["data"]["db_error_classification"]["recommended_command"],
+                "am doctor migrate --check"
+            );
         }
 
         #[test]
@@ -1362,6 +1478,21 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_keeps_fts_integrity_repairable() {
+            let err = db_error_to_mcp_error(DbError::IntegrityCorruption {
+                message: "integrity failed".into(),
+                details: vec!["fts5 search index malformed".into()],
+            });
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+            assert_eq!(data["error"]["recoverable"], true);
+            let classification = &data["error"]["data"]["db_error_classification"];
+            assert_eq!(classification["class"], "fts_index_corruption");
+            assert_eq!(classification["safe_to_continue_read_only"], true);
+            assert_eq!(classification["blocks_edits"], false);
         }
 
         #[test]

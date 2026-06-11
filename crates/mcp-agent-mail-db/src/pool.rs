@@ -4359,18 +4359,7 @@ pub fn is_corruption_error_message(message: &str) -> bool {
     // silently disabled the MCP read surface (see GH#99). The string stays
     // classified as a recovery-error via is_sqlite_recovery_error_message so
     // the WAL sidecar gets cleaned up, without escalating to Broken.
-    lower.contains("database disk image is malformed")
-        || lower.contains("malformed database schema")
-        || lower.contains("database schema is corrupt")
-        || lower.contains("file is not a database")
-        || lower.contains("database file too small for header")
-        || lower.contains("invalid database header")
-        || lower.contains("invalid database header magic")
-        || lower.contains("invalid page size")
-        || lower.contains("malformed page")
-        || lower.contains("page checksum mismatch")
-        || lower.contains("header checksum mismatch")
-        || lower.contains("no healthy backup was found")
+    crate::error::is_corruption_error(message) || lower.contains("no healthy backup was found")
 }
 
 #[allow(clippy::result_large_err)]

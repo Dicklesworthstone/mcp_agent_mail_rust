@@ -237,6 +237,39 @@ fn post_commit_visibility_probe_maps_to_resource_busy() {
     );
 }
 
+#[test]
+fn send_message_fd_exhaustion_anchor_maps_to_resource_busy() {
+    let err = db_error_to_mcp_error(DbError::Internal(
+        "send_message retry loop exhausted: Too many open files. Freed 0 cached repos".into(),
+    ));
+    let p = error_payload(&err);
+
+    assert_eq!(p["type"], "RESOURCE_BUSY");
+    assert_eq!(p["recoverable"], true);
+    assert_eq!(p["data"]["resource_class"], "file_descriptors");
+    assert!(
+        p["message"]
+            .as_str()
+            .unwrap()
+            .contains("File descriptor limit exhausted")
+    );
+    assert!(
+        p["data"]["error_detail"]
+            .as_str()
+            .unwrap()
+            .contains("Freed 0 cached repos")
+    );
+}
+
+#[test]
+fn bad_file_descriptor_does_not_map_to_fd_exhaustion() {
+    let err = db_error_to_mcp_error(DbError::Internal("bad file descriptor".into()));
+    let p = error_payload(&err);
+
+    assert_eq!(p["type"], "UNHANDLED_EXCEPTION");
+    assert_eq!(p["recoverable"], false);
+}
+
 // -----------------------------------------------------------------------
 // T9.2: Circuit breaker (RESOURCE_BUSY variant)
 // -----------------------------------------------------------------------
