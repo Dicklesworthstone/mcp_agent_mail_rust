@@ -333,8 +333,14 @@ pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 /// verification/recovery work.
 pub type CanonicalDbConn = sqlmodel_sqlite::SqliteConnection;
 
-pub fn close_db_conn(conn: DbConn, _context: &'static str) {
-    drop(conn);
+pub fn close_db_conn(conn: DbConn, context: &'static str) {
+    if let Err(error) = conn.close_sync() {
+        tracing::warn!(
+            context,
+            error = %error,
+            "failed to close FrankenSQLite connection explicitly"
+        );
+    }
 }
 
 pub struct DbConnGuard {

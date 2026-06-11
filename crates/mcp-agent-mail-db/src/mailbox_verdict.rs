@@ -1447,6 +1447,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             .and_then(|count| usize::try_from(count).ok())
             .unwrap_or(0),
         Err(error) => {
+            crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
             return ProbeResult::error(
                 "schema_populated",
                 format!("Cannot query sqlite_master: {error}"),
@@ -1461,7 +1462,7 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
         )
         .is_ok_and(|rows| !rows.is_empty());
 
-    match (table_count, archive_presence, has_messages_table) {
+    let result = match (table_count, archive_presence, has_messages_table) {
         (0, ArchiveStatePresence::Empty, _) => ProbeResult::ok(
             "schema_populated",
             "Database schema is empty and the archive is also empty",
@@ -1485,7 +1486,9 @@ fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence
             format!("Database schema populated with {tables} tables including 'messages'"),
         ),
         _ => ProbeResult::ok("schema_populated", "Schema state accepted"),
-    }
+    };
+    crate::close_db_conn(conn.into_inner(), "mailbox_verdict::probe_schema_populated");
+    result
 }
 
 // ============================================================================
