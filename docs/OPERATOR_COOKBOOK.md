@@ -243,6 +243,24 @@ am mail send \
 **Expected output:** A delivery summary showing the message was queued for the
 explicit recipient and attached to the requested thread.
 
+**Sender token (proving identity):** `am mail send` accepts a per-agent
+`sender_token`. If `--from` was registered with `am agents register` or
+`am macros start-session`, the token is persisted locally and reused
+automatically — no extra flags needed. To supply it explicitly without echoing
+the raw secret into shell history, prefer one of:
+
+```bash
+# From a file (contents trimmed):
+am mail send ... --sender-token-file ~/.config/mcp-agent-mail/sender.token
+
+# From the environment (not visible in `ps`/history):
+AGENT_MAIL_SENDER_TOKEN="$(cat ~/.config/mcp-agent-mail/sender.token)" \
+  am mail send ...
+```
+
+Resolution precedence: `--sender-token` (discouraged — visible in the process
+list) > `--sender-token-file` > `AGENT_MAIL_SENDER_TOKEN` > persisted identity.
+
 **Troubleshooting:** If the recipient is unknown, confirm the exact agent name
 with `am agents list --project "$PROJECT"`. Do not look for a broadcast flag;
 targeted delivery is the only supported path.

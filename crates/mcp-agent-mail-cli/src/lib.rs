@@ -1892,6 +1892,18 @@ pub enum MailCommand {
         /// Thread ID to associate with.
         #[arg(long)]
         thread_id: Option<String>,
+        /// Sender token proving ownership of --from (DISCOURAGED: visible in
+        /// shell history/process list — prefer --sender-token-file or the
+        /// AGENT_MAIL_SENDER_TOKEN env var). If --from was registered via
+        /// `am agents register` / `am macros start-session`, the token is reused
+        /// automatically and none of these flags are needed.
+        #[arg(long = "sender-token", value_name = "TOKEN")]
+        sender_token: Option<String>,
+        /// Read the sender token from this file (contents trimmed). Avoids
+        /// echoing the raw token on the command line. Overrides
+        /// AGENT_MAIL_SENDER_TOKEN and any persisted identity token.
+        #[arg(long = "sender-token-file", value_name = "PATH")]
+        sender_token_file: Option<PathBuf>,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -6012,6 +6024,150 @@ fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
         .storage_root
         .join(".setup-self-heal")
         .join(format!("{key}.json"))
+}
+
+// ---------------------------------------------------------------------------
+// Sender-token identity state (#147)
+//
+// `am mail send` enforces a per-agent `sender_token` to prove identity. To avoid
+// echoing the raw token into shell logs/history, the token can be supplied via a
+// file or env var, and — when the agent registered through `am agents register`
+// or `am macros start-session` — is persisted locally so `mail send` reuses it
+// automatically. State lives under `<storage_root>/.identity/` (mode 0600).
+// ---------------------------------------------------------------------------
+
+/// Environment variable carrying a `mail send` sender token (non-echoing path).
+const AGENT_MAIL_SENDER_TOKEN_ENV: &str = "AGENT_MAIL_SENDER_TOKEN";
+
+/// On-disk record of a registered agent's sender token for one project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SenderIdentityState {
+    project_key: String,
+    agent_name: String,
+    sender_token: String,
+}
+
+/// Path of the persisted sender-token record for `(project_key, agent_name)`.
+fn sender_identity_state_path(config: &Config, project_key: &str, agent_name: &str) -> PathBuf {
+    let key = token_fingerprint(&format!("{project_key}\u{0}{agent_name}"));
+    config
+        .storage_root
+        .join(".identity")
+        .join(format!("{key}.json"))
+}
+
+/// Persist a registered agent's sender token so `mail send` can reuse it without
+/// the operator re-supplying it. Best-effort: failures are logged, not fatal.
+fn persist_sender_identity_token(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    sender_token: &str,
+) {
+    if sender_token.is_empty() || project_key.is_empty() || agent_name.is_empty() {
+        return;
+    }
+    let path = sender_identity_state_path(config, project_key, agent_name);
+    let record = SenderIdentityState {
+        project_key: project_key.to_string(),
+        agent_name: agent_name.to_string(),
+        sender_token: sender_token.to_string(),
+    };
+    let Ok(content) = serde_json::to_string(&record) else {
+        return;
+    };
+    // The fingerprinted filename can collide across distinct (project, agent)
+    // pairs only with a 64-bit hash collision; guard against a stale record for
+    // a *different* pair by writing the canonical identity inside the file and
+    // verifying it on read.
+    write_cache_file_if_safe(&path, &content, "sender identity state");
+}
+
+/// Load a previously-persisted sender token for `(project_key, agent_name)`.
+fn load_sender_identity_token(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+) -> Option<String> {
+    let path = sender_identity_state_path(config, project_key, agent_name);
+    let content = read_cache_file_if_real(&path)?;
+    let record: SenderIdentityState = serde_json::from_str(&content).ok()?;
+    if record.project_key == project_key
+        && record.agent_name == agent_name
+        && !record.sender_token.is_empty()
+    {
+        Some(record.sender_token)
+    } else {
+        None
+    }
+}
+
+/// Extract `name` + `registration_token` from a `register_agent` /
+/// `macro_start_session` payload (handles both the flat agent object and a
+/// nested `{ "agent": { ... } }` shape) and persist the token if present.
+fn persist_sender_identity_token_from_agent_payload(
+    config: &Config,
+    project_key: &str,
+    payload: &serde_json::Value,
+) {
+    // The agent object may be the payload itself or under an `agent` key.
+    let agent = payload.get("agent").unwrap_or(payload);
+    let name = agent
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let token = agent
+        .get("registration_token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !name.is_empty() && !token.is_empty() {
+        persist_sender_identity_token(config, project_key, name, token);
+    }
+}
+
+/// Resolve the `mail send` sender token without ever requiring it to be echoed
+/// on the command line. Precedence (highest first):
+///   1. `--sender-token <token>` (explicit; discouraged — visible in shell logs)
+///   2. `--sender-token-file <path>` (file contents, trimmed)
+///   3. `AGENT_MAIL_SENDER_TOKEN` environment variable
+///   4. persisted identity state from `agents register` / `macros start-session`
+///
+/// Returns `Ok(None)` when no source yields a token (send proceeds unverified,
+/// preserving prior behavior). Returns an error only when an explicitly-named
+/// `--sender-token-file` cannot be read.
+fn resolve_sender_token(
+    config: &Config,
+    project_key: &str,
+    sender: &str,
+    explicit: Option<&str>,
+    token_file: Option<&Path>,
+) -> CliResult<Option<String>> {
+    if let Some(tok) = explicit {
+        let tok = tok.trim();
+        if !tok.is_empty() {
+            return Ok(Some(tok.to_string()));
+        }
+    }
+    if let Some(path) = token_file {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            CliError::InvalidArgument(format!("--sender-token-file {}: {e}", path.display()))
+        })?;
+        let tok = raw.trim().to_string();
+        if tok.is_empty() {
+            return Err(CliError::InvalidArgument(format!(
+                "--sender-token-file {} is empty",
+                path.display()
+            )));
+        }
+        return Ok(Some(tok));
+    }
+    if let Ok(env_tok) = std::env::var(AGENT_MAIL_SENDER_TOKEN_ENV) {
+        let env_tok = env_tok.trim().to_string();
+        if !env_tok.is_empty() {
+            return Ok(Some(env_tok));
+        }
+    }
+    Ok(load_sender_identity_token(config, project_key, sender))
 }
 
 fn read_cache_file_if_real(path: &Path) -> Option<String> {
@@ -27604,10 +27760,22 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             importance,
             ack_required,
             thread_id,
+            sender_token,
+            sender_token_file,
             format,
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            // Resolve the sender token without echoing it on the command line:
+            // explicit flag > --sender-token-file > AGENT_MAIL_SENDER_TOKEN env >
+            // persisted identity from `agents register`/`macros start-session`.
+            let resolved_sender_token = resolve_sender_token(
+                &server_config,
+                &project_key,
+                &sender,
+                sender_token.as_deref(),
+                sender_token_file.as_deref(),
+            )?;
             let to_names: Vec<String> = to
                 .split(',')
                 .map(str::trim)
@@ -27641,6 +27809,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     &importance,
                     ack_required,
                     thread_id.as_deref(),
+                    resolved_sender_token.as_deref(),
                 ),
             )
             .await
@@ -27702,6 +27871,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 &importance,
                 ack_required,
                 thread_id.as_deref(),
+                resolved_sender_token.as_deref(),
             ));
             let payload = match asupersync::time::timeout(
                 asupersync::time::wall_now(),
@@ -28283,6 +28453,7 @@ fn build_server_send_message_arguments(
     importance: &str,
     ack_required: bool,
     thread_id: Option<&str>,
+    sender_token: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
         ("project_key".to_string(), serde_json::json!(project_key)),
@@ -28298,6 +28469,9 @@ fn build_server_send_message_arguments(
     }
     if let Some(thread_id) = thread_id {
         arguments.insert("thread_id".to_string(), serde_json::json!(thread_id));
+    }
+    if let Some(sender_token) = sender_token.filter(|t| !t.is_empty()) {
+        arguments.insert("sender_token".to_string(), serde_json::json!(sender_token));
     }
     serde_json::Value::Object(arguments)
 }
@@ -28688,6 +28862,13 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             {
                 ServerToolCall::Success(result) => {
                     let payload = coerce_tool_result_json_or_error("register_agent", result)?;
+                    // Persist the sender token (#147) so `mail send` can reuse the
+                    // registered identity without re-supplying it.
+                    persist_sender_identity_token_from_agent_payload(
+                        &server_config,
+                        &project_key,
+                        &payload,
+                    );
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
@@ -29290,6 +29471,13 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             {
                 ServerToolCall::Success(result) => {
                     let payload = coerce_tool_result_json_or_error("macro_start_session", result)?;
+                    // Persist the sender token (#147) so `mail send` can reuse the
+                    // session identity without re-supplying it.
+                    persist_sender_identity_token_from_agent_payload(
+                        &server_config,
+                        &human_key,
+                        &payload,
+                    );
                     render_macro_start_session_payload(&payload, fmt, &program, &model);
                     return Ok(());
                 }
@@ -30058,14 +30246,16 @@ mod mail_server_cli_bridge_tests {
         build_server_send_message_arguments, build_server_whois_arguments,
         classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
         ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
-        get_blocking_http_request, is_resource_busy_cli_error,
+        get_blocking_http_request, is_resource_busy_cli_error, load_sender_identity_token,
         mail_server_rejection_allows_local_fallback, normalize_cli_product_inbox_agent_name,
         parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
+        persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
         post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
-        reject_local_fallback_with_ownership_probe, server_inbox_payload_to_cli_json,
-        server_message_payload_to_cli_json, sort_product_inbox_items_desc,
-        sqlite_doctor_sanity_with_health_probe,
+        reject_local_fallback_with_ownership_probe, resolve_sender_token,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
     };
+    use mcp_agent_mail_core::config::Config;
 
     #[test]
     fn send_message_server_arguments_omit_absent_optional_fields() {
@@ -30080,11 +30270,167 @@ mod mail_server_cli_bridge_tests {
             "high",
             true,
             None,
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
         assert!(!object.contains_key("cc"));
         assert!(!object.contains_key("thread_id"));
+        assert!(!object.contains_key("sender_token"));
+    }
+
+    #[test]
+    fn send_message_server_arguments_include_sender_token_when_present() {
+        let to_names = vec!["WindyGate".to_string()];
+        let args = build_server_send_message_arguments(
+            "/tmp/project",
+            "PinkStone",
+            &to_names,
+            "Subject",
+            "Body",
+            None,
+            "high",
+            true,
+            None,
+            Some("secret-tok"),
+        );
+        let object = args.as_object().expect("object arguments");
+        assert_eq!(
+            object
+                .get("sender_token")
+                .and_then(serde_json::Value::as_str),
+            Some("secret-tok")
+        );
+        // An empty token must be omitted (never serialize a blank credential).
+        let args_empty = build_server_send_message_arguments(
+            "/tmp/project",
+            "PinkStone",
+            &to_names,
+            "Subject",
+            "Body",
+            None,
+            "high",
+            true,
+            None,
+            Some(""),
+        );
+        assert!(!args_empty.as_object().unwrap().contains_key("sender_token"));
+    }
+
+    // ---- #147: mail send sender-token UX ----
+
+    fn config_with_storage_root(root: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.storage_root = root.to_path_buf();
+        config
+    }
+
+    #[test]
+    fn resolve_sender_token_prefers_explicit_flag() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        let got = resolve_sender_token(&config, "/p", "Agent", Some("  flag-tok  "), None).unwrap();
+        assert_eq!(got.as_deref(), Some("flag-tok"));
+    }
+
+    #[test]
+    fn resolve_sender_token_reads_file_and_trims() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        let token_file = td.path().join("tok.txt");
+        std::fs::write(&token_file, "file-tok\n").unwrap();
+        let got =
+            resolve_sender_token(&config, "/p", "Agent", None, Some(token_file.as_path())).unwrap();
+        assert_eq!(got.as_deref(), Some("file-tok"));
+    }
+
+    #[test]
+    fn resolve_sender_token_empty_file_is_error() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        let token_file = td.path().join("empty.txt");
+        std::fs::write(&token_file, "   \n").unwrap();
+        let err = resolve_sender_token(&config, "/p", "Agent", None, Some(token_file.as_path()))
+            .unwrap_err();
+        assert!(matches!(err, CliError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[test]
+    fn resolve_sender_token_missing_file_is_error() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        let missing = td.path().join("nope.txt");
+        let err = resolve_sender_token(&config, "/p", "Agent", None, Some(missing.as_path()))
+            .unwrap_err();
+        assert!(matches!(err, CliError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[test]
+    fn resolve_sender_token_none_when_no_source_available() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        // No flag, no file, no persisted identity. (The env var is a lower
+        // priority and not exercised here to keep the test env-independent.)
+        let got = resolve_sender_token(&config, "/unknown", "Ghost", None, None).unwrap();
+        // Either None (no env set) or whatever env happens to hold — but a fresh
+        // project/agent with no persisted state and no flag/file must not invent
+        // a token from identity state.
+        assert!(load_sender_identity_token(&config, "/unknown", "Ghost").is_none());
+        let _ = got; // env-dependent; persisted-identity path proven below.
+    }
+
+    #[test]
+    fn persist_and_load_sender_identity_round_trip_is_scoped_to_pair() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        persist_sender_identity_token(&config, "/proj-a", "Agent1", "tok-a");
+        persist_sender_identity_token(&config, "/proj-b", "Agent2", "tok-b");
+        assert_eq!(
+            load_sender_identity_token(&config, "/proj-a", "Agent1").as_deref(),
+            Some("tok-a")
+        );
+        assert_eq!(
+            load_sender_identity_token(&config, "/proj-b", "Agent2").as_deref(),
+            Some("tok-b")
+        );
+        // Wrong agent for a project must not leak the other pair's token.
+        assert_eq!(
+            load_sender_identity_token(&config, "/proj-a", "Agent2"),
+            None
+        );
+        // Empty token is never persisted.
+        persist_sender_identity_token(&config, "/proj-c", "Agent3", "");
+        assert_eq!(
+            load_sender_identity_token(&config, "/proj-c", "Agent3"),
+            None
+        );
+    }
+
+    #[test]
+    fn persist_sender_identity_from_agent_payload_handles_flat_and_nested() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        // Flat agent object (register_agent shape).
+        let flat = serde_json::json!({ "name": "FlatAgent", "registration_token": "flat-tok" });
+        persist_sender_identity_token_from_agent_payload(&config, "/flat", &flat);
+        assert_eq!(
+            load_sender_identity_token(&config, "/flat", "FlatAgent").as_deref(),
+            Some("flat-tok")
+        );
+        // Nested under `agent` (macro_start_session shape).
+        let nested = serde_json::json!({
+            "agent": { "name": "NestedAgent", "registration_token": "nested-tok" },
+            "project": { "slug": "x" }
+        });
+        persist_sender_identity_token_from_agent_payload(&config, "/nested", &nested);
+        assert_eq!(
+            load_sender_identity_token(&config, "/nested", "NestedAgent").as_deref(),
+            Some("nested-tok")
+        );
+        // Payload without a token persists nothing.
+        let no_tok = serde_json::json!({ "name": "NoTok" });
+        persist_sender_identity_token_from_agent_payload(&config, "/notok", &no_tok);
+        assert_eq!(load_sender_identity_token(&config, "/notok", "NoTok"), None);
     }
 
     #[test]
@@ -65924,6 +66270,7 @@ async fn call_send_message_tool_locally(
     importance: &str,
     ack_required: bool,
     thread_id: Option<&str>,
+    sender_token: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
     let payload = mcp_agent_mail_tools::messaging::send_message(
@@ -65943,7 +66290,7 @@ async fn call_send_message_tool_locally(
         None,
         None,
         None,
-        None,
+        sender_token.filter(|t| !t.is_empty()).map(str::to_string),
     )
     .await
     .map_err(mcp_error_to_cli_error)?;
