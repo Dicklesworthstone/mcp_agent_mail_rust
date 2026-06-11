@@ -61,6 +61,12 @@ fn write_version_shim(path: &Path, binary: &str, version: &str) {
     set_executable(path);
 }
 
+fn write_empty_ps_shim(path: &Path) {
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").expect("write ps shim");
+    #[cfg(unix)]
+    set_executable(path);
+}
+
 fn read_fixture(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -209,6 +215,58 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                                 Value::String("<SERVER_PROCESS_CPU_SUMMARY>".to_string()),
                             );
                         }
+                        "db_file_sanity"
+                            if out.get("detail").and_then(Value::as_str).is_some_and(
+                                |detail| {
+                                    detail.starts_with("quick_check OK (")
+                                        && detail.ends_with(" bytes)")
+                                },
+                            ) =>
+                        {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("quick_check OK (<DB_BYTES> bytes)".to_string()),
+                            );
+                        }
+                        "binary_version" | "server_binary_version" => {
+                            if let Some(candidates) =
+                                out.get_mut("candidates").and_then(Value::as_array_mut)
+                            {
+                                for candidate in candidates {
+                                    if let Some(obj) = candidate.as_object_mut() {
+                                        obj.insert(
+                                            "parsed_version".to_string(),
+                                            Value::String("<PACKAGE_VERSION>".to_string()),
+                                        );
+                                        if let Some(source) =
+                                            obj.get("source").and_then(Value::as_str)
+                                            && source == "path"
+                                            && let Some(path) =
+                                                obj.get("path").and_then(Value::as_str)
+                                        {
+                                            let name = if path.ends_with("/mcp-agent-mail") {
+                                                "mcp-agent-mail"
+                                            } else {
+                                                "am"
+                                            };
+                                            obj.insert(
+                                                "version_line".to_string(),
+                                                Value::String(format!("{name} <PACKAGE_VERSION>")),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(detail) = out.get("detail").and_then(Value::as_str) {
+                                let normalized =
+                                    detail.replace(env!("CARGO_PKG_VERSION"), "<PACKAGE_VERSION>");
+                                out.insert("detail".to_string(), Value::String(normalized));
+                            }
+                            out.insert(
+                                "source_version".to_string(),
+                                Value::String("<PACKAGE_VERSION>".to_string()),
+                            );
+                        }
                         "git_binary_path" => {
                             out.insert(
                                 "detail".to_string(),
@@ -225,10 +283,30 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                         _ => {}
                     }
                 }
+                if out
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "sqlite_db")
+                    && out
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .is_some_and(|detail| detail.starts_with("bytes="))
+                {
+                    out.insert(
+                        "detail".to_string(),
+                        Value::String("bytes=<DB_BYTES>".to_string()),
+                    );
+                }
                 if out.contains_key("generated_at") {
                     out.insert(
                         "generated_at".to_string(),
                         Value::String("<GENERATED_AT>".to_string()),
+                    );
+                }
+                if out.contains_key("binary_version") {
+                    out.insert(
+                        "binary_version".to_string(),
+                        Value::String("<PACKAGE_VERSION>".to_string()),
                     );
                 }
                 if out.contains_key("running_exe") {
@@ -305,6 +383,7 @@ impl TestEnv {
             "mcp-agent-mail",
             env!("CARGO_PKG_VERSION"),
         );
+        write_empty_ps_shim(&local_bin.join("ps"));
 
         write_login_profile(&home_dir.join(".bash_profile"), &local_bin);
         write_login_profile(&home_dir.join(".profile"), &local_bin);
@@ -384,6 +463,13 @@ impl TestEnv {
             ("HTTP_PATH".to_string(), "/mcp/".to_string()),
         ]
     }
+}
+
+fn close_and_checkpoint_seeded_db(conn: mcp_agent_mail_db::DbConn, db_path: &Path, context: &str) {
+    conn.close_sync()
+        .unwrap_or_else(|e| panic!("{context}: close seeded database: {e}"));
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
+        .unwrap_or_else(|e| panic!("{context}: checkpoint seeded database: {e}"));
 }
 
 fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
@@ -590,6 +676,8 @@ fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
     )
     .unwrap();
 
+    close_and_checkpoint_seeded_db(conn, db_path, "seed_cli_json_db");
+
     ("abc123".to_string(), "GreenCastle".to_string())
 }
 
@@ -613,6 +701,8 @@ fn seed_cli_json_db_product_only(db_path: &Path) -> String {
         ],
     )
     .unwrap();
+
+    close_and_checkpoint_seeded_db(conn, db_path, "seed_cli_json_db_product_only");
 
     "deadbeef".to_string()
 }
@@ -713,6 +803,8 @@ fn seed_cli_acks_db(db_path: &Path, root: &Path) -> (String, String, i64) {
         ],
     )
     .unwrap();
+
+    close_and_checkpoint_seeded_db(conn, db_path, "seed_cli_acks_db");
 
     ("proj-alpha".to_string(), "GreenCastle".to_string(), msg_id)
 }

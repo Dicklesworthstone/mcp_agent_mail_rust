@@ -2146,17 +2146,19 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     match crate::doctor_database_fix_strategy_read_only(&cfg.database_url, &config.storage_root) {
         Ok(crate::DoctorDatabaseFixStrategy::None(_)) => {}
         Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => {
-            println!("fail: live mailbox needs repair: {detail}; next: am doctor repair --dry-run");
+            ftui_runtime::ftui_println!(
+                "fail: live mailbox needs repair: {detail}; next: am doctor repair --dry-run"
+            );
             return Err(CliError::ExitCode(1));
         }
         Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => {
-            println!(
+            ftui_runtime::ftui_println!(
                 "fail: live mailbox needs reconstruct: {detail}; next: am doctor reconstruct --dry-run"
             );
             return Err(CliError::ExitCode(1));
         }
         Err(error) => {
-            println!("fail: live mailbox health probe failed: {error}");
+            ftui_runtime::ftui_println!("fail: live mailbox health probe failed: {error}");
             return Err(CliError::ExitCode(1));
         }
     }
@@ -2170,13 +2172,13 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         },
     ) {
         Ok(report) => {
-            println!("{}", report.health_line());
+            ftui_runtime::ftui_println!("{}", report.health_line());
             if !report.ok {
                 return Err(CliError::ExitCode(1));
             }
         }
         Err(error) => {
-            println!("reservation_parity: not_run ({error})");
+            ftui_runtime::ftui_println!("reservation_parity: not_run ({error})");
         }
     }
 
@@ -2187,14 +2189,14 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     if path_absent_without_following_symlink(&latest)
         && path_absent_without_following_symlink(&runs_dir)
     {
-        println!("ok: live mailbox healthy; no prior runs");
+        ftui_runtime::ftui_println!("ok: live mailbox healthy; no prior runs");
         return Ok(());
     }
 
     let report_path = latest_doctor_report_path_for_root(&root);
 
     let Some(report_path) = report_path else {
-        println!("warn: no report.json in latest run");
+        ftui_runtime::ftui_println!("warn: no report.json in latest run");
         // Explicit exit 1: findings are present and no fix was run.
         return Err(CliError::ExitCode(1));
     };
@@ -2213,12 +2215,13 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     let exit_code = v.get("exit_code").and_then(|n| n.as_i64()).unwrap_or(0);
 
     if ok && total == 0 {
-        println!("ok: 0 findings (last run exit {exit_code})");
+        ftui_runtime::ftui_println!("ok: 0 findings (last run exit {exit_code})");
         Ok(())
     } else {
-        println!(
+        ftui_runtime::ftui_println!(
             "findings_present: {} findings (last run exit {})",
-            total, exit_code
+            total,
+            exit_code
         );
         // Explicit exit 1: findings are present and no fix was run.
         Err(CliError::ExitCode(1))

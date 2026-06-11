@@ -543,9 +543,11 @@ fn preferences_persist_to_tmpfile() {
     let dir = tempfile::tempdir().expect("tmp");
     let path = dir.path().join("test_config.env");
 
-    let mut config = Config::default();
-    config.console_persist_path = path.clone();
-    config.console_auto_save = true;
+    let config = Config {
+        console_persist_path: path.clone(),
+        console_auto_save: true,
+        ..Config::default()
+    };
 
     let mut persister = PreferencePersister::new(&config);
     let prefs = TuiPreferences::default();
@@ -564,9 +566,11 @@ fn preferences_skip_when_auto_save_disabled() {
     let dir = tempfile::tempdir().expect("tmp");
     let path = dir.path().join("no_save.env");
 
-    let mut config = Config::default();
-    config.console_persist_path = path.clone();
-    config.console_auto_save = false;
+    let config = Config {
+        console_persist_path: path.clone(),
+        console_auto_save: false,
+        ..Config::default()
+    };
 
     let mut persister = PreferencePersister::new(&config);
     persister.mark_dirty();
@@ -579,9 +583,11 @@ fn preferences_export_import_json() {
     let dir = tempfile::tempdir().expect("tmp");
     let path = dir.path().join("layout_test.env");
 
-    let mut config = Config::default();
-    config.console_persist_path = path;
-    config.console_auto_save = true;
+    let config = Config {
+        console_persist_path: path,
+        console_auto_save: true,
+        ..Config::default()
+    };
 
     let persister = PreferencePersister::new(&config);
     let prefs = TuiPreferences::default();
@@ -598,9 +604,11 @@ fn preferences_export_import_json() {
 #[test]
 fn timeline_preset_shortcuts_persist_and_reload_filters() {
     let dir = tempfile::tempdir().expect("tmp");
-    let mut config = Config::default();
-    config.console_persist_path = dir.path().join("console.env");
-    config.console_auto_save = true;
+    let config = Config {
+        console_persist_path: dir.path().join("console.env"),
+        console_auto_save: true,
+        ..Config::default()
+    };
     let preset_path = screen_filter_presets_path(&config.console_persist_path);
 
     let (mut model, _state) = new_model_with_config(&config);
@@ -1005,9 +1013,11 @@ fn query_bar_history_navigation() {
 
 #[test]
 fn model_with_config_applies_accessibility() {
-    let mut config = Config::default();
-    config.tui_high_contrast = true;
-    config.tui_key_hints = false;
+    let config = Config {
+        tui_high_contrast: true,
+        tui_key_hints: false,
+        ..Config::default()
+    };
 
     let state = TuiSharedState::new(&config);
     let model = MailAppModel::with_config(Arc::clone(&state), &config);

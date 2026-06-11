@@ -4359,7 +4359,17 @@ pub fn is_corruption_error_message(message: &str) -> bool {
     // silently disabled the MCP read surface (see GH#99). The string stays
     // classified as a recovery-error via is_sqlite_recovery_error_message so
     // the WAL sidecar gets cleaned up, without escalating to Broken.
-    crate::error::is_corruption_error(message) || lower.contains("no healthy backup was found")
+    //
+    // The typed classifier is deliberately conservative about raw schema
+    // strings: callers should not report main DB B-tree corruption unless an
+    // authoritative integrity probe produced that evidence. Startup recovery is
+    // a lower-level tripwire, so it still treats SQLite's schema-corruption
+    // strings as recovery-worthy signals.
+    let schema_corruption_tripwire =
+        lower.contains("malformed database schema") || lower.contains("database schema is corrupt");
+    crate::error::is_corruption_error(message)
+        || schema_corruption_tripwire
+        || lower.contains("no healthy backup was found")
 }
 
 #[allow(clippy::result_large_err)]

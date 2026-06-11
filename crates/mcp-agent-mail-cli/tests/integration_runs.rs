@@ -414,6 +414,9 @@ fn init_cli_schema(db_path: &Path) {
         .expect("open sqlite db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init schema");
+    conn.close_sync().expect("close initialized sqlite db");
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
+        .expect("checkpoint initialized sqlite db");
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -621,8 +624,10 @@ fn seed_startup_recovery_orphan_recipient(env: &TestEnv) {
     insert_message(&conn, 1, 1, 1, "startup repair replay", "body");
     insert_recipient(&conn, 1, 2);
     insert_recipient(&conn, 999, 2);
-    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
-        .expect("checkpoint crash replay fixture");
+    conn.close_sync()
+        .expect("close startup recovery orphan fixture");
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path)
+        .expect("checkpoint startup recovery orphan fixture");
 }
 
 fn seed_startup_recovery_archive_only(env: &TestEnv) {

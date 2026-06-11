@@ -8797,128 +8797,131 @@ pub async fn create_file_reservations(
     let now = now_micros();
     let expires = now.saturating_add(ttl_seconds.saturating_mul(1_000_000));
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-
-    // Batch all reservation inserts in a single transaction (1 fsync instead of N).
-    // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-
-    let exclusive_filter = if exclusive {
-        ""
-    } else {
-        "AND \"exclusive\" = 1"
-    };
-
-    // Check for conflicting active reservations held by others to prevent TOCTOU races.
-    let conflict_sql = format!(
-        "SELECT path_pattern FROM file_reservations \
-         WHERE project_id = ? AND agent_id != ? \
-           AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
-           {exclusive_filter}"
-    );
-    let conflict_params = [
-        Value::BigInt(project_id),
-        Value::BigInt(agent_id),
-        Value::BigInt(now),
-    ];
-    let active_rows = try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, &conflict_sql, &conflict_params).await)
-    );
-
-    let active_index = ReservationConflictIndex::build(
-        active_rows
-            .into_iter()
-            .filter_map(|row| row.get_named::<String>("path_pattern").ok()),
-    );
-
-    for path in paths {
-        let req_pat = CompiledPattern::cached(path);
-        if let Some(active_pat) = active_index.first_conflict(req_pat.as_ref()) {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::ResourceBusy(format!(
-                "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
-                path,
-                active_pat.normalized()
-            )));
-        }
-    }
-
-    let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
-    for path in paths {
-        let mut row = FileReservationRow {
-            id: None,
-            project_id,
-            agent_id,
-            path_pattern: (*path).to_string(),
-            exclusive: i64::from(exclusive),
-            reason: reason.to_string(),
-            created_ts: now,
-            expires_ts: expires,
-            released_ts: None,
+    run_with_mvcc_retry(cx, "create_file_reservations", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        // Insert the row explicitly so this critical coordination path does not
-        // depend on macro-generated SQL shape.
-        let insert_sql = "INSERT INTO file_reservations \
-            (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)";
-        let insert_params = [
-            Value::BigInt(row.project_id),
-            Value::BigInt(row.agent_id),
-            Value::Text(row.path_pattern.clone()),
-            Value::BigInt(row.exclusive),
-            Value::Text(row.reason.clone()),
-            Value::BigInt(row.created_ts),
-            Value::BigInt(row.expires_ts),
+        let tracked = tracked(&*conn);
+
+        // Batch all reservation inserts in a single transaction (1 fsync instead of N).
+        // Use IMMEDIATE transaction to serialize reservation checks and prevent TOCTOU races.
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        let exclusive_filter = if exclusive {
+            ""
+        } else {
+            "AND \"exclusive\" = 1"
+        };
+
+        // Check for conflicting active reservations held by others to prevent TOCTOU races.
+        let conflict_sql = format!(
+            "SELECT path_pattern FROM file_reservations \
+             WHERE project_id = ? AND agent_id != ? \
+               AND ({ACTIVE_RESERVATION_PREDICATE}) AND expires_ts > ? \
+               {exclusive_filter}"
+        );
+        let conflict_params = [
+            Value::BigInt(project_id),
+            Value::BigInt(agent_id),
+            Value::BigInt(now),
         ];
-        try_in_tx!(
+        let active_rows = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            map_sql_outcome(traw_query(cx, &tracked, &conflict_sql, &conflict_params).await)
         );
 
-        // Use connection-local rowid state to retrieve the ID for this exact insert.
-        // This avoids cross-transaction races that can happen with MAX(id).
-        let lookup_sql = "SELECT last_insert_rowid() AS id";
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, lookup_sql, &[]).await)
+        let active_index = ReservationConflictIndex::build(
+            active_rows
+                .into_iter()
+                .filter_map(|row| row.get_named::<String>("path_pattern").ok()),
         );
-        let Some(id_row) = rows.first() else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "file reservation insert succeeded but last_insert_rowid() returned no row for project_id={project_id} agent_id={agent_id} path={path}"
-            )));
-        };
-        let id: i64 = match id_row.get_named("id") {
-            Ok(v) => v,
-            Err(e) => {
+
+        for path in paths {
+            let req_pat = CompiledPattern::cached(path);
+            if let Some(active_pat) = active_index.first_conflict(req_pat.as_ref()) {
                 rollback_tx(cx, &tracked).await;
-                return Outcome::Err(map_sql_error(&e));
+                return Outcome::Err(DbError::ResourceBusy(format!(
+                    "Reservation conflict: '{}' overlaps with active exclusive reservation '{}'",
+                    path,
+                    active_pat.normalized()
+                )));
             }
-        };
-        if id <= 0 {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "file reservation insert succeeded but last_insert_rowid() returned invalid id={id} for project_id={project_id} agent_id={agent_id} path={path}"
-            )));
         }
-        row.id = Some(id);
-        out.push(row);
-    }
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(out)
+        let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut row = FileReservationRow {
+                id: None,
+                project_id,
+                agent_id,
+                path_pattern: (*path).to_string(),
+                exclusive: i64::from(exclusive),
+                reason: reason.to_string(),
+                created_ts: now,
+                expires_ts: expires,
+                released_ts: None,
+            };
+
+            // Insert the row explicitly so this critical coordination path does not
+            // depend on macro-generated SQL shape.
+            let insert_sql = "INSERT INTO file_reservations \
+                (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)";
+            let insert_params = [
+                Value::BigInt(row.project_id),
+                Value::BigInt(row.agent_id),
+                Value::Text(row.path_pattern.clone()),
+                Value::BigInt(row.exclusive),
+                Value::Text(row.reason.clone()),
+                Value::BigInt(row.created_ts),
+                Value::BigInt(row.expires_ts),
+            ];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            );
+
+            // Use connection-local rowid state to retrieve the ID for this exact insert.
+            // This avoids cross-transaction races that can happen with MAX(id).
+            let lookup_sql = "SELECT last_insert_rowid() AS id";
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, lookup_sql, &[]).await)
+            );
+            let Some(id_row) = rows.first() else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "file reservation insert succeeded but last_insert_rowid() returned no row for project_id={project_id} agent_id={agent_id} path={path}"
+                )));
+            };
+            let id: i64 = match id_row.get_named("id") {
+                Ok(v) => v,
+                Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(map_sql_error(&e));
+                }
+            };
+            if id <= 0 {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "file reservation insert succeeded but last_insert_rowid() returned invalid id={id} for project_id={project_id} agent_id={agent_id} path={path}"
+                )));
+            }
+            row.id = Some(id);
+            out.push(row);
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(out)
+    })
+    .await
 }
 
 /// Get active file reservations for a project.
@@ -8929,6 +8932,17 @@ pub async fn create_file_reservations(
 /// snapshot which causes phantom conflicts after release (Bug #85) and
 /// missed conflicts before insert (Bug #86).
 pub async fn get_active_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "get_active_reservations", || {
+        get_active_reservations_once(cx, pool, project_id)
+    })
+    .await
+}
+
+async fn get_active_reservations_once(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
@@ -9547,6 +9561,18 @@ pub async fn list_file_reservations(
     project_id: i64,
     active_only: bool,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_file_reservations", || {
+        list_file_reservations_once(cx, pool, project_id, active_only)
+    })
+    .await
+}
+
+async fn list_file_reservations_once(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    active_only: bool,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9733,6 +9759,17 @@ pub async fn list_file_reservations(
 /// This is used by cleanup logic to avoid scanning the full historical table
 /// (released reservations can be unbounded).
 pub async fn list_unreleased_file_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_unreleased_file_reservations", || {
+        list_unreleased_file_reservations_once(cx, pool, project_id)
+    })
+    .await
+}
+
+async fn list_unreleased_file_reservations_once(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,

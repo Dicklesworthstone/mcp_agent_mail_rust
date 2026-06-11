@@ -49,7 +49,7 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 - `acknowledge_message` - Mark a delivered message as read and acknowledged.
 - `request_contact` - Request permission to open a contact link with another agent.
 - `respond_contact` - Approve or deny a pending contact request.
-- `list_contacts` - List the outgoing contact edges for an agent.
+- `list_contacts` - List contact relationships for an agent.
 - `set_contact_policy` - Set an agent's inbound contact policy.
 - `file_reservation_paths` - Reserve project-relative files or globs for coordinated edits.
 - `release_file_reservations` - Release one or more active file reservations.

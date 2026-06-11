@@ -5549,7 +5549,10 @@ fn load_recipient_display_names(
 
 fn is_missing_agents_table_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string();
-    message.contains("table not found: agents") || message.contains("no such table: agents")
+    message.contains("table not found: agents")
+        || message.contains("no such table: agents")
+        || message.contains("column not found: a.id")
+        || message.contains("column not found: a.name")
 }
 
 fn is_agent_not_found_error(error: &CliError) -> bool {
@@ -10085,37 +10088,29 @@ fn fetch_robot_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
+    let approved_link_exists_sql = "\
+        SELECT 1 FROM agent_links link \
+        WHERE link.status = 'approved' \
+          AND (link.expires_ts IS NULL OR link.expires_ts <= 0 OR link.expires_ts > ?) \
+          AND ( \
+            (link.a_agent_id = m.sender_id AND link.b_agent_id = mr.agent_id) \
+            OR (link.b_agent_id = m.sender_id AND link.a_agent_id = mr.agent_id) \
+          )";
     let sql = format!(
-        "WITH approved_links AS ( \
-            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
-            FROM agent_links \
-            WHERE status = 'approved' \
-              AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
-            UNION \
-            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
-            FROM agent_links \
-            WHERE status = 'approved' \
-              AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
-         ) \
-         SELECT \
+        "SELECT \
             mr.agent_id AS agent_id, \
             SUM(CASE \
                     WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
                     WHEN m.sender_id = mr.agent_id THEN 1 \
-                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
+                    WHEN recipient.contact_policy = 'contacts_only' \
+                     AND EXISTS ({approved_link_exists_sql}) \
+                    THEN 1 \
                     ELSE 0 END) AS respected_count, \
             SUM(CASE \
                     WHEN recipient.contact_policy = 'contacts_only' \
                      AND m.sender_id != mr.agent_id \
-                     AND NOT EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
+                     AND NOT EXISTS ({approved_link_exists_sql}) \
+                    THEN 1 \
                     WHEN recipient.contact_policy = 'block_all' \
                      AND m.sender_id != mr.agent_id \
                     THEN 1 \
@@ -10141,13 +10136,28 @@ fn fetch_robot_agent_contact_stats(
     .map(|rows| {
         rows.into_iter()
             .map(|row| {
+                let agent_id = row
+                    .get_named::<i64>("agent_id")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(0).ok())
+                    .unwrap_or(0);
+                let respected_count = row
+                    .get_named::<i64>("respected_count")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(1).ok())
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let violation_count = row
+                    .get_named::<i64>("violation_count")
+                    .ok()
+                    .or_else(|| row.get_as::<i64>(2).ok())
+                    .unwrap_or(0)
+                    .max(0) as u64;
                 (
-                    row.get_named::<i64>("agent_id").unwrap_or(0),
+                    agent_id,
                     RobotAgentContactStats {
-                        respected_count: row.get_named::<i64>("respected_count").unwrap_or(0).max(0)
-                            as u64,
-                        violation_count: row.get_named::<i64>("violation_count").unwrap_or(0).max(0)
-                            as u64,
+                        respected_count,
+                        violation_count,
                     },
                 )
             })

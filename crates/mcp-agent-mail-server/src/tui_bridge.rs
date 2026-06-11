@@ -1641,6 +1641,36 @@ mod tests {
     }
 
     #[test]
+    fn loop_heartbeats_capture_render_stall_without_hiding_input_progress() {
+        let heartbeats = LoopHeartbeatSlots::new();
+
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 10_000, 5_000);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Render, 14_000, 4_000);
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Input, 15_000, 6_000);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Input, 16_000, 700);
+
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Render, 200_000, 191_000);
+        heartbeats.record_failure_at(TuiLoopHeartbeatKind::Render, 201_000);
+        heartbeats.record_tick_at(TuiLoopHeartbeatKind::Input, 202_000, 192_000);
+        heartbeats.record_success_at(TuiLoopHeartbeatKind::Input, 203_000, 800);
+
+        let render = heartbeats.snapshot(TuiLoopHeartbeatKind::Render);
+        assert_eq!(render.last_gap_micros, 186_000);
+        assert_eq!(render.last_success_duration_micros, 4_000);
+        assert_eq!(render.ticks_total, 2);
+        assert_eq!(render.successes_total, 1);
+        assert_eq!(render.failures_total, 1);
+        assert_eq!(render.consecutive_failures, 1);
+
+        let input = heartbeats.snapshot(TuiLoopHeartbeatKind::Input);
+        assert_eq!(input.ticks_total, 2);
+        assert_eq!(input.successes_total, 2);
+        assert_eq!(input.failures_total, 0);
+        assert_eq!(input.consecutive_failures, 0);
+        assert_eq!(input.last_success_duration_micros, 800);
+    }
+
+    #[test]
     fn record_request_large_duration_clamped_for_sparkline() {
         let config = Config::default();
         let state = TuiSharedState::new(&config);

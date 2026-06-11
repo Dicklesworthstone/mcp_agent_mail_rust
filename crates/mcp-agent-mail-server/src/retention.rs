@@ -1148,10 +1148,12 @@ mod tests {
         let linked_storage = tmp.path().join("linked-storage");
         symlink(&real_storage, &linked_storage).unwrap();
 
-        let mut config = Config::default();
-        config.storage_root = linked_storage;
-        config.retention_report_enabled = true;
-        config.quota_enabled = true;
+        let config = Config {
+            storage_root: linked_storage,
+            retention_report_enabled: true,
+            quota_enabled: true,
+            ..Config::default()
+        };
 
         let report = run_retention_cycle(&config).unwrap();
         assert_eq!(report.projects_scanned, 0);
@@ -1321,8 +1323,10 @@ mod tests {
         std::fs::write(&doctor_report, "doctor").unwrap();
         std::fs::write(&attachment, vec![0u8; 16]).unwrap();
 
-        let mut config = Config::default();
-        config.storage_root = storage.path().to_path_buf();
+        let config = Config {
+            storage_root: storage.path().to_path_buf(),
+            ..Config::default()
+        };
         let report = artifact_retention_report(&config, repo.path(), 4);
 
         assert_eq!(report.schema_version, ARTIFACT_REPORT_SCHEMA_VERSION);
@@ -1389,8 +1393,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = Config::default();
-        config.storage_root = storage.path().to_path_buf();
+        let config = Config {
+            storage_root: storage.path().to_path_buf(),
+            ..Config::default()
+        };
         let report = artifact_retention_report(&config, repo.path(), 1);
 
         assert_eq!(report.largest_roots.len(), 1);

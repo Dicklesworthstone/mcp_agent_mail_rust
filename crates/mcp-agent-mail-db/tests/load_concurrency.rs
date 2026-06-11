@@ -339,6 +339,317 @@ fn concurrent_write_and_search() {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// L3. Mixed mailbox + reservation contention reproducer
+// ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn mixed_inbox_reservation_search_send_load_reproducer() {
+    let (pool, _dir) = make_pool_with_connections(6, 1);
+    let (project_id, agents) = seed_project(&pool, "/tmp/load-l3-mixed", 6);
+    let sender_ids = agents[0..3].to_vec();
+    let recipient_ids = agents[3..6].to_vec();
+
+    for (idx, recipient_id) in recipient_ids.iter().copied().enumerate() {
+        let sender_id = sender_ids[idx % sender_ids.len()];
+        block_on(|cx| {
+            let pool = pool.clone();
+            async move {
+                let recipients = [(recipient_id, "to")];
+                match queries::create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &format!("l3fixture baseline inbox {idx}"),
+                    &format!("l3fixture baseline mailbox content {idx}"),
+                    Some("l3-mixed-baseline"),
+                    "normal",
+                    false,
+                    "[]",
+                    &recipients,
+                )
+                .await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("baseline recipient message failed: {other:?}"),
+                }
+            }
+        });
+    }
+
+    let send_threads = 3;
+    let inbox_threads = 2;
+    let search_threads = 2;
+    let reservation_threads = 3;
+    let barrier = Arc::new(Barrier::new(
+        send_threads + inbox_threads + search_threads + reservation_threads,
+    ));
+    let sends = Arc::new(AtomicU64::new(0));
+    let inbox_reads = Arc::new(AtomicU64::new(0));
+    let searches = Arc::new(AtomicU64::new(0));
+    let reservations_created = Arc::new(AtomicU64::new(0));
+    let reservations_released = Arc::new(AtomicU64::new(0));
+    let active_reads = Arc::new(AtomicU64::new(0));
+    let latencies = Arc::new(Mutex::new(Vec::new()));
+
+    let mut handles = Vec::new();
+
+    for worker in 0..send_threads {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let sends = Arc::clone(&sends);
+        let latencies = Arc::clone(&latencies);
+        let sender_id = sender_ids[worker % sender_ids.len()];
+        let recipient_ids = recipient_ids.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..12 {
+                let recipient_id = recipient_ids[(worker + i) % recipient_ids.len()];
+                let started = Instant::now();
+                block_on(|cx| {
+                    let pool = pool.clone();
+                    async move {
+                        let recipients = [(recipient_id, "to")];
+                        match queries::create_message_with_recipients(
+                            &cx,
+                            &pool,
+                            project_id,
+                            sender_id,
+                            &format!("l3fixture send worker{worker} msg{i}"),
+                            &format!(
+                                "l3fixture concurrent send body worker {worker} iteration {i}"
+                            ),
+                            Some("l3-mixed-contention"),
+                            "normal",
+                            i % 3 == 0,
+                            "[]",
+                            &recipients,
+                        )
+                        .await
+                        {
+                            Outcome::Ok(_) => {}
+                            other => panic!("l3 send worker {worker} msg {i} failed: {other:?}"),
+                        }
+                    }
+                });
+                sends.fetch_add(1, Ordering::Relaxed);
+                latencies
+                    .lock()
+                    .unwrap()
+                    .push(started.elapsed().as_micros() as u64);
+            }
+        }));
+    }
+
+    for worker in 0..inbox_threads {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let inbox_reads = Arc::clone(&inbox_reads);
+        let recipient_ids = recipient_ids.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..20 {
+                let agent_id = recipient_ids[(worker + i) % recipient_ids.len()];
+                let rows = block_on(|cx| {
+                    let pool = pool.clone();
+                    async move {
+                        match queries::fetch_inbox(
+                            &cx, &pool, project_id, agent_id, false, None, 50,
+                        )
+                        .await
+                        {
+                            Outcome::Ok(rows) => rows,
+                            other => panic!("l3 inbox worker {worker} iter {i} failed: {other:?}"),
+                        }
+                    }
+                });
+                assert!(
+                    !rows.is_empty(),
+                    "pre-seeded inbox rows should keep fetches non-empty"
+                );
+                inbox_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for worker in 0..search_threads {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let searches = Arc::clone(&searches);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..20 {
+                let resp = block_on(|cx| {
+                    let pool = pool.clone();
+                    async move {
+                        match execute_search_simple(
+                            &cx,
+                            &pool,
+                            &SearchQuery::messages("l3fixture", project_id),
+                        )
+                        .await
+                        {
+                            Outcome::Ok(resp) => resp,
+                            other => panic!("l3 search worker {worker} iter {i} failed: {other:?}"),
+                        }
+                    }
+                });
+                assert!(
+                    !resp.results.is_empty(),
+                    "pre-seeded l3fixture messages should keep searches non-empty"
+                );
+                searches.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for worker in 0..reservation_threads {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let created = Arc::clone(&reservations_created);
+        let released = Arc::clone(&reservations_released);
+        let active_reads = Arc::clone(&active_reads);
+        let agent_id = sender_ids[worker % sender_ids.len()];
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..8 {
+                let path = format!("src/l3_mixed/worker_{worker}/file_{i}.rs");
+                let reservation_id = block_on(|cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        let paths = [path.as_str()];
+                        let rows = match queries::create_file_reservations(
+                            &cx,
+                            &pool,
+                            project_id,
+                            agent_id,
+                            &paths,
+                            3600,
+                            true,
+                            "br-bvq1x.12.3 l3 mixed load",
+                        )
+                        .await
+                        {
+                            Outcome::Ok(rows) => rows,
+                            other => {
+                                panic!("l3 reservation create worker {worker} iter {i}: {other:?}")
+                            }
+                        };
+                        rows.first()
+                            .and_then(|row| row.id)
+                            .expect("created reservation id")
+                    }
+                });
+                created.fetch_add(1, Ordering::Relaxed);
+
+                let active = block_on(|cx| {
+                    let pool = pool.clone();
+                    async move {
+                        match queries::get_active_reservations(&cx, &pool, project_id).await {
+                            Outcome::Ok(rows) => rows,
+                            other => {
+                                panic!(
+                                    "l3 active reservation read worker {worker} iter {i}: {other:?}"
+                                )
+                            }
+                        }
+                    }
+                });
+                assert!(
+                    active.iter().any(|row| row.id == Some(reservation_id)),
+                    "fresh reservation should be visible before release"
+                );
+                active_reads.fetch_add(1, Ordering::Relaxed);
+
+                let released_rows = block_on(|cx| {
+                    let pool = pool.clone();
+                    async move {
+                        let ids = [reservation_id];
+                        match queries::release_reservations(
+                            &cx,
+                            &pool,
+                            project_id,
+                            agent_id,
+                            None,
+                            Some(&ids),
+                        )
+                        .await
+                        {
+                            Outcome::Ok(rows) => rows,
+                            other => {
+                                panic!("l3 reservation release worker {worker} iter {i}: {other:?}")
+                            }
+                        }
+                    }
+                });
+                assert_eq!(released_rows.len(), 1, "release should target one row");
+                released.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("l3 mixed workload join");
+    }
+
+    let final_active = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::get_active_reservations(&cx, &pool, project_id).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("final active reservation read failed: {other:?}"),
+            }
+        }
+    });
+    let final_search = search(&pool, &SearchQuery::messages("l3fixture", project_id));
+    let final_inbox = block_on(|cx| {
+        let pool = pool.clone();
+        let agent_id = recipient_ids[0];
+        async move {
+            match queries::fetch_inbox(&cx, &pool, project_id, agent_id, false, None, 100).await {
+                Outcome::Ok(rows) => rows,
+                other => panic!("final inbox read failed: {other:?}"),
+            }
+        }
+    });
+
+    let mut latency_samples = latencies.lock().unwrap().clone();
+    latency_samples.sort_unstable();
+    eprintln!(
+        "mixed_inbox_reservation_search_send_load_reproducer: sends={} inbox_reads={} searches={} reservations={}/{} active_reads={} send_p95={}μs",
+        sends.load(Ordering::Relaxed),
+        inbox_reads.load(Ordering::Relaxed),
+        searches.load(Ordering::Relaxed),
+        reservations_created.load(Ordering::Relaxed),
+        reservations_released.load(Ordering::Relaxed),
+        active_reads.load(Ordering::Relaxed),
+        percentile(&latency_samples, 95)
+    );
+
+    assert_eq!(sends.load(Ordering::Relaxed), 36);
+    assert_eq!(inbox_reads.load(Ordering::Relaxed), 40);
+    assert_eq!(searches.load(Ordering::Relaxed), 40);
+    assert_eq!(reservations_created.load(Ordering::Relaxed), 24);
+    assert_eq!(reservations_released.load(Ordering::Relaxed), 24);
+    assert_eq!(active_reads.load(Ordering::Relaxed), 24);
+    assert!(
+        final_active.is_empty(),
+        "all L3 fixture reservations should be released"
+    );
+    assert!(
+        final_search.results.len() >= 3,
+        "search should still see the seeded L3 corpus under mixed load, got {}",
+        final_search.results.len()
+    );
+    assert!(
+        final_inbox.len() >= 10,
+        "recipient inbox should retain concurrent sends, got {}",
+        final_inbox.len()
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
 // 2. Index freshness lag
 // ────────────────────────────────────────────────────────────────────
 

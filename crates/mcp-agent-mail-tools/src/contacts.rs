@@ -53,7 +53,7 @@ pub struct ContactListResponse {
     pub incoming: Vec<ContactLinkState>,
 }
 
-/// Simple contact entry for `list_contacts` (matches Python format).
+/// Simple contact entry for `list_contacts`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleContactEntry {
     pub to: String,
@@ -242,7 +242,7 @@ fn parse_contact_target(
 /// Creates or refreshes a pending `AgentLink` and sends a small `ack_required` intro message.
 ///
 /// # Conformance
-/// Python-parity.
+/// Rust extends the legacy Python fixture by returning both outgoing and incoming relationships.
 #[allow(clippy::too_many_arguments)]
 #[tool(
     description = "Request contact approval to message another agent.\n\nCreates (or refreshes) a pending AgentLink and sends a small ack_required intro message.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nfrom_agent : str\n    Your agent name (must be registered in the project).\nto_agent : str\n    Target agent name (use resource://agents/{project_key} to discover names).\nto_project : Optional[str]\n    Target project if different from your project (cross-project coordination).\nreason : str\n    Optional explanation for the contact request.\nttl_seconds : int\n    Time to live for the contact approval request (default: 7 days)."
@@ -554,7 +554,11 @@ pub async fn respond_contact(
 /// - `agent_name`: Agent to list contacts for
 ///
 /// # Returns
-/// Array of outgoing contacts with `to`, `status`, `reason`, `updated_ts`, `expires_ts`
+/// Array of contact counterparties with `to`, `status`, `reason`, `updated_ts`, `expires_ts`.
+///
+/// The legacy Python-compatible shape uses the field name `to` for the
+/// counterparty. Outgoing links put the request target there; incoming links
+/// put the requester there.
 ///
 /// # Conformance
 /// Python-parity.
@@ -583,22 +587,28 @@ pub async fn list_contacts(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    let (outgoing_rows, _incoming_rows) = db_outcome_to_mcp_result(
+    let (outgoing_rows, incoming_rows) = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_contacts(ctx.cx(), &pool, project_id, agent_id).await,
     )?;
 
     // Resolve referenced agents to names (batch)
-    let mut b_agent_ids: SmallVec<[i64; 32]> = SmallVec::with_capacity(outgoing_rows.len());
+    let mut counterparty_agent_ids: SmallVec<[i64; 32]> =
+        SmallVec::with_capacity(outgoing_rows.len() + incoming_rows.len());
     for r in &outgoing_rows {
-        b_agent_ids.push(r.b_agent_id);
+        counterparty_agent_ids.push(r.b_agent_id);
     }
-    b_agent_ids.sort_unstable();
-    b_agent_ids.dedup();
+    for r in &incoming_rows {
+        counterparty_agent_ids.push(r.a_agent_id);
+    }
+    counterparty_agent_ids.sort_unstable();
+    counterparty_agent_ids.dedup();
 
-    let mut agent_names: HashMap<i64, String> = HashMap::with_capacity(b_agent_ids.len());
-    if !b_agent_ids.is_empty() {
+    let mut agent_names: HashMap<i64, String> =
+        HashMap::with_capacity(counterparty_agent_ids.len());
+    if !counterparty_agent_ids.is_empty() {
         match db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &b_agent_ids).await,
+            mcp_agent_mail_db::queries::get_agents_by_ids(ctx.cx(), &pool, &counterparty_agent_ids)
+                .await,
         ) {
             Ok(rows) => {
                 for row in rows {
@@ -609,7 +619,7 @@ pub async fn list_contacts(
             }
             Err(e) => {
                 tracing::warn!(
-                    agent_ids = ?b_agent_ids,
+                    agent_ids = ?counterparty_agent_ids,
                     error = %e,
                     "list_contacts: failed to resolve agent names, using synthetic fallbacks"
                 );
@@ -618,9 +628,10 @@ pub async fn list_contacts(
     }
 
     // Return simple array format with actual timestamps from the database.
-    let contacts: Vec<SimpleContactEntry> = outgoing_rows
-        .into_iter()
-        .map(|r| SimpleContactEntry {
+    let mut contacts: Vec<SimpleContactEntry> =
+        Vec::with_capacity(outgoing_rows.len() + incoming_rows.len());
+    contacts.extend(outgoing_rows.into_iter().map(|r| {
+        SimpleContactEntry {
             to: agent_names
                 .get(&r.b_agent_id)
                 .cloned()
@@ -629,8 +640,20 @@ pub async fn list_contacts(
             reason: r.reason,
             updated_ts: Some(micros_to_iso(r.updated_ts)),
             expires_ts: r.expires_ts.map(micros_to_iso),
-        })
-        .collect();
+        }
+    }));
+    contacts.extend(incoming_rows.into_iter().map(|r| {
+        SimpleContactEntry {
+            to: agent_names
+                .get(&r.a_agent_id)
+                .cloned()
+                .unwrap_or_else(|| format!("agent_{}", r.a_agent_id)),
+            status: r.status,
+            reason: r.reason,
+            updated_ts: Some(micros_to_iso(r.updated_ts)),
+            expires_ts: r.expires_ts.map(micros_to_iso),
+        }
+    }));
 
     tracing::debug!(
         "Listed {} contacts for {} in project {}",

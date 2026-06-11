@@ -58,3 +58,15 @@ Commands:
 Options:
   -h, --help     Print help
   -V, --version  Print version
+
+MCP tool-name corrections:
+  reserve/file-reserve/file_reservation_paths -> am file_reservations reserve <project> <agent> <path> [--exclusive]
+  release_file_reservations -> am file_reservations release <project> <agent> [--paths <path>...]
+  macro_start_session -> am macros start-session --project <abs-path> --program <program> --model <model>
+  send/send-message/send_message -> am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>
+  inbox/fetch_inbox -> am inbox --project <project> --agent <agent>
+  acknowledge_message -> am mail ack --project <project> --agent <agent> <message-id>
+  list_agents -> am agents list --project <project>
+  whois -> am agents show --project <project> <agent>
+  reservations -> am reservations --project <project> --agent <agent>
+  serve-http/serve-stdio -> am serve-http ...  OR  am serve-stdio ...

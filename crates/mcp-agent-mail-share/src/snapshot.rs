@@ -317,6 +317,14 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     transfer_result?;
     drop(src);
     drop(dst_conn);
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&staged_dest).map_err(|e| {
+        ShareError::Sqlite {
+            message: format!(
+                "cannot checkpoint destination DB {} before publishing snapshot: {e}",
+                staged_dest.display()
+            ),
+        }
+    })?;
     std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)

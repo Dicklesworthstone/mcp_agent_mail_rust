@@ -1,5 +1,8 @@
 //! Error types for the database layer
 
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Database error types
@@ -162,6 +165,10 @@ impl DbErrorSeverity {
 
 /// Policy metadata for a classified database failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "diagnostic policy is intentionally a flat JSON-facing set of independent facts"
+)]
 pub struct DbErrorClassification {
     pub class: DbErrorClass,
     pub severity: DbErrorSeverity,
@@ -288,6 +295,139 @@ impl DbErrorClassification {
     }
 }
 
+pub const DB_FAILURE_ENVELOPE_SCHEMA_VERSION: &str = "am.db_failure_envelope.v1";
+
+/// Stable robot-facing policy section for a classified database failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailurePolicy {
+    pub repairable: bool,
+    pub safe_to_retry: bool,
+    pub safe_to_continue_read_only: bool,
+    pub blocks_edits: bool,
+    pub recommended_command: &'static str,
+}
+
+impl From<DbErrorClassification> for DbFailurePolicy {
+    fn from(classification: DbErrorClassification) -> Self {
+        Self {
+            repairable: classification.repairable,
+            safe_to_retry: classification.safe_to_retry,
+            safe_to_continue_read_only: classification.safe_to_continue_read_only,
+            blocks_edits: classification.blocks_edits,
+            recommended_command: classification.recommended_command,
+        }
+    }
+}
+
+/// Process identity captured without opening or mutating the database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureProcessIdentity {
+    pub pid: u32,
+    pub binary_path: Option<String>,
+    pub binary_version: &'static str,
+}
+
+/// Best-effort sidecar state for a SQLite WAL/SHM file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureSidecarState {
+    pub path: Option<String>,
+    pub exists: bool,
+    pub len_bytes: Option<u64>,
+    pub modified_unix_ms: Option<u64>,
+    pub modified_age_ms: Option<u64>,
+    pub inspect_error: Option<String>,
+}
+
+/// Best-effort WAL/SHM state captured from filesystem metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureSidecars {
+    pub wal: DbFailureSidecarState,
+    pub shm: DbFailureSidecarState,
+}
+
+/// Probe status that is safe to include from an error-path formatter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureProbeResult {
+    pub status: &'static str,
+    pub detail: Option<String>,
+}
+
+/// Host context collected with side-effect-free std/procfs reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureHostSummary {
+    pub loadavg: Option<String>,
+    pub disk_summary: Option<String>,
+    pub inspect_error: Option<String>,
+}
+
+/// Single structured failure envelope for database and DB-adjacent failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureEnvelope {
+    pub schema_version: &'static str,
+    pub class: &'static str,
+    pub severity: &'static str,
+    pub error_code: &'static str,
+    pub error_detail: String,
+    pub effective_db_path: Option<String>,
+    pub effective_storage_root: Option<String>,
+    pub process: DbFailureProcessIdentity,
+    pub wal_mode: DbFailureProbeResult,
+    pub sidecars: DbFailureSidecars,
+    pub canonical_sqlite_probe: DbFailureProbeResult,
+    pub frankensqlite_probe: DbFailureProbeResult,
+    pub last_successful_health_ts: Option<String>,
+    pub last_successful_write_ts: Option<String>,
+    pub legacy_python_present: Option<bool>,
+    pub tui_polling_active: Option<bool>,
+    pub host: DbFailureHostSummary,
+    pub policy: DbFailurePolicy,
+}
+
+impl DbFailureEnvelope {
+    /// Build a failure-tolerant envelope without opening or mutating SQLite.
+    #[must_use]
+    pub fn from_error(error: &DbError) -> Self {
+        let classification = error.classification();
+        let (db_path, storage_root) = effective_db_environment();
+
+        Self {
+            schema_version: DB_FAILURE_ENVELOPE_SCHEMA_VERSION,
+            class: classification.class.as_str(),
+            severity: classification.severity.as_str(),
+            error_code: error.error_code(),
+            error_detail: error.to_string(),
+            effective_db_path: db_path.as_deref().map(path_to_string),
+            effective_storage_root: storage_root.as_deref().map(path_to_string),
+            process: process_identity(),
+            wal_mode: DbFailureProbeResult {
+                status: "not_collected",
+                detail: Some(
+                    "error-path envelope does not open SQLite; run `am doctor health` for live WAL mode"
+                        .to_string(),
+                ),
+            },
+            sidecars: sidecar_snapshot(db_path.as_deref()),
+            canonical_sqlite_probe: DbFailureProbeResult {
+                status: "not_collected",
+                detail: Some(
+                    "canonical SQLite probe is intentionally side-effect-free in this formatter"
+                        .to_string(),
+                ),
+            },
+            frankensqlite_probe: DbFailureProbeResult {
+                status: "classified_from_error",
+                detail: Some(error.to_string()),
+            },
+            last_successful_health_ts: None,
+            last_successful_write_ts: None,
+            legacy_python_present: None,
+            tui_polling_active: None,
+            host: host_summary(),
+            policy: DbFailurePolicy::from(classification),
+        }
+    }
+}
+
 impl DbError {
     /// Create a not found error
     pub fn not_found(entity: &'static str, identifier: impl Into<String>) -> Self {
@@ -387,6 +527,12 @@ impl DbError {
         }
     }
 
+    /// Structured robot-facing failure envelope for this error.
+    #[must_use]
+    pub fn failure_envelope(&self) -> DbFailureEnvelope {
+        DbFailureEnvelope::from_error(self)
+    }
+
     /// The legacy error code string for this error.
     #[must_use]
     pub const fn error_code(&self) -> &'static str {
@@ -411,6 +557,114 @@ impl DbError {
                 | Self::CircuitBreakerOpen { .. }
                 | Self::Pool(_)
         )
+    }
+}
+
+fn effective_db_environment() -> (Option<PathBuf>, Option<PathBuf>) {
+    std::panic::catch_unwind(|| {
+        let config = mcp_agent_mail_core::Config::from_env();
+        let db_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(
+            config.database_url.as_str(),
+        );
+        (db_path, Some(config.storage_root))
+    })
+    .unwrap_or((None, None))
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn process_identity() -> DbFailureProcessIdentity {
+    DbFailureProcessIdentity {
+        pid: std::process::id(),
+        binary_path: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        binary_version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+fn sidecar_snapshot(db_path: Option<&Path>) -> DbFailureSidecars {
+    let wal = db_path.map(|path| sidecar_state(&PathBuf::from(format!("{}-wal", path.display()))));
+    let shm = db_path.map(|path| sidecar_state(&PathBuf::from(format!("{}-shm", path.display()))));
+
+    DbFailureSidecars {
+        wal: wal.unwrap_or_else(|| absent_sidecar_state(None)),
+        shm: shm.unwrap_or_else(|| absent_sidecar_state(None)),
+    }
+}
+
+fn sidecar_state(path: &Path) -> DbFailureSidecarState {
+    let path_text = Some(path.display().to_string());
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let modified_unix_ms = metadata.modified().ok().and_then(system_time_unix_ms);
+            let modified_age_ms = metadata.modified().ok().and_then(system_time_age_ms);
+            DbFailureSidecarState {
+                path: path_text,
+                exists: true,
+                len_bytes: Some(metadata.len()),
+                modified_unix_ms,
+                modified_age_ms,
+                inspect_error: None,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            absent_sidecar_state(path_text)
+        }
+        Err(error) => DbFailureSidecarState {
+            path: path_text,
+            exists: false,
+            len_bytes: None,
+            modified_unix_ms: None,
+            modified_age_ms: None,
+            inspect_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn absent_sidecar_state(path: Option<String>) -> DbFailureSidecarState {
+    DbFailureSidecarState {
+        path,
+        exists: false,
+        len_bytes: None,
+        modified_unix_ms: None,
+        modified_age_ms: None,
+        inspect_error: None,
+    }
+}
+
+fn system_time_unix_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_millis().try_into().ok())
+}
+
+fn system_time_age_ms(time: SystemTime) -> Option<u64> {
+    SystemTime::now()
+        .duration_since(time)
+        .ok()
+        .and_then(|duration| duration.as_millis().try_into().ok())
+}
+
+fn host_summary() -> DbFailureHostSummary {
+    match std::fs::read_to_string("/proc/loadavg") {
+        Ok(loadavg) => DbFailureHostSummary {
+            loadavg: Some(loadavg.trim().to_string()),
+            disk_summary: None,
+            inspect_error: None,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DbFailureHostSummary {
+            loadavg: None,
+            disk_summary: None,
+            inspect_error: None,
+        },
+        Err(error) => DbFailureHostSummary {
+            loadavg: None,
+            disk_summary: None,
+            inspect_error: Some(error.to_string()),
+        },
     }
 }
 
@@ -459,9 +713,9 @@ pub fn is_mvcc_conflict(msg: &str) -> bool {
     contains_mvcc_conflict(msg)
 }
 
-/// Check whether an error message indicates database corruption
-/// (malformed image, corrupt schema, etc.) that may be recoverable
-/// via backup restore or archive reconstruction.
+/// Check whether an error message indicates authoritative main database
+/// corruption that may be recoverable via backup restore or archive
+/// reconstruction.
 #[must_use]
 pub fn is_corruption_error(msg: &str) -> bool {
     matches!(
@@ -517,11 +771,11 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_schema_drift(msg) {
         return DbErrorClass::SchemaDriftOrMissingTables;
     }
-    if contains_main_db_corruption(msg) {
-        return DbErrorClass::MainDbBtreeCorruption;
-    }
     if contains_engine_probe_limitation(msg) {
         return DbErrorClass::EngineProbeLimitation;
+    }
+    if contains_main_db_corruption(msg) {
+        return DbErrorClass::MainDbBtreeCorruption;
     }
     DbErrorClass::ConnectionOrConfigError
 }
@@ -551,8 +805,6 @@ fn contains_mvcc_conflict(msg: &str) -> bool {
 fn contains_main_db_corruption(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("database disk image is malformed")
-        || lower.contains("malformed database schema")
-        || lower.contains("database schema is corrupt")
         || lower.contains("file is not a database")
         || lower.contains("database file too small for header")
         || lower.contains("invalid database header")
@@ -583,6 +835,8 @@ fn contains_schema_drift(msg: &str) -> bool {
         || lower.contains("no such column")
         || lower.contains("missing table")
         || lower.contains("missing column")
+        || lower.contains("malformed database schema")
+        || lower.contains("database schema is corrupt")
         || lower.contains("schema version mismatch")
         || lower.contains("schema drift")
 }
@@ -763,6 +1017,13 @@ mod tests {
             DbErrorClass::SchemaDriftOrMissingTables,
         );
         assert_class(
+            "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)",
+            DbErrorClass::SchemaDriftOrMissingTables,
+        );
+        assert!(!is_corruption_error(
+            "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)"
+        ));
+        assert_class(
             "frankensqlite internal error: cursor stack is empty",
             DbErrorClass::EngineProbeLimitation,
         );
@@ -848,6 +1109,45 @@ mod tests {
         assert_eq!(
             owner.classification().class,
             DbErrorClass::LiveOwnerNoActivityLock
+        );
+
+        let authoritative_integrity = DbError::IntegrityCorruption {
+            message: "integrity failed".into(),
+            details: vec![
+                "malformed database schema (idx_agent_links_pair_unique) - invalid rootpage (11)"
+                    .into(),
+            ],
+        };
+        assert_eq!(
+            authoritative_integrity.classification().class,
+            DbErrorClass::MainDbBtreeCorruption
+        );
+    }
+
+    #[test]
+    fn failure_envelope_serializes_stable_a2_robot_shape() {
+        let error = DbError::ResourceBusy("database is locked".into());
+        let envelope = error.failure_envelope();
+        assert_eq!(envelope.schema_version, DB_FAILURE_ENVELOPE_SCHEMA_VERSION);
+        assert_eq!(envelope.class, "busy_retryable");
+        assert_eq!(envelope.severity, "P2");
+        assert_eq!(envelope.error_code, "RESOURCE_BUSY");
+        assert!(envelope.policy.safe_to_retry);
+        assert!(envelope.policy.blocks_edits);
+        assert_eq!(envelope.wal_mode.status, "not_collected");
+        assert_eq!(envelope.frankensqlite_probe.status, "classified_from_error");
+
+        let value = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(value["schema_version"], DB_FAILURE_ENVELOPE_SCHEMA_VERSION);
+        assert_eq!(value["class"], "busy_retryable");
+        assert!(value["process"]["pid"].as_u64().is_some());
+        assert!(value["sidecars"]["wal"].get("exists").is_some());
+        assert!(value["sidecars"]["shm"].get("exists").is_some());
+        assert!(value["canonical_sqlite_probe"]["status"].is_string());
+        assert!(value["host"].get("loadavg").is_some());
+        assert_eq!(
+            value["policy"]["recommended_command"],
+            envelope.policy.recommended_command
         );
     }
 
@@ -1162,8 +1462,6 @@ mod tests {
     fn corruption_error_patterns() {
         assert!(is_corruption_error("database disk image is malformed"));
         assert!(is_corruption_error("Database Disk Image Is Malformed")); // case-insensitive
-        assert!(is_corruption_error("malformed database schema: agents"));
-        assert!(is_corruption_error("database schema is corrupt"));
         assert!(is_corruption_error("file is not a database"));
         assert!(is_corruption_error(
             "database file too small for header: 14 bytes (< 100)"
@@ -1175,6 +1473,8 @@ mod tests {
 
     #[test]
     fn not_corruption_error() {
+        assert!(!is_corruption_error("malformed database schema: agents"));
+        assert!(!is_corruption_error("database schema is corrupt"));
         assert!(!is_corruption_error("database is locked"));
         assert!(!is_corruption_error("syntax error"));
         assert!(!is_corruption_error("table not found"));

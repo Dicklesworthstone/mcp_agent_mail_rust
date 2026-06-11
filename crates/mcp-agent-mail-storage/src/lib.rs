@@ -7396,7 +7396,11 @@ pub fn get_recent_commits(
                     .unwrap_or_default()
                     .to_rfc3339()
             },
-            summary: commit.summary().unwrap_or("").to_string(),
+            summary: commit
+                .summary()
+                .unwrap_or_default()
+                .unwrap_or("")
+                .to_string(),
         });
     }
 
@@ -7480,7 +7484,11 @@ pub fn find_commit_for_path(
                         .unwrap_or_default()
                         .to_rfc3339()
                 },
-                summary: commit.summary().unwrap_or("").to_string(),
+                summary: commit
+                    .summary()
+                    .unwrap_or_default()
+                    .unwrap_or("")
+                    .to_string(),
             }));
         }
     }
@@ -7528,7 +7536,11 @@ pub fn get_commits_by_author(
                         .unwrap_or_default()
                         .to_rfc3339()
                 },
-                summary: commit.summary().unwrap_or("").to_string(),
+                summary: commit
+                    .summary()
+                    .unwrap_or_default()
+                    .unwrap_or("")
+                    .to_string(),
             });
         }
     }
@@ -8168,7 +8180,7 @@ pub fn get_historical_inbox_snapshot(
                     }
                 }
                 Some(git2::ObjectType::Blob) => {
-                    let Some(name) = item.name() else {
+                    let Ok(name) = item.name() else {
                         continue;
                     };
                     if !name.ends_with(".md") {
@@ -8427,7 +8439,11 @@ pub fn get_timeline_commits(
             continue;
         }
 
-        let subject = commit.summary().unwrap_or("").to_string();
+        let subject = commit
+            .summary()
+            .unwrap_or_default()
+            .unwrap_or("")
+            .to_string();
         let authored_secs = commit.author().when().seconds();
 
         // Classify commit type and extract sender/recipients
@@ -8637,7 +8653,7 @@ fn repo_path_matches_filter(candidate: &Path, filter: &Path) -> bool {
 fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &Path) -> bool {
     let mut found = false;
     let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        let Some(name) = entry.name() else {
+        let Ok(name) = entry.name() else {
             return git2::TreeWalkResult::Ok;
         };
         let candidate = if root.is_empty() {

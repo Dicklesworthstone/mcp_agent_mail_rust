@@ -6100,9 +6100,11 @@ mod tests {
         .expect("insert history");
         drop(conn);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            ..mcp_agent_mail_core::Config::default()
+        };
         let state = crate::tui_bridge::TuiSharedState::new(&config);
 
         let mut screen = SearchCockpitScreen::new();

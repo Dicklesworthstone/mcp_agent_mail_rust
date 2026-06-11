@@ -46,6 +46,7 @@
 use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::{Op, mutate};
 use serde::Serialize;
+use std::io::Read;
 use std::path::PathBuf;
 
 pub const FM_ID: &str = "fm-db-state-files-wal-mode-disabled";
@@ -102,10 +103,10 @@ pub fn detect(candidate_paths: &[PathBuf]) -> Vec<WalModeDisabledFinding> {
         if !path.is_file() {
             continue;
         }
-        let Ok(conn) = super::open_immutable_sqlite(path) else {
-            continue;
-        };
-        let mode = match read_journal_mode(&conn) {
+        let mode = match read_journal_mode_from_header(path).or_else(|| {
+            let conn = super::open_immutable_sqlite(path).ok()?;
+            read_journal_mode(&conn)
+        }) {
             Some(m) => m,
             None => continue,
         };
@@ -134,6 +135,20 @@ fn read_journal_mode(conn: &sqlmodel_sqlite::SqliteConnection) -> Option<String>
         .get_named::<String>("journal_mode")
         .ok()
         .map(|s| s.to_lowercase())
+}
+
+fn read_journal_mode_from_header(path: &std::path::Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header).ok()?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    Some(match header[18] {
+        2 => TARGET_JOURNAL_MODE.to_string(),
+        1 => "delete".to_string(),
+        other => format!("unknown({other})"),
+    })
 }
 
 /// Fixer. Routes through `mutate()` with `Op::DbExec`.

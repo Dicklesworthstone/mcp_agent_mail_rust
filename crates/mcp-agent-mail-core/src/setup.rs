@@ -2794,9 +2794,12 @@ mod tests {
             ..Default::default()
         };
         let actions = AgentPlatform::Cursor.config_actions(&params);
-        let value = match &actions[0].content {
-            ConfigContent::JsonMerge { server_value, .. } => server_value,
-            _ => panic!("expected JsonMerge"),
+        let ConfigContent::JsonMerge {
+            server_value: value,
+            ..
+        } = &actions[0].content
+        else {
+            panic!("expected JsonMerge");
         };
         assert_eq!(value["headers"]["Authorization"], "Bearer real-token");
     }

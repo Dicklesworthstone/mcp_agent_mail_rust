@@ -2308,10 +2308,12 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_redirects_tmp_projects() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.allow_ephemeral_projects_in_default_storage = false;
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            allow_ephemeral_projects_in_default_storage: false,
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
         assert!(
@@ -2346,9 +2348,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_respects_deny_mode() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Deny;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Deny,
+            ..Config::default()
+        };
 
         // Deny mode treats all contexts as production, so no reroute
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
@@ -2357,9 +2361,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_deterministic_hash() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let r1 = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
         let r2 = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
@@ -2379,10 +2385,12 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_uses_custom_ephemeral_root() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
-        config.ephemeral_root = Some(PathBuf::from("/dev/shm/my-ephemeral"));
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ephemeral_root: Some(PathBuf::from("/dev/shm/my-ephemeral")),
+            ..Config::default()
+        };
 
         let rerouted = maybe_reroute_ephemeral_storage(&config, "/tmp/test-project");
         assert!(rerouted.is_some());
@@ -2395,9 +2403,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_skips_production_paths() {
-        let mut config = Config::default();
-        config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
-        config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: mcp_agent_mail_core::config::default_storage_root_path(),
+            ephemeral_mode: mcp_agent_mail_core::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         // `cargo test` itself sets `RUST_TEST_THREADS`, which is a high-
         // confidence ephemeral signal, so going through

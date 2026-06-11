@@ -5527,9 +5527,15 @@ fn handle_serve_http(
         emit_pre_tui_startup_banner(&config);
     }
     if config.tui_enabled {
-        mcp_agent_mail_server::run_http_with_tui(&config)?;
+        let result = mcp_agent_mail_server::run_http_with_tui(&config);
+        let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
+        result?;
+        cleanup_result?;
     } else {
-        mcp_agent_mail_server::run_http(&config)?;
+        let result = mcp_agent_mail_server::run_http(&config);
+        let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
+        result?;
+        cleanup_result?;
     }
     Ok(())
 }
@@ -5587,6 +5593,7 @@ where
             repair_result?;
             let post_repair_detail =
                 verify_doctor_database_repair_cleared(database_url, storage_root, &detail)?;
+            cleanup_database_sidecars_after_startup_use(database_url)?;
             let post_repair_detail =
                 startup_post_repair_detail_with_artifacts(post_repair_detail, &repair_output);
             output::info(&format!(
@@ -5600,10 +5607,18 @@ where
                 "Startup detected mailbox database issues; reconstructing from archive ({detail})"
             ));
             run_startup_doctor_subcommand_quietly(|| run_reconstruct(&reconstruct_db_path))?;
+            cleanup_stale_db_artifacts(&reconstruct_db_path)?;
             output::info("Automatic mailbox reconstruction completed; continuing startup");
             Ok(())
         }
     }
+}
+
+fn cleanup_database_sidecars_after_startup_use(database_url: &str) -> CliResult<()> {
+    if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
+        cleanup_stale_db_artifacts(&db_path)?;
+    }
+    Ok(())
 }
 
 fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
@@ -6344,7 +6359,10 @@ fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
 fn handle_serve_stdio() -> CliResult<()> {
     let config = Config::from_env();
     prepare_runtime_server_startup(&config)?;
-    mcp_agent_mail_server::run_stdio(&config)?;
+    let result = mcp_agent_mail_server::run_stdio(&config);
+    let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
+    result?;
+    cleanup_result?;
     Ok(())
 }
 
@@ -18754,6 +18772,19 @@ fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::
 fn open_db_for_doctor_check_read_only_with_context(
     database_url: &str,
 ) -> CliResult<DoctorReadOnlyOpenContext> {
+    open_db_for_doctor_check_read_only_with_context_inner(database_url, false)
+}
+
+fn open_db_for_doctor_archive_parity_read_only_with_context(
+    database_url: &str,
+) -> CliResult<DoctorReadOnlyOpenContext> {
+    open_db_for_doctor_check_read_only_with_context_inner(database_url, true)
+}
+
+fn open_db_for_doctor_check_read_only_with_context_inner(
+    database_url: &str,
+    tolerate_frame_free_wal_after_sanity: bool,
+) -> CliResult<DoctorReadOnlyOpenContext> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -18788,14 +18819,17 @@ fn open_db_for_doctor_check_read_only_with_context(
         }
     }
 
-    if doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).is_some()
+    if !tolerate_frame_free_wal_after_sanity
+        && doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)).is_some()
         && let Some(absolute_candidate) = sqlite_absolute_candidate_path(&candidate_path)
     {
         candidate_path = absolute_candidate;
         used_absolute_fallback = true;
     }
 
-    if let Some(detail) = doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path)) {
+    if !tolerate_frame_free_wal_after_sanity
+        && let Some(detail) = doctor_truncated_wal_sidecar_detail(Path::new(&candidate_path))
+    {
         return Err(CliError::Other(format!(
             "{detail}; refusing non-mutating doctor probe; run `am doctor repair` to quarantine it before opening the database"
         )));
@@ -20433,18 +20467,37 @@ fn storage_root_permissions_hint(path: &Path) -> String {
 }
 
 fn storage_root_write_probe(storage_root: &Path) -> Result<(), std::io::Error> {
-    let probe_name = format!(
-        ".am-doctor-write-probe-{}-{}",
-        std::process::id(),
-        mcp_agent_mail_core::timestamps::now_micros()
-    );
-    let probe_path = storage_root.join(probe_name);
-    let file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe_path)?;
-    drop(file);
-    let _ = std::fs::remove_file(&probe_path);
+    let metadata = std::fs::metadata(storage_root)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "storage root is not a directory",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o222 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "storage root has no write permission bits set",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if metadata.permissions().readonly() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "storage root is read-only",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -24743,6 +24796,39 @@ fn push_binary_provenance_findings(checks: &mut Vec<serde_json::Value>) {
     ));
 }
 
+fn parse_unknown_project_placeholder(key: &str) -> Option<i64> {
+    key.strip_prefix("[unknown-project-")?
+        .strip_suffix(']')?
+        .parse::<i64>()
+        .ok()
+}
+
+fn doctor_orphaned_project_reference_exists_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    project_id: i64,
+) -> CliResult<bool> {
+    let rows = conn
+        .query_sync(
+            "SELECT ( \
+                 EXISTS(SELECT 1 FROM agents WHERE project_id = ?) \
+                 OR EXISTS(SELECT 1 FROM messages WHERE project_id = ?) \
+                 OR EXISTS(SELECT 1 FROM file_reservations WHERE project_id = ?) \
+                 OR EXISTS(SELECT 1 FROM product_project_links WHERE project_id = ?) \
+             ) AS exists_ref",
+            &[
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(project_id),
+            ],
+        )
+        .map_err(|e| CliError::Other(format!("orphaned project probe failed: {e}")))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("exists_ref").ok())
+        .is_some_and(|value| value != 0))
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -25197,7 +25283,8 @@ fn handle_doctor_check_with(
         }));
     } else {
         let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
-        match open_db_for_doctor_check_read_only_with_context(database_url).and_then(|opened| {
+        match open_db_for_doctor_archive_parity_read_only_with_context(database_url).and_then(
+            |opened| {
             let archive = archive_audit
                 .as_ref()
                 .map(|report| report.inventory.clone())
@@ -25219,7 +25306,8 @@ fn handle_doctor_check_with(
                 None
             };
             Ok((archive, db, drift))
-        }) {
+            },
+        ) {
             Ok((archive, db, Some(detail))) => checks.push(serde_json::json!({
                 "check": "archive_db_parity",
                 "status": "fail",
@@ -26197,12 +26285,22 @@ fn handle_doctor_check_with(
                             ],
                         )
                         .unwrap_or_default();
-                    let resolved_project = project_rows.first().and_then(|row| {
+                    let mut resolved_project = project_rows.first().and_then(|row| {
                         Some((
                             row.get_named::<i64>("id").ok()?,
                             row.get_named::<String>("slug").ok()?,
                         ))
                     });
+                    if resolved_project.is_none()
+                        && let Some(project_id) = parse_unknown_project_placeholder(key)
+                        && doctor_orphaned_project_reference_exists_canonical(
+                            &opened.conn,
+                            project_id,
+                        )
+                        .unwrap_or(false)
+                    {
+                        resolved_project = Some((project_id, key.to_string()));
+                    }
                     checks.push(serde_json::json!({
                         "check": "project_exists",
                         "status": if resolved_project.is_some() { "ok" } else { "fail" },
@@ -26259,8 +26357,16 @@ fn handle_doctor_check_with(
     let all_ok = checks.iter().all(|c| c["status"] != "fail");
     let fail_count = checks.iter().filter(|c| c["status"] == "fail").count();
     let warn_count = checks.iter().filter(|c| c["status"] == "warn").count();
-    let database_fix_strategy = database_probe_blocker_strategy
-        .or_else(|| doctor_database_fix_strategy_read_only(database_url, storage_root).ok());
+    let live_database_failure_present = checks.iter().any(|check| {
+        doctor_check_value_str(check, "status") == Some("fail")
+            && doctor_check_value_str(check, "check")
+                .is_some_and(|name| DOCTOR_DATABASE_INCIDENT_CHECKS.contains(&name))
+    });
+    let database_fix_strategy = database_probe_blocker_strategy.or_else(|| {
+        live_database_failure_present
+            .then(|| doctor_database_fix_strategy_read_only(database_url, storage_root).ok())
+            .flatten()
+    });
     let summary = build_doctor_check_summary(
         &checks,
         database_fix_strategy.as_ref(),
@@ -30320,9 +30426,10 @@ mod mail_server_cli_bridge_tests {
     // ---- #147: mail send sender-token UX ----
 
     fn config_with_storage_root(root: &std::path::Path) -> Config {
-        let mut config = Config::default();
-        config.storage_root = root.to_path_buf();
-        config
+        Config {
+            storage_root: root.to_path_buf(),
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -30447,6 +30554,7 @@ mod mail_server_cli_bridge_tests {
             "normal",
             false,
             Some("br-123"),
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
@@ -34793,7 +34901,10 @@ http_headers = { Authorization = "Bearer secret" }
                     allowed_host.is_empty(),
                     "--allowed-host defaults to empty (loopback-only)"
                 );
-                assert!(!takeover, "--takeover defaults to false (probe-before-kill)");
+                assert!(
+                    !takeover,
+                    "--takeover defaults to false (probe-before-kill)"
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -39100,6 +39211,9 @@ http_headers = { Authorization = "Bearer secret" }
         .unwrap();
         conn.execute_raw("COMMIT")
             .unwrap_or_else(|e| panic!("seed_mailbox_db: COMMIT at {}: {e}", db_path.display()));
+        super::migrate_seeded_test_db(&conn, "seed_mailbox_db");
+        conn.close_sync()
+            .unwrap_or_else(|e| panic!("seed_mailbox_db: close at {}: {e}", db_path.display()));
     }
 
     fn seed_storage_root(storage_root: &Path) {
@@ -40354,12 +40468,13 @@ http_headers = { Authorization = "Bearer secret" }
                 db_path.display()
             )
         });
-        let conn = mcp_agent_mail_db::DbConn::open_file(db_path_str).unwrap_or_else(|e| {
-            panic!(
-                "seed_products_cli_db: open db at {}: {e}",
-                db_path.display()
-            )
-        });
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_str).unwrap_or_else(|e| {
+                panic!(
+                    "seed_products_cli_db: open db at {}: {e}",
+                    db_path.display()
+                )
+            });
         // Transaction ensures atomicity: SQLite auto-rollbacks on connection drop if
         // any operation panics before COMMIT.
         conn.execute_raw("BEGIN IMMEDIATE").unwrap_or_else(|e| {
@@ -40548,6 +40663,13 @@ http_headers = { Authorization = "Bearer secret" }
         conn.execute_raw("COMMIT").unwrap_or_else(|e| {
             panic!("seed_products_cli_db: COMMIT at {}: {e}", db_path.display())
         });
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "seed_products_cli_db: checkpoint at {}: {e}",
+                    db_path.display()
+                )
+            });
 
         (db_path, proj_alpha_key, proj_beta_key, created_at_us)
     }
@@ -40626,7 +40748,7 @@ http_headers = { Authorization = "Bearer secret" }
                 max_connections: 1,
                 acquire_timeout_ms: 5_000,
                 max_lifetime_ms: 60_000,
-                run_migrations: false, // skip migrations to isolate corruption
+                run_migrations: true,
                 warmup_connections: 0,
                 cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
             })
@@ -40970,7 +41092,7 @@ http_headers = { Authorization = "Bearer secret" }
             max_connections: 1,
             acquire_timeout_ms: 5_000,
             max_lifetime_ms: 60_000,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
         })
@@ -41049,7 +41171,7 @@ http_headers = { Authorization = "Bearer secret" }
             max_connections: 1,
             acquire_timeout_ms: 5_000,
             max_lifetime_ms: 60_000,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
         })
@@ -41126,7 +41248,7 @@ http_headers = { Authorization = "Bearer secret" }
             max_connections: 1,
             acquire_timeout_ms: 5_000,
             max_lifetime_ms: 60_000,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
         })
@@ -43577,6 +43699,9 @@ startup_timeout_sec = 42
         .expect("insert orphaned recipient");
         conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint fixture rows");
+        conn.close_sync().expect("close seeded FK orphan db");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
+            .expect("truncate FK orphan fixture WAL");
     }
 
     fn seed_startup_self_heal_missing_agent_only_recipient(db_path: &Path) {
@@ -43611,6 +43736,11 @@ startup_timeout_sec = 42
         )
         .expect("insert missing-agent recipient");
         let _ = conn.execute_raw("DELETE FROM inbox_stats WHERE agent_id = 999");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint missing-agent fixture rows");
+        conn.close_sync().expect("close missing-agent fixture db");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
+            .expect("truncate missing-agent fixture WAL");
     }
 
     #[test]
@@ -49192,7 +49322,11 @@ startup_timeout_sec = 42
              VALUES (999, 1, 'to')",
         )
         .expect("insert orphaned recipient");
-        drop(conn);
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint FK failure fixture");
+        conn.close_sync().expect("close FK failure fixture db");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("truncate FK failure fixture WAL");
 
         let parsed = run_doctor_check_json(&db_url, dir.path());
         assert_eq!(
@@ -53935,7 +54069,7 @@ startup_timeout_sec = 42
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 2,
-            run_migrations: false,
+            run_migrations: true,
             warmup_connections: 0,
             ..mcp_agent_mail_db::DbPoolConfig::default()
         };
@@ -58276,7 +58410,12 @@ startup_timeout_sec = 42
             .expect("insert agent");
                 conn.execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
                     .expect("delete project");
-                drop(conn);
+                conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .expect("checkpoint orphaned-project fixture");
+                conn.close_sync()
+                    .expect("close orphaned-project fixture db");
+                mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+                    .expect("truncate orphaned-project fixture WAL");
 
                 let capture = ftui_runtime::StdioCapture::install().expect("install capture");
                 handle_doctor_check_with(
@@ -60384,8 +60523,9 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
+    let sqlite_path = resolve_mailbox_activity_sqlite_path(&cfg.database_url)?;
     let _mailbox_read_locks =
-        acquire_cli_mailbox_read_locks(&cfg.database_url, Some(&config.storage_root))?;
+        acquire_cli_mailbox_read_locks_for_paths(&sqlite_path, &config.storage_root)?;
     let source = resolve_canonical_snapshot_source_with_database_url(
         &cfg.database_url,
         &config.storage_root,
@@ -60588,8 +60728,9 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         &params.bundle.join("manifest.sig.json"),
         "bundle signature",
     )?;
+    let sqlite_path = resolve_mailbox_activity_sqlite_path(&cfg.database_url)?;
     let _mailbox_read_locks =
-        acquire_cli_mailbox_read_locks(&cfg.database_url, Some(&config.storage_root))?;
+        acquire_cli_mailbox_read_locks_for_paths(&sqlite_path, &config.storage_root)?;
     let source = resolve_canonical_snapshot_source_with_database_url(
         &cfg.database_url,
         &config.storage_root,
@@ -63689,26 +63830,26 @@ fn attempt_best_doctor_salvage_artifact_from_candidates(
     current_db: &Path,
     candidates: Vec<(String, PathBuf)>,
 ) -> DoctorSalvageAttempt {
-    let mut first_failure = None;
+    let mut failures = Vec::new();
     for (label, candidate) in candidates {
         match attempt_readable_sqlite_salvage_source(&candidate, &label) {
             DoctorSalvageAttempt::Succeeded(artifact) => {
                 return DoctorSalvageAttempt::Succeeded(artifact);
             }
             DoctorSalvageAttempt::Failed(detail) => {
-                if first_failure.is_none() {
-                    first_failure = Some(detail);
-                }
+                failures.push(detail);
             }
         }
     }
 
-    DoctorSalvageAttempt::Failed(first_failure.unwrap_or_else(|| {
-        format!(
+    if failures.is_empty() {
+        return DoctorSalvageAttempt::Failed(format!(
             "no readable salvage artifact candidates found near {}",
             current_db.display()
-        )
-    }))
+        ));
+    }
+
+    DoctorSalvageAttempt::Failed(failures.join("; "))
 }
 
 fn attempt_best_doctor_salvage_artifact(current_db: &Path) -> DoctorSalvageAttempt {
@@ -71523,6 +71664,30 @@ fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
 }
 
 #[cfg(test)]
+fn migrate_seeded_test_db(conn: &mcp_agent_mail_db::DbConn, context: &str) {
+    let cx = asupersync::Cx::for_testing();
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap_or_else(|e| panic!("{context}: build test runtime: {e}"));
+    rt.block_on(async {
+        mcp_agent_mail_db::schema::migrate_to_latest_base(&cx, conn)
+            .await
+            .into_result()
+            .unwrap_or_else(|e| panic!("{context}: migrate base schema: {e}"));
+        mcp_agent_mail_db::schema::migrate_runtime_canonical_followup(&cx, conn)
+            .await
+            .into_result()
+            .unwrap_or_else(|e| panic!("{context}: migrate runtime follow-up schema: {e}"));
+    });
+    mcp_agent_mail_db::schema::enforce_runtime_fts_cleanup(conn)
+        .unwrap_or_else(|e| panic!("{context}: enforce runtime FTS cleanup: {e}"));
+    conn.execute_raw(&mcp_agent_mail_db::schema::schema_user_version_sql())
+        .unwrap_or_else(|e| panic!("{context}: set schema user_version: {e}"));
+    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap_or_else(|e| panic!("{context}: checkpoint seeded DB: {e}"));
+}
+
+#[cfg(test)]
 fn seed_share_export_source_db(path: &Path) {
     let conn =
         mcp_agent_mail_db::DbConn::open_file(path.display().to_string()).expect("open source db");
@@ -71538,6 +71703,9 @@ fn seed_share_export_source_db(path: &Path) {
         ],
     )
     .expect("insert project");
+    migrate_seeded_test_db(&conn, "seed_share_export_source_db");
+    conn.close_sync()
+        .expect("close seeded share export source db");
 }
 
 #[cfg(test)]
@@ -71562,20 +71730,24 @@ fn seed_archive_mailbox_project(storage_root: &Path) -> PathBuf {
 
 #[cfg(test)]
 fn seed_project_only_db(db_path: &Path, slug: &str, human_key: &str) {
-    let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-        .expect("open project-only db");
-    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-        .expect("init project-only schema");
-    conn.query_sync(
-        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
-        &[
-            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
-            mcp_agent_mail_db::sqlmodel_core::Value::Text(slug.to_string()),
-            mcp_agent_mail_db::sqlmodel_core::Value::Text(human_key.to_string()),
-            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
-        ],
-    )
-    .expect("insert project-only row");
+    let db_path_text = db_path.display().to_string();
+    init_schema_sqlite_canonical(&db_path_text).expect("init project-only schema");
+    {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
+            .expect("open project-only canonical db");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(slug.to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(human_key.to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+            ],
+        )
+        .expect("insert project-only row");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint project-only canonical db");
+    }
 }
 
 #[cfg(test)]

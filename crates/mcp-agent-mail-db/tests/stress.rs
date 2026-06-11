@@ -3582,17 +3582,18 @@ fn concurrent_reservation_create_renew_release_lane_stays_consistent() {
         let pool = pool.clone();
         let human_key = human_key.clone();
         async move {
-            let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
-                Outcome::Ok(r) => r,
-                other => panic!("ensure_project failed: {other:?}"),
-            };
-            let pid = proj.id.unwrap();
             // Distinct, valid adjective+noun agent names (e.g. "RedLake",
             // "OrangePeak", ...) — must pass `is_valid_agent_name`.
             const ADJECTIVES: &[&str] = &[
                 "Red", "Orange", "Yellow", "Pink", "Black", "Purple", "Blue", "Brown", "White",
                 "Green",
             ];
+
+            let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
+                Outcome::Ok(r) => r,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let pid = proj.id.unwrap();
             let mut agent_ids = Vec::with_capacity(WORKERS as usize);
             for i in 0..WORKERS {
                 let name = format!(

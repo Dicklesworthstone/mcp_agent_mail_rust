@@ -594,7 +594,7 @@ fn write_ref_backup(
         text.push_str("#\n# ALL refs at backup time:\n");
         if let Ok(references) = repo.references() {
             for reference in references.flatten() {
-                if let (Some(name), Some(target)) = (reference.name(), reference.target()) {
+                if let (Ok(name), Some(target)) = (reference.name(), reference.target()) {
                     text.push_str(&format!("ref  {name}  {target}\n"));
                 }
             }

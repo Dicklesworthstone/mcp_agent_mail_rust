@@ -90,6 +90,15 @@ fn resource_sync_db_error_to_mcp_error(message: String) -> McpError {
     db_error_to_mcp_error(db_error)
 }
 
+fn resource_project_not_found_error() -> McpError {
+    McpError::new(McpErrorCode::InvalidParams, "Project not found")
+}
+
+fn is_missing_projects_table_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no such table") && lower.contains("projects")
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResourceReconcileInventory {
     projects: usize,
@@ -412,6 +421,25 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
 
+fn resource_live_database_missing_without_archive_state() -> bool {
+    let config = Config::from_env();
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return false;
+    }
+
+    let Ok(resolved) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+    else {
+        return false;
+    };
+    let resolved_path = PathBuf::from(&resolved.canonical_path);
+    let archive_has_authoritative_state =
+        crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+            &config.storage_root,
+            &resolved_path,
+        ) && resource_archive_inventory_has_state(&config.storage_root);
+    !resolved_path.exists() && !archive_has_authoritative_state
+}
+
 fn get_resource_db_pool() -> McpResult<ResourceReadPool> {
     match open_resource_read_pool() {
         Ok(Some(pool)) => Ok(pool),
@@ -602,14 +630,51 @@ async fn resolve_existing_resource_project(
         ));
     }
 
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), pool).await)?;
-    projects
-        .into_iter()
-        .find(|project| {
-            project.slug.eq_ignore_ascii_case(&project_key) || project.human_key == project_key // human_key is a path — case-sensitive
-        })
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))
+    let conn = acquire_resource_conn(ctx.cx(), pool).await?;
+    let sql = "\
+        SELECT id, slug, human_key, created_at \
+          FROM projects \
+         WHERE slug = ? COLLATE NOCASE OR human_key = ? \
+         ORDER BY CASE \
+                    WHEN slug = ? THEN 0 \
+                    WHEN slug = ? COLLATE NOCASE THEN 1 \
+                    ELSE 2 \
+                  END, id \
+         LIMIT 1";
+    let params = [
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+        mcp_agent_mail_db::sqlmodel::Value::Text(project_key.to_string()),
+    ];
+    let rows = conn.query_sync(sql, &params).map_err(|err| {
+        let message = err.to_string();
+        if is_missing_projects_table_error(&message) {
+            resource_project_not_found_error()
+        } else {
+            resource_sync_db_error_to_mcp_error(message)
+        }
+    })?;
+
+    let Some(row) = rows.first() else {
+        return Err(resource_project_not_found_error());
+    };
+    let slug = row
+        .get_named::<String>("slug")
+        .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
+    let human_key = row
+        .get_named::<String>("human_key")
+        .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
+    let created_at = row
+        .get_named::<i64>("created_at")
+        .map_err(|err| McpError::internal_error(format!("Malformed project row: {err}")))?;
+
+    Ok(mcp_agent_mail_db::ProjectRow {
+        id: row.get_named::<i64>("id").ok(),
+        slug,
+        human_key,
+        created_at,
+    })
 }
 
 // Float -> int casts saturate, but we treat out-of-range values as invalid timestamps.
@@ -2185,7 +2250,13 @@ pub struct ProjectDetailResponse {
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, _query) = split_param_and_query(&slug);
-    let pool = get_resource_db_pool()?;
+    let pool = match get_resource_db_pool() {
+        Ok(pool) => pool,
+        Err(_) if resource_live_database_missing_without_archive_state() => {
+            return Err(resource_project_not_found_error());
+        }
+        Err(err) => return Err(err),
+    };
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug).await?;
 
@@ -3863,7 +3934,7 @@ fn reservation_pathspec_ls_files_libgit2(
 
     if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
         for se in statuses.iter() {
-            let Some(path_str) = se.path() else { continue };
+            let Ok(path_str) = se.path() else { continue };
             let candidate = repo_root.join(path_str);
             let modified_us = std::fs::metadata(&candidate)
                 .ok()

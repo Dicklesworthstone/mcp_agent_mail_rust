@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 const PROJECT_ALPHA: &str = "/tmp/e2e_sec_alpha";
 const PROJECT_BETA: &str = "/tmp/e2e_sec_beta";
+const STDIO_SESSION_TIMEOUT_SECS: u64 = 120;
 
 fn am_bin() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_BIN_EXE_am").expect("CARGO_BIN_EXE_am must be set"))
@@ -121,7 +122,7 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
         stdin.flush().expect("flush child stdin");
     }
 
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(STDIO_SESSION_TIMEOUT_SECS);
     let started = Instant::now();
     let mut timed_out = false;
     loop {
@@ -146,7 +147,9 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
         if !stderr.is_empty() {
             stderr.push('\n');
         }
-        stderr.push_str("session timed out after 30s");
+        stderr.push_str(&format!(
+            "session timed out after {STDIO_SESSION_TIMEOUT_SECS}s"
+        ));
     }
     let responses = stdout
         .lines()

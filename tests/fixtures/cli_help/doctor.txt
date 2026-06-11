@@ -19,6 +19,7 @@ Commands:
   undo               Restore from `.doctor/runs/<run-id>/backups/`
   ls                 List runs in `.doctor/runs/` with `{run_id, started_at, exit_code, action_count, finding_count, bytes_backed_up}`
   health             Cheap one-line liveness summary from live mailbox state and latest run history
+  locks              Inspect mailbox activity locks and live owners without mutating state
   triage             Mega-command: returns `{summary, findings, actions_planned, recommended_command, capabilities_url}` in a single round-trip
   explain            Expand a single finding by id with full evidence + remediation
   selftest           End-to-end self-test of the mutate() chokepoint primitives

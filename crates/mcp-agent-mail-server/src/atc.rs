@@ -11774,6 +11774,44 @@ mod alien_enhancement_tests {
     }
 
     #[test]
+    fn atc_replay_tick_fixture_records_budget_overrun_debt() {
+        let mut engine = AtcEngine::new_for_testing();
+
+        engine.replay_from_ledger([ReplayEvent::Tick {
+            total_micros: 186_000,
+            tick_budget_micros: 5_000,
+            utilization_ratio: 37.2,
+            budget_exceeded: true,
+            baseline_probe_limit: 3,
+        }]);
+
+        assert_eq!(engine.slow_controller.budget_debt_micros(), 181_000);
+        assert!(
+            engine.slow_controller.probe_budget_fraction <= 0.051,
+            "overrun should clamp probe budget fraction near minimum, got {}",
+            engine.slow_controller.probe_budget_fraction
+        );
+        assert_eq!(engine.slow_controller.probe_limit, 1);
+
+        engine.replay_from_ledger([ReplayEvent::Tick {
+            total_micros: 1_000,
+            tick_budget_micros: 5_000,
+            utilization_ratio: 0.2,
+            budget_exceeded: false,
+            baseline_probe_limit: 3,
+        }]);
+
+        assert!(
+            engine.slow_controller.budget_debt_micros() < 181_000,
+            "subsequent cheap tick should repay some budget debt"
+        );
+        assert!(
+            engine.slow_controller.budget_debt_micros() > 0,
+            "one cheap tick should not erase the 186ms overrun debt"
+        );
+    }
+
+    #[test]
     fn shadow_policy_probe_disagreement_does_not_dilute_regret_average() {
         let mut shadow = AtcShadowPolicyState::default();
         shadow.record_decision_pair(

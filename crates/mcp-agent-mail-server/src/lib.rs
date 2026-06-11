@@ -894,6 +894,13 @@ fn cleanup_shutdown_sqlite_sidecars(config: &mcp_agent_mail_core::Config) {
         }
     };
 
+    if let Err(error) = mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path) {
+        tracing::warn!(
+            path = %db_path.display(),
+            error = %error,
+            "shutdown SQLite WAL checkpoint failed; continuing with frame-free sidecar cleanup"
+        );
+    }
     mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(&db_path);
 }
 
@@ -1143,6 +1150,63 @@ pub struct MailboxActivityLockGuard {
 impl Drop for MailboxActivityLockGuard {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.lock_file);
+        release_mailbox_activity_process_lock(&self._lock_path, self._mode);
+    }
+}
+
+#[derive(Debug, Default)]
+struct MailboxActivityProcessLockEntry {
+    shared_count: usize,
+    exclusive_count: usize,
+}
+
+static MAILBOX_ACTIVITY_PROCESS_LOCKS: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, MailboxActivityProcessLockEntry>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn mailbox_activity_process_lock_conflicts(
+    entry: &MailboxActivityProcessLockEntry,
+    mode: MailboxActivityLockMode,
+) -> bool {
+    match mode {
+        MailboxActivityLockMode::Shared => entry.exclusive_count > 0,
+        MailboxActivityLockMode::Exclusive => entry.exclusive_count > 0 || entry.shared_count > 0,
+    }
+}
+
+fn record_mailbox_activity_process_lock(
+    lock_path: &Path,
+    mode: MailboxActivityLockMode,
+    registry: &mut HashMap<PathBuf, MailboxActivityProcessLockEntry>,
+) {
+    let entry = registry.entry(lock_path.to_path_buf()).or_default();
+    match mode {
+        MailboxActivityLockMode::Shared => {
+            entry.shared_count = entry.shared_count.saturating_add(1);
+        }
+        MailboxActivityLockMode::Exclusive => {
+            entry.exclusive_count = entry.exclusive_count.saturating_add(1);
+        }
+    }
+}
+
+fn release_mailbox_activity_process_lock(lock_path: &Path, mode: MailboxActivityLockMode) {
+    let mut registry = MAILBOX_ACTIVITY_PROCESS_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = registry.get_mut(lock_path) else {
+        return;
+    };
+    match mode {
+        MailboxActivityLockMode::Shared => {
+            entry.shared_count = entry.shared_count.saturating_sub(1);
+        }
+        MailboxActivityLockMode::Exclusive => {
+            entry.exclusive_count = entry.exclusive_count.saturating_sub(1);
+        }
+    }
+    if entry.shared_count == 0 && entry.exclusive_count == 0 {
+        registry.remove(lock_path);
     }
 }
 
@@ -1285,19 +1349,43 @@ fn acquire_mailbox_activity_lock_for_subject(
         .truncate(false)
         .open(&lock_path)?;
 
-    let lock_result = match mode {
-        MailboxActivityLockMode::Shared => fs2::FileExt::try_lock_shared(&lock_file),
-        MailboxActivityLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_file),
-    };
-    if let Err(err) = lock_result {
-        return Err(mailbox_activity_lock_contention_error(
-            subject_path,
-            subject_kind,
-            &lock_path,
-            mode,
-            &err,
-        ));
+    {
+        let mut registry = MAILBOX_ACTIVITY_PROCESS_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registry
+            .get(&lock_path)
+            .is_some_and(|entry| mailbox_activity_process_lock_conflicts(entry, mode))
+        {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "mailbox activity lock is already held in this process",
+            );
+            return Err(mailbox_activity_lock_contention_error(
+                subject_path,
+                subject_kind,
+                &lock_path,
+                mode,
+                &err,
+            ));
+        }
+
+        let lock_result = match mode {
+            MailboxActivityLockMode::Shared => fs2::FileExt::try_lock_shared(&lock_file),
+            MailboxActivityLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_file),
+        };
+        if let Err(err) = lock_result {
+            return Err(mailbox_activity_lock_contention_error(
+                subject_path,
+                subject_kind,
+                &lock_path,
+                mode,
+                &err,
+            ));
+        }
+        record_mailbox_activity_process_lock(&lock_path, mode, &mut registry);
     }
+
     if let Err(error) = write_mailbox_activity_lock_metadata(
         &mut lock_file,
         subject_path,
@@ -15872,8 +15960,10 @@ mod tests {
 
     #[test]
     fn hardened_http_listener_allows_configured_host_headers() {
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_host = "127.0.0.1".to_string();
+        let config = mcp_agent_mail_core::Config {
+            http_host: "127.0.0.1".to_string(),
+            ..mcp_agent_mail_core::Config::default()
+        };
         let listener = hardened_http_listener_config(&config);
 
         match listener.http_config.allowed_hosts {
@@ -15901,9 +15991,11 @@ mod tests {
         // `config.http_allowed_hosts` and must be accepted by the listener's
         // Host allow-list, while any host NOT configured stays rejected. The
         // loopback built-ins remain present regardless.
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_host = "127.0.0.1".to_string();
-        config.http_allowed_hosts = vec!["Mail.Internal".to_string(), "10.0.0.5".to_string()];
+        let config = mcp_agent_mail_core::Config {
+            http_host: "127.0.0.1".to_string(),
+            http_allowed_hosts: vec!["Mail.Internal".to_string(), "10.0.0.5".to_string()],
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let hosts = http_allowed_hosts(&config);
 
@@ -16182,10 +16274,12 @@ mod tests {
         std::fs::create_dir_all(&storage_root).expect("create storage root");
         let db_path = temp.path().join("missing.sqlite3");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = true;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let result = readiness_check(&config);
         assert!(
@@ -16230,8 +16324,10 @@ mod tests {
         )
         .expect("symlink cache file");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.storage_root = storage_root;
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         assert!(
             read_startup_integrity_cache(&config).is_none(),
@@ -16259,8 +16355,10 @@ mod tests {
         )
         .expect("symlink cache file");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.storage_root = storage_root;
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         write_startup_integrity_cache(
             &config,
@@ -16286,8 +16384,10 @@ mod tests {
         std::fs::create_dir_all(&outside_dir).expect("create outside diagnostics dir");
         symlink(&outside_dir, storage_root.join("diagnostics")).expect("symlink diagnostics dir");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.storage_root = storage_root;
+        let config = mcp_agent_mail_core::Config {
+            storage_root,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         write_startup_integrity_cache(
             &config,
@@ -16311,10 +16411,12 @@ mod tests {
         std::fs::create_dir_all(&storage_root).expect("create storage root");
         let db_path = temp.path().join("busy-missing.sqlite3");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = true;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let _sqlite_lock = acquire_mailbox_activity_lock_for_sqlite_path(
             &db_path,
@@ -16348,10 +16450,12 @@ mod tests {
             "relative shadow path should be absent so absolute candidate fallback is exercised"
         );
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", relative_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", relative_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let _sqlite_lock = acquire_mailbox_activity_lock_for_sqlite_path(
             &absolute_db,
@@ -16376,10 +16480,12 @@ mod tests {
         std::fs::create_dir_all(&storage_root).expect("create storage root");
         let db_path = temp.path().join("missing-readiness.sqlite3");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let error =
             readiness_check_quick(&config).expect_err("quick readiness should not initialize db");
@@ -16438,10 +16544,12 @@ first body
             .expect("init schema");
         drop(conn);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let error = readiness_check_quick(&config)
             .expect_err("archive-ahead mailbox must not report quick readiness");
@@ -16514,10 +16622,12 @@ first body
                     .expect("init schema");
                 drop(conn);
 
-                let mut config = mcp_agent_mail_core::Config::from_env();
-                config.database_url = format!("sqlite:///{}", db_path.display());
-                config.storage_root = storage_root;
-                config.integrity_check_on_startup = false;
+                let config = mcp_agent_mail_core::Config {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    storage_root,
+                    integrity_check_on_startup: false,
+                    ..mcp_agent_mail_core::Config::from_env()
+                };
 
                 readiness_check_quick(&config).expect(
                     "default-root archive drift must be ignored for an external sqlite path",
@@ -16546,10 +16656,12 @@ first body
             .expect("init schema");
         drop(conn);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let error = readiness_check_quick(&config)
             .expect_err("archive agent inventory ahead of sqlite must fail readiness");
@@ -16607,10 +16719,12 @@ first body
         .expect("insert agent");
         drop(conn);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         let error = readiness_check_quick(&config)
             .expect_err("project identity drift should fail readiness even when counts match");
@@ -16722,10 +16836,12 @@ first body
         )
         .expect("write archive-only agent metadata");
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         readiness_check_quick(&config).expect(
             "metadata-only archive drift should not fail readiness when the DB has newer messages",
@@ -16777,10 +16893,12 @@ first body
             .expect("init schema");
         drop(conn);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            integrity_check_on_startup: false,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         readiness_check_with_archive_reconcile(&config)
             .expect("archive-ahead readiness repair should reconcile");
@@ -16848,10 +16966,12 @@ first body
                 .expect("init schema");
             drop(conn);
 
-            let mut config = mcp_agent_mail_core::Config::default();
-            config.database_url = format!("sqlite:///{}", db_path.display());
-            config.storage_root = storage_root;
-            config.integrity_check_on_startup = false;
+            let config = mcp_agent_mail_core::Config {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root,
+                integrity_check_on_startup: false,
+                ..mcp_agent_mail_core::Config::default()
+            };
 
             let state = build_state(config);
             let req = make_request(Http1Method::Get, "/health/readiness", &[]);
@@ -24392,17 +24512,21 @@ first body
     /// listening (so a genuinely dead holder remains eligible for cleanup).
     #[test]
     fn probe_http_healthz_blocking_false_when_no_server_listening() {
+        use std::net::TcpListener;
+
         // Bind then drop a listener to obtain a port that is (almost certainly)
         // free, so the probe hits a closed port and fails fast.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.http_host = "127.0.0.1".to_string();
-        config.http_port = port;
-        // Keep the probe snappy in tests.
-        config.http_probe_timeout_secs = 1;
+        let config = mcp_agent_mail_core::Config {
+            http_host: "127.0.0.1".to_string(),
+            http_port: port,
+            // Keep the probe snappy in tests.
+            http_probe_timeout_secs: 1,
+            ..mcp_agent_mail_core::Config::default()
+        };
 
         assert!(
             !probe_http_healthz_blocking(&config),
