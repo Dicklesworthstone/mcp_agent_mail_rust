@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-05-14 | **Project:** mcp_agent_mail_rust | **Language:** Rust
+**Date:** 2026-06-11 | **Project:** mcp_agent_mail_rust | **Language:** Rust
 
 ## Summary
 
@@ -18,6 +18,14 @@
 - `ftui*`: `0.3.1` -> `0.4.0` to match `/dp/frankentui`.
 - `beads_rust`: `0.2.6` -> `0.2.7` to match `/dp/beads_rust`.
 - Removed the unused `sqlmodel-frankensqlite` patch entry because the active workspace graph does not depend on that package; keeping it caused Cargo patch warnings.
+
+### 2026-06-11 local /dp refresh
+
+- `asupersync`: `0.3.3` -> `0.3.4` to match `/dp/asupersync`.
+- `beads_rust`: manifest constraint `0.2.10` -> `0.2.15` to match `/dp/beads_rust`.
+- `franken-agent-detection`: `0.1.7` -> `0.1.8` to match `/dp/franken_agent_detection`.
+- `frankensearch`: `0.3.0` -> `0.3.2` to match `/dp/frankensearch/frankensearch`.
+- `frankensearch-core`, `frankensearch-embed`, `frankensearch-index`, `frankensearch-fusion`: `0.2.0` -> `0.2.1` to match the current local `/dp/frankensearch` crate versions.
 
 ### Compatible registry updates
 
@@ -38,6 +46,17 @@
 - `tantivy`: `0.25.0` -> `0.26.1`.
 - `tokenizers`: `0.22.2` -> `0.23.1`.
 - `unicode-width`: `0.1.14` -> `0.2.2`.
+
+### 2026-06-11 latest-stable direct registry refresh
+
+- `git2`: `0.20.4` -> `0.21.0`; current source uses stable repository/status/diff APIs.
+- `toml_edit`: `0.23.10+spec-1.0.0` -> `0.25.12+spec-1.1.0`; current source uses `DocumentMut`, `Item`, `Array`, and `value` APIs.
+- `safetensors`: `0.7.0` -> `0.8.0`; no direct source call sites, optional dependency only.
+- `wide`: `1.4.0` -> `1.5.0`; no direct source call sites, dependency surface only.
+
+### 2026-06-11 compatible transitive refresh
+
+- Ran `cargo update`, resolving 54 package changes including `chrono`, `dashmap`, `minijinja`, `regex`, `uuid`, `wasm-bindgen`, `zerocopy`, and related transitive crates to their latest compatible stable versions.
 
 ## Failed
 
