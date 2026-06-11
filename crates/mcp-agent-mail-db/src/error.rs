@@ -299,6 +299,10 @@ pub const DB_FAILURE_ENVELOPE_SCHEMA_VERSION: &str = "am.db_failure_envelope.v1"
 
 /// Stable robot-facing policy section for a classified database failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "diagnostic policy is intentionally a flat JSON-facing set of independent facts"
+)]
 pub struct DbFailurePolicy {
     pub repairable: bool,
     pub safe_to_retry: bool,
