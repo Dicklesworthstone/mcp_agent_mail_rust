@@ -356,6 +356,77 @@ fn is_missing_inbox_stats_table_error(message: &str) -> bool {
     lowered.contains("no such table") && lowered.contains("inbox_stats")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SyncAgentInboxStatsRebuild {
+    total_count: i64,
+    unread_count: i64,
+    ack_pending_count: i64,
+    last_message_ts: Option<i64>,
+}
+
+fn compute_agent_inbox_stats_sync(
+    conn: &DbConn,
+    agent_id: i64,
+) -> Result<Option<SyncAgentInboxStatsRebuild>, DbError> {
+    let sql = "\
+        SELECT \
+            COUNT(*) AS total_count, \
+            SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE \
+                WHEN ack_ts IS NULL \
+                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+                THEN 1 ELSE 0 END) AS ack_pending_count, \
+            (SELECT MAX(created_ts) \
+               FROM messages \
+              WHERE id IN (SELECT message_id \
+                             FROM message_recipients \
+                            WHERE agent_id = ?)) AS last_message_ts \
+        FROM message_recipients \
+        WHERE agent_id = ? \
+          AND message_id IN (SELECT id FROM messages)";
+    let rows = conn
+        .query_sync(sql, &[Value::BigInt(agent_id), Value::BigInt(agent_id)])
+        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    let row = rows.first().ok_or_else(|| {
+        DbError::Internal(format!(
+            "inbox_stats rebuild returned no aggregate row for agent_id={agent_id}"
+        ))
+    })?;
+    let total_count = row.get_named::<i64>("total_count").unwrap_or(0);
+    if total_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(SyncAgentInboxStatsRebuild {
+        total_count,
+        unread_count: row.get_named::<i64>("unread_count").unwrap_or(0),
+        ack_pending_count: row.get_named::<i64>("ack_pending_count").unwrap_or(0),
+        last_message_ts: row.get_named::<i64>("last_message_ts").ok(),
+    }))
+}
+
+fn insert_agent_inbox_stats_sync(
+    conn: &DbConn,
+    agent_id: i64,
+    stats: SyncAgentInboxStatsRebuild,
+) -> Result<(), DbError> {
+    let sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         VALUES (?, ?, ?, ?, ?)";
+    let last_message_ts = stats.last_message_ts.map_or(Value::Null, Value::BigInt);
+    conn.execute_sync(
+        sql,
+        &[
+            Value::BigInt(agent_id),
+            Value::BigInt(stats.total_count),
+            Value::BigInt(stats.unread_count),
+            Value::BigInt(stats.ack_pending_count),
+            last_message_ts,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| DbError::Sqlite(e.to_string()))
+}
+
 fn rebuild_agent_inbox_stats_sync(conn: &DbConn, agent_id: i64) -> Result<(), DbError> {
     let params = [Value::BigInt(agent_id)];
     match conn.execute_sync("DELETE FROM inbox_stats WHERE agent_id = ?", &params) {
@@ -369,20 +440,11 @@ fn rebuild_agent_inbox_stats_sync(conn: &DbConn, agent_id: i64) -> Result<(), Db
         }
     }
 
-    let rebuild_sql = "INSERT INTO inbox_stats \
-         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-         SELECT \
-             r.agent_id, \
-             COUNT(*) AS total_count, \
-             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-             MAX(m.created_ts) AS last_message_ts \
-         FROM message_recipients r \
-         JOIN messages m ON m.id = r.message_id \
-         WHERE r.agent_id = ? \
-         GROUP BY r.agent_id";
-    match conn.execute_sync(rebuild_sql, &params) {
-        Ok(_) => Ok(()),
+    let Some(stats) = compute_agent_inbox_stats_sync(conn, agent_id)? else {
+        return Ok(());
+    };
+    match insert_agent_inbox_stats_sync(conn, agent_id, stats) {
+        Ok(()) => Ok(()),
         Err(err) => {
             let message = err.to_string();
             if is_missing_inbox_stats_table_error(&message) {

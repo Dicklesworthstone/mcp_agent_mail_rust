@@ -8399,10 +8399,10 @@ pub async fn get_inbox_stats(
 /// Rebuild `inbox_stats` for a single agent from ground truth, inside an
 /// already-open transaction.
 ///
-/// Uses DELETE + INSERT … SELECT to recompute counters from
-/// `message_recipients` joined with `messages`.  This is the canonical way to
-/// keep `inbox_stats` consistent — it is always correct regardless of whether
-/// `SQLite` triggers fire, partially fire, or are absent.
+/// Uses DELETE + per-agent aggregate reads + INSERT to recompute counters from
+/// `message_recipients` and `messages`. This is the canonical way to keep
+/// `inbox_stats` consistent regardless of whether SQLite triggers fire,
+/// partially fire, or are absent.
 fn is_tolerable_inbox_stats_rebuild_error(error: &DbError) -> bool {
     match error {
         DbError::Sqlite(message) => {
@@ -8434,20 +8434,6 @@ async fn rebuild_agents_inbox_stats_in_tx(
     for chunk in unique_agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let placeholders = placeholders(chunk.len());
         let reset_sql = format!("DELETE FROM inbox_stats WHERE agent_id IN ({placeholders})");
-        let rebuild_sql = format!(
-            "INSERT INTO inbox_stats \
-             (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-             SELECT \
-                 r.agent_id, \
-                 COUNT(*) AS total_count, \
-                 SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-                 SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-                 MAX(m.created_ts) AS last_message_ts \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             WHERE r.agent_id IN ({placeholders}) \
-             GROUP BY r.agent_id"
-        );
 
         let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
 
@@ -8461,19 +8447,114 @@ async fn rebuild_agents_inbox_stats_in_tx(
             Outcome::Panicked(panic) => return Outcome::Panicked(panic),
         }
 
-        let rebuild_params = params.clone();
-        match map_sql_outcome(traw_execute(cx, tracked, &rebuild_sql, &rebuild_params).await) {
-            Outcome::Ok(_) => {}
-            Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
-                return Outcome::Ok(());
+        for agent_id in chunk {
+            let stats = match compute_agent_inbox_stats_in_tx(cx, tracked, *agent_id).await {
+                Outcome::Ok(stats) => stats,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+            };
+            let Some(stats) = stats else {
+                continue;
+            };
+            match insert_agent_inbox_stats_in_tx(cx, tracked, *agent_id, stats).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
+                    return Outcome::Ok(());
+                }
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(panic) => return Outcome::Panicked(panic),
             }
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
         }
     }
 
     Outcome::Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentInboxStatsRebuild {
+    total_count: i64,
+    unread_count: i64,
+    ack_pending_count: i64,
+    last_message_ts: Option<i64>,
+}
+
+async fn compute_agent_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+) -> Outcome<Option<AgentInboxStatsRebuild>, DbError> {
+    let sql = "\
+        SELECT \
+            COUNT(*) AS total_count, \
+            SUM(CASE WHEN read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+            SUM(CASE \
+                WHEN ack_ts IS NULL \
+                 AND message_id IN (SELECT id FROM messages WHERE ack_required = 1) \
+                THEN 1 ELSE 0 END) AS ack_pending_count, \
+            (SELECT MAX(created_ts) \
+               FROM messages \
+              WHERE id IN (SELECT message_id \
+                             FROM message_recipients \
+                            WHERE agent_id = ?)) AS last_message_ts \
+        FROM message_recipients \
+        WHERE agent_id = ? \
+          AND message_id IN (SELECT id FROM messages)";
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            sql,
+            &[Value::BigInt(agent_id), Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::Internal(format!(
+            "inbox_stats rebuild returned no aggregate row for agent_id={agent_id}"
+        )));
+    };
+    let total_count = row.get(0).and_then(value_as_i64).unwrap_or(0);
+    if total_count == 0 {
+        return Outcome::Ok(None);
+    }
+    Outcome::Ok(Some(AgentInboxStatsRebuild {
+        total_count,
+        unread_count: row.get(1).and_then(value_as_i64).unwrap_or(0),
+        ack_pending_count: row.get(2).and_then(value_as_i64).unwrap_or(0),
+        last_message_ts: row.get(3).and_then(value_as_i64),
+    }))
+}
+
+async fn insert_agent_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    stats: AgentInboxStatsRebuild,
+) -> Outcome<(), DbError> {
+    let sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         VALUES (?, ?, ?, ?, ?)";
+    let last_message_ts = stats.last_message_ts.map_or(Value::Null, Value::BigInt);
+    let params = [
+        Value::BigInt(agent_id),
+        Value::BigInt(stats.total_count),
+        Value::BigInt(stats.unread_count),
+        Value::BigInt(stats.ack_pending_count),
+        last_message_ts,
+    ];
+    match map_sql_outcome(traw_execute(cx, tracked, sql, &params).await) {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => Outcome::Panicked(panic),
+    }
 }
 
 /// Rebuild **all** rows in `inbox_stats` from ground truth.
@@ -8498,22 +8579,29 @@ pub async fn rebuild_all_inbox_stats(cx: &Cx, pool: &DbPool) -> Outcome<(), DbEr
         map_sql_outcome(traw_execute(cx, &tracked, delete_sql, &[]).await)
     );
 
-    let rebuild_sql = "\
-        INSERT INTO inbox_stats \
-            (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-        SELECT \
-            r.agent_id, \
-            COUNT(*) AS total_count, \
-            SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-            SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-            MAX(m.created_ts) AS last_message_ts \
-        FROM message_recipients r \
-        JOIN messages m ON m.id = r.message_id \
-        GROUP BY r.agent_id";
+    let agent_rows = try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                &tracked,
+                "SELECT DISTINCT agent_id FROM message_recipients ORDER BY agent_id",
+                &[],
+            )
+            .await
+        )
+    );
+    let mut agent_ids = Vec::with_capacity(agent_rows.len());
+    for row in agent_rows {
+        if let Some(agent_id) = row.get(0).and_then(value_as_i64) {
+            agent_ids.push(agent_id);
+        }
+    }
     try_in_tx!(
         cx,
         &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, rebuild_sql, &[]).await)
+        rebuild_agents_inbox_stats_in_tx(cx, &tracked, &agent_ids).await
     );
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
