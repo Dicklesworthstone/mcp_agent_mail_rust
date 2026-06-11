@@ -194,9 +194,10 @@ pub use cache::{
 };
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{
-    DbError, DbErrorClass, DbErrorClassification, DbErrorSeverity, DbResult,
-    classify_db_error_message, is_corruption_error, is_fd_exhaustion_error, is_lock_error,
-    is_mailbox_ownership_contention, is_pool_exhausted_error,
+    DB_FAILURE_ENVELOPE_SCHEMA_VERSION, DbError, DbErrorClass, DbErrorClassification,
+    DbErrorSeverity, DbFailureEnvelope, DbResult, classify_db_error_message, is_corruption_error,
+    is_fd_exhaustion_error, is_lock_error, is_mailbox_ownership_contention,
+    is_pool_exhausted_error,
 };
 pub use forensics::{
     ForensicFileLock, ForensicPreSnapshot, ForensicProcessHolder, MailboxForensicCapture,
