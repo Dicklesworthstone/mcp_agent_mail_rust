@@ -292,7 +292,7 @@ pub fn recipe_migrations() -> Vec<Migration> {
             "v8_idx_query_history_ts".to_string(),
             "index query_history by execution time for recent-first listing".to_string(),
             "CREATE INDEX IF NOT EXISTS idx_query_history_executed_ts \
-                ON query_history(executed_ts DESC)"
+                ON query_history(executed_ts DESC, id DESC)"
                 .to_string(),
             String::new(),
         ),
@@ -593,27 +593,56 @@ pub fn list_recent_history(conn: &DbConn, limit: usize) -> Result<Vec<QueryHisto
     ensure_recipe_schema(conn)?;
     let sql = "SELECT id, query_text, doc_kind, scope_mode, scope_id, \
         result_count, executed_ts \
-        FROM query_history \
-        ORDER BY executed_ts DESC \
-        LIMIT ?";
+        FROM query_history";
 
-    let limit_val = i64::try_from(limit.min(500)).unwrap_or(50);
     let rows = conn
-        .query_sync(sql, &[Value::BigInt(limit_val)])
+        .query_sync(sql, &[])
         .map_err(|e| e.to_string())?;
-    Ok(rows.iter().map(row_to_history).collect())
+    let mut history = rows.iter().map(row_to_history).collect::<Vec<_>>();
+    history.sort_by(|a, b| {
+        b.executed_ts
+            .cmp(&a.executed_ts)
+            .then_with(|| b.id.unwrap_or_default().cmp(&a.id.unwrap_or_default()))
+    });
+    history.truncate(limit.min(500));
+    Ok(history)
 }
 
 /// Prune old history entries, keeping only the most recent `keep` entries.
 pub fn prune_history(conn: &DbConn, keep: usize) -> Result<u64, String> {
     ensure_recipe_schema(conn)?;
-    let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(500);
-    let sql = "DELETE FROM query_history WHERE id NOT IN ( \
-        SELECT id FROM query_history ORDER BY executed_ts DESC LIMIT ? \
-    )";
+    let keep = keep.min(10_000);
+    let rows = conn
+        .query_sync("SELECT id, executed_ts FROM query_history", &[])
+        .map_err(|e| e.to_string())?;
+    let mut entries = rows
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row_named_i64(row, "id").or_else(|| row_first_i64(row))?,
+                row.get_named("executed_ts").unwrap_or_default(),
+            ))
+        })
+        .collect::<Vec<(i64, i64)>>();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    let delete_ids = entries
+        .into_iter()
+        .skip(keep)
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+
     with_sync_write_tx(conn, |conn| {
-        conn.execute_sync(sql, &[Value::BigInt(keep_val)])
-            .map_err(|e| e.to_string())
+        let mut deleted = 0_u64;
+        for id in delete_ids {
+            deleted = deleted.saturating_add(
+                conn.execute_sync(
+                    "DELETE FROM query_history WHERE id = ?",
+                    &[Value::BigInt(id)],
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(deleted)
     })
 }
 

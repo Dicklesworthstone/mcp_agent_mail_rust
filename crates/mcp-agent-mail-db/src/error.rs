@@ -501,6 +501,10 @@ impl DbError {
                     || contains_fts_index_corruption(&joined_details)
                 {
                     DbErrorClass::FtsIndexCorruption
+                } else if contains_main_db_corruption(message)
+                    || contains_main_db_corruption(&joined_details)
+                {
+                    DbErrorClass::MainDbBtreeCorruption
                 } else if contains_foreign_key_inconsistency(message)
                     || contains_foreign_key_inconsistency(&joined_details)
                 {
@@ -769,9 +773,6 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     if contains_fts_index_corruption(msg) {
         return DbErrorClass::FtsIndexCorruption;
     }
-    if contains_foreign_key_inconsistency(msg) {
-        return DbErrorClass::ForeignKeyInconsistency;
-    }
     if contains_schema_drift(msg) {
         return DbErrorClass::SchemaDriftOrMissingTables;
     }
@@ -780,6 +781,9 @@ fn classify_db_error_message_class(msg: &str) -> DbErrorClass {
     }
     if contains_main_db_corruption(msg) {
         return DbErrorClass::MainDbBtreeCorruption;
+    }
+    if contains_foreign_key_inconsistency(msg) {
+        return DbErrorClass::ForeignKeyInconsistency;
     }
     DbErrorClass::ConnectionOrConfigError
 }

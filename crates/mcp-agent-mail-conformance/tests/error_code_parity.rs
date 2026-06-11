@@ -266,6 +266,7 @@ fn error_code_catalog_is_stable() {
         "MISSING_PANE_ID",
         "NOT_FOUND",
         "RECIPIENT_NOT_FOUND",
+        "RELEASE_INTENT_WRITE_FAILED",
         "RESERVATION_ACTIVE",
         "RESOURCE_BUSY",
         "SENDER_TOKEN_MISMATCH",

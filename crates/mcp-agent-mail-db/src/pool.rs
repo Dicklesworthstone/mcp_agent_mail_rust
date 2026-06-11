@@ -3438,15 +3438,17 @@ async fn run_sqlite_init_once(
         )));
     }
 
-    match schema::validate_startup_schema_gate(cx, &*runtime_conn).await {
-        Outcome::Ok(()) => {}
-        Outcome::Err(err) => {
-            return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=schema_gate failed: {err}"
-            )));
+    if run_migrations {
+        match schema::validate_startup_schema_gate(cx, &*runtime_conn).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=schema_gate failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     }
 
     if let Err(err) = execute_sql_with_lock_retry(
@@ -13012,8 +13014,8 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            wal.exists(),
-            "empty wal stub should remain in the live DB family"
+            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
+            "health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal.db-wal").len(),
@@ -13049,8 +13051,8 @@ mod tests {
             "primary db should remain healthy with an empty wal attached"
         );
         assert!(
-            wal.exists(),
-            "archive-aware recovery should keep the empty wal stub in the live DB family"
+            !wal.exists() || std::fs::metadata(&wal).expect("stat retained WAL").len() == 0,
+            "archive-aware health checks may let SQLite remove an inert empty WAL, but must not rewrite it into live data"
         );
         assert_eq!(
             sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal-archive.db-wal").len(),
