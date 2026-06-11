@@ -1911,6 +1911,19 @@ pub enum MailCommand {
         #[arg(long, default_value_t = true)]
         json: bool,
     },
+    /// Replay a previously queued UNSENT message artifact.
+    #[command(name = "replay-queued")]
+    ReplayQueued {
+        /// Path printed by a failed `am mail send` queued-send error.
+        #[arg(long, value_name = "PATH")]
+        artifact: PathBuf,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
     /// Reply to an existing message.
     Reply {
         /// Project key.
@@ -2022,6 +2035,59 @@ pub enum MailCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+}
+
+const PENDING_SEND_SCHEMA_VERSION: &str = "am.pending_send.v1";
+const PENDING_SEND_RECEIPT_SCHEMA_VERSION: &str = "am.pending_send_receipt.v1";
+const PENDING_SEND_UNSENT_STATUS: &str = "UNSENT_UNTIL_REPLAY";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingMailSendEnvelope {
+    project_key: String,
+    sender: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    subject: String,
+    body_md: String,
+    attachment_paths: Vec<String>,
+    convert_images: Option<bool>,
+    importance: String,
+    ack_required: bool,
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingSendFailure {
+    class: String,
+    repairable: bool,
+    safe_to_retry: bool,
+    safe_to_continue_read_only: bool,
+    blocks_edits: bool,
+    recommended_command: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingSendArtifact {
+    schema_version: String,
+    status: String,
+    content_hash: String,
+    created_ts: String,
+    replay_command: String,
+    sender_token_was_provided: bool,
+    sender_token_stored: bool,
+    envelope: PendingMailSendEnvelope,
+    failure: PendingSendFailure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingSendReceipt {
+    schema_version: String,
+    content_hash: String,
+    artifact_path: String,
+    sent_ts: String,
+    response: serde_json::Value,
 }
 
 #[derive(Subcommand, Debug)]
@@ -27842,6 +27908,452 @@ fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand
     Ok(())
 }
 
+fn split_cli_agent_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn split_optional_cli_agent_list(value: Option<&String>) -> Vec<String> {
+    value.map_or_else(Vec::new, |items| split_cli_agent_list(items))
+}
+
+fn cli_output_to_display_recipients(payload: &serde_json::Value, fallback: &[String]) -> String {
+    payload
+        .get("to")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.join(", "))
+}
+
+async fn send_mail_envelope_via_server_or_local(
+    server_config: &Config,
+    database_url: &str,
+    server_url: &str,
+    bearer: Option<&str>,
+    envelope: &PendingMailSendEnvelope,
+    sender_token: Option<&str>,
+) -> CliResult<serde_json::Value> {
+    let cc_names = if envelope.cc.is_empty() {
+        None
+    } else {
+        Some(envelope.cc.as_slice())
+    };
+    match try_call_server_tool(
+        server_url,
+        bearer,
+        "send_message",
+        build_server_send_message_arguments(
+            &envelope.project_key,
+            &envelope.sender,
+            &envelope.to,
+            &envelope.subject,
+            &envelope.body_md,
+            cc_names,
+            &envelope.importance,
+            envelope.ack_required,
+            envelope.thread_id.as_deref(),
+            sender_token,
+        ),
+    )
+    .await
+    {
+        ServerToolCall::Success(result) => {
+            let payload = coerce_tool_result_json_or_error("send_message", result)?;
+            return server_message_payload_to_cli_json(payload).ok_or_else(|| {
+                CliError::Other("unexpected send_message response shape".to_string())
+            });
+        }
+        ServerToolCall::Unavailable(message) => {
+            reject_local_fallback_if_mailbox_owned(
+                "mail send",
+                server_url,
+                &message,
+                database_url,
+                server_config.storage_root.as_path(),
+            )?;
+        }
+        ServerToolCall::Rejected(message) => {
+            if !mail_server_rejection_allows_local_fallback(&message) {
+                return Err(CliError::Other(format!(
+                    "send_message via server failed: {message}"
+                )));
+            }
+            tracing::debug!(
+                message = %message,
+                "mail send fell back to local tool after server scope mismatch"
+            );
+        }
+    }
+
+    let local_send_future = Box::pin(call_send_message_tool_locally(
+        &envelope.project_key,
+        &envelope.sender,
+        &envelope.to,
+        &envelope.subject,
+        &envelope.body_md,
+        cc_names,
+        &envelope.importance,
+        envelope.ack_required,
+        envelope.thread_id.as_deref(),
+        sender_token,
+    ));
+    let payload = match asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        std::time::Duration::from_secs(30),
+        local_send_future,
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(CliError::Other(
+                "mail send timed out after 30s in local fallback mode".to_string(),
+            ));
+        }
+    };
+    server_message_payload_to_cli_json(payload)
+        .ok_or_else(|| CliError::Other("unexpected local send_message response shape".to_string()))
+}
+
+fn pending_send_content_hash(envelope: &PendingMailSendEnvelope) -> CliResult<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let bytes = serde_json::to_vec(envelope)
+        .map_err(|error| CliError::Format(format!("serialize pending-send envelope: {error}")))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn pending_send_artifact_path(storage_root: &Path, content_hash: &str) -> PathBuf {
+    storage_root
+        .join("pending_sends")
+        .join(format!("{content_hash}.json"))
+}
+
+fn pending_send_receipt_path(artifact_path: &Path) -> PathBuf {
+    let stem = artifact_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("pending-send");
+    artifact_path.with_file_name(format!("{stem}.sent.json"))
+}
+
+fn pending_send_failure_from_error(error: &CliError) -> Option<PendingSendFailure> {
+    match error {
+        CliError::InvalidArgument(_) | CliError::Usage(_) | CliError::ExitCode(_) => return None,
+        CliError::Share(_) | CliError::Guard(_) => return None,
+        CliError::NotImplemented(_) => return None,
+        CliError::Other(_) | CliError::Io(_) | CliError::Format(_) => {}
+    }
+
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("broadcast=true")
+        || lower.contains("broadcast send_message")
+        || lower.contains("sender_token does not match")
+        || lower.contains("at least one recipient is required")
+        || lower.contains("invalid argument value: importance")
+        || lower.contains("recipient")
+        || lower.contains("agent not found")
+        || lower.contains("project not found")
+    {
+        return None;
+    }
+
+    let classification = mcp_agent_mail_db::classify_db_error_message(&message);
+    let queueable = match classification.class {
+        mcp_agent_mail_db::DbErrorClass::ConnectionOrConfigError => {
+            lower.contains("database")
+                || lower.contains("sqlite")
+                || lower.contains("mailbox")
+                || lower.contains("storage")
+                || lower.contains("wal")
+                || lower.contains("shm")
+                || lower.contains("disk")
+        }
+        mcp_agent_mail_db::DbErrorClass::EngineProbeLimitation => false,
+        _ => true,
+    };
+    if !queueable {
+        return None;
+    }
+
+    Some(PendingSendFailure {
+        class: classification.class.as_str().to_string(),
+        repairable: classification.repairable,
+        safe_to_retry: classification.safe_to_retry,
+        safe_to_continue_read_only: classification.safe_to_continue_read_only,
+        blocks_edits: classification.blocks_edits,
+        recommended_command: classification.recommended_command.to_string(),
+        message,
+    })
+}
+
+fn load_pending_send_artifact(path: &Path) -> CliResult<PendingSendArtifact> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        CliError::Other(format!(
+            "read queued-send artifact {}: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        CliError::Format(format!(
+            "parse queued-send artifact {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn load_pending_send_receipt(path: &Path) -> CliResult<PendingSendReceipt> {
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        CliError::Other(format!(
+            "read queued-send receipt {}: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        CliError::Format(format!(
+            "parse queued-send receipt {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn validate_pending_send_artifact(path: &Path, artifact: &PendingSendArtifact) -> CliResult<()> {
+    if artifact.schema_version != PENDING_SEND_SCHEMA_VERSION {
+        return Err(CliError::InvalidArgument(format!(
+            "unsupported queued-send schema_version '{}' in {}",
+            artifact.schema_version,
+            path.display()
+        )));
+    }
+    if artifact.status != PENDING_SEND_UNSENT_STATUS {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send artifact {} is not marked {PENDING_SEND_UNSENT_STATUS}",
+            path.display()
+        )));
+    }
+    let expected_hash = pending_send_content_hash(&artifact.envelope)?;
+    if artifact.content_hash != expected_hash {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send artifact {} content_hash mismatch: expected {expected_hash}, found {}",
+            path.display(),
+            artifact.content_hash
+        )));
+    }
+    if artifact.envelope.to.is_empty()
+        && artifact.envelope.cc.is_empty()
+        && artifact.envelope.bcc.is_empty()
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send artifact {} has no recipients",
+            path.display()
+        )));
+    }
+    if !artifact.envelope.bcc.is_empty() || !artifact.envelope.attachment_paths.is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send artifact {} uses fields not replayable by `am mail replay-queued` yet",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_pending_send_receipt(
+    path: &Path,
+    artifact: &PendingSendArtifact,
+    receipt: &PendingSendReceipt,
+) -> CliResult<()> {
+    if receipt.schema_version != PENDING_SEND_RECEIPT_SCHEMA_VERSION {
+        return Err(CliError::InvalidArgument(format!(
+            "unsupported queued-send receipt schema_version '{}' in {}",
+            receipt.schema_version,
+            path.display()
+        )));
+    }
+    if receipt.content_hash != artifact.content_hash {
+        return Err(CliError::InvalidArgument(format!(
+            "queued-send receipt {} content_hash mismatch: expected {}, found {}",
+            path.display(),
+            artifact.content_hash,
+            receipt.content_hash
+        )));
+    }
+    Ok(())
+}
+
+fn create_pending_send_artifact(
+    config: &Config,
+    envelope: &PendingMailSendEnvelope,
+    failure: PendingSendFailure,
+    sender_token_was_provided: bool,
+) -> CliResult<(PathBuf, PendingSendArtifact)> {
+    use std::io::Write as _;
+
+    let content_hash = pending_send_content_hash(envelope)?;
+    let artifact_path = pending_send_artifact_path(&config.storage_root, &content_hash);
+    if artifact_path.exists() {
+        let artifact = load_pending_send_artifact(&artifact_path)?;
+        validate_pending_send_artifact(&artifact_path, &artifact)?;
+        return Ok((artifact_path, artifact));
+    }
+
+    let parent = artifact_path.parent().ok_or_else(|| {
+        CliError::Other(format!(
+            "queued-send artifact path has no parent: {}",
+            artifact_path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        CliError::Other(format!(
+            "create queued-send artifact directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+
+    let replay_command = format!(
+        "am mail replay-queued --artifact {}",
+        shell_quote(&artifact_path.display().to_string())
+    );
+    let artifact = PendingSendArtifact {
+        schema_version: PENDING_SEND_SCHEMA_VERSION.to_string(),
+        status: PENDING_SEND_UNSENT_STATUS.to_string(),
+        content_hash,
+        created_ts: Utc::now().to_rfc3339(),
+        replay_command,
+        sender_token_was_provided,
+        sender_token_stored: false,
+        envelope: envelope.clone(),
+        failure,
+    };
+
+    let mut bytes = serde_json::to_vec_pretty(&artifact)
+        .map_err(|error| CliError::Format(format!("serialize queued-send artifact: {error}")))?;
+    bytes.push(b'\n');
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&artifact_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes).map_err(|error| {
+                CliError::Other(format!(
+                    "write queued-send artifact {}: {error}",
+                    artifact_path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|error| {
+                CliError::Other(format!(
+                    "sync queued-send artifact {}: {error}",
+                    artifact_path.display()
+                ))
+            })?;
+            Ok((artifact_path, artifact))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let artifact = load_pending_send_artifact(&artifact_path)?;
+            validate_pending_send_artifact(&artifact_path, &artifact)?;
+            Ok((artifact_path, artifact))
+        }
+        Err(error) => Err(CliError::Other(format!(
+            "create queued-send artifact {}: {error}",
+            artifact_path.display()
+        ))),
+    }
+}
+
+fn queue_or_return_mail_send_error(
+    config: &Config,
+    envelope: &PendingMailSendEnvelope,
+    error: CliError,
+    sender_token_was_provided: bool,
+) -> CliError {
+    let Some(failure) = pending_send_failure_from_error(&error) else {
+        return error;
+    };
+    match create_pending_send_artifact(config, envelope, failure, sender_token_was_provided) {
+        Ok((path, artifact)) => CliError::Other(format!(
+            "send_message failed; queued a durable UNSENT artifact at {}\nReplay command: {}\nOriginal failure: {}",
+            path.display(),
+            artifact.replay_command,
+            artifact.failure.message
+        )),
+        Err(queue_error) => CliError::Other(format!(
+            "send_message failed and queued-send artifact creation also failed: {queue_error}\nOriginal failure: {error}"
+        )),
+    }
+}
+
+fn write_pending_send_receipt(
+    artifact_path: &Path,
+    artifact: &PendingSendArtifact,
+    response: &serde_json::Value,
+) -> CliResult<PathBuf> {
+    use std::io::Write as _;
+
+    let receipt_path = pending_send_receipt_path(artifact_path);
+    if receipt_path.exists() {
+        let receipt = load_pending_send_receipt(&receipt_path)?;
+        validate_pending_send_receipt(&receipt_path, artifact, &receipt)?;
+        return Ok(receipt_path);
+    }
+
+    let receipt = PendingSendReceipt {
+        schema_version: PENDING_SEND_RECEIPT_SCHEMA_VERSION.to_string(),
+        content_hash: artifact.content_hash.clone(),
+        artifact_path: artifact_path.display().to_string(),
+        sent_ts: Utc::now().to_rfc3339(),
+        response: response.clone(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&receipt)
+        .map_err(|error| CliError::Format(format!("serialize queued-send receipt: {error}")))?;
+    bytes.push(b'\n');
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes).map_err(|error| {
+                CliError::Other(format!(
+                    "write queued-send receipt {}: {error}",
+                    receipt_path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|error| {
+                CliError::Other(format!(
+                    "sync queued-send receipt {}: {error}",
+                    receipt_path.display()
+                ))
+            })?;
+            Ok(receipt_path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let receipt = load_pending_send_receipt(&receipt_path)?;
+            validate_pending_send_receipt(&receipt_path, artifact, &receipt)?;
+            Ok(receipt_path)
+        }
+        Err(error) => Err(CliError::Other(format!(
+            "create queued-send receipt {}: {error}",
+            receipt_path.display()
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
@@ -27872,9 +28384,6 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            // Resolve the sender token without echoing it on the command line:
-            // explicit flag > --sender-token-file > AGENT_MAIL_SENDER_TOKEN env >
-            // persisted identity from `agents register`/`macros start-session`.
             let resolved_sender_token = resolve_sender_token(
                 &server_config,
                 &project_key,
@@ -27882,125 +28391,118 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 sender_token.as_deref(),
                 sender_token_file.as_deref(),
             )?;
-            let to_names: Vec<String> = to
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
+            let to_names = split_cli_agent_list(&to);
             if to_names.is_empty() {
                 return Err(CliError::InvalidArgument(
                     "--to requires at least one recipient".into(),
                 ));
             }
-            let cc_names: Option<Vec<String>> = cc.as_ref().map(|cc_str| {
-                cc_str
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            });
-            match try_call_server_tool(
+            let envelope = PendingMailSendEnvelope {
+                project_key,
+                sender,
+                to: to_names,
+                cc: split_optional_cli_agent_list(cc.as_ref()),
+                bcc: Vec::new(),
+                subject,
+                body_md: body,
+                attachment_paths: Vec::new(),
+                convert_images: None,
+                importance,
+                ack_required,
+                thread_id,
+            };
+            let data = send_mail_envelope_via_server_or_local(
+                &server_config,
+                &database_url,
                 &server_url,
                 bearer.as_deref(),
-                "send_message",
-                build_server_send_message_arguments(
-                    &project_key,
-                    &sender,
-                    &to_names,
-                    &subject,
-                    &body,
-                    cc_names.as_deref(),
-                    &importance,
-                    ack_required,
-                    thread_id.as_deref(),
-                    resolved_sender_token.as_deref(),
-                ),
-            )
-            .await
-            {
-                ServerToolCall::Success(result) => {
-                    let payload = coerce_tool_result_json_or_error("send_message", result)?;
-                    let payload = server_message_payload_to_cli_json(payload).ok_or_else(|| {
-                        CliError::Other("unexpected send_message response shape".to_string())
-                    })?;
-                    output::emit_output(&payload, fmt, || {
-                        let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let rendered_to = payload
-                            .get("to")
-                            .and_then(|v| v.as_array())
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .filter_map(|item| item.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            })
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or_else(|| to.clone());
-                        output::success(&format!(
-                            "Message sent (id={message_id}) to {rendered_to}"
-                        ));
-                    });
-                    return Ok(());
-                }
-                ServerToolCall::Unavailable(message) => {
-                    reject_local_fallback_if_mailbox_owned(
-                        "mail send",
-                        &server_url,
-                        &message,
-                        &database_url,
-                        server_config.storage_root.as_path(),
-                    )?;
-                }
-                ServerToolCall::Rejected(message) => {
-                    if !mail_server_rejection_allows_local_fallback(&message) {
-                        return Err(CliError::Other(format!(
-                            "send_message via server failed: {message}"
-                        )));
-                    }
-                    tracing::debug!(
-                        message = %message,
-                        "mail send fell back to local tool after server scope mismatch"
-                    );
-                }
-            }
-
-            let local_send_future = Box::pin(call_send_message_tool_locally(
-                &project_key,
-                &sender,
-                &to_names,
-                &subject,
-                &body,
-                cc_names.as_deref(),
-                &importance,
-                ack_required,
-                thread_id.as_deref(),
+                &envelope,
                 resolved_sender_token.as_deref(),
-            ));
-            let payload = match asupersync::time::timeout(
-                asupersync::time::wall_now(),
-                std::time::Duration::from_secs(30),
-                local_send_future,
             )
             .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(CliError::Other(
-                        "mail send timed out after 30s in local fallback mode".to_string(),
-                    ));
-                }
-            };
-            let data = server_message_payload_to_cli_json(payload).ok_or_else(|| {
-                CliError::Other("unexpected local send_message response shape".to_string())
+            .map_err(|error| {
+                queue_or_return_mail_send_error(
+                    &server_config,
+                    &envelope,
+                    error,
+                    resolved_sender_token.is_some(),
+                )
             })?;
             output::emit_output(&data, fmt, || {
+                let message_id = data.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                let rendered_to = cli_output_to_display_recipients(&data, &envelope.to);
+                output::success(&format!("Message sent (id={message_id}) to {rendered_to}"));
+            });
+            Ok(())
+        }
+
+        MailCommand::ReplayQueued {
+            artifact,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let queued = load_pending_send_artifact(&artifact)?;
+            validate_pending_send_artifact(&artifact, &queued)?;
+            let receipt_path = pending_send_receipt_path(&artifact);
+            if receipt_path.exists() {
+                let receipt = load_pending_send_receipt(&receipt_path)?;
+                validate_pending_send_receipt(&receipt_path, &queued, &receipt)?;
+                let data = serde_json::json!({
+                    "queued_status": "already_replayed",
+                    "artifact": artifact.display().to_string(),
+                    "receipt": receipt_path.display().to_string(),
+                    "content_hash": queued.content_hash,
+                });
+                output::emit_output(&data, fmt, || {
+                    output::success(&format!(
+                        "Queued message already replayed; receipt at {}",
+                        receipt_path.display()
+                    ));
+                });
+                return Ok(());
+            }
+
+            let resolved_sender_token = resolve_sender_token(
+                &server_config,
+                &queued.envelope.project_key,
+                &queued.envelope.sender,
+                None,
+                None,
+            )?;
+            let mut data = send_mail_envelope_via_server_or_local(
+                &server_config,
+                &database_url,
+                &server_url,
+                bearer.as_deref(),
+                &queued.envelope,
+                resolved_sender_token.as_deref(),
+            )
+            .await?;
+            let receipt_path = write_pending_send_receipt(&artifact, &queued, &data)?;
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "queued_status".to_string(),
+                    serde_json::Value::String("replayed".to_string()),
+                );
+                object.insert(
+                    "queued_artifact".to_string(),
+                    serde_json::Value::String(artifact.display().to_string()),
+                );
+                object.insert(
+                    "queued_receipt".to_string(),
+                    serde_json::Value::String(receipt_path.display().to_string()),
+                );
+                object.insert(
+                    "pending_content_hash".to_string(),
+                    serde_json::Value::String(queued.content_hash.clone()),
+                );
+            }
+            output::emit_output(&data, fmt, || {
+                let message_id = data.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                let rendered_to = cli_output_to_display_recipients(&data, &queued.envelope.to);
                 output::success(&format!(
-                    "Message sent (id={}) to {}",
-                    data.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                    to
+                    "Queued message replayed (id={message_id}) to {rendered_to}"
                 ));
             });
             Ok(())
@@ -30343,7 +30845,8 @@ fn server_inbox_payload_to_cli_json(
 #[cfg(test)]
 mod mail_server_cli_bridge_tests {
     use super::{
-        CliError, ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
+        CliError, PENDING_SEND_SCHEMA_VERSION, PENDING_SEND_UNSENT_STATUS, PendingMailSendEnvelope,
+        ServerToolCall, acquire_doctor_mailbox_activity_lock_for_database_url,
         acquire_doctor_mailbox_activity_lock_for_sqlite_path,
         acquire_doctor_mailbox_activity_lock_for_storage_root,
         build_server_create_agent_identity_arguments, build_server_fetch_inbox_product_arguments,
@@ -30351,15 +30854,18 @@ mod mail_server_cli_bridge_tests {
         build_server_register_agent_arguments, build_server_reply_message_arguments,
         build_server_send_message_arguments, build_server_whois_arguments,
         classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
-        ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
-        get_blocking_http_request, is_resource_busy_cli_error, load_sender_identity_token,
-        mail_server_rejection_allows_local_fallback, normalize_cli_product_inbox_agent_name,
-        parse_blocking_http_url, parse_cli_fetch_inbox_product_limit, parse_cli_search_limit,
-        persist_sender_identity_token, persist_sender_identity_token_from_agent_payload,
-        post_jsonrpc_request_blocking_http, product_inbox_row_to_json,
-        reject_local_fallback_with_ownership_probe, resolve_sender_token,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        create_pending_send_artifact, ensure_message_in_project,
+        fetch_inbox_server_rejection_allows_local_fallback, get_blocking_http_request,
+        is_resource_busy_cli_error, load_pending_send_artifact, load_pending_send_receipt,
+        load_sender_identity_token, mail_server_rejection_allows_local_fallback,
+        normalize_cli_product_inbox_agent_name, parse_blocking_http_url,
+        parse_cli_fetch_inbox_product_limit, parse_cli_search_limit, pending_send_content_hash,
+        pending_send_failure_from_error, pending_send_receipt_path, persist_sender_identity_token,
+        persist_sender_identity_token_from_agent_payload, post_jsonrpc_request_blocking_http,
+        product_inbox_row_to_json, reject_local_fallback_with_ownership_probe,
+        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
+        validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
     use mcp_agent_mail_core::config::Config;
 
@@ -30430,6 +30936,145 @@ mod mail_server_cli_bridge_tests {
             storage_root: root.to_path_buf(),
             ..Config::default()
         }
+    }
+
+    fn pending_send_test_envelope() -> PendingMailSendEnvelope {
+        PendingMailSendEnvelope {
+            project_key: "/tmp/project".to_string(),
+            sender: "PinkStone".to_string(),
+            to: vec!["WindyGate".to_string()],
+            cc: vec!["BlueLake".to_string()],
+            bcc: Vec::new(),
+            subject: "Closeout".to_string(),
+            body_md: "Proof and status".to_string(),
+            attachment_paths: Vec::new(),
+            convert_images: None,
+            importance: "normal".to_string(),
+            ack_required: false,
+            thread_id: Some("br-test".to_string()),
+        }
+    }
+
+    #[test]
+    fn queued_send_artifact_is_unsent_and_omits_sender_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let envelope = pending_send_test_envelope();
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("lock failure should be queueable");
+
+        let (path, artifact) =
+            create_pending_send_artifact(&config, &envelope, failure.clone(), true)
+                .expect("create queued-send artifact");
+
+        assert_eq!(artifact.schema_version, PENDING_SEND_SCHEMA_VERSION);
+        assert_eq!(artifact.status, PENDING_SEND_UNSENT_STATUS);
+        assert!(artifact.sender_token_was_provided);
+        assert!(
+            !artifact.sender_token_stored,
+            "queued artifacts must not persist sender tokens"
+        );
+        assert_eq!(
+            artifact.content_hash,
+            pending_send_content_hash(&envelope).expect("hash")
+        );
+        assert!(
+            artifact
+                .replay_command
+                .contains("am mail replay-queued --artifact")
+        );
+        assert!(
+            artifact
+                .replay_command
+                .contains(&path.display().to_string())
+        );
+
+        let loaded = load_pending_send_artifact(&path).expect("load queued-send artifact");
+        validate_pending_send_artifact(&path, &loaded).expect("valid queued-send artifact");
+        assert_eq!(loaded.envelope, envelope);
+        assert_eq!(loaded.failure, failure);
+
+        let (second_path, second_artifact) =
+            create_pending_send_artifact(&config, &loaded.envelope, loaded.failure.clone(), true)
+                .expect("idempotent create");
+        assert_eq!(second_path, path);
+        assert_eq!(second_artifact.content_hash, loaded.content_hash);
+    }
+
+    #[test]
+    fn queued_send_failure_filter_skips_validation_errors_and_broadcast() {
+        assert!(
+            pending_send_failure_from_error(&CliError::InvalidArgument(
+                "--to requires at least one recipient".to_string()
+            ))
+            .is_none()
+        );
+        assert!(
+            pending_send_failure_from_error(&CliError::Other(
+                "broadcast=true is intentionally unsupported".to_string()
+            ))
+            .is_none()
+        );
+
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("database lock should queue");
+        assert_eq!(failure.class, "busy_retryable");
+        assert!(failure.safe_to_retry);
+    }
+
+    #[test]
+    fn queued_send_receipt_is_idempotent_duplicate_send_guard() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let envelope = pending_send_test_envelope();
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("lock failure should be queueable");
+        let (path, artifact) = create_pending_send_artifact(&config, &envelope, failure, false)
+            .expect("create queued-send artifact");
+        let response = serde_json::json!({"id": 7, "to": ["WindyGate"]});
+
+        let receipt =
+            write_pending_send_receipt(&path, &artifact, &response).expect("write receipt");
+        let second = write_pending_send_receipt(&path, &artifact, &response)
+            .expect("second receipt write is idempotent");
+
+        assert_eq!(receipt, pending_send_receipt_path(&path));
+        assert_eq!(second, receipt);
+        let receipt_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&receipt).expect("read receipt"))
+                .expect("parse receipt");
+        assert_eq!(
+            receipt_json["schema_version"],
+            super::PENDING_SEND_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(receipt_json["content_hash"], artifact.content_hash);
+
+        let loaded_receipt = load_pending_send_receipt(&receipt).expect("load receipt");
+        validate_pending_send_receipt(&receipt, &artifact, &loaded_receipt)
+            .expect("receipt matches artifact content hash");
+
+        let mismatched_receipt_path = path.with_file_name("mismatched.sent.json");
+        std::fs::write(
+            &mismatched_receipt_path,
+            serde_json::json!({
+                "schema_version": super::PENDING_SEND_RECEIPT_SCHEMA_VERSION,
+                "content_hash": "different",
+                "artifact_path": path.display().to_string(),
+                "sent_ts": "2026-06-11T00:00:00Z",
+                "response": {"id": 8}
+            })
+            .to_string(),
+        )
+        .expect("write mismatched receipt");
+        let mismatched_receipt =
+            load_pending_send_receipt(&mismatched_receipt_path).expect("load mismatched receipt");
+        let mismatch =
+            validate_pending_send_receipt(&mismatched_receipt_path, &artifact, &mismatched_receipt)
+                .expect_err("mismatched receipt hash should be rejected");
+        assert!(mismatch.to_string().contains("content_hash mismatch"));
     }
 
     #[test]

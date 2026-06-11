@@ -2,9 +2,27 @@ Usage: am serve-http [OPTIONS]
 
 Options:
       --host <HOST>
+
+
       --port <PORT>
+
+
       --path <PATH>
-      --no-auth              Disable bearer token authentication for this run (for local development)
-      --no-tui               Disable the interactive TUI and run headless
-      --allowed-host <HOST>  Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS)
-  -h, --help                 Print help
+
+
+      --no-auth
+          Disable bearer token authentication for this run (for local development)
+
+      --no-tui
+          Disable the interactive TUI and run headless
+
+      --allowed-host <HOST>
+          Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS)
+
+      --takeover
+          Forcibly take over the storage root from an already-running server.
+
+          By default, if another Agent Mail server is LIVE and answering `/healthz` on this host:port, startup REFUSES (exit 1) rather than killing the responsive peer. Pass --takeover to SIGTERM/SIGKILL the existing holder and seize the storage root anyway.
+
+  -h, --help
+          Print help (see a summary with '-h')
