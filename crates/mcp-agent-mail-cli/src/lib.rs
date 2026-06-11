@@ -365,10 +365,7 @@ pub enum Commands {
         /// Disable the interactive TUI and run headless.
         #[arg(long)]
         no_tui: bool,
-        /// Additional Host header value to accept (repeatable). The listener
-        /// always accepts the bind host, its loopback variant, and `localhost`;
-        /// use this to reach the /mail web UI via a hostname or reverse proxy.
-        /// Equivalent to (and merged with) the HTTP_ALLOWED_HOSTS env var.
+        /// Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS).
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_host: Vec<String>,
     },
