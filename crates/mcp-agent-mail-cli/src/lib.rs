@@ -85,6 +85,7 @@ struct CliCapabilities {
     version: &'static str,
     binaries: Vec<&'static str>,
     primary_agent_surfaces: BTreeMap<&'static str, &'static str>,
+    mcp_tool_cli_corrections: &'static [McpToolCliCorrection],
     output_formats: CapabilityOutputFormats,
     exit_codes: Vec<ExitCodeCapability>,
     environment: Vec<EnvCapability>,
@@ -121,6 +122,117 @@ struct CommandCapability {
     output_formats: Vec<&'static str>,
     project_scoped: bool,
     recommended_for_agents: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct McpToolCliCorrection {
+    pub attempted_names: &'static [&'static str],
+    pub cli: &'static str,
+    pub mcp_tool: Option<&'static str>,
+}
+
+macro_rules! attempted_names_help {
+    ([$first:literal $(, $rest:literal)* $(,)?]) => {
+        concat!($first $(, "/", $rest)*)
+    };
+}
+
+macro_rules! define_mcp_tool_cli_corrections {
+    (
+        $(
+            {
+                attempted_names: [$($attempted_name:literal),+ $(,)?],
+                cli: $cli:literal,
+                mcp_tool: $mcp_tool:expr $(,)?
+            }
+        ),+ $(,)?
+    ) => {
+        pub const MCP_TOOL_CLI_CORRECTION_HELP: &str = concat!(
+            "MCP tool-name corrections:\n",
+            $(
+                "  ",
+                attempted_names_help!([$($attempted_name),+]),
+                " -> ",
+                $cli,
+                "\n",
+            )+
+        );
+
+        pub const MCP_TOOL_CLI_CORRECTIONS: &[McpToolCliCorrection] = &[
+            $(
+                McpToolCliCorrection {
+                    attempted_names: &[$($attempted_name),+],
+                    cli: $cli,
+                    mcp_tool: $mcp_tool,
+                },
+            )+
+        ];
+    };
+}
+
+define_mcp_tool_cli_corrections! {
+    {
+        attempted_names: ["reserve", "file-reserve", "file_reservation_paths"],
+        cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+        mcp_tool: Some("file_reservation_paths"),
+    },
+    {
+        attempted_names: ["release_file_reservations"],
+        cli: "am file_reservations release <project> <agent> [--paths <path>...]",
+        mcp_tool: Some("release_file_reservations"),
+    },
+    {
+        attempted_names: ["macro_start_session"],
+        cli: "am macros start-session --project <abs-path> --program <program> --model <model>",
+        mcp_tool: Some("macro_start_session"),
+    },
+    {
+        attempted_names: ["send", "send-message", "send_message"],
+        cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
+        mcp_tool: Some("send_message"),
+    },
+    {
+        attempted_names: ["inbox", "fetch_inbox"],
+        cli: "am inbox --project <project> --agent <agent>",
+        mcp_tool: Some("fetch_inbox"),
+    },
+    {
+        attempted_names: ["acknowledge_message"],
+        cli: "am mail ack --project <project> --agent <agent> <message-id>",
+        mcp_tool: Some("acknowledge_message"),
+    },
+    {
+        attempted_names: ["list_agents"],
+        cli: "am agents list --project <project>",
+        mcp_tool: Some("list_agents"),
+    },
+    {
+        attempted_names: ["whois"],
+        cli: "am agents show --project <project> <agent>",
+        mcp_tool: Some("whois"),
+    },
+    {
+        attempted_names: ["reservations"],
+        cli: "am reservations --project <project> --agent <agent>",
+        mcp_tool: None,
+    },
+    {
+        attempted_names: ["serve-http", "serve-stdio"],
+        cli: "am serve-http ...  OR  am serve-stdio ...",
+        mcp_tool: None,
+    },
+}
+
+#[must_use]
+pub const fn mcp_tool_cli_corrections() -> &'static [McpToolCliCorrection] {
+    MCP_TOOL_CLI_CORRECTIONS
+}
+
+#[must_use]
+pub fn mcp_tool_cli_correction(command: &str) -> Option<&'static McpToolCliCorrection> {
+    MCP_TOOL_CLI_CORRECTIONS
+        .iter()
+        .find(|correction| correction.attempted_names.contains(&command))
 }
 
 #[derive(Debug, Serialize)]
@@ -226,7 +338,12 @@ struct AgentStartFixAction {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "am", version = env!("CARGO_PKG_VERSION"), about = "MCP Agent Mail CLI (Rust)")]
+#[command(
+    name = "am",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "MCP Agent Mail CLI (Rust)",
+    after_help = MCP_TOOL_CLI_CORRECTION_HELP
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -248,6 +365,12 @@ pub enum Commands {
         /// Disable the interactive TUI and run headless.
         #[arg(long)]
         no_tui: bool,
+        /// Additional Host header value to accept (repeatable). The listener
+        /// always accepts the bind host, its loopback variant, and `localhost`;
+        /// use this to reach the /mail web UI via a hostname or reverse proxy.
+        /// Equivalent to (and merged with) the HTTP_ALLOWED_HOSTS env var.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
     },
     #[command(name = "serve-stdio")]
     ServeStdio,
@@ -3046,7 +3169,8 @@ fn execute(cli: Cli) -> CliResult<()> {
             path,
             no_auth,
             no_tui,
-        } => handle_serve_http(host, port, path, no_auth, no_tui),
+            allowed_host,
+        } => handle_serve_http(host, port, path, no_auth, no_tui, allowed_host),
         Commands::ServeStdio => handle_serve_stdio(),
         Commands::Capabilities { format, json } => handle_capabilities(format, json),
         Commands::Agent { action } => handle_agent(action),
@@ -3255,7 +3379,7 @@ fn handle_default_launch() -> CliResult<()> {
     }
 
     // Interactive: full server launch experience (setup self-heal + port check + serve)
-    handle_serve_http(None, None, None, false, false)
+    handle_serve_http(None, None, None, false, false, Vec::new())
 }
 
 #[derive(Debug, Serialize)]
@@ -5304,8 +5428,9 @@ fn handle_serve_http(
     path: Option<String>,
     no_auth: bool,
     no_tui: bool,
+    allowed_host: Vec<String>,
 ) -> CliResult<()> {
-    let mut config = build_http_config(host, port, path, no_auth);
+    let mut config = build_http_config(host, port, path, no_auth, allowed_host);
     if no_tui {
         config.tui_enabled = false;
     }
@@ -6224,9 +6349,10 @@ fn build_http_config(
     port: Option<u16>,
     path: Option<String>,
     no_auth: bool,
+    allowed_host: Vec<String>,
 ) -> Config {
     let config = Config::from_env();
-    apply_http_config_overrides(config, host, port, path, no_auth)
+    apply_http_config_overrides(config, host, port, path, no_auth, allowed_host)
 }
 
 fn apply_http_config_overrides(
@@ -6235,6 +6361,7 @@ fn apply_http_config_overrides(
     port: Option<u16>,
     path: Option<String>,
     no_auth: bool,
+    allowed_host: Vec<String>,
 ) -> Config {
     // Keep env and CLI semantics aligned (`HTTP_PATH=mcp` == `--path mcp`).
     config.http_path = normalize_http_path(&config.http_path);
@@ -6246,6 +6373,21 @@ fn apply_http_config_overrides(
     }
     if let Some(path) = path {
         config.http_path = normalize_http_path(&path);
+    }
+    // Merge `--allowed-host` flags with any HTTP_ALLOWED_HOSTS env values so the
+    // listener accepts these Host headers in addition to the loopback built-ins.
+    // CLI and env compose (neither clobbers the other); duplicates are deduped
+    // later in the server's `http_allowed_hosts`. See GitHub issue #146.
+    for extra in allowed_host {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty()
+            && !config
+                .http_allowed_hosts
+                .iter()
+                .any(|existing| existing == trimmed)
+        {
+            config.http_allowed_hosts.push(trimmed.to_string());
+        }
     }
     if no_auth {
         // Disable bearer token authentication for this run. `--no-auth` is the
@@ -31807,7 +31949,7 @@ fn current_uid() -> CliResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -31864,6 +32006,39 @@ mod tests {
             s = &s[consumed..];
         }
         blocks
+    }
+
+    #[test]
+    fn mcp_tool_cli_correction_catalog_covers_e1_minimum() {
+        let attempted_names = mcp_tool_cli_corrections()
+            .iter()
+            .flat_map(|correction| correction.attempted_names.iter().copied())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "send",
+            "send-message",
+            "send_message",
+            "reserve",
+            "file-reserve",
+            "file_reservation_paths",
+            "release_file_reservations",
+            "macro_start_session",
+            "fetch_inbox",
+            "inbox",
+            "reservations",
+            "whois",
+            "list_agents",
+            "acknowledge_message",
+        ] {
+            assert!(
+                attempted_names.contains(required),
+                "missing MCP tool-name correction for {required}"
+            );
+            assert!(
+                MCP_TOOL_CLI_CORRECTION_HELP.contains(required),
+                "root help correction text should mention {required}"
+            );
+        }
     }
 
     #[test]
@@ -33933,6 +34108,7 @@ http_headers = { Authorization = "Bearer secret" }
             Some(9000),
             Some("/api/v2/".to_string()),
             false,
+            Vec::new(),
         );
         assert_eq!(config.http_host, "0.0.0.0");
         assert_eq!(config.http_port, 9000);
@@ -33941,16 +34117,22 @@ http_headers = { Authorization = "Bearer secret" }
 
     #[test]
     fn serve_http_path_aliases_are_normalized() {
-        let config_mcp = build_http_config(None, None, Some("mcp".to_string()), false);
+        let config_mcp = build_http_config(None, None, Some("mcp".to_string()), false, Vec::new());
         assert_eq!(config_mcp.http_path, "/mcp/");
 
-        let config_api = build_http_config(None, None, Some("/api".to_string()), false);
+        let config_api = build_http_config(None, None, Some("/api".to_string()), false, Vec::new());
         assert_eq!(config_api.http_path, "/api/");
     }
 
     #[test]
     fn serve_http_relative_path_is_normalized() {
-        let config = build_http_config(None, None, Some("custom/path".to_string()), false);
+        let config = build_http_config(
+            None,
+            None,
+            Some("custom/path".to_string()),
+            false,
+            Vec::new(),
+        );
         assert_eq!(config.http_path, "/custom/path/");
     }
 
@@ -33960,14 +34142,14 @@ http_headers = { Authorization = "Bearer secret" }
             http_path: "api".to_string(),
             ..Config::default()
         };
-        let normalized = apply_http_config_overrides(config, None, None, None, false);
+        let normalized = apply_http_config_overrides(config, None, None, None, false, Vec::new());
         assert_eq!(normalized.http_path, "/api/");
     }
 
     #[test]
     fn serve_http_no_auth_clears_token() {
         // Verify --no-auth clears any token (whether loaded from env or not)
-        let config_no_auth = build_http_config(None, None, None, true);
+        let config_no_auth = build_http_config(None, None, None, true, Vec::new());
         assert!(
             config_no_auth.http_bearer_token.is_none(),
             "--no-auth should clear bearer token"
@@ -33986,7 +34168,7 @@ http_headers = { Authorization = "Bearer secret" }
             http_allow_localhost_unauthenticated: false,
             ..Config::default()
         };
-        let with_no_auth = apply_http_config_overrides(base, None, None, None, true);
+        let with_no_auth = apply_http_config_overrides(base, None, None, None, true, Vec::new());
         assert!(
             with_no_auth.http_allow_localhost_unauthenticated,
             "--no-auth should enable localhost-unauthenticated access for writes"
@@ -33997,7 +34179,8 @@ http_headers = { Authorization = "Bearer secret" }
             http_allow_localhost_unauthenticated: false,
             ..Config::default()
         };
-        let without_no_auth = apply_http_config_overrides(base_off, None, None, None, false);
+        let without_no_auth =
+            apply_http_config_overrides(base_off, None, None, None, false, Vec::new());
         assert!(
             !without_no_auth.http_allow_localhost_unauthenticated,
             "without --no-auth the localhost-unauthenticated default must be preserved"
@@ -34045,6 +34228,7 @@ http_headers = { Authorization = "Bearer secret" }
             Some(8765),
             Some("mcp".to_string()),
             false,
+            Vec::new(),
         );
 
         match build_setup_run_command_for_http_server(&config) {
@@ -34176,15 +34360,67 @@ http_headers = { Authorization = "Bearer secret" }
                 path,
                 no_auth,
                 no_tui,
+                allowed_host,
             } => {
                 assert_eq!(host.as_deref(), Some("0.0.0.0"));
                 assert_eq!(port, Some(9999));
                 assert_eq!(path.as_deref(), Some("/api/x/"));
                 assert!(!no_auth);
                 assert!(!no_tui);
+                assert!(
+                    allowed_host.is_empty(),
+                    "--allowed-host defaults to empty (loopback-only)"
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn clap_parses_serve_http_allowed_host_repeatable() {
+        // #146: the repeatable `--allowed-host` flag collects every value so the
+        // listener can accept non-loopback Host headers (e.g. a reverse-proxy
+        // hostname) without an env var.
+        let cli = Cli::try_parse_from([
+            "am",
+            "serve-http",
+            "--allowed-host",
+            "mail.internal",
+            "--allowed-host",
+            "10.0.0.5",
+        ])
+        .expect("failed to parse serve-http --allowed-host");
+        match cli.command.expect("expected command") {
+            Commands::ServeHttp { allowed_host, .. } => {
+                assert_eq!(
+                    allowed_host,
+                    vec!["mail.internal".to_string(), "10.0.0.5".to_string()]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_http_allowed_host_flag_merges_into_config() {
+        // #146: `--allowed-host` values land on `Config::http_allowed_hosts`
+        // (trimmed + deduped) so the server's host allow-list accepts them.
+        let config = build_http_config(
+            None,
+            None,
+            None,
+            false,
+            vec![
+                "  mail.internal ".to_string(),
+                "mail.internal".to_string(),
+                "10.0.0.5".to_string(),
+            ],
+        );
+        assert_eq!(
+            config.http_allowed_hosts,
+            vec!["mail.internal".to_string(), "10.0.0.5".to_string()],
+            "flag values are trimmed and deduped, env+CLI compose"
+        );
     }
 
     #[test]
@@ -67649,6 +67885,7 @@ fn build_cli_capabilities() -> CliCapabilities {
         version: env!("CARGO_PKG_VERSION"),
         binaries: vec!["am", "mcp-agent-mail"],
         primary_agent_surfaces,
+        mcp_tool_cli_corrections: mcp_tool_cli_corrections(),
         output_formats: CapabilityOutputFormats {
             cli: vec!["table", "json", "toon"],
             robot: vec!["toon", "json", "md"],
@@ -69407,6 +69644,7 @@ fn handle_tooling_directory(
     let val = serde_json::json!({
         "tool_count": cluster_map.len(),
         "clusters": clusters,
+        "mcp_tool_cli_corrections": mcp_tool_cli_corrections(),
     });
 
     output::emit_output(&val, fmt, || {
@@ -69419,6 +69657,18 @@ fn handle_tooling_directory(
             table.add_row(vec![tool.to_string(), cluster.to_string()]);
         }
         table.render();
+        ftui_runtime::ftui_println!("");
+
+        output::section("MCP Tool-Name Corrections:");
+        let mut corrections = output::CliTable::new(vec!["ATTEMPTED", "CLI", "MCP TOOL"]);
+        for correction in mcp_tool_cli_corrections() {
+            corrections.add_row(vec![
+                correction.attempted_names.join(", "),
+                correction.cli.to_string(),
+                correction.mcp_tool.unwrap_or("").to_string(),
+            ]);
+        }
+        corrections.render();
     });
     Ok(())
 }

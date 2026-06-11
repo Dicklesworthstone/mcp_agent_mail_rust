@@ -388,6 +388,13 @@ enum Commands {
         #[arg(long)]
         no_tui: bool,
 
+        /// Additional `Host:` header value to accept (repeatable). The listener
+        /// always accepts the bind host, its loopback variant, and `localhost`;
+        /// use this to reach the server via a hostname or reverse proxy without
+        /// an HTTP 421. Merged with the `HTTP_ALLOWED_HOSTS` env var. See #146.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
+
         /// Read `HTTP_BEARER_TOKEN` fallback from this env file for `serve`.
         ///
         /// Process env and regular config loading still take precedence.
@@ -717,6 +724,7 @@ fn main() {
             path,
             transport,
             no_tui,
+            allowed_host,
             env_file,
             reuse_running,
             no_reuse_running,
@@ -732,6 +740,20 @@ fn main() {
             }
             if no_tui {
                 config.tui_enabled = false;
+            }
+            // Merge `--allowed-host` flags with any HTTP_ALLOWED_HOSTS env values
+            // (neither clobbers the other; deduped by the server's allow-list).
+            // See GitHub issue #146.
+            for extra in allowed_host {
+                let trimmed = extra.trim();
+                if !trimmed.is_empty()
+                    && !config
+                        .http_allowed_hosts
+                        .iter()
+                        .any(|existing| existing == trimmed)
+                {
+                    config.http_allowed_hosts.push(trimmed.to_string());
+                }
             }
             let resolved_path =
                 resolve_serve_http_path(path.as_deref(), transport, env_value("HTTP_PATH"));
@@ -847,7 +869,7 @@ fn render_denial(command: &str) {
     eprintln!("Error: \"{command}\" is not an MCP server command.\n");
     eprintln!("Agent Mail is not a CLI.");
     eprintln!("Agent Mail MCP server accepts: serve, config");
-    if let Some(correction) = command_correction(command) {
+    if let Some(correction) = mcp_agent_mail_cli::mcp_tool_cli_correction(command) {
         eprintln!("Corrected command:");
         eprintln!("  CLI: {}", correction.cli);
         if let Some(mcp_tool) = correction.mcp_tool {
@@ -862,42 +884,6 @@ fn render_denial(command: &str) {
     let no_color = env::var_os("NO_COLOR").is_some();
     if std::io::stderr().is_terminal() && !no_color {
         eprintln!("\nTip: Run `am --help` for the full command list.");
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CommandCorrection {
-    cli: &'static str,
-    mcp_tool: Option<&'static str>,
-}
-
-fn command_correction(command: &str) -> Option<CommandCorrection> {
-    match command {
-        "reserve" | "file-reserve" | "file_reservation_paths" => Some(CommandCorrection {
-            cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-            mcp_tool: Some("file_reservation_paths"),
-        }),
-        "macro_start_session" => Some(CommandCorrection {
-            cli: "am macros start-session --project <abs-path> --program <program> --model <model>",
-            mcp_tool: Some("macro_start_session"),
-        }),
-        "send" | "send_message" => Some(CommandCorrection {
-            cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
-            mcp_tool: Some("send_message"),
-        }),
-        "inbox" | "fetch_inbox" => Some(CommandCorrection {
-            cli: "am inbox --project <project> --agent <agent>",
-            mcp_tool: Some("fetch_inbox"),
-        }),
-        "reservations" => Some(CommandCorrection {
-            cli: "am reservations --project <project> --agent <agent>",
-            mcp_tool: None,
-        }),
-        "serve-http" | "serve-stdio" => Some(CommandCorrection {
-            cli: "am serve-http ...  OR  am serve-stdio ...",
-            mcp_tool: None,
-        }),
-        _ => None,
     }
 }
 
@@ -1125,6 +1111,40 @@ mod tests {
             Some(Commands::Serve { no_tui, .. }) => {
                 assert!(!no_tui);
             }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_command_allowed_host_repeatable_parsed() {
+        // #146: repeatable `--allowed-host` so the listener accepts non-loopback
+        // Host headers (reverse proxy / hostname) without an env var.
+        let cli = Cli::try_parse_from([
+            "mcp-agent-mail",
+            "serve",
+            "--allowed-host",
+            "mail.internal",
+            "--allowed-host",
+            "10.0.0.5",
+        ])
+        .expect("should parse");
+
+        match cli.command {
+            Some(Commands::Serve { allowed_host, .. }) => {
+                assert_eq!(
+                    allowed_host,
+                    vec!["mail.internal".to_string(), "10.0.0.5".to_string()]
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_command_allowed_host_defaults_empty() {
+        let cli = Cli::try_parse_from(["mcp-agent-mail", "serve"]).expect("should parse");
+        match cli.command {
+            Some(Commands::Serve { allowed_host, .. }) => assert!(allowed_host.is_empty()),
             other => panic!("expected Serve, got {other:?}"),
         }
     }
@@ -1389,68 +1409,37 @@ mod tests {
 
     #[test]
     fn command_correction_covers_protocol_and_cli_mismatch_names() {
-        let cases = [
-            (
-                "reserve",
-                "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-                Some("file_reservation_paths"),
-            ),
-            (
-                "file-reserve",
-                "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-                Some("file_reservation_paths"),
-            ),
-            (
-                "file_reservation_paths",
-                "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-                Some("file_reservation_paths"),
-            ),
-            (
-                "macro_start_session",
-                "am macros start-session --project <abs-path> --program <program> --model <model>",
-                Some("macro_start_session"),
-            ),
-            (
-                "send_message",
-                "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
-                Some("send_message"),
-            ),
-            (
-                "send",
-                "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
-                Some("send_message"),
-            ),
-            (
-                "inbox",
-                "am inbox --project <project> --agent <agent>",
-                Some("fetch_inbox"),
-            ),
-            (
-                "fetch_inbox",
-                "am inbox --project <project> --agent <agent>",
-                Some("fetch_inbox"),
-            ),
-            (
-                "reservations",
-                "am reservations --project <project> --agent <agent>",
-                None,
-            ),
-            (
-                "serve-http",
-                "am serve-http ...  OR  am serve-stdio ...",
-                None,
-            ),
-            (
-                "serve-stdio",
-                "am serve-http ...  OR  am serve-stdio ...",
-                None,
-            ),
+        let required = [
+            "send",
+            "send-message",
+            "send_message",
+            "reserve",
+            "file-reserve",
+            "file_reservation_paths",
+            "release_file_reservations",
+            "macro_start_session",
+            "fetch_inbox",
+            "inbox",
+            "reservations",
+            "whois",
+            "list_agents",
+            "acknowledge_message",
         ];
 
-        for (input, expected_cli, expected_mcp_tool) in cases {
-            let correction = command_correction(input).expect("correction");
-            assert_eq!(correction.cli, expected_cli);
-            assert_eq!(correction.mcp_tool, expected_mcp_tool);
+        for input in required {
+            assert!(
+                mcp_agent_mail_cli::mcp_tool_cli_correction(input).is_some(),
+                "missing correction for {input}"
+            );
+        }
+
+        for correction in mcp_agent_mail_cli::mcp_tool_cli_corrections() {
+            for input in correction.attempted_names {
+                let actual =
+                    mcp_agent_mail_cli::mcp_tool_cli_correction(input).expect("correction");
+                assert_eq!(actual.cli, correction.cli);
+                assert_eq!(actual.mcp_tool, correction.mcp_tool);
+            }
         }
     }
 

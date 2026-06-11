@@ -1253,6 +1253,29 @@ fn capabilities_json_exposes_agent_contract() {
     let commands = value["commands"]
         .as_array()
         .expect("commands should be an array");
+    let corrections = value["mcp_tool_cli_corrections"]
+        .as_array()
+        .expect("mcp_tool_cli_corrections should be an array");
+    for expected in mcp_agent_mail_cli::mcp_tool_cli_corrections() {
+        let actual = corrections
+            .iter()
+            .find(|entry| entry["cli"].as_str() == Some(expected.cli))
+            .unwrap_or_else(|| panic!("missing correction for {}", expected.cli));
+        let attempted_names = actual["attempted_names"]
+            .as_array()
+            .expect("attempted_names should be an array");
+        for attempted in expected.attempted_names {
+            assert!(
+                attempted_names
+                    .iter()
+                    .any(|value| value.as_str() == Some(*attempted)),
+                "capabilities correction for {} should include attempted name {}",
+                expected.cli,
+                attempted
+            );
+        }
+        assert_eq!(actual["mcp_tool"].as_str(), expected.mcp_tool);
+    }
     assert!(
         commands.iter().any(|command| {
             command["name"].as_str() == Some("robot status")
@@ -1287,6 +1310,43 @@ fn capabilities_json_exposes_agent_contract() {
 }
 
 #[test]
+fn root_help_exposes_mcp_tool_correction_catalog() {
+    let env = TestEnv::new();
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &["--help"], None);
+    if !out.status.success() {
+        write_artifact("root_help", &["--help"], &out);
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8(out.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("MCP tool-name corrections:"));
+    let compact_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    for correction in mcp_agent_mail_cli::mcp_tool_cli_corrections() {
+        let compact_cli = correction
+            .cli
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            compact_stdout.contains(&compact_cli),
+            "root help should expose correction `{}`.\nstdout:\n{}",
+            correction.cli,
+            stdout
+        );
+        for attempted in correction.attempted_names {
+            assert!(
+                stdout.contains(attempted),
+                "root help should mention MCP-style attempted name `{attempted}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn robot_status_accepts_json_shorthand() {
     let env = TestEnv::new();
     let out = run_am(
@@ -1312,6 +1372,43 @@ fn robot_status_accepts_json_shorthand() {
         stdout.contains("--json"),
         "robot status help should document --json shorthand"
     );
+}
+
+#[test]
+fn tooling_directory_json_exposes_mcp_tool_corrections() {
+    let env = TestEnv::new();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["tooling", "directory", "--json"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "tooling_directory_json",
+            &["tooling", "directory", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let corrections = value["mcp_tool_cli_corrections"]
+        .as_array()
+        .expect("mcp_tool_cli_corrections should be an array");
+    for expected in mcp_agent_mail_cli::mcp_tool_cli_corrections() {
+        assert!(
+            corrections
+                .iter()
+                .any(|entry| entry["cli"].as_str() == Some(expected.cli)),
+            "tooling directory should expose correction `{}`",
+            expected.cli
+        );
+    }
 }
 
 #[test]

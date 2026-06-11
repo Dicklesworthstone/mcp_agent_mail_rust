@@ -31,9 +31,9 @@ use crate::templates;
 
 /// Mail UI request budget helper.
 ///
-/// `asupersync::Budget::with_deadline_secs` stores an absolute timestamp in
-/// asupersync's process-relative clock. Request handlers need a fresh relative
-/// deadline for every request, so keep the conversion at this boundary.
+/// `asupersync::Budget` deadlines are absolute timestamps in asupersync's
+/// process-relative clock. Request handlers need a fresh relative deadline for
+/// every request, so keep the conversion at this boundary.
 struct Budget;
 
 impl Budget {

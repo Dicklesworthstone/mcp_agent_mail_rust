@@ -1828,6 +1828,12 @@ fn http_allowed_hosts(config: &mcp_agent_mail_core::Config) -> Vec<String> {
         normalize_allowed_http_host(normalized_probe_host(&config.http_host)),
     );
     push_unique_host(&mut hosts, "localhost".to_string());
+    // Operator-supplied extra hosts (HTTP_ALLOWED_HOSTS / `--allowed-host`).
+    // Additive on top of the loopback-only built-ins so the secure default is
+    // preserved when this is empty. See GitHub issue #146.
+    for extra in &config.http_allowed_hosts {
+        push_unique_host(&mut hosts, normalize_allowed_http_host(extra));
+    }
     hosts
 }
 
@@ -15594,9 +15600,9 @@ mod tests {
 
     /// Regression test: Budget deadline must be relative to `wall_now()`, not absolute.
     ///
-    /// BUG HISTORY: `Budget::with_deadline_secs(30)` created a deadline of 30 seconds
-    /// since epoch (1970-01-01 00:00:30), but `wall_now()` returns time relative to
-    /// process start. Since `wall_now()` > 30 seconds, the deadline was always exceeded
+    /// BUG HISTORY: treating an absolute deadline constructor as a 30-second timeout
+    /// created a deadline of 30 seconds after the asupersync epoch. Since
+    /// `wall_now()` was already beyond that absolute instant, the deadline was exceeded
     /// immediately, causing all MCP requests to timeout.
     ///
     /// FIX: Use `wall_now()` + `Duration::from_secs(timeout)` for a relative deadline.
@@ -15633,24 +15639,24 @@ mod tests {
         );
     }
 
-    /// Verify that `Budget::with_deadline_secs` is NOT suitable for relative timeouts.
+    /// Verify that `Budget::with_deadline_at_secs` is NOT suitable for relative timeouts.
     /// This test documents the API misuse that caused the bug.
     #[test]
-    fn budget_with_deadline_secs_is_absolute_not_relative() {
-        // Budget::with_deadline_secs(0) creates an ABSOLUTE deadline at time origin.
+    fn budget_with_deadline_at_secs_is_absolute_not_relative() {
+        // Budget::with_deadline_at_secs(0) creates an ABSOLUTE deadline at time origin.
         // Since wall_now() is always > 0 for any running process, this deadline
-        // is always already exceeded. This demonstrates why with_deadline_secs
+        // is always already exceeded. This demonstrates why with_deadline_at_secs
         // is NOT suitable for relative timeouts - it uses absolute time, not
         // "N seconds from now".
-        let budget = Budget::with_deadline_secs(0);
+        let budget = Budget::with_deadline_at_secs(0);
         let now = wall_now();
 
         // This assertion is deterministic: wall_now() > 0 always
         assert!(
             budget.is_past_deadline(now),
-            "with_deadline_secs(0) should always be expired. \
+            "with_deadline_at_secs(0) should always be expired. \
              wall_now()={now:?} is always > 0 (the absolute deadline). \
-             This demonstrates why with_deadline_secs is WRONG for relative timeouts.",
+             This demonstrates why with_deadline_at_secs is WRONG for relative timeouts.",
         );
     }
 
@@ -15846,6 +15852,56 @@ mod tests {
             HostPolicy::AllowList(hosts) => {
                 assert!(hosts.contains(&"127.0.0.1".to_string()));
                 assert!(hosts.contains(&"localhost".to_string()));
+                // Default config carries no extra hosts → loopback-only posture
+                // is preserved (secure by default). #146.
+                assert!(
+                    config.http_allowed_hosts.is_empty(),
+                    "default config must not pre-populate extra allowed hosts"
+                );
+                assert!(
+                    !hosts.contains(&"mail.internal".to_string()),
+                    "an unconfigured host must NOT be in the default allow-list"
+                );
+            }
+            other => panic!("expected HTTP host allow-list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_allowed_hosts_extends_with_configured_extra_hosts() {
+        // #146: hosts supplied via HTTP_ALLOWED_HOSTS / `--allowed-host` land on
+        // `config.http_allowed_hosts` and must be accepted by the listener's
+        // Host allow-list, while any host NOT configured stays rejected. The
+        // loopback built-ins remain present regardless.
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_host = "127.0.0.1".to_string();
+        config.http_allowed_hosts = vec!["Mail.Internal".to_string(), "10.0.0.5".to_string()];
+
+        let hosts = http_allowed_hosts(&config);
+
+        // Built-ins still present.
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert!(hosts.contains(&"localhost".to_string()));
+        // Configured extras are normalized (lowercased/trimmed) and accepted.
+        assert!(
+            hosts.contains(&"mail.internal".to_string()),
+            "a host supplied via http_allowed_hosts must be accepted"
+        );
+        assert!(hosts.contains(&"10.0.0.5".to_string()));
+        // A host that was NOT configured is still rejected.
+        assert!(
+            !hosts.contains(&"evil.example.com".to_string()),
+            "an unconfigured host must remain rejected"
+        );
+
+        // The same set drives the real listener's HostPolicy.
+        match hardened_http_listener_config(&config)
+            .http_config
+            .allowed_hosts
+        {
+            HostPolicy::AllowList(policy_hosts) => {
+                assert!(policy_hosts.contains(&"mail.internal".to_string()));
+                assert!(!policy_hosts.contains(&"evil.example.com".to_string()));
             }
             other => panic!("expected HTTP host allow-list, got {other:?}"),
         }
@@ -19931,6 +19987,90 @@ first body
         assert!(
             message.contains("JSON error"),
             "empty JSON body should fail during transport JSON decode: {message}"
+        );
+    }
+
+    #[test]
+    fn http_tools_call_param_decode_error_preserves_read_health() {
+        let config = mcp_agent_mail_core::Config {
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let mut read_before = make_request(Http1Method::Post, "/api", &[]);
+        read_before.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 701_i64))
+            .expect("serialize tools/list request");
+        let read_before_resp = block_on(state.handle(read_before));
+        assert_eq!(read_before_resp.status, 200);
+        let read_before_body: serde_json::Value =
+            serde_json::from_slice(&read_before_resp.body).expect("tools/list response json");
+        assert!(
+            read_before_body
+                .get("result")
+                .and_then(|value| value.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "baseline read path should work before decode failure: {read_before_body}"
+        );
+
+        let mut malformed_call = make_request(Http1Method::Post, "/api", &[]);
+        malformed_call.body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 702,
+            "method": "tools/call",
+            "params": {
+                "name": { "not": "a string" },
+                "arguments": {
+                    "project_key": "/tmp/l2-decode-before-tool",
+                    "sender_name": "BlueLake",
+                    "to": ["BlueLake"],
+                    "subject": "should not execute",
+                    "body_md": "tool handler must not run"
+                }
+            }
+        }))
+        .expect("serialize malformed tools/call request");
+        let malformed_resp = block_on(state.handle(malformed_call));
+        assert_eq!(malformed_resp.status, 200);
+        let malformed_body: serde_json::Value =
+            serde_json::from_slice(&malformed_resp.body).expect("malformed response json");
+        assert_eq!(malformed_body["jsonrpc"], "2.0");
+        assert_eq!(malformed_body["id"], serde_json::json!(702));
+        assert_eq!(
+            malformed_body["error"]["code"],
+            i32::from(McpErrorCode::InvalidParams)
+        );
+        let error_message = malformed_body["error"]["message"]
+            .as_str()
+            .expect("error message should be a string");
+        assert!(
+            error_message.contains("invalid type") && error_message.contains("expected a string"),
+            "decode failure should explain the malformed tool name: {malformed_body}"
+        );
+        assert!(
+            malformed_body.get("result").is_none(),
+            "decode failure must not produce a tool result: {malformed_body}"
+        );
+        assert!(
+            !malformed_body.to_string().contains("DATABASE"),
+            "decode failure must not be mislabeled as database trouble: {malformed_body}"
+        );
+
+        let mut read_after = make_request(Http1Method::Post, "/api", &[]);
+        read_after.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, 703_i64))
+            .expect("serialize post-failure tools/list request");
+        let read_after_resp = block_on(state.handle(read_after));
+        assert_eq!(read_after_resp.status, 200);
+        let read_after_body: serde_json::Value =
+            serde_json::from_slice(&read_after_resp.body).expect("post-failure response json");
+        assert!(
+            read_after_body
+                .get("result")
+                .and_then(|value| value.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "decode failure must not poison later reads: {read_after_body}"
         );
     }
 

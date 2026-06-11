@@ -248,6 +248,14 @@ pub struct Config {
     pub http_cors_allow_methods: Vec<String>,
     pub http_cors_allow_headers: Vec<String>,
 
+    /// Additional Host header values the HTTP listener accepts beyond the
+    /// always-present built-ins (the configured `http_host`, its loopback
+    /// probe variant, and `localhost`). Empty by default — keeping the
+    /// listener loopback-only — so this is purely additive/opt-in. Populated
+    /// from the `HTTP_ALLOWED_HOSTS` env var (comma-separated) or the
+    /// `serve-http --allowed-host` flag. See GitHub issue #146.
+    pub http_allowed_hosts: Vec<String>,
+
     // Contact & Messaging
     pub contact_enforcement_enabled: bool,
     pub contact_auto_ttl_seconds: u64,
@@ -1285,6 +1293,9 @@ impl Default for Config {
             http_cors_allow_methods: vec!["*".to_string()],
             http_cors_allow_headers: vec!["*".to_string()],
 
+            // Extra Host header allow-list (loopback-only by default).
+            http_allowed_hosts: vec![],
+
             // Contact & Messaging
             contact_enforcement_enabled: true,
             contact_auto_ttl_seconds: 86400, // 24 hours
@@ -1901,6 +1912,11 @@ impl Config {
         }
         if let Some(v) = env_value("HTTP_CORS_ALLOW_HEADERS") {
             config.http_cors_allow_headers = parse_csv(&v);
+        }
+
+        // Extra HTTP Host header allow-list (additive; loopback-only default).
+        if let Some(v) = env_value("HTTP_ALLOWED_HOSTS") {
+            config.http_allowed_hosts = parse_csv(&v);
         }
 
         // Contact & Messaging
@@ -4226,6 +4242,27 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("TUI_ENABLED", "true")]);
         let config = Config::from_env();
         assert!(config.tui_enabled);
+    }
+
+    #[test]
+    fn http_allowed_hosts_default_is_empty() {
+        // #146: loopback-only by default — no extra Host headers are accepted
+        // unless explicitly opted in.
+        let config = Config::default();
+        assert!(config.http_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn http_allowed_hosts_parsed_from_env_csv() {
+        // #146: HTTP_ALLOWED_HOSTS is comma-separated, trimmed, empties skipped —
+        // mirroring the HTTP_RBAC_READER_ROLES / HTTP_CORS_ORIGINS idiom.
+        let _env =
+            TestEnvOverrideGuard::set(&[("HTTP_ALLOWED_HOSTS", " mail.internal , 10.0.0.5 ,,")]);
+        let config = Config::from_env();
+        assert_eq!(
+            config.http_allowed_hosts,
+            vec!["mail.internal".to_string(), "10.0.0.5".to_string()]
+        );
     }
 
     #[test]

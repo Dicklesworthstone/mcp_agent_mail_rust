@@ -400,68 +400,26 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
 const MCP_ALLOW_COMMANDS: &[&[&str]] = &[&["serve", "--help"], &["config"]];
 
 struct CommandCorrectionCase {
-    attempted: &'static str,
+    attempted: String,
     expected_cli: &'static str,
     expected_mcp_tool: Option<&'static str>,
 }
 
-const MCP_NAME_MISMATCH_CORRECTION_CASES: &[CommandCorrectionCase] = &[
-    CommandCorrectionCase {
-        attempted: "reserve",
-        expected_cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-        expected_mcp_tool: Some("file_reservation_paths"),
-    },
-    CommandCorrectionCase {
-        attempted: "file-reserve",
-        expected_cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-        expected_mcp_tool: Some("file_reservation_paths"),
-    },
-    CommandCorrectionCase {
-        attempted: "file_reservation_paths",
-        expected_cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
-        expected_mcp_tool: Some("file_reservation_paths"),
-    },
-    CommandCorrectionCase {
-        attempted: "macro_start_session",
-        expected_cli: "am macros start-session --project <abs-path> --program <program> --model <model>",
-        expected_mcp_tool: Some("macro_start_session"),
-    },
-    CommandCorrectionCase {
-        attempted: "send_message",
-        expected_cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
-        expected_mcp_tool: Some("send_message"),
-    },
-    CommandCorrectionCase {
-        attempted: "send",
-        expected_cli: "am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>",
-        expected_mcp_tool: Some("send_message"),
-    },
-    CommandCorrectionCase {
-        attempted: "inbox",
-        expected_cli: "am inbox --project <project> --agent <agent>",
-        expected_mcp_tool: Some("fetch_inbox"),
-    },
-    CommandCorrectionCase {
-        attempted: "fetch_inbox",
-        expected_cli: "am inbox --project <project> --agent <agent>",
-        expected_mcp_tool: Some("fetch_inbox"),
-    },
-    CommandCorrectionCase {
-        attempted: "reservations",
-        expected_cli: "am reservations --project <project> --agent <agent>",
-        expected_mcp_tool: None,
-    },
-    CommandCorrectionCase {
-        attempted: "serve-http",
-        expected_cli: "am serve-http ...  OR  am serve-stdio ...",
-        expected_mcp_tool: None,
-    },
-    CommandCorrectionCase {
-        attempted: "serve-stdio",
-        expected_cli: "am serve-http ...  OR  am serve-stdio ...",
-        expected_mcp_tool: None,
-    },
-];
+fn mcp_name_mismatch_correction_cases() -> Vec<CommandCorrectionCase> {
+    mcp_agent_mail_cli::mcp_tool_cli_corrections()
+        .iter()
+        .flat_map(|correction| {
+            correction
+                .attempted_names
+                .iter()
+                .map(move |attempted| CommandCorrectionCase {
+                    attempted: (*attempted).to_string(),
+                    expected_cli: correction.cli,
+                    expected_mcp_tool: correction.mcp_tool,
+                })
+        })
+        .collect()
+}
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -647,8 +605,8 @@ fn matrix_mcp_name_mismatch_denials_print_exact_corrections() {
         return;
     }
 
-    for case in MCP_NAME_MISMATCH_CORRECTION_CASES {
-        let out = run_mcp(&[case.attempted], &env);
+    for case in mcp_name_mismatch_correction_cases() {
+        let out = run_mcp(&[case.attempted.as_str()], &env);
         let sout = stdout_str(&out);
         let serr = stderr_str(&out);
 

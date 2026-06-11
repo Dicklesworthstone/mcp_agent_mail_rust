@@ -278,6 +278,7 @@ is used in hot paths.
 | `HTTP_PATH`                           | `/mcp/`       | Base path                      |
 | `HTTP_BEARER_TOKEN`                   | (none)        | Bearer auth token              |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED`| `false`       | Skip auth for 127.0.0.1       |
+| `HTTP_ALLOWED_HOSTS`                  | (none)        | Comma-separated extra `Host:` header values the listener accepts (additive to the bind host, its loopback variant, and `localhost`). Needed to reach `/mail` via a hostname or reverse proxy without an HTTP 421. Same as repeatable `serve-http --allowed-host`. |
 
 ### Storage
 
