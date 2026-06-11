@@ -2986,10 +2986,17 @@ mod tests {
         );
     }
 
-    /// Issue #238: a merge commit that merely CARRIES a file from the origin
-    /// side (the merge itself does not change it) must NOT flag that file. The
-    /// old `-m` exploded the merge per-parent and false-flagged carried files;
-    /// `--cc` reports only files the merge changed vs ALL parents.
+    /// Issue #238: a merge commit that merely CARRIES a file already present on
+    /// origin (the merge itself does not change it) must NOT flag that file. The
+    /// old `-m` exploded the merge per-parent and false-flagged the carried file
+    /// even though it was already on the remote; `--cc` reports only files the
+    /// merge changed vs ALL parents.
+    ///
+    /// The carried file is introduced on the FEATURE side and `remote_sha` is
+    /// set to the feature tip, so the feature commit is NOT in the pushed range
+    /// (`feature..merge`) — only the merge commit and the divergent main commit
+    /// are. This isolates the merge-commit per-parent explosion, which is the
+    /// actual #238 bug.
     #[test]
     fn push_paths_merge_does_not_flag_carried_origin_files() {
         let td = tempfile::TempDir::new().expect("tempdir");
@@ -2999,26 +3006,28 @@ mod tests {
         run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
         run_git(&repo_dir, &["config", "user.name", "test"]);
 
-        // Base commit (this is what's already on the remote).
+        // Base commit.
         std::fs::write(repo_dir.join("base.txt"), "base\n").expect("write base");
         run_git(&repo_dir, &["add", "base.txt"]);
         run_git(&repo_dir, &["commit", "-qm", "base"]);
-        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
-        // Feature branch adds carried.txt (an origin-side change being merged).
+        // Feature branch adds carried.txt. Its tip is what origin already has,
+        // so this commit is NOT part of the push.
         run_git(&repo_dir, &["checkout", "-q", "-b", "feature"]);
         std::fs::write(repo_dir.join("carried.txt"), "from feature\n").expect("write carried");
         run_git(&repo_dir, &["add", "carried.txt"]);
         run_git(&repo_dir, &["commit", "-qm", "add carried"]);
+        // Origin's pre-push tip already contains the feature commit (carried.txt).
+        let remote_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
-        // main modifies a different file so the branches diverge.
+        // main diverges from base with its own change.
         run_git(&repo_dir, &["checkout", "-q", "main"]);
         std::fs::write(repo_dir.join("main_only.txt"), "main\n").expect("write main_only");
         run_git(&repo_dir, &["add", "main_only.txt"]);
         run_git(&repo_dir, &["commit", "-qm", "main change"]);
 
         // Merge feature into main with no conflict — the merge commit only
-        // CARRIES carried.txt; it does not itself modify it.
+        // CARRIES carried.txt (already on origin); it does not itself modify it.
         run_git(
             &repo_dir,
             &["merge", "--no-ff", "-q", "-m", "merge feature", "feature"],
@@ -3027,8 +3036,9 @@ mod tests {
 
         let stdin_lines = format!("refs/heads/main {local_sha} refs/heads/main {remote_sha}\n");
         let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
-        // carried.txt was introduced on the feature side and merged unchanged:
-        // the merge commit itself does not touch it, so --cc must omit it.
+        // carried.txt is already on origin (in remote_sha) and the merge commit
+        // itself does not touch it, so --cc must omit it. With the old `-m`, the
+        // merge's per-parent diff vs main's parent would have flagged it.
         assert!(
             !paths.contains(&"carried.txt".to_string()),
             "merge-carried origin file must NOT be flagged (issue #238), got: {paths:?}"
