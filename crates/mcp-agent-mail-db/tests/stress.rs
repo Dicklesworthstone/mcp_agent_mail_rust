@@ -3557,3 +3557,216 @@ fn noun_for(idx: u64) -> &'static str {
     ];
     NOUNS[(idx as usize) % NOUNS.len()]
 }
+
+// =============================================================================
+// Test: Concurrent file-reservation create→renew→release lane (#144)
+//
+// Guards the `run_with_mvcc_retry` release path in queries.rs under contention:
+// ~8 worker threads each repeatedly create, renew, and release a reservation on
+// their OWN distinct path against the shared frankensqlite store. After the
+// storm we assert the DB integrity check passes and the final reservation set
+// is consistent — no orphaned (never-released) and no duplicate active rows.
+// =============================================================================
+
+#[test]
+fn concurrent_reservation_create_renew_release_lane_stays_consistent() {
+    const WORKERS: u64 = 8;
+    const ITERATIONS: u64 = 10;
+
+    let (pool, _dir) = make_pool();
+    let suffix = unique_suffix();
+    let human_key = format!("/data/stress/reservation_lane_{suffix}");
+
+    // Set up the project and one agent per worker up front (single-threaded).
+    let (pid, agent_ids) = block_on(|cx| {
+        let pool = pool.clone();
+        let human_key = human_key.clone();
+        async move {
+            let proj = match queries::ensure_project(&cx, &pool, &human_key).await {
+                Outcome::Ok(r) => r,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let pid = proj.id.unwrap();
+            // Distinct, valid adjective+noun agent names (e.g. "RedLake",
+            // "OrangePeak", ...) — must pass `is_valid_agent_name`.
+            const ADJECTIVES: &[&str] = &[
+                "Red", "Orange", "Yellow", "Pink", "Black", "Purple", "Blue", "Brown", "White",
+                "Green",
+            ];
+            let mut agent_ids = Vec::with_capacity(WORKERS as usize);
+            for i in 0..WORKERS {
+                let name = format!(
+                    "{}{}",
+                    ADJECTIVES[i as usize % ADJECTIVES.len()],
+                    noun_for(i)
+                );
+                let agent = match queries::register_agent(
+                    &cx, &pool, pid, &name, "test", "test", None, None, None,
+                )
+                .await
+                {
+                    Outcome::Ok(r) => r,
+                    other => panic!("register_agent {name} failed: {other:?}"),
+                };
+                agent_ids.push(agent.id.unwrap());
+            }
+            (pid, agent_ids)
+        }
+    });
+
+    // All workers start their storm at the same instant.
+    let barrier = Arc::new(Barrier::new(WORKERS as usize));
+    let mut handles = Vec::with_capacity(WORKERS as usize);
+
+    for (w, agent_id) in agent_ids.iter().copied().enumerate() {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            // Each worker owns a unique path so the cycle exercises the
+            // create→renew→release MVCC-retry path without artificial exclusive
+            // conflicts (the conflict path has its own test).
+            let path = format!("src/worker_{w}/edit.rs");
+            barrier.wait();
+            for _ in 0..ITERATIONS {
+                // create
+                block_on_with_retry(50, |cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        queries::create_file_reservations(
+                            &cx,
+                            &pool,
+                            pid,
+                            agent_id,
+                            &[path.as_str()],
+                            3600,
+                            true,
+                            "lane",
+                        )
+                        .await
+                    }
+                });
+                // renew
+                block_on_with_retry(50, |cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        queries::renew_reservations(
+                            &cx,
+                            &pool,
+                            pid,
+                            agent_id,
+                            1800,
+                            Some(&[path.as_str()]),
+                            None,
+                        )
+                        .await
+                    }
+                });
+                // release
+                block_on_with_retry(50, |cx| {
+                    let pool = pool.clone();
+                    let path = path.clone();
+                    async move {
+                        queries::release_reservations(
+                            &cx,
+                            &pool,
+                            pid,
+                            agent_id,
+                            Some(&[path.as_str()]),
+                            None,
+                        )
+                        .await
+                    }
+                });
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().expect("worker thread panicked");
+    }
+
+    // 1. DB integrity check passes after the concurrent storm.
+    let integrity = pool
+        .run_full_integrity_check()
+        .expect("integrity check should run");
+    assert!(
+        integrity.ok,
+        "frankensqlite integrity check failed after concurrent reservation storm: {:?}",
+        integrity.details
+    );
+
+    // 2. Final reservation set is consistent: every worker released its path on
+    //    the last iteration, so NO active reservations should remain (no
+    //    orphaned leases left behind by the release path under contention).
+    let active = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::get_active_reservations(&cx, &pool, pid).await {
+                Outcome::Ok(r) => r,
+                other => panic!("get_active_reservations failed: {other:?}"),
+            }
+        }
+    });
+    assert!(
+        active.is_empty(),
+        "expected no active reservations after every worker released; leftovers: {:?}",
+        active
+            .iter()
+            .map(|r| (r.agent_id, r.path_pattern.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // 3. Re-create one reservation per worker and assert no duplicates: each
+    //    (agent, path) yields exactly one active row (the release path did not
+    //    leave a stale active duplicate that would block re-acquisition).
+    for (w, agent_id) in agent_ids.iter().copied().enumerate() {
+        let path = format!("src/worker_{w}/edit.rs");
+        block_on_with_retry(50, |cx| {
+            let pool = pool.clone();
+            let path = path.clone();
+            async move {
+                queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    pid,
+                    agent_id,
+                    &[path.as_str()],
+                    3600,
+                    true,
+                    "verify",
+                )
+                .await
+            }
+        });
+    }
+    let active_final = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::get_active_reservations(&cx, &pool, pid).await {
+                Outcome::Ok(r) => r,
+                other => panic!("get_active_reservations failed: {other:?}"),
+            }
+        }
+    });
+    assert_eq!(
+        active_final.len(),
+        WORKERS as usize,
+        "expected exactly one active reservation per worker after re-acquire; got: {:?}",
+        active_final
+            .iter()
+            .map(|r| (r.agent_id, r.path_pattern.clone()))
+            .collect::<Vec<_>>()
+    );
+    // No duplicate (agent_id, path) active rows.
+    let mut seen = std::collections::HashSet::new();
+    for r in &active_final {
+        assert!(
+            seen.insert((r.agent_id, r.path_pattern.clone())),
+            "duplicate active reservation for {:?}",
+            (r.agent_id, &r.path_pattern)
+        );
+    }
+}
