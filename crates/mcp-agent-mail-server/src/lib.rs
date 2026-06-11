@@ -1921,6 +1921,34 @@ enum HttpHealthProbeFailure {
     Transport { error: String, elapsed_ms: u128 },
 }
 
+/// Synchronously probe whether a live Agent Mail HTTP server is answering
+/// `/healthz` on the configured `http_host:http_port`.
+///
+/// Used by the CLI's startup self-heal (`auto_clear_db_blockers`) to decide
+/// whether a process holding the storage DB is a LIVE, responsive peer that
+/// must NOT be killed (GitHub issue #145). A `true` return means "another
+/// server is already serving this storage root — refuse to take over."
+///
+/// Builds a short-lived current-thread runtime so callers without an ambient
+/// `Cx` (the plain CLI startup path) can probe without spinning up the full
+/// HTTP runtime. A single attempt with the configured `http_probe_timeout_secs`
+/// is made: a non-answer (timeout/transport/non-200) returns `false` so a
+/// genuinely dead holder is still eligible for cleanup.
+#[must_use]
+pub fn probe_http_healthz_blocking(config: &mcp_agent_mail_core::Config) -> bool {
+    let Ok(rt) = RuntimeBuilder::current_thread().build() else {
+        // If we can't even build a probe runtime, treat the holder as
+        // non-responsive (the caller falls back to the conservative kill path
+        // only for provably-dead holders elsewhere).
+        return false;
+    };
+    rt.block_on(async {
+        let cx = Cx::for_request_with_budget(Budget::INFINITE);
+        let client = build_probe_http_client();
+        probe_http_healthz(&cx, config, &client).await.is_ok()
+    })
+}
+
 /// Maximum time to wait for the startup readiness self-probe to succeed.
 ///
 /// This covers the window between the TCP listener accepting connections and the
@@ -24357,6 +24385,29 @@ first body
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert_eq!(body, serde_json::json!({"status": "alive"}));
+    }
+
+    /// Issue #145: the blocking liveness probe used by the CLI's
+    /// probe-before-kill startup path must return `false` when nothing is
+    /// listening (so a genuinely dead holder remains eligible for cleanup).
+    #[test]
+    fn probe_http_healthz_blocking_false_when_no_server_listening() {
+        // Bind then drop a listener to obtain a port that is (almost certainly)
+        // free, so the probe hits a closed port and fails fast.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_host = "127.0.0.1".to_string();
+        config.http_port = port;
+        // Keep the probe snappy in tests.
+        config.http_probe_timeout_secs = 1;
+
+        assert!(
+            !probe_http_healthz_blocking(&config),
+            "probe must report no live server on a closed port {port}"
+        );
     }
 
     #[test]

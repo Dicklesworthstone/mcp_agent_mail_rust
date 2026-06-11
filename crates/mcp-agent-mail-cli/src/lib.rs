@@ -368,6 +368,14 @@ pub enum Commands {
         /// Extra Host header to accept (repeatable; also reads HTTP_ALLOWED_HOSTS).
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_host: Vec<String>,
+        /// Forcibly take over the storage root from an already-running server.
+        ///
+        /// By default, if another Agent Mail server is LIVE and answering
+        /// `/healthz` on this host:port, startup REFUSES (exit 1) rather than
+        /// killing the responsive peer. Pass --takeover to SIGTERM/SIGKILL the
+        /// existing holder and seize the storage root anyway.
+        #[arg(long)]
+        takeover: bool,
     },
     #[command(name = "serve-stdio")]
     ServeStdio,
@@ -3167,7 +3175,8 @@ fn execute(cli: Cli) -> CliResult<()> {
             no_auth,
             no_tui,
             allowed_host,
-        } => handle_serve_http(host, port, path, no_auth, no_tui, allowed_host),
+            takeover,
+        } => handle_serve_http(host, port, path, no_auth, no_tui, allowed_host, takeover),
         Commands::ServeStdio => handle_serve_stdio(),
         Commands::Capabilities { format, json } => handle_capabilities(format, json),
         Commands::Agent { action } => handle_agent(action),
@@ -3375,8 +3384,9 @@ fn handle_default_launch() -> CliResult<()> {
         return handle_noninteractive_default_status();
     }
 
-    // Interactive: full server launch experience (setup self-heal + port check + serve)
-    handle_serve_http(None, None, None, false, false, Vec::new())
+    // Interactive: full server launch experience (setup self-heal + port check + serve).
+    // takeover=false: bare `am` never kills a live peer serving this storage root.
+    handle_serve_http(None, None, None, false, false, Vec::new(), false)
 }
 
 #[derive(Debug, Serialize)]
@@ -4079,7 +4089,22 @@ fn resolve_auto_clear_db_blockers_sqlite_path(config: &Config) -> Option<PathBuf
     resolve_mailbox_activity_sqlite_path(&config.database_url).ok()
 }
 
-fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
+/// Clear stale Agent Mail processes holding the storage DB so a fresh server can
+/// boot.
+///
+/// Probe-before-kill (GitHub issue #145): an Agent Mail process holding the DB
+/// is NOT automatically a stale corpse — it may be a fully-alive peer already
+/// serving this storage root. `agent_mail_pids_holding_file` filters only by
+/// binary signature, with no liveness check, so the old unconditional
+/// SIGTERM→SIGKILL would happily murder a healthy running server.
+///
+/// When `takeover` is `false` (the default), if ANY holder answers `/healthz`
+/// on the configured `http_host:http_port`, startup REFUSES with a clear error
+/// (non-zero exit) instead of killing it. Only a provably non-responsive holder
+/// is eligible for the kill path. Pass `takeover = true` (via
+/// `am serve-http --takeover`) to opt back into the legacy seize-the-port
+/// behavior and kill the live holder anyway.
+fn auto_clear_db_blockers_with_takeover(config: &Config, takeover: bool) -> CliResult<()> {
     use mcp_agent_mail_server::startup_checks::{agent_mail_pids_holding_file, pids_holding_file};
     use std::time::{Duration, Instant};
 
@@ -4102,8 +4127,30 @@ fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
         return Ok(());
     }
 
+    // A peer is holding the storage DB. Unless the operator explicitly opted
+    // into a takeover, probe whether that peer is a LIVE, responsive server. If
+    // it answers /healthz, refuse to start rather than kill a working server.
+    if !takeover && mcp_agent_mail_server::probe_http_healthz_blocking(config) {
+        return Err(CliError::Other(format!(
+            "another Agent Mail server is already serving this storage root \
+             ({}): it is LIVE and answering /healthz on {}:{}. Refusing to kill \
+             a responsive peer. Use a different --port/STORAGE_ROOT, stop the \
+             other server first, or pass `am serve-http --takeover` to forcibly \
+             seize it. Holder PID(s): {:?}",
+            db_path.display(),
+            config.http_host,
+            config.http_port,
+            am_pids,
+        )));
+    }
+
     eprintln!(
-        "[info] Stale Agent Mail process(es) holding {} — killing PIDs {:?}",
+        "[info] {} Agent Mail process(es) holding {} — killing PIDs {:?}",
+        if takeover {
+            "Taking over from"
+        } else {
+            "Non-responsive (stale)"
+        },
         db_path.display(),
         am_pids,
     );
@@ -5426,6 +5473,7 @@ fn handle_serve_http(
     no_auth: bool,
     no_tui: bool,
     allowed_host: Vec<String>,
+    takeover: bool,
 ) -> CliResult<()> {
     let mut config = build_http_config(host, port, path, no_auth, allowed_host);
     if no_tui {
@@ -5442,10 +5490,11 @@ fn handle_serve_http(
     // we can't find processes by DB file handle (no /proc), but we CAN
     // find them by port.  This also handles Codex-spawned `am serve-http`.
     auto_clear_port(&config.http_host, config.http_port)?;
-    // Kill any remaining stale Agent Mail processes holding the database
-    // file and clean up stale lock/WAL artifacts, then run doctor-grade
-    // startup self-heal before boot.
-    prepare_runtime_server_startup(&config)?;
+    // Clear remaining stale Agent Mail processes holding the database file and
+    // clean up stale lock/WAL artifacts, then run doctor-grade startup self-heal
+    // before boot. Under the default (no --takeover), a LIVE peer serving this
+    // storage root is NOT killed — startup refuses instead (issue #145).
+    prepare_runtime_server_startup_with_takeover(&config, takeover)?;
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
@@ -5664,10 +5713,25 @@ where
 
 /// Prepare a server runtime to start against the mailbox by clearing stale
 /// blockers and running doctor-grade database self-heal before boot.
+///
+/// Uses the safe probe-before-kill path (issue #145): a LIVE peer serving this
+/// storage root is never killed; startup refuses instead.
 pub fn prepare_runtime_server_startup(config: &Config) -> CliResult<()> {
+    prepare_runtime_server_startup_with_takeover(config, false)
+}
+
+/// Like [`prepare_runtime_server_startup`] but with explicit takeover control.
+///
+/// When `takeover` is `true` (`am serve-http --takeover`), a live holder of the
+/// storage DB is forcibly killed (legacy seize-the-port behavior). When
+/// `false`, a responsive holder causes startup to refuse (issue #145).
+pub fn prepare_runtime_server_startup_with_takeover(
+    config: &Config,
+    takeover: bool,
+) -> CliResult<()> {
     run_runtime_server_startup_prep_with(
         config,
-        auto_clear_db_blockers,
+        |cfg| auto_clear_db_blockers_with_takeover(cfg, takeover),
         run_startup_database_self_heal,
     )
 }
@@ -34372,6 +34436,7 @@ http_headers = { Authorization = "Bearer secret" }
                 no_auth,
                 no_tui,
                 allowed_host,
+                takeover,
             } => {
                 assert_eq!(host.as_deref(), Some("0.0.0.0"));
                 assert_eq!(port, Some(9999));
@@ -34382,6 +34447,7 @@ http_headers = { Authorization = "Bearer secret" }
                     allowed_host.is_empty(),
                     "--allowed-host defaults to empty (loopback-only)"
                 );
+                assert!(!takeover, "--takeover defaults to false (probe-before-kill)");
             }
             other => panic!("unexpected command: {other:?}"),
         }
