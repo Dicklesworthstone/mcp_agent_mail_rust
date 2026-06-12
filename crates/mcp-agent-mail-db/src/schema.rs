@@ -2758,12 +2758,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "idx_file_reservations_released_expires_id",
         "idx_file_reservation_releases_ts",
     ];
-    const REQUIRED_TRIGGERS: &[&str] = &[
-        "trg_inbox_stats_insert",
-        "trg_inbox_stats_mark_read",
-        "trg_inbox_stats_ack",
-        "trg_messages_default_recipients_json",
-    ];
+    const REQUIRED_TRIGGERS: &[&str] = &["trg_messages_default_recipients_json"];
     const FORBIDDEN_FTS_TABLES: &[&str] = &["fts_messages", "fts_agents", "fts_projects"];
     const FORBIDDEN_FTS_TRIGGERS: &[&str] = &[
         "messages_ai",
