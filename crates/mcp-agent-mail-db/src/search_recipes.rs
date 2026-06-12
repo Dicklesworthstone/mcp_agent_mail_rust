@@ -595,9 +595,7 @@ pub fn list_recent_history(conn: &DbConn, limit: usize) -> Result<Vec<QueryHisto
         result_count, executed_ts \
         FROM query_history";
 
-    let rows = conn
-        .query_sync(sql, &[])
-        .map_err(|e| e.to_string())?;
+    let rows = conn.query_sync(sql, &[]).map_err(|e| e.to_string())?;
     let mut history = rows.iter().map(row_to_history).collect::<Vec<_>>();
     history.sort_by(|a, b| {
         b.executed_ts

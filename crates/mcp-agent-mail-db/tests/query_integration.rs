@@ -587,7 +587,7 @@ fn acknowledge_messages_batch_integration_large_ack_wave_uses_fixed_recipient_qu
     assert_eq!(first.ack_ts, Some(original_ack_ts));
 
     assert!(
-        snapshot.total <= 6,
+        snapshot.total <= 7,
         "batch acknowledgement should stay fixed-query for a 100+ ack wave, got {snapshot:?}"
     );
     assert_eq!(

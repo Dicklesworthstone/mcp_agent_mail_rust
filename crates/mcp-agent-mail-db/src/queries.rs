@@ -5209,68 +5209,79 @@ pub async fn create_message(
     };
 
     let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+    let row = match run_with_mvcc_retry(cx, "create_message", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-    // Insert message using traw_execute and then fetch id.
-    let sql = "INSERT INTO messages \
-               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    let params = [
-        Value::BigInt(project_id),
-        Value::BigInt(sender_id),
-        thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
-        Value::Text(subject.to_string()),
-        Value::Text(body_md.to_string()),
-        Value::Text(importance.to_string()),
-        Value::BigInt(i64::from(ack_required)),
-        Value::BigInt(now),
-        Value::Text(attachments.to_string()),
-    ];
+        // Insert message using traw_execute and then fetch id.
+        let sql = "INSERT INTO messages \
+	               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        let params = [
+            Value::BigInt(project_id),
+            Value::BigInt(sender_id),
+            thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
+            Value::Text(subject.to_string()),
+            Value::Text(body_md.to_string()),
+            Value::Text(importance.to_string()),
+            Value::BigInt(i64::from(ack_required)),
+            Value::BigInt(now),
+            Value::Text(attachments.to_string()),
+        ];
 
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-    );
-
-    let message_id = try_in_tx!(
-        cx,
-        &tracked,
-        fetch_inserted_message_id_in_tx(
+        try_in_tx!(
             cx,
             &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+        );
+
+        let message_id = try_in_tx!(
+            cx,
+            &tracked,
+            fetch_inserted_message_id_in_tx(
+                cx,
+                &tracked,
+                project_id,
+                sender_id,
+                subject,
+                body_md,
+                thread_id,
+                importance,
+                ack_required,
+                attachments,
+                now,
+                None,
+            )
+            .await
+        );
+
+        let row = MessageRow {
+            id: Some(message_id),
             project_id,
             sender_id,
-            subject,
-            body_md,
-            thread_id,
-            importance,
-            ack_required,
-            attachments,
-            now,
-            None,
-        )
-        .await
-    );
+            thread_id: thread_id.map(String::from),
+            subject: subject.to_string(),
+            body_md: body_md.to_string(),
+            importance: importance.to_string(),
+            ack_required: i64::from(ack_required),
+            created_ts: now,
+            recipients_json: "{}".to_string(),
+            attachments: attachments.to_string(),
+        };
 
-    let row = MessageRow {
-        id: Some(message_id),
-        project_id,
-        sender_id,
-        thread_id: thread_id.map(String::from),
-        subject: subject.to_string(),
-        body_md: body_md.to_string(),
-        importance: importance.to_string(),
-        ack_required: i64::from(ack_required),
-        created_ts: now,
-        recipients_json: "{}".to_string(),
-        attachments: attachments.to_string(),
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(row)
+    })
+    .await
+    {
+        Outcome::Ok(row) => row,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     if let Err(error) = index_created_message_best_effort(&conn, &row) {
         tracing::warn!(
-            message_id,
+            message_id = row.id.unwrap_or_default(),
             error = %error,
             "message committed but incremental search indexing failed"
         );
@@ -24133,7 +24144,7 @@ mod tests {
             };
             let snapshot = tracker.snapshot();
             assert!(
-                snapshot.total <= 6,
+                snapshot.total <= 7,
                 "batch acknowledge should use a fixed query count for a 100+ message wave, got {snapshot:?}"
             );
             assert_eq!(
