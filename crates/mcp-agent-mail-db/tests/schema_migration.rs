@@ -265,6 +265,10 @@ fn seed_schema_without_migrations(conn: &SqliteConnection, skipped_ids: &[&str])
             record_applied();
             continue;
         }
+        if migration.id == "v3b_rebuild_projects_created_at_integer_affinity" {
+            record_applied();
+            continue;
+        }
         if let Some(column) = migration.id.strip_prefix("v16a_atc_experiences_add_")
             && table_has_column(conn, "atc_experiences", column)
         {

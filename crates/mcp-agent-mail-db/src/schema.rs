@@ -6,6 +6,7 @@ use crate::DbConn;
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection, Error as SqlError, Value};
 use sqlmodel_schema::{Migration, MigrationRunner, MigrationStatus};
+use std::collections::HashSet;
 use std::time::Duration;
 
 // Schema creation SQL - no runtime dependencies needed
@@ -3245,6 +3246,64 @@ async fn execute_v3b_rebuild_projects_created_at_integer_affinity<C: Connection>
     }
 }
 
+async fn execute_v10a_dedup_agents_case_insensitive<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    let rows = match conn
+        .query(
+            cx,
+            "SELECT id, project_id, name FROM agents ORDER BY project_id, id",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+
+    let mut seen = HashSet::new();
+    let mut duplicate_ids = Vec::new();
+    for row in rows {
+        let id = match row.get_named::<i64>("id") {
+            Ok(id) => id,
+            Err(err) => return Outcome::Err(err),
+        };
+        let project_id = match row.get_named::<i64>("project_id") {
+            Ok(project_id) => project_id,
+            Err(err) => return Outcome::Err(err),
+        };
+        let name = match row.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(err) => return Outcome::Err(err),
+        };
+
+        if !seen.insert((project_id, name.to_ascii_lowercase())) {
+            duplicate_ids.push(id);
+        }
+    }
+
+    for duplicate_id in duplicate_ids {
+        match conn
+            .execute(
+                cx,
+                "DELETE FROM agents WHERE id = $1",
+                &[Value::BigInt(duplicate_id)],
+            )
+            .await
+        {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
 async fn cleanup_legacy_message_fts_artifacts<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -3344,6 +3403,8 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             let statement_result =
                 if migration.id == "v3b_rebuild_projects_created_at_integer_affinity" {
                     execute_v3b_rebuild_projects_created_at_integer_affinity(cx, conn).await
+                } else if migration.id == "v10a_dedup_agents_case_insensitive" {
+                    execute_v10a_dedup_agents_case_insensitive(cx, conn).await
                 } else if migration.id == "v15_add_recipients_json_to_messages" {
                     execute_v15_add_recipients_json_to_messages(cx, conn).await
                 } else {
