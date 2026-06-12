@@ -1,19 +1,86 @@
 [graph]
 all-features = true
 
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "Transitive through tokenizers/macro_rules_attribute; RustSec reports no safe upgrade. cargo audit still reports it as an allowed warning." },
+  { id = "RUSTSEC-2025-0134", reason = "Transitive through local asupersync TLS support; RustSec reports no safe upgrade. cargo audit still reports it as an allowed warning." },
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "LGPL-2.1-or-later",
+  "LPPL-1.3c",
+  "LicenseRef-MIT-OpenAI-Anthropic-Rider",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Unlicense",
+  "Zlib",
+  "zlib-acknowledgement",
+]
+confidence-threshold = 0.4
+
+[licenses.private]
+ignore = true
+
+[[licenses.clarify]]
+crate = "frankensearch"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+crate = "frankensearch-core"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+crate = "frankensearch-embed"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+crate = "frankensearch-fusion"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+crate = "frankensearch-index"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+crate = "frankensearch-lexical"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
+[[licenses.clarify]]
+crate = "frankensearch-rerank"
+expression = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+license-files = [{ path = "../../LICENSE", hash = 0x3e2e0c66 }]
+
 [bans]
 multiple-versions = "allow"
 
-# Ratchet policy:
-# - This repo is asupersync-only and must not grow new tokio/reqwest/hyper/tower ingress.
-# - The current legacy chain is still present transitively via fastembed/hf-hub and
-#   beads_rust/self_update, so those wrappers are allowed temporarily.
-# - Any new path to these crates outside the listed wrappers fails CI immediately.
+# Ratchet policy: this repo is asupersync-only and must not grow any new
+# tokio/reqwest/hyper/tower ingress.
 deny = [
-  { crate = "tokio", wrappers = ["h2", "hyper", "hyper-rustls", "hyper-tls", "hyper-util", "reqwest", "tokio-native-tls", "tokio-rustls", "tokio-util", "tower"], reason = "Project policy is asupersync-only. Current legacy tokio ingress is tolerated only through the known reqwest/hyper chain until those upstream dependencies are removed." },
-  { crate = "reqwest", wrappers = ["hf-hub", "self_update"], reason = "Use asupersync::http::h1 for HTTP. Current reqwest ingress is tolerated only via fastembed/hf-hub and beads_rust/self_update until those are retired." },
-  { crate = "hyper", wrappers = ["reqwest", "self_update", "hyper-rustls", "hyper-tls", "hyper-util"], reason = "No new hyper-based runtime stack. Existing reqwest/self_update ingress is grandfathered temporarily." },
-  { crate = "tower", wrappers = ["reqwest", "tower-http"], reason = "No new tower adoption. Existing reqwest chain is tolerated temporarily." },
+  { crate = "tokio", reason = "Project policy is asupersync-only." },
+  { crate = "reqwest", reason = "Use asupersync::http::h1 for HTTP." },
+  { crate = "hyper", reason = "Project policy is asupersync-only; no hyper-based runtime stack." },
+  { crate = "tower", reason = "Project policy is asupersync-only; no tower adoption." },
   { crate = "axum", reason = "Project policy is asupersync-only; do not introduce axum." },
   { crate = "async-std", reason = "Project policy is asupersync-only; do not introduce async-std." },
   { crate = "smol", reason = "Project policy is asupersync-only; do not introduce smol." },

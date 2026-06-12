@@ -216,3 +216,7 @@ vendor/*
 
 # Generated session-history mining report
 /COMPREHENSIVE_ISSUES_AND_PROBLEMS_WITH_AM_BASED_ON_COMPLETE_SESSION_HISTORY_ANALYSIS.md
+cursor.mcp.json
+factory.mcp.json
+gemini.mcp.json
+windsurf.mcp.json

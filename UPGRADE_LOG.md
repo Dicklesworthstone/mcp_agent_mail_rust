@@ -4,10 +4,10 @@
 
 ## Summary
 
-- **Updated:** in progress
-- **Skipped:** in progress
-- **Failed:** in progress
-- **Needs attention:** in progress
+- **Updated:** local `/dp` dependency alignment, direct manifest floors, and compatible lockfile refreshes.
+- **Skipped:** incompatible major-version lockfile upgrades constrained by upstream dependency ranges; crates.io publishing is intentionally disabled for all workspace members.
+- **Failed:** none in the completed compiler, lint, and workspace test gates.
+- **Needs attention:** binary release packaging and external distribution verification remain separate release gates.
 
 ## Updates
 
@@ -58,10 +58,25 @@
 
 - Ran `cargo update`, resolving 54 package changes including `chrono`, `dashmap`, `minijinja`, `regex`, `uuid`, `wasm-bindgen`, `zerocopy`, and related transitive crates to their latest compatible stable versions.
 
+### 2026-06-11 final compatible lockfile refresh
+
+- Ran a final `cargo update` after the local `/dp` fixes and workspace test corrections.
+- Compatible lockfile updates included `block-buffer` `0.12.0` -> `0.12.1`, `insta` `1.47.2` -> `1.48.0`, `memchr` `2.8.1` -> `2.8.2`, and `smallvec` `1.15.1` -> `1.15.2`.
+- Remaining known newer versions are constrained by dependency ranges rather than local pins: `generic-array` `0.14.7` (latest `0.14.9`) and `shlex` `1.3.0` (latest `2.0.1`).
+
+## Verification
+
+- `cargo fmt --check`: passed.
+- `cargo check --workspace --all-targets`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `cargo test --workspace`: passed.
+- `cargo test --workspace --all-features`: passed, including doctests.
+
 ## Failed
 
-- Pending.
+- None in the dependency update, format, compile, lint, default test, or all-features test pass.
 
 ## Needs Attention
 
 - `cargo outdated` cannot inspect this workspace directly because it copies the manifest to a temporary directory where relative `/dp` patches like `../asupersync` resolve to missing paths such as `/tmp/asupersync`. I am using `cargo update --dry-run --verbose`, `cargo metadata`, and direct local manifest checks instead.
+- All workspace crates currently set `publish = false`. `.github/workflows/publish.yml` is a manual publishability preflight only and documents that crates.io publication is blocked until unpublished sibling path dependencies are independently published and the workspace publication policy changes.
