@@ -2927,7 +2927,7 @@ body
     }
 
     #[test]
-    fn health_check_direct_sqlite_probe_uses_canonical_engine() {
+    fn health_check_direct_sqlite_probe_uses_mailbox_runtime_engine() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("health-check-engine.sqlite3");
 
@@ -2936,12 +2936,12 @@ body
         let type_name = std::any::type_name_of_val(&conn);
 
         assert!(
-            type_name.contains("sqlmodel_sqlite"),
-            "health_check must use canonical sqlmodel_sqlite, got {type_name}"
+            type_name.contains("sqlmodel_frankensqlite"),
+            "health_check must use the normal SQLModel FrankenSQLite runtime, got {type_name}"
         );
         assert!(
-            !type_name.contains("frankensqlite") && !type_name.contains("fsqlite"),
-            "health_check must not use experimental SQLite engines on the normal path: {type_name}"
+            type_name.contains("FrankenConnection"),
+            "health_check must use the FrankenSQLite connection type on the normal path: {type_name}"
         );
     }
 
