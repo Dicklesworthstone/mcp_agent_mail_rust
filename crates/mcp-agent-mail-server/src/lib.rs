@@ -6412,9 +6412,11 @@ fn atc_project_keys_match(left: &str, right: &str) -> bool {
     // like a slug. Two distinct filesystem paths can legitimately slugify to
     // the same value, so pure path-vs-path comparison must stay exact.
     (looks_like_project_slug(left) || looks_like_project_slug(right))
-        && left_identity
-            .slug
-            .eq_ignore_ascii_case(&right_identity.slug)
+        && (left.eq_ignore_ascii_case(&right_identity.slug)
+            || right.eq_ignore_ascii_case(&left_identity.slug)
+            || left_identity
+                .slug
+                .eq_ignore_ascii_case(&right_identity.slug))
 }
 
 /// Resolve open conflict-subsystem experiences when reservation events arrive (br-0qt6e.2.4).
@@ -9395,14 +9397,6 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     }
 }
 
-fn dashboard_active_file_reservation_predicate(conn: &DbConn) -> &'static str {
-    if dashboard_has_release_ledger_table(conn) {
-        mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE
-    } else {
-        mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE
-    }
-}
-
 fn dashboard_has_release_ledger_table(conn: &DbConn) -> bool {
     conn.query_sync(
         "SELECT 1 AS present FROM sqlite_master \
@@ -9414,43 +9408,51 @@ fn dashboard_has_release_ledger_table(conn: &DbConn) -> bool {
     .is_some_and(|rows| !rows.is_empty())
 }
 
-fn dashboard_active_file_reservations(conn: &DbConn, now_micros: i64) -> u64 {
-    let active_predicate = dashboard_active_file_reservation_predicate(conn);
-
-    if crate::tui_poller::file_reservations_support_active_fast_scan(conn) {
-        return dashboard_count_with_params(
-            conn,
-            &format!(
-                "SELECT COUNT(*) AS c FROM file_reservations WHERE ({active_predicate}) AND expires_ts > ?1"
-            ),
-            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_micros)],
-        );
-    }
-
-    let legacy_sql = format!(
-        "SELECT expires_ts AS raw_expires_ts FROM file_reservations WHERE ({active_predicate})"
-    );
-    conn.query_sync(&legacy_sql, &[]).ok().map_or(0, |rows| {
-        rows.into_iter().fold(0_u64, |count, row| {
-            if crate::tui_poller::parse_raw_ts(&row, "raw_expires_ts") > now_micros {
-                count.saturating_add(1)
-            } else {
-                count
-            }
+fn dashboard_has_reservation_released_ts_column(conn: &DbConn) -> bool {
+    conn.query_sync("PRAGMA table_info(file_reservations)", &[])
+        .ok()
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.get_named::<String>("name").ok().as_deref() == Some("released_ts"))
         })
+}
+
+fn dashboard_active_file_reservations(conn: &DbConn, now_micros: i64) -> u64 {
+    let has_release_ledger = dashboard_has_release_ledger_table(conn);
+    let has_released_ts_column = dashboard_has_reservation_released_ts_column(conn);
+    let release_join = if has_release_ledger {
+        " LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id"
+    } else {
+        ""
+    };
+    let released_ts_sql = match (has_release_ledger, has_released_ts_column) {
+        (true, true) => "COALESCE(rr.released_ts, fr.released_ts)",
+        (true, false) => "rr.released_ts",
+        (false, true) => "fr.released_ts",
+        (false, false) => "NULL",
+    };
+    let sql = format!(
+        "SELECT fr.expires_ts AS raw_expires_ts, {released_ts_sql} AS raw_released_ts \
+         FROM file_reservations fr{release_join}"
+    );
+    conn.query_sync(&sql, &[]).ok().map_or(0, |rows| {
+        rows.into_iter()
+            .filter(|row| {
+                crate::tui_poller::is_active_reservation_row(
+                    row,
+                    now_micros,
+                    "raw_expires_ts",
+                    "raw_released_ts",
+                )
+            })
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX)
     })
 }
 
 fn dashboard_count(conn: &DbConn, sql: &str) -> u64 {
-    dashboard_count_with_params(conn, sql, &[])
-}
-
-fn dashboard_count_with_params(
-    conn: &DbConn,
-    sql: &str,
-    params: &[mcp_agent_mail_db::sqlmodel_core::Value],
-) -> u64 {
-    conn.query_sync(sql, params)
+    conn.query_sync(sql, &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_named::<i64>("c").ok())

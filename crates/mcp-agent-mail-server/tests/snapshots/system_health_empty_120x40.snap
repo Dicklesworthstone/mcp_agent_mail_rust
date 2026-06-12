@@ -29,11 +29,11 @@
 │ ── Connection Diagnostics ──                                                                                         │
 │   [OK] TCP :0  0ms                                                                                                   │
 │                                                                                                                      │
+│ ── Loop Heartbeats ──                                                                                                │
+│   [WARN] render  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- gap=0ms success_duration=0ms last_tick │
+│   [OK] input  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- gap=0ms success_duration=0ms last_tick=-- │
+│                                                                                                                      │
 │ r Refresh  v Dashboard  o Open Mail UI  y Copy Mail UI                                                               │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

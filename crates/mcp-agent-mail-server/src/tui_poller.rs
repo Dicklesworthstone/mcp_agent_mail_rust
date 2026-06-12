@@ -2430,7 +2430,12 @@ fn parse_text_timestamp(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn is_active_reservation_row(row: &Row, now: i64, expires_col: &str, released_col: &str) -> bool {
+pub(crate) fn is_active_reservation_row(
+    row: &Row,
+    now: i64,
+    expires_col: &str,
+    released_col: &str,
+) -> bool {
     parse_raw_ts(row, expires_col) > now && released_ts_is_active(row.get_by_name(released_col))
 }
 
@@ -2729,10 +2734,6 @@ fn reservation_scan_mode(conn: &DbConn, sqlite_path: Option<&str>) -> Reservatio
     }
 
     detect_reservation_scan_mode(conn)
-}
-
-pub(crate) fn file_reservations_support_active_fast_scan(conn: &DbConn) -> bool {
-    detect_reservation_scan_mode(conn) == ReservationScanMode::ActiveFast
 }
 
 fn detect_reservation_scan_mode(conn: &DbConn) -> ReservationScanMode {
@@ -6380,18 +6381,18 @@ first body
 
         conn.execute_sync(
             "INSERT INTO messages (id, created_ts, ack_required) VALUES
-                (1, 1_000_000, 1),
-                (2, 2_000_000, 1),
-                (3, 3_000_000, 1),
-                (4, 4_000_000, 1)",
+                (1, 1000000, 1),
+                (2, 2000000, 1),
+                (3, 3000000, 1),
+                (4, 4000000, 1)",
             &[],
         )
         .expect("insert messages");
         conn.execute_sync(
             "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
-                (1, 7, 301_000_000),
-                (2, 7, 1_802_000_000),
-                (3, 7, 7_203_000_000),
+                (1, 7, 301000000),
+                (2, 7, 1802000000),
+                (3, 7, 7203000000),
                 (4, 7, NULL)",
             &[],
         )
@@ -6430,17 +6431,17 @@ first body
 
         conn.execute_sync(
             "INSERT INTO messages (id, created_ts, ack_required) VALUES
-                (1, 1_000_000, 1),
-                (2, 2_000_000, 1),
-                (3, 3_000_000, 1)",
+                (1, 1000000, 1),
+                (2, 2000000, 1),
+                (3, 3000000, 1)",
             &[],
         )
         .expect("insert messages");
         conn.execute_sync(
             "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
-                (1, 7, 301_000_000),
+                (1, 7, 301000000),
                 (2, 7, NULL),
-                (3, 9, 7_203_000_000)",
+                (3, 9, 7203000000)",
             &[],
         )
         .expect("insert recipients");

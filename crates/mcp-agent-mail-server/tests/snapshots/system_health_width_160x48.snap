@@ -29,18 +29,18 @@
 │ ── Connection Diagnostics ──                                                          │                                                                    │ │
 │   [OK] TCP :0  0ms                                                                    │                                                                    │ │
 │                                                                                       │                                                                    │ │
+│ ── Loop Heartbeats ──                                                                 │                                                                    │ │
+│   [WARN] render  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- gap=0ms │                                                                    │ │
+│   [OK] input  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- gap=0ms suc│                                                                    │ │
+│   [WARN] db_poll  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- gap=0ms│                                                                    │ │
+│   [OK] mcp_api  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- gap=0ms s│                                                                    │ │
+│   [OK] commit_coalescer  ticks=0 successes=0 failures=0 consecutive_failures=0 age=-- │                                                                    │ │
+│                                                                                       │                                                                    │ │
+│ ── DB Query Latency ──                                                                │                                                                    │ │
+│   [OK] queries  count=0                                                               │                                                                    │ │
+│   [OK] pool_acquire  count=0                                                          │                                                                    │ │
+│                                                                                       │                                                                    │ │
 │ r Refresh  v Dashboard  o Open Mail UI  y Copy Mail UI                                │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
-│                                                                                       │                                                                    │ │
 │                                                                                       │                                                                    │ │
 │                                                                                       │                                                                    │ │
 │                                                                                       ╰────────────────────────────────────────────────────────────────────╯ │
