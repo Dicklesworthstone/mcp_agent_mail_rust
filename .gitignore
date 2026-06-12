@@ -220,3 +220,7 @@ cursor.mcp.json
 factory.mcp.json
 gemini.mcp.json
 windsurf.mcp.json
+
+# Agent run artifacts / probes
+.space_probe
+claude-upgrade-progress.json
