@@ -291,17 +291,18 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     // Page size must be chosen before page 1 is initialized, so honor any
     // requested destination page_size before the first destination write.
     let dest_str = staged_dest.display().to_string();
-    let dst_conn = DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot create destination DB {dest_str}: {e}"),
-    })?;
-    if let Some(page_size) = destination_page_size_bytes(destination_pragmas)? {
-        let pragma = format!("PRAGMA page_size = {page_size}");
-        dst_conn
-            .execute_raw(&pragma)
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("cannot set destination DB {dest_str} page size {page_size}: {e}"),
-            })?;
-    }
+    let requested_page_size = destination_page_size_bytes(destination_pragmas)?;
+    let dst_conn = if let Some(page_size) = requested_page_size {
+        DbConn::open_file_with_page_size(&dest_str, page_size).map_err(|e| ShareError::Sqlite {
+            message: format!(
+                "cannot create destination DB {dest_str} with page size {page_size}: {e}"
+            ),
+        })?
+    } else {
+        DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
+            message: format!("cannot create destination DB {dest_str}: {e}"),
+        })?
+    };
     for pragma in destination_pragmas {
         dst_conn
             .execute_raw(pragma)

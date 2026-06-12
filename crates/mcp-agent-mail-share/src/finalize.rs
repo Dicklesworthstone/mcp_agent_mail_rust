@@ -1262,6 +1262,7 @@ mod tests {
         conn.execute_raw("DELETE FROM messages WHERE id >= 1000")
             .unwrap();
         drop(conn);
+        checkpoint_test_db_and_remove_sidecars(&db);
 
         let before = file_size(&db);
         finalize_snapshot_for_export(&db).unwrap();
