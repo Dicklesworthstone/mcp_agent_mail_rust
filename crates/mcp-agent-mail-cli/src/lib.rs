@@ -8611,9 +8611,7 @@ fn emit_supervised_owner_refusal(op_label: &str, report: &DoctorLocksReport) {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
     let mut lines: Vec<String> = vec![
-        format!(
-            "Error: refusing `am doctor {op_label}` while a live mailbox owner is present."
-        ),
+        format!("Error: refusing `am doctor {op_label}` while a live mailbox owner is present."),
         String::new(),
         "classification: supervised-owner-required".to_string(),
         format!("owner_class: {}", report.owner_state.class.as_str()),
@@ -9563,6 +9561,244 @@ fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
     None
 }
 
+// ─── br-bvq1x.11.1 (K1): loss-honest salvage/recover reporting ───────────────
+
+/// Tables whose row counts are reported in salvage/recover loss reports so a
+/// recovery can never silently imply it was lossless.
+const SALVAGE_LOSS_REPORT_TABLES: &[&str] = &[
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "file_reservations",
+    "file_reservation_releases",
+    "agent_links",
+    "products",
+    "product_project_links",
+    "build_slots",
+    "inbox_stats",
+];
+
+/// `(table, integer column)` pairs checked for suspect non-integer values that a
+/// `sqlite3 .recover` salvage can inject (e.g. a TEXT id where an i64 is
+/// expected). See br-bvq1x.11.1 L1 #7 (TEXT-id recipient fixture).
+const SALVAGE_SUSPECT_TYPED_COLUMNS: &[(&str, &str)] = &[
+    ("messages", "id"),
+    ("agents", "id"),
+    ("projects", "id"),
+    ("message_recipients", "message_id"),
+    ("message_recipients", "agent_id"),
+    ("file_reservations", "id"),
+];
+
+/// Best-effort per-table row counts for a (possibly malformed) sqlite file.
+/// Tables that cannot be counted are recorded as `Err(reason)` so the loss
+/// report can say so honestly instead of pretending the count is zero.
+#[derive(Debug, Clone, Default)]
+struct SalvageRowCounts {
+    counts: std::collections::BTreeMap<String, Result<i64, String>>,
+    open_error: Option<String>,
+}
+
+/// Copy `path` into a throwaway temp dir and open the copy, so a malformed
+/// ORIGINAL is never opened read-write (no sidecar creation, no mutation).
+/// `on_error` receives a human reason when the copy cannot be opened/read.
+fn with_salvage_readonly_copy<T>(
+    path: &Path,
+    on_conn: impl FnOnce(&mcp_agent_mail_db::DbConn) -> T,
+    on_error: impl FnOnce(String) -> T,
+) -> T {
+    if !path.exists() {
+        return on_error(format!("file does not exist: {}", path.display()));
+    }
+    let tmp = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => return on_error(format!("salvage loss-count tempdir failed: {e}")),
+    };
+    let copy = tmp.path().join("losscount.sqlite3");
+    if let Err(e) = std::fs::copy(path, &copy) {
+        return on_error(format!(
+            "copy {} for loss-count failed: {e}",
+            path.display()
+        ));
+    }
+    // Copy WAL/SHM sidecars alongside so the copy reflects pending WAL frames;
+    // counting only the main file would understate (and thus mis-report) loss.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        if sidecar.exists() {
+            let _ = std::fs::copy(&sidecar, sqlite_sidecar_path(&copy, suffix));
+        }
+    }
+    match open_sqlite_read_only_with_fallback(&copy.to_string_lossy()) {
+        Ok((conn, _opened)) => on_conn(&conn),
+        Err(e) => on_error(e.to_string()),
+    }
+}
+
+/// Count rows in each [`SALVAGE_LOSS_REPORT_TABLES`] table, tolerating a
+/// malformed/partially-readable database (per-table errors become
+/// `Err(reason)`; a total open failure marks every table uncountable).
+fn count_salvage_rows(path: &Path) -> SalvageRowCounts {
+    with_salvage_readonly_copy(
+        path,
+        |conn| {
+            let mut counts = std::collections::BTreeMap::new();
+            for table in SALVAGE_LOSS_REPORT_TABLES {
+                let sql = format!("SELECT COUNT(*) AS cnt FROM {table}");
+                let res = match conn.query_sync(&sql, &[]) {
+                    Ok(rows) => rows
+                        .first()
+                        .and_then(|row| row.get_named::<i64>("cnt").ok())
+                        .map_or_else(|| Err("count returned no rows".to_string()), Ok),
+                    Err(e) => Err(e.to_string()),
+                };
+                counts.insert((*table).to_string(), res);
+            }
+            SalvageRowCounts {
+                counts,
+                open_error: None,
+            }
+        },
+        |err| {
+            let mut counts = std::collections::BTreeMap::new();
+            for table in SALVAGE_LOSS_REPORT_TABLES {
+                counts.insert(
+                    (*table).to_string(),
+                    Err("database could not be opened".to_string()),
+                );
+            }
+            SalvageRowCounts {
+                counts,
+                open_error: Some(err),
+            }
+        },
+    )
+}
+
+/// Detect rows whose supposedly-integer id/fk columns hold a non-integer
+/// (typically TEXT) value — the hallmark of a `sqlite3 .recover` salvage.
+/// Tables/columns that do not exist are silently skipped.
+fn detect_salvage_suspect_typed_rows(path: &Path) -> Vec<String> {
+    with_salvage_readonly_copy(
+        path,
+        |conn| {
+            let mut suspects = Vec::new();
+            for (table, column) in SALVAGE_SUSPECT_TYPED_COLUMNS {
+                let sql = format!(
+                    "SELECT COUNT(*) AS cnt FROM {table} WHERE typeof({column}) <> 'integer'"
+                );
+                if let Ok(rows) = conn.query_sync(&sql, &[])
+                    && let Some(count) = rows
+                        .first()
+                        .and_then(|row| row.get_named::<i64>("cnt").ok())
+                    && count > 0
+                {
+                    suspects.push(format!(
+                        "{table}.{column}: {count} row(s) with non-integer (suspect) value"
+                    ));
+                }
+            }
+            suspects
+        },
+        |_err| Vec::new(),
+    )
+}
+
+/// Pure diff of countable tables: returns `(total_rows_lost, per-table lost
+/// detail)`. Only tables countable in BOTH snapshots contribute; growth is not
+/// counted as loss.
+fn salvage_total_lost(before: &SalvageRowCounts, after: &SalvageRowCounts) -> (i64, Vec<String>) {
+    let mut total = 0i64;
+    let mut lost = Vec::new();
+    for table in SALVAGE_LOSS_REPORT_TABLES {
+        if let (Some(Ok(b)), Some(Ok(a))) = (before.counts.get(*table), after.counts.get(*table))
+            && a < b
+        {
+            let delta = b - a;
+            total += delta;
+            lost.push(format!("{table}: {b} -> {a} (LOST {delta})"));
+        }
+    }
+    (total, lost)
+}
+
+/// Tables that could not be counted in `before` (e.g. corruption prevented it) —
+/// the operator must know these were never accounted for.
+fn salvage_uncountable_tables(counts: &SalvageRowCounts) -> Vec<String> {
+    counts
+        .counts
+        .iter()
+        .filter_map(|(table, res)| res.as_ref().err().map(|_| table.clone()))
+        .collect()
+}
+
+/// Emit the loss-honest salvage report to stderr. Framed as an EMERGENCY path —
+/// never implies a clean self-heal when data was lost.
+fn emit_salvage_loss_report(
+    mode: &str,
+    before: &SalvageRowCounts,
+    after: &SalvageRowCounts,
+    suspect_rows: &[String],
+) {
+    let render = |entry: Option<&Result<i64, String>>| -> String {
+        match entry {
+            Some(Ok(n)) => n.to_string(),
+            Some(Err(_)) => "uncountable".to_string(),
+            None => "n/a".to_string(),
+        }
+    };
+    let mut lines: Vec<String> = vec![format!(
+        "EMERGENCY RECOVERY ({mode}) — this is NOT a clean self-heal; verify the per-table loss report:"
+    )];
+    if let Some(err) = &before.open_error {
+        lines.push(format!(
+            "  pre-recovery database could not be fully counted: {err}"
+        ));
+    }
+    for table in SALVAGE_LOSS_REPORT_TABLES {
+        lines.push(format!(
+            "  {table:<27} before={:<12} after={}",
+            render(before.counts.get(*table)),
+            render(after.counts.get(*table)),
+        ));
+    }
+    let (total_lost, lost_detail) = salvage_total_lost(before, after);
+    if total_lost > 0 {
+        lines.push(format!(
+            ">>> ROWS LOST during recovery: {total_lost} (rows present pre-recovery but absent after)"
+        ));
+        for detail in &lost_detail {
+            lines.push(format!("    - {detail}"));
+        }
+    } else {
+        lines.push(
+            "  no row loss detected across tables countable both before and after".to_string(),
+        );
+    }
+    let uncountable_before = salvage_uncountable_tables(before);
+    if !uncountable_before.is_empty() {
+        lines.push(format!(
+            "  tables that could NOT be counted pre-recovery (loss for these is UNKNOWN): {}",
+            uncountable_before.join(", ")
+        ));
+    }
+    if !suspect_rows.is_empty() {
+        lines.push(
+            "  suspect recovered rows (non-integer ids — likely sqlite3 .recover salvage):"
+                .to_string(),
+        );
+        for suspect in suspect_rows {
+            lines.push(format!("    - {suspect}"));
+        }
+    }
+    lines.push(
+        "  Recovery rebuilds from the Git archive + best-effort salvage; rows absent from both are unrecoverable. Inspect the quarantined original before discarding it."
+            .to_string(),
+    );
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
+}
+
 #[cfg(test)]
 fn recover_sqlite_file(path: &Path) -> CliResult<()> {
     recover_sqlite_file_with_storage_root(path, None)
@@ -9585,6 +9821,11 @@ fn recover_sqlite_file_with_storage_root(
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let backup = find_healthy_sqlite_backup(path);
 
+    // br-bvq1x.11.1 (K1): capture best-effort pre-recovery row counts from the
+    // (possibly malformed) original BEFORE we replace it, so the loss report can
+    // be honest about what recovery could and could not preserve.
+    let salvage_before = count_salvage_rows(path);
+
     if let Some(backup_path) = backup {
         // Safety: copy backup to a temp path first, validate it, then
         // quarantine the original and swap in the validated copy.  This
@@ -9605,8 +9846,17 @@ fn recover_sqlite_file_with_storage_root(
                 backup_path.display()
             )));
         }
+        // Count the validated replacement BEFORE swapping it in.
+        let salvage_after = count_salvage_rows(&temp_restore);
+        let suspect_rows = detect_salvage_suspect_typed_rows(&temp_restore);
         swap_validated_sqlite_artifact(path, &temp_restore, &timestamp)?;
         reconcile_sqlite_file_with_archive(path, &storage_root)?;
+        emit_salvage_loss_report(
+            "backup-restore",
+            &salvage_before,
+            &salvage_after,
+            &suspect_rows,
+        );
     } else {
         // Fall back to archive reconstruction if no backup is available and
         // the archive is authoritative for this SQLite path.
@@ -9670,8 +9920,18 @@ fn recover_sqlite_file_with_storage_root(
                             path.display()
                         )));
                     }
+                    // br-bvq1x.11.1 (K1): count the reconstructed DB before swap
+                    // and report any loss vs the pre-recovery original.
+                    let salvage_after = count_salvage_rows(&temp_reconstruct);
+                    let suspect_rows = detect_salvage_suspect_typed_rows(&temp_reconstruct);
                     swap_validated_sqlite_artifact(path, &temp_reconstruct, &timestamp)?;
                     reconcile_sqlite_file_with_archive(path, &storage_root)?;
+                    emit_salvage_loss_report(
+                        "archive-reconstruct",
+                        &salvage_before,
+                        &salvage_after,
+                        &suspect_rows,
+                    );
                 }
                 Err(e) => {
                     // Clean up partial temp file; original is safe.
@@ -58356,6 +58616,139 @@ startup_timeout_sec = 42
             quarantine_count, 0,
             "read-only best-effort open must not mutate/quarantine the mailbox"
         );
+    }
+
+    // ─── br-bvq1x.11.1 (K1): loss-honest salvage reporting ──────────────────
+
+    #[test]
+    fn salvage_count_rows_counts_present_and_marks_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open db");
+            conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+                .expect("create messages");
+            for i in 1..=3 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages (id, body) VALUES ({i}, 'b{i}')"
+                ))
+                .expect("insert message");
+            }
+        }
+        let counts = count_salvage_rows(&db_path);
+        assert!(counts.open_error.is_none(), "healthy db should open");
+        assert!(
+            matches!(counts.counts.get("messages"), Some(Ok(3))),
+            "messages should count to 3: {:?}",
+            counts.counts.get("messages")
+        );
+        // A table that does not exist is uncountable, never silently zero.
+        assert!(matches!(counts.counts.get("agents"), Some(Err(_))));
+    }
+
+    #[test]
+    fn salvage_count_rows_on_non_sqlite_is_uncountable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write garbage");
+        let counts = count_salvage_rows(&db_path);
+        assert!(
+            counts.open_error.is_some(),
+            "an unopenable db must record an open_error, not pretend it is empty"
+        );
+        for table in SALVAGE_LOSS_REPORT_TABLES {
+            assert!(
+                matches!(counts.counts.get(*table), Some(Err(_))),
+                "{table} must be uncountable on a non-sqlite file"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_salvage_suspect_typed_rows_flags_text_recipient_id() {
+        // L1 #7: a sqlite3 .recover salvage can leave a TEXT id in
+        // message_recipients; this must be detected + reported, never crash.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open db");
+            conn.execute_raw(
+                "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT)",
+            )
+            .expect("create message_recipients");
+            conn.execute_raw(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'to')",
+            )
+            .expect("insert healthy row");
+            // A non-numeric string keeps TEXT affinity in an INTEGER column.
+            conn.execute_raw(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES ('not-an-id', 3, 'to')",
+            )
+            .expect("insert suspect row");
+        }
+        let suspects = detect_salvage_suspect_typed_rows(&db_path);
+        assert!(
+            suspects
+                .iter()
+                .any(|s| s.contains("message_recipients.message_id")),
+            "expected a suspect TEXT-id finding, got {suspects:?}"
+        );
+    }
+
+    #[test]
+    fn detect_salvage_suspect_typed_rows_clean_db_has_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open db");
+            conn.execute_raw(
+                "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT)",
+            )
+            .expect("create");
+            conn.execute_raw(
+                "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'to')",
+            )
+            .expect("insert");
+        }
+        assert!(
+            detect_salvage_suspect_typed_rows(&db_path).is_empty(),
+            "a clean integer-keyed db must report no suspect rows"
+        );
+    }
+
+    #[test]
+    fn salvage_total_lost_counts_only_real_losses() {
+        let mut before = SalvageRowCounts::default();
+        before.counts.insert("messages".into(), Ok(2997));
+        before.counts.insert("message_recipients".into(), Ok(6864));
+        before
+            .counts
+            .insert("file_reservations".into(), Err("corrupt".into()));
+        let mut after = SalvageRowCounts::default();
+        after.counts.insert("messages".into(), Ok(2981));
+        after.counts.insert("message_recipients".into(), Ok(6864));
+        after.counts.insert("file_reservations".into(), Ok(5));
+
+        let (total, detail) = salvage_total_lost(&before, &after);
+        assert_eq!(total, 16, "only messages 2997->2981 is a real loss");
+        assert!(
+            detail
+                .iter()
+                .any(|d| d.contains("messages") && d.contains("LOST 16")),
+            "{detail:?}"
+        );
+        // An uncountable-before table never counts as loss (unknown != zero)...
+        assert!(!detail.iter().any(|d| d.contains("file_reservations")));
+        // ...but it is surfaced as uncountable so the operator knows.
+        assert_eq!(
+            salvage_uncountable_tables(&before),
+            vec!["file_reservations".to_string()]
+        );
+        // The report renders without panicking.
+        emit_salvage_loss_report("archive-reconstruct", &before, &after, &[]);
     }
 
     #[test]
