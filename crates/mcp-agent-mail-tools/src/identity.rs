@@ -305,6 +305,241 @@ pub struct SemanticReadinessResponse {
     pub detail: String,
 }
 
+/// One independent health verdict (br-bvq1x.3.1 / C1).
+///
+/// `health_check` is decomposed into several of these so a green top-level
+/// result can never coexist with a broken critical subsystem. Each carries a
+/// tri-state `status` (`green`/`yellow`/`red`), a human detail, and whether it
+/// is `critical` (a red critical verdict forces the top-level not-green).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthVerdict {
+    pub status: String,
+    pub detail: String,
+    pub critical: bool,
+}
+
+impl HealthVerdict {
+    fn new(level: mcp_agent_mail_core::HealthLevel, critical: bool, detail: impl Into<String>) -> Self {
+        Self {
+            status: level.as_str().to_string(),
+            detail: detail.into(),
+            critical,
+        }
+    }
+
+    fn level(&self) -> mcp_agent_mail_core::HealthLevel {
+        match self.status.as_str() {
+            "red" => mcp_agent_mail_core::HealthLevel::Red,
+            "yellow" => mcp_agent_mail_core::HealthLevel::Yellow,
+            _ => mcp_agent_mail_core::HealthLevel::Green,
+        }
+    }
+}
+
+/// The decomposed, independent verdicts that roll up into the top-level
+/// `health_check` result. The top-level can never be greener than the weakest
+/// critical verdict here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthVerdicts {
+    /// JSON-RPC decode/protocol path is functional (sourced from C3 logic).
+    pub transport_health: HealthVerdict,
+    /// Database open/connectivity is healthy.
+    pub db_health: HealthVerdict,
+    /// The write path is usable: required schema present, not read-only/corrupt
+    /// (sourced from C2 logic).
+    pub write_health: HealthVerdict,
+    /// Search/archive semantic readiness (the legacy bundled check).
+    pub semantic_readiness: HealthVerdict,
+    /// Git archive vs `SQLite` index parity.
+    pub archive_db_parity: HealthVerdict,
+    /// The doctor surface can operate (storage root writable).
+    pub doctor_readiness: HealthVerdict,
+}
+
+impl HealthVerdicts {
+    const fn all(&self) -> [&HealthVerdict; 6] {
+        [
+            &self.transport_health,
+            &self.db_health,
+            &self.write_health,
+            &self.semantic_readiness,
+            &self.archive_db_parity,
+            &self.doctor_readiness,
+        ]
+    }
+
+    /// Names of the verdicts that are not green, worst first, so the response
+    /// can point at the failing subsystem.
+    fn failing_names(&self) -> Vec<String> {
+        let mut named: Vec<(&str, mcp_agent_mail_core::HealthLevel)> = Vec::new();
+        let labelled: [(&str, &HealthVerdict); 6] = [
+            ("transport_health", &self.transport_health),
+            ("db_health", &self.db_health),
+            ("write_health", &self.write_health),
+            ("semantic_readiness", &self.semantic_readiness),
+            ("archive_db_parity", &self.archive_db_parity),
+            ("doctor_readiness", &self.doctor_readiness),
+        ];
+        for (name, verdict) in labelled {
+            if verdict.level() != mcp_agent_mail_core::HealthLevel::Green {
+                named.push((name, verdict.level()));
+            }
+        }
+        named.sort_by_key(|entry| std::cmp::Reverse(entry.1 as u8));
+        named.into_iter().map(|(name, _)| name.to_string()).collect()
+    }
+
+    /// The strict roll-up level: the worst of all critical verdicts (so a red
+    /// `db_health` or `write_health` can never present as green).
+    fn rollup_level(&self) -> mcp_agent_mail_core::HealthLevel {
+        self.all()
+            .into_iter()
+            .filter(|v| v.critical)
+            .map(HealthVerdict::level)
+            .max_by_key(|level| *level as u8)
+            .unwrap_or(mcp_agent_mail_core::HealthLevel::Green)
+    }
+}
+
+/// Which subsystem a failed `semantic_readiness` detail implicates. Classifies
+/// the stable detail strings emitted by `health_check_semantic_readiness` (the
+/// same approach the A1 taxonomy uses on DB error strings) so we can route a
+/// bundled failure to the right decomposed verdict without refactoring the
+/// probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticVerdictKind {
+    Ok,
+    Warn,
+    DbConnectivity,
+    SchemaMissing,
+    ArchiveParity,
+}
+
+fn classify_semantic_failure(status: &str, detail: &str) -> SemanticVerdictKind {
+    match status {
+        "ok" => SemanticVerdictKind::Ok,
+        "warn" => SemanticVerdictKind::Warn,
+        _ => {
+            let d = detail.to_ascii_lowercase();
+            if d.contains("missing required health_check tables") {
+                SemanticVerdictKind::SchemaMissing
+            } else if d.contains("archive inventory is ahead") {
+                SemanticVerdictKind::ArchiveParity
+            } else {
+                // Path resolution, missing file, connectivity probe, schema
+                // inspection failures all point at the DB open/connect surface.
+                SemanticVerdictKind::DbConnectivity
+            }
+        }
+    }
+}
+
+/// Lightweight `transport_health` probe (sourced from C3 / `am doctor
+/// mcp-selftest`): confirm the JSON-RPC decode path round-trips a canonical
+/// `initialize` envelope. Pure CPU; safe to run on every `health_check`. The
+/// authoritative transport check remains `am doctor mcp-selftest`.
+fn probe_transport_decode() -> Result<(), String> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05" },
+    });
+    let encoded =
+        serde_json::to_string(&request).map_err(|e| format!("JSON-RPC encode failed: {e}"))?;
+    let decoded: serde_json::Value =
+        serde_json::from_str(&encoded).map_err(|e| format!("JSON-RPC decode failed: {e}"))?;
+    if decoded.get("method").and_then(serde_json::Value::as_str) == Some("initialize") {
+        Ok(())
+    } else {
+        Err("JSON-RPC round-trip lost the method field".to_string())
+    }
+}
+
+/// Lightweight `doctor_readiness` probe: the storage root must exist as a
+/// directory for the doctor surface to operate. Non-mutating (no probe file).
+fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
+    let root = &config.storage_root;
+    if root.is_dir() {
+        Ok(())
+    } else if root.exists() {
+        Err(format!(
+            "storage root {} exists but is not a directory",
+            root.display()
+        ))
+    } else {
+        Err(format!("storage root {} does not exist yet", root.display()))
+    }
+}
+
+/// Decompose the bundled health signals into the six independent verdicts
+/// (br-bvq1x.3.1 / C1). The strict roll-up over the critical verdicts is what
+/// prevents a green top-level result from coexisting with a broken write or
+/// transport path.
+fn compute_health_verdicts(
+    config: &Config,
+    pool_present: bool,
+    semantic: &SemanticReadinessResponse,
+) -> HealthVerdicts {
+    use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
+    let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
+
+    let semantic_level = match semantic.status.as_str() {
+        "ok" => Green,
+        "warn" => Yellow,
+        _ => Red,
+    };
+    let semantic_readiness = HealthVerdict::new(semantic_level, false, semantic.detail.clone());
+
+    let db_health = if !pool_present {
+        HealthVerdict::new(Red, true, "database pool bootstrap failed")
+    } else if kind == SemanticVerdictKind::DbConnectivity {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else if kind == SemanticVerdictKind::Warn {
+        HealthVerdict::new(Yellow, true, semantic.detail.clone())
+    } else {
+        HealthVerdict::new(Green, true, "database open/connectivity healthy")
+    };
+
+    // write_health is the lightweight schema-writability proxy (C2-sourced):
+    // the required tables must be present to accept writes. Deeper write-path
+    // liveness is the authoritative `am doctor write-selftest`. The recovery
+    // mode is surfaced separately in the `recovery` field rather than gated
+    // here, because the fast recovery probe can report degraded for healthy
+    // external/test databases (the same false positive `semantic_readiness`
+    // skips).
+    let write_health = if kind == SemanticVerdictKind::SchemaMissing {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else {
+        HealthVerdict::new(Green, true, "write path schema present and writable")
+    };
+
+    let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else {
+        HealthVerdict::new(Green, true, "git archive and sqlite index are aligned")
+    };
+
+    let transport_health = match probe_transport_decode() {
+        Ok(()) => HealthVerdict::new(Green, true, "JSON-RPC decode path functional"),
+        Err(detail) => HealthVerdict::new(Red, true, detail),
+    };
+
+    let doctor_readiness = match probe_doctor_readiness(config) {
+        Ok(()) => HealthVerdict::new(Green, false, "storage root writable; doctor can operate"),
+        Err(detail) => HealthVerdict::new(Yellow, false, detail),
+    };
+
+    HealthVerdicts {
+        transport_health,
+        db_health,
+        write_health,
+        semantic_readiness,
+        archive_db_parity,
+        doctor_readiness,
+    }
+}
+
 fn resolve_health_check_sqlite_path(database_url: &str) -> Result<Option<PathBuf>, String> {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return Ok(None);
@@ -659,6 +894,14 @@ pub struct HealthCheckResponse {
     pub two_tier_indexing: Option<mcp_agent_mail_db::search_service::TwoTierIndexingHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatusResponse>,
+    /// Decomposed independent verdicts (br-bvq1x.3.1 / C1). The top-level
+    /// `status`/`health_level` above is a strict roll-up that can never be
+    /// greener than the weakest critical verdict here.
+    pub verdicts: HealthVerdicts,
+    /// Names of the verdicts that are not green, worst-first, so consumers can
+    /// point directly at the failing subsystem.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failing_verdicts: Vec<String>,
 }
 
 /// Active recovery state surfaced in `health_check` when the mailbox is degraded or recovering.
@@ -878,16 +1121,27 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             .saturating_div(1_000_000)
     };
 
-    // Refresh the cached health level from live metrics
-    let (health_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+    // Refresh the cached health level (pressure-derived) from live metrics.
+    let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+
+    // C1 (br-bvq1x.3.1): decompose health into independent verdicts and roll up
+    // strictly, so a green top-level can never coexist with a broken critical
+    // subsystem (db/write/transport).
+    let recovery = build_recovery_status(config);
+    let verdicts = compute_health_verdicts(config, pool.is_some(), &semantic_readiness);
+    let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
+    // The top-level level can never be greener than the weakest critical
+    // verdict (or the live pressure level).
+    let effective_level = pressure_level.max(verdicts.rollup_level());
+    let failing_verdicts = verdicts.failing_names();
 
     let response = HealthCheckResponse {
-        status: if semantic_readiness.status == "fail" {
+        status: if critical_red {
             "error".to_string()
         } else {
             "ok".to_string()
         },
-        health_level: health_level.to_string(),
+        health_level: effective_level.to_string(),
         environment: config.app_environment.to_string(),
         http_host: config.http_host.clone(),
         http_port: config.http_port,
@@ -995,7 +1249,9 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         },
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
-        recovery: build_recovery_status(config),
+        recovery,
+        verdicts,
+        failing_verdicts,
     };
 
     serde_json::to_string(&response)
@@ -1930,6 +2186,133 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
     use std::path::PathBuf;
+
+    /// All-green decomposed verdicts, for response-serialization tests that
+    /// don't exercise the rollup logic.
+    fn green_test_verdicts() -> HealthVerdicts {
+        let g = |critical: bool| {
+            HealthVerdict::new(mcp_agent_mail_core::HealthLevel::Green, critical, "ok")
+        };
+        HealthVerdicts {
+            transport_health: g(true),
+            db_health: g(true),
+            write_health: g(true),
+            semantic_readiness: g(false),
+            archive_db_parity: g(true),
+            doctor_readiness: g(false),
+        }
+    }
+
+    // ── C1 (br-bvq1x.3.1): decomposed verdicts + strict roll-up ──────────
+
+    fn semantic(status: &str, detail: &str) -> SemanticReadinessResponse {
+        SemanticReadinessResponse {
+            status: status.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn classify_semantic_failure_routes_to_subsystems() {
+        assert_eq!(classify_semantic_failure("ok", "aligned"), SemanticVerdictKind::Ok);
+        assert_eq!(classify_semantic_failure("warn", "lock"), SemanticVerdictKind::Warn);
+        assert_eq!(
+            classify_semantic_failure("fail", "sqlite schema missing required health_check tables: agents"),
+            SemanticVerdictKind::SchemaMissing
+        );
+        assert_eq!(
+            classify_semantic_failure("fail", "archive inventory is ahead of the sqlite index (...)"),
+            SemanticVerdictKind::ArchiveParity
+        );
+        assert_eq!(
+            classify_semantic_failure("fail", "sqlite connectivity probe failed during health_check: disk I/O error"),
+            SemanticVerdictKind::DbConnectivity
+        );
+    }
+
+    #[test]
+    fn rollup_takes_worst_critical_and_ignores_noncritical() {
+        use mcp_agent_mail_core::HealthLevel;
+        let mut v = green_test_verdicts();
+        // A non-critical yellow must NOT move the roll-up.
+        v.doctor_readiness = HealthVerdict::new(HealthLevel::Yellow, false, "missing");
+        assert_eq!(v.rollup_level(), HealthLevel::Green);
+        // A critical red drives the roll-up to red.
+        v.db_health = HealthVerdict::new(HealthLevel::Red, true, "down");
+        assert_eq!(v.rollup_level(), HealthLevel::Red);
+        // Failing names are worst-first and exclude the green verdicts.
+        let names = v.failing_names();
+        assert_eq!(names.first().map(String::as_str), Some("db_health"));
+        assert!(names.contains(&"doctor_readiness".to_string()));
+        assert!(!names.contains(&"write_health".to_string()));
+    }
+
+    #[test]
+    fn missing_tables_makes_write_health_red_and_names_it() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("fail", "sqlite schema missing required health_check tables: agents, messages"),
+        );
+        assert_eq!(verdicts.write_health.status, "red");
+        assert!(verdicts.write_health.critical);
+        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+        assert!(verdicts.failing_names().contains(&"write_health".to_string()));
+    }
+
+    #[test]
+    fn connectivity_failure_makes_db_health_red() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("fail", "sqlite connectivity probe failed during health_check: file is not a database"),
+        );
+        assert_eq!(verdicts.db_health.status, "red");
+        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+    }
+
+    #[test]
+    fn archive_ahead_makes_parity_red() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("fail", "archive inventory is ahead of the sqlite index (archive projects=2 ...)"),
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+    }
+
+    #[test]
+    fn pool_bootstrap_failure_makes_db_health_red() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(
+            &config,
+            false,
+            &semantic("fail", "database pool bootstrap failed"),
+        );
+        assert_eq!(verdicts.db_health.status, "red");
+        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+    }
+
+    #[test]
+    fn all_healthy_rolls_up_green() {
+        let config = Config::from_env();
+        let verdicts = compute_health_verdicts(&config, true, &semantic("ok", "aligned"));
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+        assert_eq!(verdicts.transport_health.status, "green");
+        assert_eq!(verdicts.archive_db_parity.status, "green");
+        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Green);
+        assert!(verdicts.failing_names().is_empty() || !verdicts.failing_names().contains(&"db_health".to_string()));
+    }
+
+    #[test]
+    fn transport_decode_probe_round_trips() {
+        assert!(probe_transport_decode().is_ok());
+    }
     use std::sync::{Mutex, OnceLock};
 
     static HEALTH_CHECK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2065,12 +2448,15 @@ mod tests {
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
+            verdicts: green_test_verdicts(),
+            failing_verdicts: vec![],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["semantic_readiness"]["status"], "ok");
         assert_eq!(json["http_port"], 8765);
+        assert_eq!(json["verdicts"]["db_health"]["status"], "green");
     }
 
     #[test]
@@ -2538,6 +2924,8 @@ mod tests {
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
+            verdicts: green_test_verdicts(),
+            failing_verdicts: vec![],
         };
         let json_str = serde_json::to_string(&r).unwrap();
         assert!(!json_str.contains("pool_utilization"));

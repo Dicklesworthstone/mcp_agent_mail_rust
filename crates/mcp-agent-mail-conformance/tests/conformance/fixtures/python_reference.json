@@ -71,6 +71,8 @@
               "/recovery",
               "/semantic_readiness",
               "/two_tier_indexing",
+              "/verdicts",
+              "/failing_verdicts",
               "/pool_utilization/acquire_p50_ms",
               "/pool_utilization/acquire_p95_ms",
               "/pool_utilization/acquire_p99_ms",
