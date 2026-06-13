@@ -484,6 +484,9 @@ pub struct RetryConfig {
     pub use_circuit_breaker: bool,
     /// Which subsystem circuit breaker to use (default: `Db`).
     pub subsystem: Subsystem,
+    /// Logical operation name reported in budget-exhaustion envelopes
+    /// (default: `"db_operation"`).
+    pub operation: &'static str,
 }
 
 impl Default for RetryConfig {
@@ -494,6 +497,7 @@ impl Default for RetryConfig {
             max_delay: Duration::from_secs(8),
             use_circuit_breaker: true,
             subsystem: Subsystem::Db,
+            operation: "db_operation",
         }
     }
 }
@@ -577,7 +581,11 @@ fn jitter_factor() -> f64 {
 /// # Errors
 ///
 /// Returns the last error if all retries are exhausted, or a
-/// `CircuitBreakerOpen` error if the circuit is open.
+/// `CircuitBreakerOpen` error if the circuit is open. When a retryable error
+/// exhausts a non-zero retry budget, the final error is wrapped in
+/// [`DbError::RetryBudgetExhausted`] so consumers can report the attempts
+/// made and the wall-clock time spent instead of advising another blind
+/// retry (br-bvq1x.4.3 / D3).
 pub fn retry_sync<T, F>(config: &RetryConfig, mut op: F) -> DbResult<T>
 where
     F: FnMut() -> DbResult<T>,
@@ -588,6 +596,7 @@ where
         None
     };
 
+    let started = Instant::now();
     let mut last_err = None;
 
     for attempt in 0..=config.max_retries {
@@ -629,6 +638,19 @@ where
                         // Count one logical operation failure after retries are
                         // exhausted instead of charging every internal attempt.
                         cb.record_failure();
+                    }
+                    // D3: a retryable error that spent a real retry budget is
+                    // wrapped so downstream envelopes can say "already retried
+                    // N times over X ms" instead of advising a blind retry.
+                    if retryable && config.max_retries > 0 {
+                        return Err(DbError::RetryBudgetExhausted {
+                            operation: config.operation,
+                            attempts: attempt + 1,
+                            budget: config.max_retries + 1,
+                            elapsed_ms: u64::try_from(started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            inner: Box::new(e),
+                        });
                     }
                     return Err(e);
                 }
@@ -1025,6 +1047,7 @@ mod tests {
             max_delay: Duration::from_secs(8),
             use_circuit_breaker: false,
             subsystem: Subsystem::Db,
+            ..Default::default()
         };
 
         // Expected base delays (before jitter): 50, 100, 200, 400, 800, 1600, 3200
@@ -1050,6 +1073,7 @@ mod tests {
             max_delay: Duration::from_secs(8),
             use_circuit_breaker: false,
             subsystem: Subsystem::Db,
+            ..Default::default()
         };
 
         // Very high attempt should be capped at max_delay.
@@ -1165,9 +1189,74 @@ mod tests {
             attempt.set(attempt.get() + 1);
             Err(DbError::Sqlite("database is locked".to_string()))
         });
-        assert!(result.is_err());
         // max_retries=3 means 4 attempts total (0..=3)
         assert_eq!(attempt.get(), 4);
+
+        // D3 (br-bvq1x.4.3): a spent budget is wrapped with retry context so
+        // downstream envelopes can report attempts/elapsed honestly.
+        let err = result.unwrap_err();
+        let DbError::RetryBudgetExhausted {
+            operation,
+            attempts,
+            budget,
+            inner,
+            ..
+        } = err
+        else {
+            panic!("expected RetryBudgetExhausted, got: {err}");
+        };
+        assert_eq!(operation, "db_operation");
+        assert_eq!(attempts, 4);
+        assert_eq!(budget, 4);
+        assert!(matches!(*inner, DbError::Sqlite(_)));
+    }
+
+    #[test]
+    fn retry_sync_exhaustion_uses_configured_operation_name() {
+        let config = RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            use_circuit_breaker: false,
+            operation: "quick_check",
+            ..Default::default()
+        };
+        let result: DbResult<()> = retry_sync(&config, || {
+            Err(DbError::ResourceBusy("database is busy".to_string()))
+        });
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DbError::RetryBudgetExhausted {
+                    operation: "quick_check",
+                    ..
+                }
+            ),
+            "operation name propagates: {err}"
+        );
+        // Legacy code and retryability delegate to the wrapped error.
+        assert_eq!(err.error_code(), "RESOURCE_BUSY");
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn retry_sync_zero_budget_does_not_wrap() {
+        let config = RetryConfig {
+            max_retries: 0,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            use_circuit_breaker: false,
+            ..Default::default()
+        };
+        let result: DbResult<()> = retry_sync(&config, || {
+            Err(DbError::ResourceBusy("database is busy".to_string()))
+        });
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DbError::ResourceBusy(_)),
+            "single-attempt configs keep the raw error: {err}"
+        );
     }
 
     #[test]
@@ -1463,6 +1552,7 @@ mod tests {
             max_delay: Duration::from_millis(5),
             use_circuit_breaker: true,
             subsystem: Subsystem::Db,
+            ..Default::default()
         };
 
         let attempt = std::cell::Cell::new(0u32);
@@ -1653,6 +1743,7 @@ mod tests {
             max_delay: Duration::from_millis(5),
             use_circuit_breaker: true,
             subsystem: Subsystem::Db,
+            ..Default::default()
         };
 
         let _err: DbResult<()> = retry_sync(&config, || {
@@ -1684,6 +1775,7 @@ mod tests {
             max_delay: Duration::from_millis(5),
             use_circuit_breaker: true,
             subsystem: Subsystem::Db,
+            ..Default::default()
         };
 
         let result = retry_sync(&config, || Ok(42));

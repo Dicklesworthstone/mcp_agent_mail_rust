@@ -240,12 +240,136 @@ pub mod tool_util {
         Value::Object(object)
     }
 
+    /// Build the JSON retry-context block for a spent retry budget (D3).
+    fn retry_exhaustion_data(
+        operation: &'static str,
+        attempts: u32,
+        budget: u32,
+        elapsed_ms: u64,
+    ) -> Value {
+        json!({
+            "operation": operation,
+            "attempts_made": attempts,
+            "retry_budget": budget,
+            "elapsed_wait_ms": elapsed_ms,
+            "budget_exhausted": true,
+            "immediate_retry_useful": false,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
         let classification = e.classification();
         let failure_envelope = e.failure_envelope();
         match e {
+            // D3 (br-bvq1x.4.3): a bounded retry loop already spent its
+            // budget. Render an honest, class-distinct envelope that reports
+            // the attempts made and elapsed wait instead of advising another
+            // blind retry. Classification delegates to the wrapped error, so
+            // `classification.class` is the wrapped error's class.
+            DbError::RetryBudgetExhausted {
+                operation,
+                attempts,
+                budget,
+                elapsed_ms,
+                inner,
+            } => {
+                let inner_detail = inner.to_string();
+                let retry_data = retry_exhaustion_data(operation, attempts, budget, elapsed_ms);
+                match classification.class {
+                    mcp_agent_mail_db::DbErrorClass::FdExhaustion => {
+                        let freed = mcp_agent_mail_db::fd_eviction_freed(&inner_detail);
+                        let freed_zero = freed == Some(0);
+                        let message = if freed_zero {
+                            format!(
+                                "File descriptor limit exhausted and repo-cache eviction freed \
+                                 nothing after {attempts} attempts. Do NOT retry: close stale \
+                                 Agent Mail processes, raise the open-file limit (ulimit -n), \
+                                 or restart the owning server, then run `am doctor health`."
+                            )
+                        } else {
+                            format!(
+                                "File descriptor limit exhausted ({attempts} attempts over \
+                                 {elapsed_ms} ms). Close stale Agent Mail processes or raise \
+                                 the open-file limit, then retry once."
+                            )
+                        };
+                        legacy_tool_error(
+                            "RESOURCE_BUSY",
+                            message,
+                            !freed_zero,
+                            db_error_data(
+                                classification,
+                                &failure_envelope,
+                                json!({
+                                    "error_detail": inner_detail,
+                                    "resource_class": "file_descriptors",
+                                    "eviction_freed": freed,
+                                    "retry_exhaustion": retry_data,
+                                }),
+                            ),
+                        )
+                    }
+                    mcp_agent_mail_db::DbErrorClass::PoolExhaustion => legacy_tool_error(
+                        "DATABASE_POOL_EXHAUSTED",
+                        format!(
+                            "Database connection pool exhausted; the server already retried \
+                             {attempts} times over {elapsed_ms} ms. Reduce concurrent agents \
+                             or increase pool settings before retrying."
+                        ),
+                        true,
+                        db_error_data(
+                            classification,
+                            &failure_envelope,
+                            json!({
+                                "error_detail": inner_detail,
+                                "retry_exhaustion": retry_data,
+                            }),
+                        ),
+                    ),
+                    mcp_agent_mail_db::DbErrorClass::LiveOwnerNoActivityLock => legacy_tool_error(
+                        "RESOURCE_BUSY",
+                        format!(
+                            "Resource is busy: a running Agent Mail server owns this mailbox \
+                             and {attempts} direct-write attempts over {elapsed_ms} ms were \
+                             refused. Route this operation through that server instead of \
+                             retrying direct writes. Detail: {inner_detail}"
+                        ),
+                        true,
+                        db_error_data(
+                            classification,
+                            &failure_envelope,
+                            json!({
+                                "error_detail": inner_detail,
+                                "retry_exhaustion": retry_data,
+                            }),
+                        ),
+                    ),
+                    mcp_agent_mail_db::DbErrorClass::BusyRetryable => legacy_tool_error(
+                        "RESOURCE_BUSY",
+                        format!(
+                            "Resource is temporarily busy and the retry budget is exhausted \
+                             ({attempts} attempts over {elapsed_ms} ms). Do not immediately \
+                             retry: run `am doctor locks --json` to identify the lock holder, \
+                             wait for it to clear, then try once more."
+                        ),
+                        true,
+                        db_error_data(
+                            classification,
+                            &failure_envelope,
+                            json!({
+                                "error_detail": inner_detail,
+                                "retry_exhaustion": retry_data,
+                            }),
+                        ),
+                    ),
+                    // Corruption and config classes are never retried by the
+                    // bounded loops; if one ever arrives wrapped, fall back to
+                    // the wrapped error's own distinct envelope.
+                    _ => db_error_to_mcp_error(*inner),
+                }
+            }
             DbError::InvalidArgument { field, message } => legacy_tool_error(
                 "INVALID_ARGUMENT",
                 format!(
@@ -316,17 +440,38 @@ pub mod tool_util {
                 if mcp_agent_mail_db::is_fd_exhaustion_error(message) =>
             {
                 let message = message.clone();
+                // D3 (br-bvq1x.4.3): when the failing path reported that
+                // repo-cache eviction freed nothing, another retry will
+                // deterministically fail — stop advising it.
+                let freed = mcp_agent_mail_db::fd_eviction_freed(&message);
+                let freed_zero = freed == Some(0);
+                let (display, action) = if freed_zero {
+                    (
+                        "File descriptor limit exhausted and repo-cache eviction freed nothing. \
+                         Do NOT retry: close stale Agent Mail processes, raise the open-file \
+                         limit (ulimit -n), or restart the owning server, then run \
+                         `am doctor health`.",
+                        "do not retry; close stale Agent Mail processes, raise the open-file \
+                         limit, or restart the owning server",
+                    )
+                } else {
+                    (
+                        "File descriptor limit exhausted. Close stale Agent Mail processes or raise the open-file limit, then retry.",
+                        "close stale Agent Mail processes or raise the open-file limit, then retry",
+                    )
+                };
                 legacy_tool_error(
                     "RESOURCE_BUSY",
-                    "File descriptor limit exhausted. Close stale Agent Mail processes or raise the open-file limit, then retry.",
-                    true,
+                    display,
+                    !freed_zero,
                     db_error_data(
                         classification,
                         &failure_envelope,
                         json!({
                             "error_detail": message,
                             "resource_class": "file_descriptors",
-                            "recommended_action": "close stale Agent Mail processes or raise the open-file limit, then retry",
+                            "eviction_freed": freed,
+                            "recommended_action": action,
                         }),
                     ),
                 )
@@ -1511,23 +1656,39 @@ pub mod tool_util {
 
         #[test]
         fn db_error_to_mcp_error_maps_fd_exhaustion_as_resource_busy() {
+            // D3 (br-bvq1x.4.3): "Freed 0 cached repos" means eviction freed
+            // nothing, so the envelope must stop advising a blind retry.
             let err = db_error_to_mcp_error(DbError::Internal(
                 "send_message retry failed: Too many open files. Freed 0 cached repos".into(),
             ));
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
-            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["recoverable"], false);
             assert_eq!(data["error"]["data"]["resource_class"], "file_descriptors");
-            assert!(
-                data["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("File descriptor limit exhausted")
-            );
+            assert_eq!(data["error"]["data"]["eviction_freed"], 0);
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("File descriptor limit exhausted"));
+            assert!(msg.contains("Do NOT retry"), "non-retry guidance: {msg}");
             let classification = &data["error"]["data"]["db_error_classification"];
             assert_eq!(classification["class"], "fd_exhaustion");
             assert_eq!(classification["safe_to_retry"], true);
             assert_eq!(classification["blocks_edits"], true);
+            let fd = &data["error"]["data"]["failure_envelope"]["fd_pressure"];
+            assert_eq!(fd["eviction_freed"], 0);
+            assert_eq!(fd["immediate_retry_useful"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_fd_exhaustion_without_freed_zero_keeps_retry_advice() {
+            let err = db_error_to_mcp_error(DbError::Internal(
+                "open failed: Too many open files (os error 24)".into(),
+            ));
+            let data = err.data.expect("expected data payload");
+            assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(data["error"]["recoverable"], true);
+            assert_eq!(data["error"]["data"]["eviction_freed"], Value::Null);
+            let msg = data["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("then retry"), "retry advice retained: {msg}");
         }
 
         #[test]

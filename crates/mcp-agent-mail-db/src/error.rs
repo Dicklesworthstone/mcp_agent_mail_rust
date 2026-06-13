@@ -79,6 +79,28 @@ pub enum DbError {
         details: Vec<String>,
     },
 
+    /// A bounded retry loop spent its entire budget without success (D3).
+    ///
+    /// Wraps the final error so downstream consumers can render an honest,
+    /// budget-aware envelope ("the server already retried N times over X ms")
+    /// instead of advising another blind retry. Classification, retryability,
+    /// and legacy error codes all delegate to the wrapped error.
+    #[error(
+        "{operation}: retry budget exhausted ({attempts}/{budget} attempts, {elapsed_ms} ms elapsed): {inner}"
+    )]
+    RetryBudgetExhausted {
+        /// Logical operation name (e.g. `create_message`).
+        operation: &'static str,
+        /// Attempts actually made (initial attempt + retries).
+        attempts: u32,
+        /// Total attempt budget that was available.
+        budget: u32,
+        /// Wall-clock time spent inside the retry loop, in milliseconds.
+        elapsed_ms: u64,
+        /// The final error that exhausted the budget.
+        inner: Box<Self>,
+    },
+
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -364,6 +386,72 @@ pub struct DbFailureHostSummary {
     pub inspect_error: Option<String>,
 }
 
+/// Bounded-retry report attached when a retry loop exhausted its budget (D3).
+///
+/// `immediate_retry_useful` is the instance-level honesty bit: the static
+/// class policy (`DbFailurePolicy::safe_to_retry`) says whether this error
+/// *family* is ever retryable, while this field says whether retrying *right
+/// now, again* has any chance of helping after the budget was already spent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureRetryReport {
+    /// Logical operation whose retry loop exhausted (e.g. `create_message`).
+    pub operation: String,
+    /// Attempts actually made (initial attempt + retries).
+    pub attempts_made: u32,
+    /// Total attempt budget that was available.
+    pub retry_budget: u32,
+    /// Wall-clock time spent inside the retry loop, in milliseconds.
+    pub elapsed_wait_ms: u64,
+    /// Whether the budget was fully spent (always true when this is present).
+    pub budget_exhausted: bool,
+    /// Whether one more immediate retry is plausibly useful.
+    pub immediate_retry_useful: bool,
+    /// Exact fallback guidance for the caller.
+    pub next_action: String,
+}
+
+/// Best-effort lock-owner identity parsed from the failure detail (D3).
+///
+/// Populated for `LiveOwnerNoActivityLock` refusals (and for `BusyRetryable`
+/// when the detail names a PID). `command`/`alive` come from side-effect-free
+/// `/proc/<pid>` reads on Linux and are `None` elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureLockOwner {
+    /// Owner PID when the error detail names one.
+    pub pid: Option<u32>,
+    /// Owner process command name (`/proc/<pid>/comm`), best-effort.
+    pub command: Option<String>,
+    /// Whether the owner PID is currently alive, best-effort.
+    pub alive: Option<bool>,
+    /// Provenance of this owner identity.
+    pub source: &'static str,
+}
+
+/// File-descriptor pressure snapshot for `FdExhaustion` failures (D3).
+///
+/// Captured with side-effect-free `/proc/self` reads on Linux (`None`
+/// elsewhere). `eviction_freed` is parsed from the error detail when the
+/// failing path reported a repo-cache eviction outcome ("Freed N cached
+/// repos"); a value of `Some(0)` means eviction freed nothing, so another
+/// blind retry will deterministically fail — `immediate_retry_useful` is
+/// `false` and `next_action` gives a non-retry step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbFailureFdPressure {
+    /// Soft `RLIMIT_NOFILE` limit (`None` when unknown or unlimited).
+    pub soft_limit: Option<u64>,
+    /// Hard `RLIMIT_NOFILE` limit (`None` when unknown or unlimited).
+    pub hard_limit: Option<u64>,
+    /// Approximate open descriptor count for this process (includes the
+    /// probe's own directory descriptor).
+    pub open_fds: Option<u64>,
+    /// Repo-cache entries freed by eviction, parsed from the error detail.
+    pub eviction_freed: Option<u64>,
+    /// Whether one more immediate retry is plausibly useful.
+    pub immediate_retry_useful: bool,
+    /// Exact fallback guidance for the caller.
+    pub next_action: String,
+}
+
 /// Single structured failure envelope for database and DB-adjacent failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DbFailureEnvelope {
@@ -385,6 +473,12 @@ pub struct DbFailureEnvelope {
     pub tui_polling_active: Option<bool>,
     pub host: DbFailureHostSummary,
     pub policy: DbFailurePolicy,
+    /// Bounded-retry report; present when a retry loop exhausted its budget.
+    pub retry: Option<DbFailureRetryReport>,
+    /// Best-effort lock-owner identity for busy/live-owner contention.
+    pub lock_owner: Option<DbFailureLockOwner>,
+    /// FD-pressure snapshot; present for `fd_exhaustion` failures.
+    pub fd_pressure: Option<DbFailureFdPressure>,
 }
 
 impl DbFailureEnvelope {
@@ -393,6 +487,10 @@ impl DbFailureEnvelope {
     pub fn from_error(error: &DbError) -> Self {
         let classification = error.classification();
         let (db_path, storage_root) = effective_db_environment();
+        let detail = error.to_string();
+        let retry = retry_report_for(error, classification.class);
+        let lock_owner = lock_owner_for(classification.class, &detail);
+        let fd_pressure = fd_pressure_for(classification.class, &detail);
 
         Self {
             schema_version: DB_FAILURE_ENVELOPE_SCHEMA_VERSION,
@@ -428,6 +526,9 @@ impl DbFailureEnvelope {
             tui_polling_active: None,
             host: host_summary(),
             policy: DbFailurePolicy::from(classification),
+            retry,
+            lock_owner,
+            fd_pressure,
         }
     }
 }
@@ -458,6 +559,11 @@ impl DbError {
     }
 
     /// Whether this error indicates a retryable lock/busy condition.
+    ///
+    /// A [`Self::RetryBudgetExhausted`] wrapper delegates to the wrapped
+    /// error: the *family* stays retryable even though one loop's budget was
+    /// spent (callers should consult the failure envelope's `retry` section
+    /// before retrying immediately).
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -465,6 +571,7 @@ impl DbError {
                 classify_db_error_message(msg).safe_to_retry
             }
             Self::ResourceBusy(_) | Self::PoolExhausted { .. } => true,
+            Self::RetryBudgetExhausted { inner, .. } => inner.is_retryable(),
             _ => false,
         }
     }
@@ -476,6 +583,7 @@ impl DbError {
         match self {
             Self::Sqlite(msg) | Self::Pool(msg) | Self::Schema(msg) => is_corruption_error(msg),
             Self::IntegrityCorruption { .. } => true,
+            Self::RetryBudgetExhausted { inner, .. } => inner.is_corruption(),
             _ => false,
         }
     }
@@ -526,6 +634,7 @@ impl DbError {
             }
             Self::Sqlite(message) | Self::Schema(message) => classify_db_error_message(message),
             Self::Internal(message) => classify_db_error_message(message),
+            Self::RetryBudgetExhausted { inner, .. } => inner.classification(),
             Self::NotFound { .. }
             | Self::Duplicate { .. }
             | Self::InvalidArgument { .. }
@@ -542,8 +651,12 @@ impl DbError {
     }
 
     /// The legacy error code string for this error.
+    ///
+    /// A [`Self::RetryBudgetExhausted`] wrapper reports the wrapped error's
+    /// code so legacy consumers keep seeing `RESOURCE_BUSY` /
+    /// `DATABASE_POOL_EXHAUSTED` rather than a new opaque code.
     #[must_use]
-    pub const fn error_code(&self) -> &'static str {
+    pub fn error_code(&self) -> &'static str {
         match self {
             Self::PoolExhausted { .. } => "DATABASE_POOL_EXHAUSTED",
             Self::ResourceBusy(_) | Self::CircuitBreakerOpen { .. } => "RESOURCE_BUSY",
@@ -551,20 +664,22 @@ impl DbError {
             Self::Duplicate { .. } => "DUPLICATE",
             Self::InvalidArgument { .. } => "INVALID_ARGUMENT",
             Self::IntegrityCorruption { .. } => "INTEGRITY_CORRUPTION",
+            Self::RetryBudgetExhausted { inner, .. } => inner.error_code(),
             _ => "INTERNAL_ERROR",
         }
     }
 
     /// Whether the error is recoverable (client can retry).
     #[must_use]
-    pub const fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
+    pub fn is_recoverable(&self) -> bool {
+        match self {
             Self::PoolExhausted { .. }
-                | Self::ResourceBusy(_)
-                | Self::CircuitBreakerOpen { .. }
-                | Self::Pool(_)
-        )
+            | Self::ResourceBusy(_)
+            | Self::CircuitBreakerOpen { .. }
+            | Self::Pool(_) => true,
+            Self::RetryBudgetExhausted { inner, .. } => inner.is_recoverable(),
+            _ => false,
+        }
     }
 }
 
@@ -674,6 +789,201 @@ fn host_summary() -> DbFailureHostSummary {
             inspect_error: Some(error.to_string()),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// D3: bounded-retry / lock-owner / FD-pressure envelope sections
+// ---------------------------------------------------------------------------
+
+fn retry_report_for(error: &DbError, class: DbErrorClass) -> Option<DbFailureRetryReport> {
+    let DbError::RetryBudgetExhausted {
+        operation,
+        attempts,
+        budget,
+        elapsed_ms,
+        inner,
+    } = error
+    else {
+        return None;
+    };
+    Some(DbFailureRetryReport {
+        operation: (*operation).to_string(),
+        attempts_made: *attempts,
+        retry_budget: *budget,
+        elapsed_wait_ms: *elapsed_ms,
+        budget_exhausted: true,
+        immediate_retry_useful: false,
+        next_action: exhausted_next_action(class, &inner.to_string()),
+    })
+}
+
+/// Class-specific fallback guidance once a retry budget is exhausted.
+fn exhausted_next_action(class: DbErrorClass, inner_detail: &str) -> String {
+    match class {
+        DbErrorClass::BusyRetryable => "Do not immediately retry: the server already retried \
+             this operation. Run `am doctor locks --json` to identify the lock holder, wait \
+             for it to clear, then retry once."
+            .to_string(),
+        DbErrorClass::LiveOwnerNoActivityLock => "Do not retry the direct write. A running \
+             Agent Mail server owns this mailbox; route the operation through that server \
+             (see `am doctor locks --json` for the owner)."
+            .to_string(),
+        DbErrorClass::PoolExhaustion => "Reduce concurrent Agent Mail callers or raise pool \
+             capacity, then retry. Inspect `am robot metrics` for pool wait times."
+            .to_string(),
+        DbErrorClass::FdExhaustion => fd_next_action(fd_eviction_freed(inner_detail)),
+        other => format!(
+            "Run `{}`.",
+            DbErrorClassification::for_class(other).recommended_command
+        ),
+    }
+}
+
+fn lock_owner_for(class: DbErrorClass, detail: &str) -> Option<DbFailureLockOwner> {
+    let pid = parse_owner_pid(detail);
+    match class {
+        // A live-owner refusal always has an owner, even when the detail did
+        // not name a PID; surface the section so agents know one exists.
+        DbErrorClass::LiveOwnerNoActivityLock => Some(build_lock_owner(pid)),
+        DbErrorClass::BusyRetryable => pid.map(|p| build_lock_owner(Some(p))),
+        _ => None,
+    }
+}
+
+fn build_lock_owner(pid: Option<u32>) -> DbFailureLockOwner {
+    let (command, alive) = pid.map_or((None, None), owner_process_info);
+    DbFailureLockOwner {
+        pid,
+        command,
+        alive,
+        source: "parsed_from_error_detail",
+    }
+}
+
+/// Parse a PID out of an error detail ("pid 4242", "pid=17", "pid: 9").
+///
+/// Requires a word boundary before "pid" so words like "rapid" do not match.
+fn parse_owner_pid(detail: &str) -> Option<u32> {
+    let lower = detail.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut search_from = 0;
+    while let Some(pos) = lower[search_from..].find("pid") {
+        let start = search_from + pos;
+        let boundary_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after = &lower[start + 3..];
+        if boundary_ok {
+            let after =
+                after.trim_start_matches(|c: char| c == '=' || c == ':' || c.is_whitespace());
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty()
+                && let Ok(pid) = digits.parse()
+            {
+                return Some(pid);
+            }
+        }
+        search_from = start + 3;
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn owner_process_info(pid: u32) -> (Option<String>, Option<bool>) {
+    let alive = std::fs::metadata(format!("/proc/{pid}")).is_ok();
+    let command = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    (command, Some(alive))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn owner_process_info(_pid: u32) -> (Option<String>, Option<bool>) {
+    (None, None)
+}
+
+fn fd_pressure_for(class: DbErrorClass, detail: &str) -> Option<DbFailureFdPressure> {
+    if class != DbErrorClass::FdExhaustion {
+        return None;
+    }
+    let (soft_limit, hard_limit) = read_fd_limits();
+    let eviction_freed = fd_eviction_freed(detail);
+    Some(DbFailureFdPressure {
+        soft_limit,
+        hard_limit,
+        open_fds: count_open_fds(),
+        eviction_freed,
+        immediate_retry_useful: eviction_freed != Some(0),
+        next_action: fd_next_action(eviction_freed),
+    })
+}
+
+fn fd_next_action(eviction_freed: Option<u64>) -> String {
+    match eviction_freed {
+        Some(0) => "Repo-cache eviction freed 0 entries, so retrying will fail again. Close \
+             stale Agent Mail processes, raise the open-file limit (ulimit -n), or restart \
+             the owning server, then run `am doctor health`."
+            .to_string(),
+        Some(n) => format!(
+            "Repo-cache eviction freed {n} entries; one immediate retry is reasonable. If FD \
+             pressure recurs, raise the open-file limit (ulimit -n) or reduce concurrent agents."
+        ),
+        None => "Compare open_fds against soft_limit; close stale Agent Mail processes or \
+             raise the open-file limit (ulimit -n) before retrying."
+            .to_string(),
+    }
+}
+
+/// Parse the repo-cache eviction outcome from an error detail.
+///
+/// Recognizes the "Freed N cached repos" phrasing emitted by FD-pressure
+/// eviction paths (and preserved in historical session anchors). Returns
+/// `None` when the detail does not report an eviction outcome.
+#[must_use]
+pub fn fd_eviction_freed(detail: &str) -> Option<u64> {
+    let lower = detail.to_lowercase();
+    if !lower.contains("cached repo") && !lower.contains("repo cache") {
+        return None;
+    }
+    let pos = lower.find("freed")?;
+    let after = lower[pos + "freed".len()..].trim_start();
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return (None, None);
+    };
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            let mut fields = rest.split_whitespace();
+            let soft = fields.next().and_then(|v| v.parse().ok());
+            let hard = fields.next().and_then(|v| v.parse().ok());
+            return (soft, hard);
+        }
+    }
+    (None, None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+#[cfg(target_os = "linux")]
+fn count_open_fds() -> Option<u64> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .and_then(|entries| u64::try_from(entries.count()).ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn count_open_fds() -> Option<u64> {
+    None
 }
 
 /// Check whether an error message indicates a database lock/busy condition.
@@ -1513,6 +1823,193 @@ mod tests {
         let db_err: DbError = json_err.into();
         assert!(matches!(db_err, DbError::Serialization(_)));
         assert_eq!(db_err.error_code(), "INTERNAL_ERROR");
+    }
+
+    // ── D3: retry budget, lock owner, FD pressure ────────────────────
+
+    fn wrap_exhausted(inner: DbError) -> DbError {
+        DbError::RetryBudgetExhausted {
+            operation: "create_message",
+            attempts: 17,
+            budget: 17,
+            elapsed_ms: 29_000,
+            inner: Box::new(inner),
+        }
+    }
+
+    #[test]
+    fn retry_budget_exhausted_delegates_classification_and_codes() {
+        let busy = wrap_exhausted(DbError::ResourceBusy("database is locked".into()));
+        assert_eq!(busy.classification().class, DbErrorClass::BusyRetryable);
+        assert_eq!(busy.error_code(), "RESOURCE_BUSY");
+        assert!(busy.is_retryable());
+        assert!(busy.is_recoverable());
+        assert!(!busy.is_corruption());
+
+        let pool = wrap_exhausted(DbError::PoolExhausted {
+            message: "all connections in use".into(),
+            pool_size: 4,
+            max_overflow: 2,
+        });
+        assert_eq!(pool.classification().class, DbErrorClass::PoolExhaustion);
+        assert_eq!(pool.error_code(), "DATABASE_POOL_EXHAUSTED");
+
+        let corrupt = wrap_exhausted(DbError::Sqlite("database disk image is malformed".into()));
+        assert!(corrupt.is_corruption());
+        assert!(!corrupt.is_retryable());
+    }
+
+    #[test]
+    fn retry_budget_exhausted_display_preserves_inner_detail() {
+        let e = wrap_exhausted(DbError::ResourceBusy("database is locked".into()));
+        let text = e.to_string();
+        assert!(text.contains("create_message"), "{text}");
+        assert!(text.contains("17/17 attempts"), "{text}");
+        assert!(text.contains("29000 ms"), "{text}");
+        assert!(text.contains("database is locked"), "{text}");
+    }
+
+    #[test]
+    fn retry_budget_exhausted_envelope_has_retry_section() {
+        let e = wrap_exhausted(DbError::ResourceBusy("database is locked".into()));
+        let envelope = e.failure_envelope();
+        let retry = envelope.retry.expect("retry section present");
+        assert_eq!(retry.operation, "create_message");
+        assert_eq!(retry.attempts_made, 17);
+        assert_eq!(retry.retry_budget, 17);
+        assert_eq!(retry.elapsed_wait_ms, 29_000);
+        assert!(retry.budget_exhausted);
+        assert!(!retry.immediate_retry_useful);
+        assert!(retry.next_action.contains("am doctor locks --json"));
+
+        // Class policy stays family-level; instance honesty lives in `retry`.
+        assert!(envelope.policy.safe_to_retry);
+        assert_eq!(envelope.class, "busy_retryable");
+    }
+
+    #[test]
+    fn plain_errors_have_no_retry_section() {
+        let e = DbError::ResourceBusy("database is locked".into());
+        let envelope = e.failure_envelope();
+        assert!(envelope.retry.is_none());
+        assert!(envelope.fd_pressure.is_none());
+    }
+
+    #[test]
+    fn live_owner_envelope_names_parsed_owner() {
+        let e = DbError::ResourceBusy(
+            "Another active process owns this mailbox (pid 4242). \
+             Route writes through that process or stop it first."
+                .into(),
+        );
+        let envelope = e.failure_envelope();
+        assert_eq!(envelope.class, "live_owner_no_activity_lock");
+        let owner = envelope.lock_owner.expect("owner section present");
+        assert_eq!(owner.pid, Some(4242));
+        assert_eq!(owner.source, "parsed_from_error_detail");
+    }
+
+    #[test]
+    fn live_owner_envelope_present_even_without_pid() {
+        let e = DbError::ResourceBusy(
+            "mailbox mutation refused: another server owns the mailbox".into(),
+        );
+        let envelope = e.failure_envelope();
+        let owner = envelope.lock_owner.expect("owner section present");
+        assert_eq!(owner.pid, None);
+    }
+
+    #[test]
+    fn busy_envelope_includes_owner_only_when_pid_known() {
+        let with_pid =
+            DbError::ResourceBusy("database is locked by another process: pid=17".into());
+        assert_eq!(
+            with_pid.failure_envelope().lock_owner.and_then(|o| o.pid),
+            Some(17)
+        );
+
+        let without_pid = DbError::ResourceBusy("database is locked".into());
+        assert!(without_pid.failure_envelope().lock_owner.is_none());
+    }
+
+    #[test]
+    fn parse_owner_pid_variants() {
+        assert_eq!(
+            parse_owner_pid("owner: pid 4242 mode=exclusive"),
+            Some(4242)
+        );
+        assert_eq!(parse_owner_pid("owner hint: pid=17"), Some(17));
+        assert_eq!(parse_owner_pid("holder pid: 9"), Some(9));
+        assert_eq!(parse_owner_pid("PID 33 holds the lock"), Some(33));
+        assert_eq!(parse_owner_pid("rapid 5 growth"), None);
+        assert_eq!(parse_owner_pid("no owner named"), None);
+        assert_eq!(parse_owner_pid("pid unknown"), None);
+    }
+
+    #[test]
+    fn fd_eviction_freed_parses_anchor_phrasings() {
+        assert_eq!(
+            fd_eviction_freed("Too many open files. Freed 0 cached repos"),
+            Some(0)
+        );
+        assert_eq!(
+            fd_eviction_freed("Too many open files. Freed 1 cached repos. Retry"),
+            Some(1)
+        );
+        assert_eq!(
+            fd_eviction_freed("too many open files. freed 12 cached repos"),
+            Some(12)
+        );
+        // No eviction outcome reported.
+        assert_eq!(fd_eviction_freed("Too many open files (os error 24)"), None);
+        // "freed" without the repo-cache phrase is not an eviction outcome.
+        assert_eq!(fd_eviction_freed("freed 3 buffers"), None);
+    }
+
+    #[test]
+    fn fd_exhaustion_envelope_freed_zero_is_not_retry_useful() {
+        let e = DbError::Internal(
+            "send_message retry loop exhausted: Too many open files. Freed 0 cached repos".into(),
+        );
+        let envelope = e.failure_envelope();
+        assert_eq!(envelope.class, "fd_exhaustion");
+        let fd = envelope.fd_pressure.expect("fd section present");
+        assert_eq!(fd.eviction_freed, Some(0));
+        assert!(!fd.immediate_retry_useful);
+        assert!(fd.next_action.contains("retrying will fail again"));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(fd.soft_limit.is_some(), "soft limit on linux: {fd:?}");
+            assert!(fd.open_fds.is_some(), "open fds on linux: {fd:?}");
+        }
+    }
+
+    #[test]
+    fn fd_exhaustion_envelope_with_successful_eviction_is_retry_useful() {
+        let e = DbError::Internal("Too many open files. Freed 2 cached repos".into());
+        let fd = e
+            .failure_envelope()
+            .fd_pressure
+            .expect("fd section present");
+        assert_eq!(fd.eviction_freed, Some(2));
+        assert!(fd.immediate_retry_useful);
+    }
+
+    #[test]
+    fn fd_exhaustion_wrapped_retry_next_action_is_freed_aware() {
+        let e = wrap_exhausted(DbError::Internal(
+            "Too many open files. Freed 0 cached repos".into(),
+        ));
+        let envelope = e.failure_envelope();
+        let retry = envelope.retry.expect("retry section present");
+        assert!(
+            retry.next_action.contains("retrying will fail again"),
+            "freed-0 next action: {}",
+            retry.next_action
+        );
+        let fd = envelope.fd_pressure.expect("fd section present");
+        assert_eq!(fd.eviction_freed, Some(0));
     }
 
     // ── Display ─────────────────────────────────────────────────────

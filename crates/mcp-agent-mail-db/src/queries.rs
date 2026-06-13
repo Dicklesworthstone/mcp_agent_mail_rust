@@ -3463,15 +3463,41 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 /// `snapshot_high` permanently lags behind `commit_seq`.  Callers achieve
 /// this by placing `begin_concurrent_tx` inside the closure passed here.
 async fn run_with_mvcc_retry<T, F, Fut>(
+    cx: &Cx,
+    operation: &'static str,
+    op: F,
+) -> Outcome<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Outcome<T, DbError>>,
+{
+    run_with_mvcc_retry_with_budget(cx, operation, *MVCC_MAX_RETRIES, op).await
+}
+
+/// [`run_with_mvcc_retry`] with an explicit retry budget (testable core).
+///
+/// On budget exhaustion the final busy/MVCC error is wrapped in
+/// [`DbError::RetryBudgetExhausted`] so downstream envelopes can report the
+/// attempts made, the wall-clock time spent, and honest fallback guidance
+/// instead of advising yet another blind retry (br-bvq1x.4.3 / D3).
+async fn run_with_mvcc_retry_with_budget<T, F, Fut>(
     _cx: &Cx,
     operation: &'static str,
+    max: u32,
     mut op: F,
 ) -> Outcome<T, DbError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Outcome<T, DbError>>,
 {
-    let max = *MVCC_MAX_RETRIES;
+    let started = std::time::Instant::now();
+    let exhausted = |e: DbError| DbError::RetryBudgetExhausted {
+        operation,
+        attempts: max + 1,
+        budget: max + 1,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        inner: Box::new(e),
+    };
     for attempt in 0..=max {
         match op().await {
             Outcome::Err(e) if is_mvcc_error(&e) && attempt < max => {
@@ -3503,7 +3529,7 @@ where
                     operation,
                     "MVCC retries exhausted"
                 );
-                return Outcome::Err(e);
+                return Outcome::Err(exhausted(e));
             }
             Outcome::Err(e) if is_plain_write_contention_error(&e) => {
                 tracing::error!(
@@ -3512,7 +3538,7 @@ where
                     operation,
                     "SQLite write-contention retries exhausted"
                 );
-                return Outcome::Err(e);
+                return Outcome::Err(exhausted(e));
             }
             other => return other,
         }
@@ -13169,6 +13195,106 @@ mod tests {
         fn enter(&self, _span: &Id) {}
 
         fn exit(&self, _span: &Id) {}
+    }
+
+    // ── D3 (br-bvq1x.4.3): retry budget exhaustion wrapping ──────────
+
+    #[test]
+    fn mvcc_retry_exhaustion_wraps_error_with_budget_context() {
+        use asupersync::runtime::RuntimeBuilder;
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async move {
+            let outcome: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_op", 1, || async {
+                    Outcome::Err(DbError::ResourceBusy("database is locked".into()))
+                })
+                .await;
+            let Outcome::Err(err) = outcome else {
+                panic!("expected exhaustion error");
+            };
+            let DbError::RetryBudgetExhausted {
+                operation,
+                attempts,
+                budget,
+                elapsed_ms: _,
+                inner,
+            } = err
+            else {
+                panic!("expected RetryBudgetExhausted, got: {err}");
+            };
+            assert_eq!(operation, "test_op");
+            assert_eq!(attempts, 2);
+            assert_eq!(budget, 2);
+            assert!(matches!(*inner, DbError::ResourceBusy(_)));
+        });
+    }
+
+    #[test]
+    fn mvcc_retry_exhaustion_wraps_mvcc_conflicts_too() {
+        use asupersync::runtime::RuntimeBuilder;
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async move {
+            let outcome: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_mvcc_op", 0, || async {
+                    Outcome::Err(DbError::Sqlite(
+                        "write conflict on page 42: held by transaction 7".into(),
+                    ))
+                })
+                .await;
+            let Outcome::Err(err) = outcome else {
+                panic!("expected exhaustion error");
+            };
+            assert!(
+                matches!(
+                    err,
+                    DbError::RetryBudgetExhausted {
+                        attempts: 1,
+                        budget: 1,
+                        ..
+                    }
+                ),
+                "zero-retry budget still wraps with attempts=1: {err}"
+            );
+            // The wrapped error keeps the busy classification for envelopes.
+            assert_eq!(
+                err.classification().class,
+                crate::error::DbErrorClass::BusyRetryable
+            );
+        });
+    }
+
+    #[test]
+    fn mvcc_retry_success_and_non_busy_errors_pass_through_unwrapped() {
+        use asupersync::runtime::RuntimeBuilder;
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async move {
+            let ok: Outcome<u32, DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_ok", 1, || async { Outcome::Ok(7) })
+                    .await;
+            assert!(matches!(ok, Outcome::Ok(7)));
+
+            let not_busy: Outcome<(), DbError> =
+                run_with_mvcc_retry_with_budget(&cx, "test_not_busy", 1, || async {
+                    Outcome::Err(DbError::not_found("Agent", "BlueLake"))
+                })
+                .await;
+            let Outcome::Err(err) = not_busy else {
+                panic!("expected error");
+            };
+            assert!(
+                matches!(err, DbError::NotFound { .. }),
+                "non-busy errors must not be wrapped: {err}"
+            );
+        });
     }
 
     async fn set_agent_last_active_for_test(cx: &Cx, pool: &DbPool, agent_id: i64, ts: i64) {
