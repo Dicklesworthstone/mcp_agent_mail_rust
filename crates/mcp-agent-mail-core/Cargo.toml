@@ -26,7 +26,8 @@ sha1.workspace = true
 sha2.workspace = true
 fs2.workspace = true
 globset.workspace = true
-nix.workspace = true
+# `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`.
+nix = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 
 [features]

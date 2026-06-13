@@ -46,6 +46,7 @@ pub mod flake_triage;
 pub mod git_binary;
 pub mod git_cmd;
 pub mod git_lock;
+pub mod host_health;
 pub mod identity;
 pub mod intern;
 pub mod kpi;

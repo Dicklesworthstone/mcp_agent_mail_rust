@@ -2243,7 +2243,14 @@ pub enum RobotSubcommand {
     Metrics,
 
     /// System diagnostics synthesis (probes, DB pool, disk, anomalies).
-    Health,
+    Health {
+        /// Include a bounded host-pressure section (disk/inodes/load/memory,
+        /// data-dir writability, DB/WAL/SHM sizes, stale-WAL age, writer-PID
+        /// liveness) with a conservative `host_pressure_likely` verdict. Helps
+        /// distinguish host overload from Agent Mail corruption.
+        #[arg(long)]
+        include_host: bool,
+    },
 
     /// Anomaly insights with severity, confidence, remediation commands.
     Analytics,
@@ -2341,7 +2348,7 @@ impl RobotSubcommand {
             Self::Navigate { .. } => "robot navigate",
             Self::Reservations { .. } => "robot reservations",
             Self::Metrics => "robot metrics",
-            Self::Health => "robot health",
+            Self::Health { .. } => "robot health",
             Self::Analytics => "robot analytics",
             Self::Agents { .. } => "robot agents",
             Self::Contacts => "robot contacts",
@@ -13079,7 +13086,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             format_output(&env, format)?
         }
-        RobotSubcommand::Health => {
+        RobotSubcommand::Health { include_host } => {
             let mut probes: Vec<HealthProbe> = Vec::new();
             let config = mcp_agent_mail_core::Config::from_env();
             let mut db_conn: Option<DbConn> = None;
@@ -13269,6 +13276,63 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 },
             });
 
+            // 6. Host-pressure section (opt-in via --include-host).
+            //
+            // This stops agents from misclassifying host overload (full disk,
+            // exhausted inodes, scheduler saturation, memory pressure, an
+            // unwritable data dir) as Agent Mail corruption. It is intentionally
+            // kept OUT of the mailbox `overall` verdict — host pressure is not a
+            // mailbox fault — and surfaced as a distinct section + alert instead.
+            let host_report: Option<mcp_agent_mail_core::host_health::HostHealthReport> =
+                if include_host {
+                    let mut inputs = mcp_agent_mail_core::host_health::collect_inputs(&config);
+                    // Populate writer-PID liveness from the recovery lock when the
+                    // DB is file-backed (best-effort; absent => left unset).
+                    if let Ok(resolved) =
+                        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+                    {
+                        let db_path = std::path::PathBuf::from(&resolved.canonical_path);
+                        let recovery_lock =
+                            mcp_agent_mail_db::pool::inspect_mailbox_recovery_lock(&db_path);
+                        if let Some(pid) = recovery_lock.pid {
+                            inputs.writer_pid = Some(pid);
+                            inputs.writer_pid_alive = Some(recovery_lock.active);
+                        }
+                    }
+                    let report = mcp_agent_mail_core::host_health::evaluate(
+                        &inputs,
+                        &mcp_agent_mail_core::host_health::HostHealthThresholds::from_env(),
+                    );
+                    // Map host status into the probe vocabulary (ok/degraded);
+                    // host pressure is never a hard mailbox "fail".
+                    let probe_status = if report.status == "ok" {
+                        "ok"
+                    } else {
+                        "degraded"
+                    };
+                    let detail = if report.reasons.is_empty() {
+                        format!(
+                            "host_pressure_likely={}; no threshold breaches",
+                            report.host_pressure_likely
+                        )
+                    } else {
+                        format!(
+                            "host_pressure_likely={}; {}",
+                            report.host_pressure_likely,
+                            report.reasons.join("; ")
+                        )
+                    };
+                    probes.push(HealthProbe {
+                        name: "host".into(),
+                        status: probe_status.into(),
+                        latency_ms: 0.0,
+                        detail,
+                    });
+                    Some(report)
+                } else {
+                    None
+                };
+
             // Overall health
             let overall = if !db_ok
                 || db_file_sanity_unhealthy
@@ -13300,6 +13364,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 circuits: Vec<CircuitEntry>,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 search_index: Option<LexicalBackfillHealth>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
             }
 
             #[derive(Serialize)]
@@ -13310,6 +13376,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 threshold: u32,
             }
 
+            // Capture host-pressure alert inputs before `host_report` is moved
+            // into the envelope payload.
+            let host_pressure_likely = host_report.as_ref().is_some_and(|r| r.host_pressure_likely);
+            let host_reasons_summary = host_report
+                .as_ref()
+                .map(|r| r.reasons.join("; "))
+                .unwrap_or_default();
+            let host_dir_unwritable = host_report
+                .as_ref()
+                .is_some_and(|r| r.db_dir_writable == Some(false));
+
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -13319,12 +13396,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     probes,
                     circuits: circuit_entries,
                     search_index: search_index_snapshot,
+                    host: host_report,
                 },
             );
 
             // Alerts
             if !db_ok {
                 env = env.with_alert("error", "Database connectivity probe failed", None);
+            }
+            if host_dir_unwritable {
+                env = env.with_alert(
+                    "error",
+                    format!(
+                        "Data directory is not writable ({host_reasons_summary}). This is a host/permission fault, not Agent Mail corruption."
+                    ),
+                    None,
+                );
+            }
+            if host_pressure_likely {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "Host pressure likely ({host_reasons_summary}). Investigate host resources (disk/inodes/load/memory) before assuming Agent Mail corruption."
+                    ),
+                    None,
+                );
             }
             if db_file_sanity_unhealthy {
                 env = env.with_alert("error", "Live sqlite file sanity probe failed", None);
@@ -13395,6 +13491,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // Actions
             if !db_ok {
                 env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
+            }
+            if host_pressure_likely || host_dir_unwritable {
+                env = env.with_action(
+                    "Inspect the `host` section (free disk/inodes, load/cpu, memory, data-dir writability); relieve host pressure before assuming Agent Mail corruption",
+                );
             }
             if db_schema_unhealthy || archive_db_parity_unhealthy {
                 env = env.with_action(
@@ -21326,7 +21427,9 @@ mod tests {
                 json: false,
                 project: None,
                 agent: None,
-                command: RobotSubcommand::Health,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
             },
             &db_url,
             storage_root.to_string_lossy().as_ref(),
@@ -21352,6 +21455,77 @@ mod tests {
         assert!(
             rows.is_empty(),
             "robot health should not initialize schema tables in an uninitialized sqlite file"
+        );
+    }
+
+    #[test]
+    fn robot_health_include_host_emits_host_section() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_host.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        // Without --include-host, the host section is omitted entirely.
+        let without_host = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+        assert!(
+            without_host.get("host").is_none(),
+            "host section must be absent without --include-host: {without_host:?}"
+        );
+
+        // With --include-host, the bounded host-pressure section is present with
+        // its conservative verdict and the listed fields.
+        let with_host = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health { include_host: true },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+        let host = with_host
+            .get("host")
+            .expect("host section present with --include-host");
+        assert!(
+            host.get("host_pressure_likely").is_some(),
+            "host section must carry the verdict: {host:?}"
+        );
+        assert!(
+            host.get("status").and_then(|v| v.as_str()).is_some(),
+            "host section must carry a status label: {host:?}"
+        );
+        // A `host` probe is also surfaced in the probes list.
+        let host_probe = with_host["probes"]
+            .as_array()
+            .expect("probes array")
+            .iter()
+            .find(|probe| probe["name"] == "host");
+        assert!(
+            host_probe.is_some(),
+            "expected a host probe in {with_host:?}"
         );
     }
 
@@ -21386,7 +21560,9 @@ mod tests {
                 json: false,
                 project: None,
                 agent: None,
-                command: RobotSubcommand::Health,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
             },
             &db_url,
             storage_root.to_string_lossy().as_ref(),

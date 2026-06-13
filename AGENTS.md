@@ -677,7 +677,7 @@ Use it when you need structured snapshots quickly (especially in automated loops
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics synthesis | `--format`, `--project`, `--agent` |
+| `am robot health` | Runtime/system diagnostics synthesis | `--format`, `--project`, `--agent`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |

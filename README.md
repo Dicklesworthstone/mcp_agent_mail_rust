@@ -662,7 +662,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent` |
+| `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
@@ -1437,6 +1437,7 @@ What `check` inspects:
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
+| Tools time out / "Database corruption detected" under heavy load | Run `am robot health --include-host --format json` and read the `host` section. If `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, the problem is **host overload, not mailbox corruption** — relieve host pressure before reconstructing. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
 | `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |
 

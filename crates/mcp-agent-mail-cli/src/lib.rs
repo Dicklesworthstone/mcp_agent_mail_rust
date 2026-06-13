@@ -485,6 +485,9 @@ pub enum Commands {
         /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
         #[arg(long)]
         agent: Option<String>,
+        /// Include the bounded host-pressure section (disk/inodes/load/memory).
+        #[arg(long)]
+        include_host: bool,
     },
     /// Direct alias for `am robot thread`.
     #[command(name = "thread")]
@@ -3355,12 +3358,13 @@ fn execute(cli: Cli) -> CliResult<()> {
             json,
             project,
             agent,
+            include_host,
         } => robot::handle_robot(robot_alias_args(
             format,
             json,
             project,
             agent,
-            robot::RobotSubcommand::Health,
+            robot::RobotSubcommand::Health { include_host },
         )),
         Commands::Thread {
             id,
