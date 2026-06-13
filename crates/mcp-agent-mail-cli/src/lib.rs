@@ -2271,6 +2271,17 @@ pub enum DoctorCommand {
         /// must be requested explicitly.
         #[arg(long)]
         prune_orphan_recipients: bool,
+        /// Override the supervised-owner safety guard and repair even while a
+        /// live mailbox owner is present.
+        ///
+        /// By default `am doctor repair` REFUSES (exit 3) when a live `am`
+        /// owner, a wedged process, or unreconciled split-brain ownership holds
+        /// the mailbox — repairing under a live writer can corrupt state. The
+        /// safe path is to gracefully drain/stop the owner via your supervisor
+        /// (never `kill -9 am`), confirm with `am doctor drain`, then re-run.
+        /// Pass this flag only when you have already drained the owner.
+        #[arg(long)]
+        allow_live_owner: bool,
     },
     Backups {
         /// Output format: table, json, or toon (default: auto-detect).
@@ -2300,6 +2311,27 @@ pub enum DoctorCommand {
         #[arg(long, short = 'y')]
         yes: bool,
         /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+        /// Override the supervised-owner safety guard and reconstruct even while
+        /// a live mailbox owner is present (see `am doctor repair --help`).
+        /// Default: REFUSE (exit 3) when a live/wedged/split-brain owner holds
+        /// the mailbox; drain it first via `am doctor drain`.
+        #[arg(long)]
+        allow_live_owner: bool,
+    },
+    /// Report the supervised drain/restart protocol for the current mailbox
+    /// owner without killing any process (read-only).
+    ///
+    /// Answers "is it safe to run mutating doctor work right now?" and, when a
+    /// live owner is present, prints the exact supervisor-managed steps to
+    /// drain it safely. Never terminates `am`. Exit 0 always (read-only); the
+    /// `safe_to_mutate` field carries the verdict.
+    Drain {
+        /// Output format. JSON is recommended for agents.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
     },
@@ -3258,7 +3290,12 @@ fn contacts_command_is_read_only(action: &ContactsCommand) -> bool {
 }
 
 fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
-    matches!(action, DoctorCommand::Locks { .. })
+    // `Drain` is read-only and MUST run even while a live owner holds the
+    // mailbox — reporting the supervised drain protocol is its whole purpose.
+    matches!(
+        action,
+        DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. }
+    )
 }
 
 fn execute(cli: Cli) -> CliResult<()> {
@@ -5787,6 +5824,10 @@ fn run_startup_doctor_repair_subprocess(
         .arg("doctor")
         .arg("repair")
         .arg("--yes")
+        // br-bvq1x.4.4 (D4): startup self-heal is a controlled, pre-bind repair
+        // (this process is about to own the mailbox); bypass the interactive
+        // supervised-owner guard so boot self-heal behavior is unchanged.
+        .arg("--allow-live-owner")
         .arg("--backup-dir")
         .arg(backup_dir)
         .env("AM_INTERFACE_MODE", "cli")
@@ -6781,16 +6822,28 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             yes,
             backup_dir,
             prune_orphan_recipients,
-        } => handle_doctor_repair(project, dry_run, yes, backup_dir, prune_orphan_recipients),
+            allow_live_owner,
+        } => handle_doctor_repair(
+            project,
+            dry_run,
+            yes,
+            backup_dir,
+            prune_orphan_recipients,
+            allow_live_owner,
+        ),
         DoctorCommand::Backups { format, json } => handle_doctor_backups(format, json),
         DoctorCommand::Restore {
             backup_path,
             dry_run,
             yes,
         } => handle_doctor_restore(backup_path, dry_run, yes),
-        DoctorCommand::Reconstruct { dry_run, yes, json } => {
-            handle_doctor_reconstruct(dry_run, yes, json)
-        }
+        DoctorCommand::Reconstruct {
+            dry_run,
+            yes,
+            json,
+            allow_live_owner,
+        } => handle_doctor_reconstruct(dry_run, yes, json, allow_live_owner),
+        DoctorCommand::Drain { format, json } => handle_doctor_drain(format, json),
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
         DoctorCommand::ArchiveVerify { format, json } => handle_doctor_archive_verify(format, json),
         DoctorCommand::ArchiveNormalize {
@@ -7952,15 +8005,24 @@ fn build_doctor_locks_report() -> CliResult<DoctorLocksReport> {
 }
 
 fn build_doctor_locks_report_with_config(config: &Config) -> CliResult<DoctorLocksReport> {
-    let memory_database =
-        mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
+    build_doctor_locks_report_for(&config.database_url, &config.storage_root)
+}
+
+/// Build the live-owner lock report for an explicit `(database_url, storage_root)`
+/// pair so callers (e.g. the supervised-owner repair guard) can reuse the exact
+/// same classification used by `am doctor locks`.
+fn build_doctor_locks_report_for(
+    database_url: &str,
+    storage_root: &Path,
+) -> CliResult<DoctorLocksReport> {
+    let memory_database = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url);
     let database_path = if memory_database {
         PathBuf::from(":memory:")
     } else {
-        resolve_mailbox_activity_sqlite_path(&config.database_url)?
+        resolve_mailbox_activity_sqlite_path(database_url)?
     };
     let ownership =
-        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&database_path, &config.storage_root);
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&database_path, storage_root);
     let storage_root_lock_path = PathBuf::from(&ownership.storage_lock_path);
     let sqlite_lock_path = PathBuf::from(&ownership.sqlite_lock_path);
     let storage_root_lock = inspect_doctor_lock_path("storage_root", &storage_root_lock_path);
@@ -8012,7 +8074,7 @@ fn build_doctor_locks_report_with_config(config: &Config) -> CliResult<DoctorLoc
     Ok(DoctorLocksReport {
         schema_version: "doctor_locks.v1",
         inspected_at: Utc::now().to_rfc3339(),
-        storage_root: config.storage_root.display().to_string(),
+        storage_root: storage_root.display().to_string(),
         database_path: database_path.display().to_string(),
         memory_database,
         disposition: ownership.disposition,
@@ -8479,6 +8541,168 @@ fn doctor_locks_recommended_next_action(
             "{waiter_prefix}Owner class unsafe-to-touch: do not run repair, reconstruct, or other mutating doctor work until the ownership evidence is reconciled. Safe next command: `{}`.",
             owner_state.safe_next_command
         ),
+    }
+}
+
+// ─── br-bvq1x.4.4 (D4): supervised-owner guard + drain protocol ──────────────
+
+/// Whether a mutating doctor op must be refused given the live-owner class.
+///
+/// Only [`DoctorLockOwnerClass::Stale`] (no live owner visible) is safe to
+/// mutate without a supervised drain. `Live`, `Wedged`, and `UnsafeToTouch` all
+/// indicate a process is (or may be) actively using the mailbox, so repairing
+/// under them risks corruption — they require an explicit operator override
+/// (`--allow-live-owner`) performed *after* a supervised drain.
+fn doctor_mutation_blocked_by_owner(class: DoctorLockOwnerClass, allow_live_owner: bool) -> bool {
+    if allow_live_owner {
+        return false;
+    }
+    !matches!(class, DoctorLockOwnerClass::Stale)
+}
+
+/// Build the supervised drain/restart steps for the operator. The owner is
+/// never killed; the safe path is a supervisor-managed graceful stop.
+fn supervised_drain_protocol_steps(safe_to_mutate: bool) -> Vec<String> {
+    if safe_to_mutate {
+        return vec![
+            "No live mailbox owner is holding the database; mutating doctor work (repair/reconstruct) is safe to run."
+                .to_string(),
+        ];
+    }
+    vec![
+        "A live mailbox owner is present. Do NOT `kill -9 am` or force-remove lock files.".to_string(),
+        "1. Inspect the live owner: am doctor locks --json".to_string(),
+        "2. Gracefully stop it via your supervisor: `am service restart`, or `systemctl --user stop mcp-agent-mail` (never a hard kill)."
+            .to_string(),
+        "3. Re-run `am doctor drain` and confirm safe_to_mutate=true.".to_string(),
+        "4. Then run `am doctor repair`/`reconstruct`, or pass --allow-live-owner if you have ALREADY drained it."
+            .to_string(),
+    ]
+}
+
+/// Refuse a mutating doctor operation (`repair`/`reconstruct`) while a live
+/// mailbox owner is present, unless the operator already drained it
+/// (`--allow-live-owner`). Read-only previews (`dry_run`) are always allowed,
+/// and `--allow-live-owner` short-circuits the (slightly expensive) ownership
+/// scan so the startup self-heal subprocess stays a strict no-op for the guard.
+fn enforce_supervised_owner_guard(
+    database_url: &str,
+    storage_root: &Path,
+    op_label: &str,
+    dry_run: bool,
+    allow_live_owner: bool,
+) -> CliResult<()> {
+    if dry_run || allow_live_owner {
+        return Ok(());
+    }
+    let report = build_doctor_locks_report_for(database_url, storage_root)?;
+    if !doctor_mutation_blocked_by_owner(report.owner_state.class, allow_live_owner) {
+        return Ok(());
+    }
+    emit_supervised_owner_refusal(op_label, &report);
+    Err(CliError::ExitCode(3))
+}
+
+/// Print the structured supervised-owner refusal to stderr (machine-greppable
+/// `classification:`/`exit_code:` lines, mirroring the legacy `am serve`
+/// migration message).
+fn emit_supervised_owner_refusal(op_label: &str, report: &DoctorLocksReport) {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let mut lines: Vec<String> = vec![
+        format!(
+            "Error: refusing `am doctor {op_label}` while a live mailbox owner is present."
+        ),
+        String::new(),
+        "classification: supervised-owner-required".to_string(),
+        format!("owner_class: {}", report.owner_state.class.as_str()),
+        format!("reason: {}", report.owner_state.reason),
+        "exit_code: 3".to_string(),
+        "retry_policy: do-not-retry-unchanged".to_string(),
+        String::new(),
+        "Effective target (act on the RIGHT mailbox):".to_string(),
+        format!("  binary:       {exe}"),
+        format!("  version:      {}", env!("CARGO_PKG_VERSION")),
+        format!("  storage_root: {}", report.storage_root),
+        format!("  database:     {}", report.database_path),
+        format!("  ownership:    {}", report.detail),
+        String::new(),
+    ];
+    lines.extend(supervised_drain_protocol_steps(false));
+    lines.push(String::new());
+    lines.push(format!("next_action: {}", report.recommended_next_action));
+    lines.push(format!(
+        "safe_next_command: {}",
+        report.owner_state.safe_next_command
+    ));
+    ftui_runtime::ftui_eprintln!("{}", lines.join("\n"));
+}
+
+/// Read-only report answering "is it safe to run mutating doctor work now?" and,
+/// when a live owner is present, the supervised steps to drain it safely.
+#[derive(Debug, Clone, Serialize)]
+struct DoctorDrainReport {
+    schema_version: &'static str,
+    owner_class: &'static str,
+    reason: String,
+    safe_to_mutate: bool,
+    binary: String,
+    version: &'static str,
+    storage_root: String,
+    database_path: String,
+    detail: String,
+    recommended_next_action: String,
+    safe_next_command: String,
+    supervised_protocol: Vec<String>,
+    read_only: bool,
+}
+
+fn handle_doctor_drain(format: Option<output::CliOutputFormat>, json: bool) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let config = Config::from_env();
+    let locks = build_doctor_locks_report_with_config(&config)?;
+    let safe_to_mutate = !doctor_mutation_blocked_by_owner(locks.owner_state.class, false);
+    let report = DoctorDrainReport {
+        schema_version: "doctor_drain.v1",
+        owner_class: locks.owner_state.class.as_str(),
+        reason: locks.owner_state.reason.clone(),
+        safe_to_mutate,
+        binary: std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string()),
+        version: env!("CARGO_PKG_VERSION"),
+        storage_root: locks.storage_root.clone(),
+        database_path: locks.database_path.clone(),
+        detail: locks.detail.clone(),
+        recommended_next_action: locks.recommended_next_action.clone(),
+        safe_next_command: locks.owner_state.safe_next_command.clone(),
+        supervised_protocol: supervised_drain_protocol_steps(safe_to_mutate),
+        read_only: true,
+    };
+    output::emit_output(&report, fmt, || render_doctor_drain_report(&report));
+    Ok(())
+}
+
+fn render_doctor_drain_report(report: &DoctorDrainReport) {
+    let verdict = if report.safe_to_mutate {
+        "SAFE to mutate (no live owner present)"
+    } else {
+        "BLOCKED — live mailbox owner present"
+    };
+    ftui_runtime::ftui_println!("Supervised drain status: {verdict}");
+    ftui_runtime::ftui_println!("  owner_class:  {}", report.owner_class);
+    ftui_runtime::ftui_println!("  reason:       {}", report.reason);
+    ftui_runtime::ftui_println!("  binary:       {}", report.binary);
+    ftui_runtime::ftui_println!("  version:      {}", report.version);
+    ftui_runtime::ftui_println!("  storage_root: {}", report.storage_root);
+    ftui_runtime::ftui_println!("  database:     {}", report.database_path);
+    ftui_runtime::ftui_println!("  ownership:    {}", report.detail);
+    ftui_runtime::ftui_println!("  next_action:  {}", report.recommended_next_action);
+    ftui_runtime::ftui_println!("  safe_to_mutate: {}", report.safe_to_mutate);
+    ftui_runtime::ftui_println!("protocol:");
+    for step in &report.supervised_protocol {
+        ftui_runtime::ftui_println!("  - {step}");
     }
 }
 
@@ -42400,6 +42624,7 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         backup_dir,
                         prune_orphan_recipients,
+                        allow_live_owner,
                     },
             } => {
                 assert!(project.is_none());
@@ -42409,6 +42634,10 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(
                     !prune_orphan_recipients,
                     "--prune-orphan-recipients must default off (drops data)"
+                );
+                assert!(
+                    !allow_live_owner,
+                    "--allow-live-owner must default off (supervised-owner guard armed)"
                 );
             }
             _ => panic!("expected Doctor Repair"),
@@ -42427,6 +42656,7 @@ http_headers = { Authorization = "Bearer secret" }
             "--backup-dir",
             "/tmp/bak",
             "--prune-orphan-recipients",
+            "--allow-live-owner",
         ])
         .unwrap();
         match cli.command.expect("expected command") {
@@ -42438,6 +42668,7 @@ http_headers = { Authorization = "Bearer secret" }
                         yes,
                         backup_dir,
                         prune_orphan_recipients,
+                        allow_live_owner,
                     },
             } => {
                 assert_eq!(project.as_deref(), Some("proj"));
@@ -42445,6 +42676,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(yes);
                 assert_eq!(backup_dir.unwrap(), PathBuf::from("/tmp/bak"));
                 assert!(prune_orphan_recipients);
+                assert!(allow_live_owner);
             }
             _ => panic!("expected Doctor Repair"),
         }
@@ -42531,11 +42763,21 @@ http_headers = { Authorization = "Bearer secret" }
         let cli = Cli::try_parse_from(["am", "doctor", "reconstruct"]).unwrap();
         match cli.command.unwrap() {
             Commands::Doctor {
-                action: DoctorCommand::Reconstruct { dry_run, yes, json },
+                action:
+                    DoctorCommand::Reconstruct {
+                        dry_run,
+                        yes,
+                        json,
+                        allow_live_owner,
+                    },
             } => {
                 assert!(!dry_run);
                 assert!(!yes);
                 assert!(!json);
+                assert!(
+                    !allow_live_owner,
+                    "--allow-live-owner must default off for reconstruct"
+                );
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
@@ -42543,15 +42785,30 @@ http_headers = { Authorization = "Bearer secret" }
 
     #[test]
     fn parse_doctor_reconstruct_all_flags() {
-        let cli = Cli::try_parse_from(["am", "doctor", "reconstruct", "--dry-run", "-y", "--json"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "am",
+            "doctor",
+            "reconstruct",
+            "--dry-run",
+            "-y",
+            "--json",
+            "--allow-live-owner",
+        ])
+        .unwrap();
         match cli.command.unwrap() {
             Commands::Doctor {
-                action: DoctorCommand::Reconstruct { dry_run, yes, json },
+                action:
+                    DoctorCommand::Reconstruct {
+                        dry_run,
+                        yes,
+                        json,
+                        allow_live_owner,
+                    },
             } => {
                 assert!(dry_run);
                 assert!(yes);
                 assert!(json);
+                assert!(allow_live_owner);
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
@@ -42860,6 +43117,98 @@ http_headers = { Authorization = "Bearer secret" }
             state.safe_next_command,
             "ps -p 17,23 -o pid,ppid,stat,lstart,cmd"
         );
+    }
+
+    // ─── br-bvq1x.4.4 (D4): supervised-owner guard ──────────────────────────
+
+    #[test]
+    fn supervised_guard_blocks_live_wedged_unsafe_allows_stale() {
+        // Only `Stale` (no live owner) is safe to mutate without an override.
+        assert!(doctor_mutation_blocked_by_owner(
+            DoctorLockOwnerClass::Live,
+            false
+        ));
+        assert!(doctor_mutation_blocked_by_owner(
+            DoctorLockOwnerClass::Wedged,
+            false
+        ));
+        assert!(doctor_mutation_blocked_by_owner(
+            DoctorLockOwnerClass::UnsafeToTouch,
+            false
+        ));
+        assert!(!doctor_mutation_blocked_by_owner(
+            DoctorLockOwnerClass::Stale,
+            false
+        ));
+    }
+
+    #[test]
+    fn supervised_guard_allow_live_owner_overrides_every_class() {
+        for class in [
+            DoctorLockOwnerClass::Live,
+            DoctorLockOwnerClass::Wedged,
+            DoctorLockOwnerClass::UnsafeToTouch,
+            DoctorLockOwnerClass::Stale,
+        ] {
+            assert!(
+                !doctor_mutation_blocked_by_owner(class, true),
+                "--allow-live-owner must override class {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supervised_guard_skips_scan_on_dry_run_and_override() {
+        // A non-resolvable database URL would make `build_doctor_locks_report_for`
+        // error; the guard must NOT reach that path for dry-run or override, so
+        // these calls return Ok without touching the ownership scan.
+        let bogus_db = "sqlite:///__definitely__/missing__/db.sqlite3";
+        let storage = std::path::Path::new("/__definitely__/missing__");
+        assert!(
+            enforce_supervised_owner_guard(bogus_db, storage, "repair", true, false).is_ok(),
+            "dry_run must bypass the ownership scan"
+        );
+        assert!(
+            enforce_supervised_owner_guard(bogus_db, storage, "repair", false, true).is_ok(),
+            "--allow-live-owner must bypass the ownership scan"
+        );
+    }
+
+    #[test]
+    fn supervised_drain_steps_reflect_safety() {
+        let safe = supervised_drain_protocol_steps(true);
+        assert_eq!(safe.len(), 1);
+        assert!(safe[0].contains("safe to run"));
+
+        let blocked = supervised_drain_protocol_steps(false);
+        assert!(blocked.len() >= 4);
+        assert!(blocked.iter().any(|s| s.contains("Do NOT")));
+        assert!(blocked.iter().any(|s| s.contains("am doctor drain")));
+        assert!(blocked.iter().any(|s| s.contains("--allow-live-owner")));
+    }
+
+    #[test]
+    fn doctor_drain_report_serializes_verdict_and_protocol() {
+        let report = DoctorDrainReport {
+            schema_version: "doctor_drain.v1",
+            owner_class: "stale",
+            reason: "no live owner".to_string(),
+            safe_to_mutate: true,
+            binary: "/usr/local/bin/am".to_string(),
+            version: "test",
+            storage_root: "/data/storage".to_string(),
+            database_path: "/data/storage/storage.sqlite3".to_string(),
+            detail: "unowned".to_string(),
+            recommended_next_action: "am doctor --dry-run --fix".to_string(),
+            safe_next_command: "am doctor --dry-run --fix".to_string(),
+            supervised_protocol: supervised_drain_protocol_steps(true),
+            read_only: true,
+        };
+        let json = serde_json::to_string(&report).expect("serialize drain report");
+        assert!(json.contains("\"safe_to_mutate\":true"));
+        assert!(json.contains("supervised_protocol"));
+        // The human renderer prints directly and must not panic.
+        render_doctor_drain_report(&report);
     }
 
     #[test]
@@ -46442,7 +46791,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", db_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false),
+            || handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false, true),
         );
         assert!(
             result.is_ok(),
@@ -46785,7 +47134,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_reconstruct(true, true, false),
+            || handle_doctor_reconstruct(true, true, false, true),
         );
         let output = capture.drain_to_string();
 
@@ -63071,10 +63420,20 @@ fn handle_doctor_repair(
     yes: bool,
     backup_dir: Option<PathBuf>,
     prune_orphan_recipients: bool,
+    allow_live_owner: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let database_url = &cfg.database_url;
+    // br-bvq1x.4.4 (D4): refuse mutating repair while a live owner holds the
+    // mailbox unless the operator drained it first (or passed --allow-live-owner).
+    enforce_supervised_owner_guard(
+        database_url,
+        &config.storage_root,
+        "repair",
+        dry_run,
+        allow_live_owner,
+    )?;
     let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
     handle_doctor_repair_with_options(
         database_url,
@@ -63833,9 +64192,23 @@ fn handle_doctor_restore_to(
     Ok(())
 }
 
-fn handle_doctor_reconstruct(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
+fn handle_doctor_reconstruct(
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    allow_live_owner: bool,
+) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    // br-bvq1x.4.4 (D4): reconstruct replaces the live DB; refuse while a live
+    // owner is present unless the operator drained it first.
+    enforce_supervised_owner_guard(
+        &cfg.database_url,
+        &config.storage_root,
+        "reconstruct",
+        dry_run,
+        allow_live_owner,
+    )?;
     handle_doctor_reconstruct_locked(&cfg.database_url, &config.storage_root, dry_run, yes, json)
 }
 

@@ -263,11 +263,12 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 `am doctor` diagnoses and (with `--fix`) repairs Agent Mail's mailbox state. The world-class surface (added in commit `641990d8`, hardened in pass-2) provides reversible, hash-witnessed, agent-ergonomic remediation with strict scope isolation.
 
-### Verbs (15 total — pass-30 baseline)
+### Verbs (16 total — pass-30 baseline + D4 drain)
 
 | Verb | Mutates? | Default exit |
 |------|----------|--------------|
 | `am doctor` (or `check`) | No | 0 healthy / 1 findings |
+| `am doctor drain` | No (read-only) | 0 |
 | `am doctor --fix` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
 | `am doctor --dry-run --fix` | No | 0 |
 | `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
@@ -284,6 +285,8 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 | `am doctor selftest` | No | 0 / 1 |
 
 Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
+
+**Supervised-owner guard (br-bvq1x.4.4 / D4):** `am doctor repair` and `am doctor reconstruct` now REFUSE (exit 3) when a live mailbox owner is present (owner class `live`/`wedged`/`unsafe-to-touch` from `am doctor locks`). They never ask you to kill `am`. The safe path: gracefully drain/stop the owner via your supervisor (`am service restart`, `systemctl --user stop ...`), confirm with `am doctor drain` (reports `safe_to_mutate`), then re-run — or pass `--allow-live-owner` if you have already drained it. Startup self-heal passes `--allow-live-owner` internally so boot behavior is unchanged.
 
 ### Per-FM registry
 
