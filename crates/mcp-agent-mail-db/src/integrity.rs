@@ -369,6 +369,10 @@ pub fn evaluate_check_rows(
     s.checks_total.fetch_add(1, Ordering::Relaxed);
     if ok {
         s.last_ok_ts.store(now, Ordering::Relaxed);
+        // K3 (br-bvq1x.11.3): a clean integrity check means the database is
+        // healthy again, so clear the corruption circuit breaker (self-heal
+        // after `am doctor repair`/`reconstruct`) and let writes resume.
+        crate::corruption_circuit_breaker().reset();
     } else {
         s.failures_total.fetch_add(1, Ordering::Relaxed);
         // A5 (br-bvq1x.1.5): record the corruption-class detection keyed by

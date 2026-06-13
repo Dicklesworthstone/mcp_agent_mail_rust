@@ -3490,6 +3490,15 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Outcome<T, DbError>>,
 {
+    // K3 (br-bvq1x.11.3): if the corruption circuit breaker is open, refuse the
+    // write immediately — without touching the database again — so agents stop
+    // hammering a corrupt store. Reads do not go through this wrapper, and the
+    // CLI/doctor sync path runs in a separate process, so recovery is never
+    // gated.
+    if let Some(refusal) = crate::corruption_circuit_breaker().refusal_error() {
+        return Outcome::Err(refusal);
+    }
+
     let started = std::time::Instant::now();
     let exhausted = |e: DbError| DbError::RetryBudgetExhausted {
         operation,
@@ -3540,7 +3549,15 @@ where
                 );
                 return Outcome::Err(exhausted(e));
             }
-            other => return other,
+            other => {
+                // K3: a hard, edit-blocking corruption surfaced on the write
+                // path — trip the breaker so subsequent writes are refused
+                // until the database is verified healthy again.
+                if let Outcome::Err(ref e) = other {
+                    crate::corruption_circuit_breaker().observe_error(e);
+                }
+                return other;
+            }
         }
     }
 

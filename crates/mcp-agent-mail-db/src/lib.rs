@@ -36,6 +36,7 @@
 pub mod archive_anomaly;
 pub mod atc_queries;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod coalesce;
 pub mod error;
 pub mod forensics;
@@ -191,6 +192,10 @@ pub use atc_queries::{
 pub use cache::{
     CacheDiagnosticsSnapshot, CacheEntryCounts, CacheFootprintEstimate, CacheMetrics,
     CacheMetricsSnapshot, cache_diagnostics_snapshot, cache_metrics, read_cache,
+};
+pub use circuit_breaker::{
+    CorruptionBreakerSnapshot, CorruptionCircuitBreaker, corruption_circuit_breaker,
+    reset_corruption_circuit_breaker,
 };
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{
