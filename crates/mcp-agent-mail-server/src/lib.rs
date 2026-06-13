@@ -1983,7 +1983,7 @@ async fn probe_http_healthz(
     match timeout(
         wall_now(),
         Duration::from_secs(config.http_probe_timeout_secs),
-        client.get(cx, &url),
+        client.send_get(cx, &url),
     )
     .await
     {
@@ -10437,7 +10437,7 @@ to skip auth for local requests.</p>
             {
                 body
             } else {
-                let fut = Box::pin(self.jwks_http_client.get(cx, url));
+                let fut = Box::pin(self.jwks_http_client.send_get(cx, url));
                 let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
                     return Err(());
                 };
