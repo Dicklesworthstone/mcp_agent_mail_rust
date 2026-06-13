@@ -2588,6 +2588,41 @@ pub enum DoctorCommand {
         format: Option<output::CliOutputFormat>,
     },
 
+    /// Real write-path self-test in an isolated scratch mailbox.
+    ///
+    /// Runs `ensure_project → register_agent (×2) → send_message →
+    /// acknowledge_message → file_reservation_paths →
+    /// release_file_reservations → list_agents` against a private
+    /// `STORAGE_ROOT`/SQLite file under a tempdir — never the live
+    /// mailbox — and emits a per-dimension pass/fail verdict across
+    /// `transport`, `schema`, `lock`, `corruption`, and `permissions`.
+    /// A failure isolates which dimension broke. The sequence runs in a
+    /// bounded, killable child process for hard isolation + timeout.
+    /// Produces the `write_health` verdict for `health_check`. Exit 0 on
+    /// pass, 1 on fail. JSON output.
+    #[command(name = "write-selftest")]
+    WriteSelftest {
+        /// Output format. JSON is the default.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
+
+    /// MCP JSON-RPC decode + dispatch self-test in an isolated scratch mailbox.
+    ///
+    /// Verifies a valid `initialize` decodes, a malformed frame is
+    /// rejected as a PROTOCOL error (never silently accepted, never
+    /// mislabeled as a database error), tool schema negotiation succeeds,
+    /// and a harmless write + read-after-write round-trips THROUGH the MCP
+    /// transport (decode → dispatch → tool). On a decode failure it
+    /// surfaces protocol/version guidance. Produces the `transport_health`
+    /// verdict for `health_check`. Exit 0 on pass, 1 on fail. JSON output.
+    #[command(name = "mcp-selftest")]
+    McpSelftest {
+        /// Output format. JSON is the default.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+    },
+
     /// List all per-FM detector+fixer pairs registered in this build.
     ///
     /// Each registered fixer reports its FM id, severity, subsystem,
@@ -6839,6 +6874,8 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             doctor::handle_explain(&target, &finding_id, format)
         }
         DoctorCommand::Selftest { format } => doctor::handle_selftest(format),
+        DoctorCommand::WriteSelftest { format } => doctor::selftest::handle_write_selftest(format),
+        DoctorCommand::McpSelftest { format } => doctor::selftest::handle_mcp_selftest(format),
         DoctorCommand::Fixers { format } => doctor::handle_fixers(format),
     }
 }

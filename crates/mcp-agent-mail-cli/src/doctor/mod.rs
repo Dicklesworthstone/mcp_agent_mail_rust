@@ -22,6 +22,7 @@ pub mod mutate;
 pub(crate) mod platform;
 pub mod robot_docs;
 pub mod runs;
+pub mod selftest;
 pub mod undo;
 
 use crate::output::CliOutputFormat;
