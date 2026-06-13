@@ -262,6 +262,13 @@ pub mod tool_util {
     pub fn db_error_to_mcp_error(e: DbError) -> McpError {
         let classification = e.classification();
         let failure_envelope = e.failure_envelope();
+        // A5 (br-bvq1x.1.5): record the typed class at the single chokepoint
+        // where a DB error is surfaced to a caller, so corruption-class trend
+        // counters (and the K3 circuit breaker) see every classified failure
+        // exactly once.
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_class(classification.class.as_str());
         match e {
             // D3 (br-bvq1x.4.3): a bounded retry loop already spent its
             // budget. Render an honest, class-distinct envelope that reports
@@ -1736,6 +1743,24 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
+        }
+
+        #[test]
+        fn db_error_to_mcp_error_records_corruption_class_metric() {
+            // A5 (br-bvq1x.1.5): the surfacing chokepoint must feed the
+            // corruption-class counter. Use a delta (>= before + 1) so the
+            // assertion is correct even under concurrent test execution that
+            // shares the process-global metrics singleton.
+            let counter = &mcp_agent_mail_core::global_metrics()
+                .corruption
+                .class_main_db_btree_corruption_total;
+            let before = counter.load();
+            let _ =
+                db_error_to_mcp_error(DbError::Sqlite("database disk image is malformed".into()));
+            assert!(
+                counter.load() > before,
+                "main_db_btree_corruption counter should increment on a classified corruption error"
+            );
         }
 
         #[test]

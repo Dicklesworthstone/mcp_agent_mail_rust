@@ -12984,6 +12984,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 })
                 .collect();
 
+            // A5 (br-bvq1x.1.5): surface corruption-class metrics so agents and
+            // operators get trend visibility on integrity/classification events.
+            let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+
             #[derive(Serialize)]
             struct MetricsData {
                 total_calls: u64,
@@ -12991,6 +12995,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 error_rate_pct: f64,
                 avg_latency_ms: f64,
                 tools: Vec<MetricEntry>,
+                corruption: mcp_agent_mail_core::CorruptionMetricsSnapshot,
             }
 
             let mut env = RobotEnvelope::new(
@@ -13002,8 +13007,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     error_rate_pct: (error_rate * 100.0).round() / 100.0,
                     avg_latency_ms: (avg_latency * 100.0).round() / 100.0,
                     tools,
+                    corruption: corruption.clone(),
                 },
             );
+
+            // Alert when real corruption-class events have occurred (edit-blocking
+            // damage), and warn on any detection-source trips.
+            if corruption.corruption_class_total > 0 {
+                env = env.with_alert(
+                    "error",
+                    format!(
+                        "{} corruption-class error(s) classified since start; run `am doctor --json`",
+                        corruption.corruption_class_total
+                    ),
+                    Some("am doctor --json".to_string()),
+                );
+            } else if corruption.detections_total > 0 {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "{} integrity detection(s) recorded since start",
+                        corruption.detections_total
+                    ),
+                    Some("am doctor health".to_string()),
+                );
+            }
 
             // Generate alerts for problematic tools
             for e in &snapshot {

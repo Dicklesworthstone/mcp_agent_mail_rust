@@ -174,7 +174,8 @@ pub use mcp_config::{
 };
 pub use memory::{MemoryPressure, MemorySample};
 pub use metrics::{
-    CanaryMetrics, CanaryMetricsSnapshot, Counter, DbMetricsSnapshot, GaugeI64, GaugeU64,
+    CanaryMetrics, CanaryMetricsSnapshot, CorruptionDetectionSource, CorruptionMetrics,
+    CorruptionMetricsSnapshot, Counter, DbMetricsSnapshot, GaugeI64, GaugeU64,
     GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, Log2Histogram,
     StorageMetricsSnapshot, ToolsMetricsSnapshot, global_metrics,
 };

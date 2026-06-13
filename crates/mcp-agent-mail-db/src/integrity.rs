@@ -371,6 +371,17 @@ pub fn evaluate_check_rows(
         s.last_ok_ts.store(now, Ordering::Relaxed);
     } else {
         s.failures_total.fetch_add(1, Ordering::Relaxed);
+        // A5 (br-bvq1x.1.5): record the corruption-class detection keyed by
+        // probe source so operators get trend visibility, not a one-shot scare.
+        let source = match kind {
+            CheckKind::Quick => mcp_agent_mail_core::CorruptionDetectionSource::QuickCheck,
+            CheckKind::Incremental | CheckKind::Full => {
+                mcp_agent_mail_core::CorruptionDetectionSource::IntegrityCheck
+            }
+        };
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(source);
     }
 
     let result = IntegrityCheckResult {

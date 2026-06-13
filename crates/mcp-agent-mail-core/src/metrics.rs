@@ -704,6 +704,248 @@ impl SystemMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Corruption-class metrics (br-bvq1x.1.5 / A5)
+// ---------------------------------------------------------------------------
+
+/// Where a corruption/integrity signal was detected.
+///
+/// These are the probe sources that can surface a corruption-class condition.
+/// Counters are keyed by source so operators can tell a quick-check trip from
+/// an open-failure or a WAL/SHM mismatch instead of seeing one opaque total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptionDetectionSource {
+    /// `PRAGMA quick_check` reported a problem.
+    QuickCheck,
+    /// `PRAGMA integrity_check` (incremental or full) reported a problem.
+    IntegrityCheck,
+    /// Schema smoke probe (required tables/columns) failed.
+    SchemaSmoke,
+    /// A connection/open attempt failed in a way that looks like damage.
+    OpenFailure,
+    /// WAL/SHM sidecar state was inconsistent with the main DB.
+    WalShmMismatch,
+    /// `PRAGMA foreign_key_check` reported orphaned/inconsistent rows.
+    FkCheck,
+    /// FTS / search-index integrity check failed.
+    FtsCheck,
+}
+
+impl CorruptionDetectionSource {
+    /// Stable machine string for JSON/metric keys.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QuickCheck => "quick_check",
+            Self::IntegrityCheck => "integrity_check",
+            Self::SchemaSmoke => "schema_smoke",
+            Self::OpenFailure => "open_failure",
+            Self::WalShmMismatch => "wal_shm_mismatch",
+            Self::FkCheck => "fk_check",
+            Self::FtsCheck => "fts_check",
+        }
+    }
+}
+
+/// Corruption/integrity detection and classification counters.
+///
+/// All counters are process-global atomics, so they accumulate over the life
+/// of one process (most usefully the long-running server). Detection-source
+/// counters answer "where did we trip?"; per-class counters mirror the A1
+/// `DbErrorClass` taxonomy and answer "how do classified failures break
+/// down?"; the `last_*_us` gauges answer "when did this last happen?" (0 means
+/// never). These feed operator/agent trend visibility and the K3 circuit
+/// breaker instead of one-shot scary strings.
+#[derive(Debug, Default)]
+pub struct CorruptionMetrics {
+    // -- Detection-source counters --
+    pub quick_check_failures_total: Counter,
+    pub integrity_check_failures_total: Counter,
+    pub schema_smoke_failures_total: Counter,
+    pub open_failures_total: Counter,
+    pub wal_shm_mismatch_total: Counter,
+    pub fk_check_failures_total: Counter,
+    pub fts_check_failures_total: Counter,
+
+    // -- Per-typed-class (A1 `DbErrorClass`) counters --
+    pub class_main_db_btree_corruption_total: Counter,
+    pub class_wal_sidecar_corruption_total: Counter,
+    pub class_schema_drift_or_missing_tables_total: Counter,
+    pub class_engine_probe_limitation_total: Counter,
+    pub class_foreign_key_inconsistency_total: Counter,
+    pub class_fts_index_corruption_total: Counter,
+    pub class_connection_or_config_error_total: Counter,
+    pub class_busy_retryable_total: Counter,
+    pub class_fd_exhaustion_total: Counter,
+    pub class_pool_exhaustion_total: Counter,
+    pub class_live_owner_no_activity_lock_total: Counter,
+    pub class_host_pressure_total: Counter,
+    /// Classified error whose class string did not match any known A1 class
+    /// (guards against silent drift if the taxonomy grows).
+    pub class_unknown_total: Counter,
+
+    // -- Last-corruption timestamps (micros since epoch; 0 = never) --
+    /// Last time any detection source tripped.
+    pub last_detection_us: GaugeU64,
+    /// Last time any error was classified through `record_class`.
+    pub last_classified_us: GaugeU64,
+    /// Last time a class that blocks edits / indicates real corruption fired
+    /// (main-db / WAL-sidecar / schema-drift / FK / FTS corruption classes).
+    pub last_corruption_class_us: GaugeU64,
+}
+
+/// Serializable snapshot of [`CorruptionMetrics`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CorruptionMetricsSnapshot {
+    pub quick_check_failures_total: u64,
+    pub integrity_check_failures_total: u64,
+    pub schema_smoke_failures_total: u64,
+    pub open_failures_total: u64,
+    pub wal_shm_mismatch_total: u64,
+    pub fk_check_failures_total: u64,
+    pub fts_check_failures_total: u64,
+
+    pub class_main_db_btree_corruption_total: u64,
+    pub class_wal_sidecar_corruption_total: u64,
+    pub class_schema_drift_or_missing_tables_total: u64,
+    pub class_engine_probe_limitation_total: u64,
+    pub class_foreign_key_inconsistency_total: u64,
+    pub class_fts_index_corruption_total: u64,
+    pub class_connection_or_config_error_total: u64,
+    pub class_busy_retryable_total: u64,
+    pub class_fd_exhaustion_total: u64,
+    pub class_pool_exhaustion_total: u64,
+    pub class_live_owner_no_activity_lock_total: u64,
+    pub class_host_pressure_total: u64,
+    pub class_unknown_total: u64,
+
+    pub last_detection_us: u64,
+    pub last_classified_us: u64,
+    pub last_corruption_class_us: u64,
+
+    /// Convenience rollup: sum of all detection-source counters.
+    pub detections_total: u64,
+    /// Convenience rollup: sum of the classes that indicate real corruption
+    /// (main-db / WAL-sidecar / schema-drift / FK / FTS) — i.e. edit-blocking
+    /// damage, excluding transient busy/pool/FD/host-pressure classes.
+    pub corruption_class_total: u64,
+}
+
+impl CorruptionMetrics {
+    /// Record a corruption/integrity detection from a specific source.
+    pub fn record_detection(&self, source: CorruptionDetectionSource) {
+        self.record_detection_at(source, now_us_for_metrics());
+    }
+
+    /// [`Self::record_detection`] with an explicit timestamp (for tests).
+    pub fn record_detection_at(&self, source: CorruptionDetectionSource, now_us: u64) {
+        let counter = match source {
+            CorruptionDetectionSource::QuickCheck => &self.quick_check_failures_total,
+            CorruptionDetectionSource::IntegrityCheck => &self.integrity_check_failures_total,
+            CorruptionDetectionSource::SchemaSmoke => &self.schema_smoke_failures_total,
+            CorruptionDetectionSource::OpenFailure => &self.open_failures_total,
+            CorruptionDetectionSource::WalShmMismatch => &self.wal_shm_mismatch_total,
+            CorruptionDetectionSource::FkCheck => &self.fk_check_failures_total,
+            CorruptionDetectionSource::FtsCheck => &self.fts_check_failures_total,
+        };
+        counter.inc();
+        self.last_detection_us.set(now_us);
+    }
+
+    /// Record a classified error by its A1 `DbErrorClass::as_str()` value.
+    ///
+    /// Accepts the stable class string so the zero-dependency `core` crate
+    /// does not need to depend on the `db` crate that owns the enum.
+    pub fn record_class(&self, class: &str) {
+        self.record_class_at(class, now_us_for_metrics());
+    }
+
+    /// [`Self::record_class`] with an explicit timestamp (for tests).
+    pub fn record_class_at(&self, class: &str, now_us: u64) {
+        let (counter, is_corruption) = match class {
+            "main_db_btree_corruption" => (&self.class_main_db_btree_corruption_total, true),
+            "wal_sidecar_corruption" => (&self.class_wal_sidecar_corruption_total, true),
+            "schema_drift_or_missing_tables" => {
+                (&self.class_schema_drift_or_missing_tables_total, true)
+            }
+            "engine_probe_limitation" => (&self.class_engine_probe_limitation_total, false),
+            "foreign_key_inconsistency" => (&self.class_foreign_key_inconsistency_total, true),
+            "fts_index_corruption" => (&self.class_fts_index_corruption_total, true),
+            "connection_or_config_error" => (&self.class_connection_or_config_error_total, false),
+            "busy_retryable" => (&self.class_busy_retryable_total, false),
+            "fd_exhaustion" => (&self.class_fd_exhaustion_total, false),
+            "pool_exhaustion" => (&self.class_pool_exhaustion_total, false),
+            "live_owner_no_activity_lock" => (&self.class_live_owner_no_activity_lock_total, false),
+            "host_pressure" => (&self.class_host_pressure_total, false),
+            _ => (&self.class_unknown_total, false),
+        };
+        counter.inc();
+        self.last_classified_us.set(now_us);
+        if is_corruption {
+            self.last_corruption_class_us.set(now_us);
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> CorruptionMetricsSnapshot {
+        let detections_total = self.quick_check_failures_total.load()
+            + self.integrity_check_failures_total.load()
+            + self.schema_smoke_failures_total.load()
+            + self.open_failures_total.load()
+            + self.wal_shm_mismatch_total.load()
+            + self.fk_check_failures_total.load()
+            + self.fts_check_failures_total.load();
+        let corruption_class_total = self.class_main_db_btree_corruption_total.load()
+            + self.class_wal_sidecar_corruption_total.load()
+            + self.class_schema_drift_or_missing_tables_total.load()
+            + self.class_foreign_key_inconsistency_total.load()
+            + self.class_fts_index_corruption_total.load();
+        CorruptionMetricsSnapshot {
+            quick_check_failures_total: self.quick_check_failures_total.load(),
+            integrity_check_failures_total: self.integrity_check_failures_total.load(),
+            schema_smoke_failures_total: self.schema_smoke_failures_total.load(),
+            open_failures_total: self.open_failures_total.load(),
+            wal_shm_mismatch_total: self.wal_shm_mismatch_total.load(),
+            fk_check_failures_total: self.fk_check_failures_total.load(),
+            fts_check_failures_total: self.fts_check_failures_total.load(),
+
+            class_main_db_btree_corruption_total: self.class_main_db_btree_corruption_total.load(),
+            class_wal_sidecar_corruption_total: self.class_wal_sidecar_corruption_total.load(),
+            class_schema_drift_or_missing_tables_total: self
+                .class_schema_drift_or_missing_tables_total
+                .load(),
+            class_engine_probe_limitation_total: self.class_engine_probe_limitation_total.load(),
+            class_foreign_key_inconsistency_total: self
+                .class_foreign_key_inconsistency_total
+                .load(),
+            class_fts_index_corruption_total: self.class_fts_index_corruption_total.load(),
+            class_connection_or_config_error_total: self
+                .class_connection_or_config_error_total
+                .load(),
+            class_busy_retryable_total: self.class_busy_retryable_total.load(),
+            class_fd_exhaustion_total: self.class_fd_exhaustion_total.load(),
+            class_pool_exhaustion_total: self.class_pool_exhaustion_total.load(),
+            class_live_owner_no_activity_lock_total: self
+                .class_live_owner_no_activity_lock_total
+                .load(),
+            class_host_pressure_total: self.class_host_pressure_total.load(),
+            class_unknown_total: self.class_unknown_total.load(),
+
+            last_detection_us: self.last_detection_us.load(),
+            last_classified_us: self.last_classified_us.load(),
+            last_corruption_class_us: self.last_corruption_class_us.load(),
+
+            detections_total,
+            corruption_class_total,
+        }
+    }
+}
+
+/// Current wall-clock micros for metric timestamps, saturating to `u64`.
+fn now_us_for_metrics() -> u64 {
+    u64::try_from(crate::timestamps::now_micros()).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Search V3 Metrics
 // ---------------------------------------------------------------------------
 
@@ -1589,6 +1831,7 @@ pub struct GlobalMetrics {
     pub search: SearchMetrics,
     pub atc: AtcMetrics,
     pub canary: CanaryMetrics,
+    pub corruption: CorruptionMetrics,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1601,6 +1844,7 @@ pub struct GlobalMetricsSnapshot {
     pub search: SearchMetricsSnapshot,
     pub atc: AtcMetricsSnapshot,
     pub canary: CanaryMetricsSnapshot,
+    pub corruption: CorruptionMetricsSnapshot,
 }
 
 impl GlobalMetrics {
@@ -1615,6 +1859,7 @@ impl GlobalMetrics {
             search: self.search.snapshot(),
             atc: self.atc.snapshot(),
             canary: self.canary.snapshot(),
+            corruption: self.corruption.snapshot(),
         }
     }
 }
@@ -2402,5 +2647,108 @@ mod tests {
         let gm1 = super::global_metrics();
         let gm2 = super::global_metrics();
         assert!(std::ptr::eq(gm1, gm2));
+    }
+
+    // ── A5 (br-bvq1x.1.5): corruption-class metrics ───────────────────
+
+    #[test]
+    fn corruption_metrics_record_detection_by_source() {
+        let m = CorruptionMetrics::default();
+        m.record_detection_at(CorruptionDetectionSource::QuickCheck, 1_000);
+        m.record_detection_at(CorruptionDetectionSource::QuickCheck, 2_000);
+        m.record_detection_at(CorruptionDetectionSource::IntegrityCheck, 3_000);
+        m.record_detection_at(CorruptionDetectionSource::FkCheck, 4_000);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.quick_check_failures_total, 2);
+        assert_eq!(snap.integrity_check_failures_total, 1);
+        assert_eq!(snap.fk_check_failures_total, 1);
+        assert_eq!(snap.schema_smoke_failures_total, 0);
+        assert_eq!(snap.detections_total, 4);
+        // Last detection timestamp tracks the most recent record.
+        assert_eq!(snap.last_detection_us, 4_000);
+    }
+
+    #[test]
+    fn corruption_metrics_record_class_increments_typed_counters() {
+        let m = CorruptionMetrics::default();
+        // Real corruption classes feed corruption_class_total + the timestamp.
+        m.record_class_at("main_db_btree_corruption", 10);
+        m.record_class_at("fts_index_corruption", 20);
+        m.record_class_at("foreign_key_inconsistency", 30);
+        // Transient classes increment their counter but are NOT corruption.
+        m.record_class_at("busy_retryable", 40);
+        m.record_class_at("pool_exhaustion", 50);
+        // Unknown class string is captured separately (drift guard).
+        m.record_class_at("some_future_class", 60);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.class_main_db_btree_corruption_total, 1);
+        assert_eq!(snap.class_fts_index_corruption_total, 1);
+        assert_eq!(snap.class_foreign_key_inconsistency_total, 1);
+        assert_eq!(snap.class_busy_retryable_total, 1);
+        assert_eq!(snap.class_pool_exhaustion_total, 1);
+        assert_eq!(snap.class_unknown_total, 1);
+
+        // corruption_class_total counts only the edit-blocking corruption
+        // classes (3), not the transient/unknown ones.
+        assert_eq!(snap.corruption_class_total, 3);
+        // last_classified tracks every record; last_corruption_class only the
+        // real-corruption ones (most recent was fk at ts=30).
+        assert_eq!(snap.last_classified_us, 60);
+        assert_eq!(snap.last_corruption_class_us, 30);
+    }
+
+    #[test]
+    fn corruption_metrics_snapshot_serializes_with_stable_keys() {
+        let m = CorruptionMetrics::default();
+        m.record_detection_at(CorruptionDetectionSource::WalShmMismatch, 1);
+        m.record_class_at("schema_drift_or_missing_tables", 2);
+        let snap = m.snapshot();
+        let json = serde_json::to_value(&snap).expect("snapshot serializes");
+        assert_eq!(json["wal_shm_mismatch_total"], 1);
+        assert_eq!(json["class_schema_drift_or_missing_tables_total"], 1);
+        assert_eq!(json["detections_total"], 1);
+        assert_eq!(json["corruption_class_total"], 1);
+        assert!(json.get("last_detection_us").is_some());
+    }
+
+    #[test]
+    fn corruption_detection_source_strings_are_stable() {
+        assert_eq!(
+            CorruptionDetectionSource::QuickCheck.as_str(),
+            "quick_check"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::IntegrityCheck.as_str(),
+            "integrity_check"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::SchemaSmoke.as_str(),
+            "schema_smoke"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::OpenFailure.as_str(),
+            "open_failure"
+        );
+        assert_eq!(
+            CorruptionDetectionSource::WalShmMismatch.as_str(),
+            "wal_shm_mismatch"
+        );
+        assert_eq!(CorruptionDetectionSource::FkCheck.as_str(), "fk_check");
+        assert_eq!(CorruptionDetectionSource::FtsCheck.as_str(), "fts_check");
+    }
+
+    #[test]
+    fn global_metrics_snapshot_includes_corruption_section() {
+        // The aggregate snapshot must carry the corruption section so it
+        // reaches `am robot metrics` / `tooling/metrics_core`.
+        let snap = GlobalMetrics::default().snapshot();
+        let json = serde_json::to_value(&snap).expect("global snapshot serializes");
+        assert!(
+            json.get("corruption").is_some(),
+            "global metrics snapshot must expose a corruption section"
+        );
+        assert_eq!(json["corruption"]["detections_total"], 0);
     }
 }

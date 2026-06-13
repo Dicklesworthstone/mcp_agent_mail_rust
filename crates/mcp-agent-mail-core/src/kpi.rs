@@ -1621,9 +1621,9 @@ pub fn quick_insight_feed() -> InsightFeed {
 mod tests {
     use super::*;
     use crate::metrics::{
-        AtcMetricsSnapshot, CanaryMetricsSnapshot, DbMetricsSnapshot, GlobalMetricsSnapshot,
-        HistogramSnapshot, HttpMetricsSnapshot, SearchMetricsSnapshot, StorageMetricsSnapshot,
-        SystemMetricsSnapshot, ToolsMetricsSnapshot,
+        AtcMetricsSnapshot, CanaryMetricsSnapshot, CorruptionMetricsSnapshot, DbMetricsSnapshot,
+        GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, SearchMetricsSnapshot,
+        StorageMetricsSnapshot, SystemMetricsSnapshot, ToolsMetricsSnapshot,
     };
     use std::sync::Mutex;
     use std::thread;
@@ -1752,6 +1752,7 @@ mod tests {
             search: SearchMetricsSnapshot::default(),
             atc: AtcMetricsSnapshot::default(),
             canary: CanaryMetricsSnapshot::default(),
+            corruption: CorruptionMetricsSnapshot::default(),
         }
     }
 

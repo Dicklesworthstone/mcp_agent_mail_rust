@@ -2163,6 +2163,25 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
+    // A5 (br-bvq1x.1.5): surface corruption-class metrics when any have fired
+    // in this process. Counters are process-global atomics, so a fresh CLI
+    // invocation usually reads zero; this line is meaningful when the same
+    // process already classified an error (e.g. a doctor probe) or in a
+    // long-lived host. Stay quiet on a clean slate to avoid healthy-run noise.
+    let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+    if corruption.corruption_class_total > 0 {
+        ftui_runtime::ftui_println!(
+            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor --json",
+            corruption.corruption_class_total,
+            corruption.detections_total
+        );
+    } else if corruption.detections_total > 0 {
+        ftui_runtime::ftui_println!(
+            "corruption_metrics: {} integrity detection(s) recorded (no edit-blocking corruption class)",
+            corruption.detections_total
+        );
+    }
+
     match crate::open_db_for_doctor_check_read_only_with_context(&cfg.database_url).and_then(
         |opened| {
             check_reservation_parity_with_canonical_conn(&opened.conn, &config.storage_root)

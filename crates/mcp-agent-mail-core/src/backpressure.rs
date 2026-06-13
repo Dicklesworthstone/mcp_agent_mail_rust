@@ -1041,6 +1041,7 @@ mod tests {
             search: SearchMetricsSnapshot::default(),
             atc: AtcMetricsSnapshot::default(),
             canary: CanaryMetricsSnapshot::default(),
+            corruption: CorruptionMetricsSnapshot::default(),
         };
 
         let signals = HealthSignals::from_snapshot(&snap, 1_000_000_000);
