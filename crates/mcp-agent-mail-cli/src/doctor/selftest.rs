@@ -431,8 +431,12 @@ fn spawn_inner_child(
         }
     };
 
-    let stdout = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-    let stderr = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     if timed_out {
         ChildOutcome::TimedOut {
@@ -443,9 +447,7 @@ fn spawn_inner_child(
     }
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(
-    mut reader: R,
-) -> std::thread::JoinHandle<String> {
+fn spawn_pipe_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = reader.read_to_string(&mut buf);
@@ -721,8 +723,14 @@ fn finalize_report(mut steps: Vec<StepResult>) -> WriteSelftestReport {
     let failing_dimension = first_failure.and_then(|s| s.dimension);
     let failed_dimensions = first_failure
         .and_then(|s| {
-            s.dimension
-                .map(|d| (d, s.error.clone().unwrap_or_else(|| format!("step `{}` failed", s.name))))
+            s.dimension.map(|d| {
+                (
+                    d,
+                    s.error
+                        .clone()
+                        .unwrap_or_else(|| format!("step `{}` failed", s.name)),
+                )
+            })
         })
         .into_iter()
         .collect();
@@ -753,7 +761,9 @@ fn parse_message_id(payload: &str) -> Option<i64> {
 /// True iff `candidate` is equal to or nested under `base` (lexical check on
 /// the already-canonical config path; both are absolute).
 fn path_is_within(candidate: &Path, base: &Path) -> bool {
-    let candidate = candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf());
+    let candidate = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.to_path_buf());
     let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     candidate.starts_with(&base)
 }
@@ -1041,7 +1051,8 @@ fn run_mcp_selftest_in_process(project_key: &str) -> McpSelftestReport {
     // Check 2: the L2 malformed frame MUST be rejected as a protocol error.
     {
         let cx = Cx::for_request();
-        let mut transport = StdioTransport::new(Cursor::new(L2_MALFORMED_FIXTURE.to_vec()), Vec::new());
+        let mut transport =
+            StdioTransport::new(Cursor::new(L2_MALFORMED_FIXTURE.to_vec()), Vec::new());
         match transport.recv(&cx) {
             Err(_) => checks.push(CheckResult::pass_with(
                 "decode_failure_detected",
@@ -1255,7 +1266,10 @@ fn tool_response_is_error(resp: &Value) -> bool {
 /// Best-effort extraction of a human-readable error string from a tool/JSON-RPC
 /// error response.
 fn tool_error_text(resp: &Value) -> String {
-    if let Some(text) = resp.pointer("/result/content/0/text").and_then(Value::as_str) {
+    if let Some(text) = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+    {
         return tail(text, 200);
     }
     if let Some(message) = resp.pointer("/error/message").and_then(Value::as_str) {
@@ -1269,7 +1283,10 @@ fn tool_error_text(resp: &Value) -> String {
 /// names are present (and, when an `agents` array is exposed, that it holds at
 /// least two entries).
 fn tool_payload_lists_both_agents(resp: &Value) -> bool {
-    let Some(text) = resp.pointer("/result/content/0/text").and_then(Value::as_str) else {
+    let Some(text) = resp
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+    else {
         return false;
     };
     if !text.contains(SENDER) || !text.contains(RECIPIENT) {
@@ -1277,7 +1294,11 @@ fn tool_payload_lists_both_agents(resp: &Value) -> bool {
     }
     // If the payload exposes a count/agents array, require at least two.
     if let Ok(payload) = serde_json::from_str::<Value>(text) {
-        if payload.get("count").and_then(Value::as_i64).is_some_and(|c| c < 2) {
+        if payload
+            .get("count")
+            .and_then(Value::as_i64)
+            .is_some_and(|c| c < 2)
+        {
             return false;
         }
         if payload
@@ -1301,10 +1322,7 @@ mod tests {
             classify_dimension("no such table: messages"),
             Dimension::Schema
         );
-        assert_eq!(
-            classify_dimension("database is locked"),
-            Dimension::Lock
-        );
+        assert_eq!(classify_dimension("database is locked"), Dimension::Lock);
         assert_eq!(
             classify_dimension("database disk image is malformed"),
             Dimension::Corruption
@@ -1401,7 +1419,11 @@ mod tests {
         // were once surfaced as scary DB errors).
         let guidance = value["guidance"].as_str().expect("guidance present");
         assert!(guidance.contains("PROTOCOL"));
-        assert!(guidance.to_ascii_lowercase().contains("not a database error"));
+        assert!(
+            guidance
+                .to_ascii_lowercase()
+                .contains("not a database error")
+        );
     }
 
     #[test]
@@ -1446,7 +1468,9 @@ mod tests {
         assert!(!tool_response_is_error(
             &json!({ "result": { "isError": false, "content": [] } })
         ));
-        assert!(!tool_response_is_error(&json!({ "result": { "tools": [] } })));
+        assert!(!tool_response_is_error(
+            &json!({ "result": { "tools": [] } })
+        ));
     }
 
     #[test]

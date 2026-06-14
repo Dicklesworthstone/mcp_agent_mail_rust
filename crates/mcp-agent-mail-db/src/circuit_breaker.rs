@@ -190,7 +190,10 @@ mod tests {
         let refusal = b.refusal_error().expect("open breaker must refuse writes");
         // The refusal must re-classify as corruption (keywords preserved) and
         // carry degraded-mode guidance — never a generic/scary raw error.
-        assert!(refusal.is_corruption(), "refusal must be a corruption class");
+        assert!(
+            refusal.is_corruption(),
+            "refusal must be a corruption class"
+        );
         assert!(refusal.classification().blocks_edits);
         let text = refusal.to_string();
         assert!(text.contains("am doctor repair"));
@@ -211,9 +214,7 @@ mod tests {
         assert!(!b.is_tripped());
 
         // Hard corruption trips it.
-        assert!(b.observe_error(&DbError::Sqlite(
-            "database disk image is malformed".into()
-        )));
+        assert!(b.observe_error(&DbError::Sqlite("database disk image is malformed".into())));
         assert!(b.is_tripped());
     }
 

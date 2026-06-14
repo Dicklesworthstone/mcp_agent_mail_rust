@@ -55,19 +55,17 @@ fn write_selftest_passes_all_dimensions_in_isolated_scratch() {
         "write-selftest must exit 0 on a healthy host.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    let envelope: serde_json::Value =
-        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!("write-selftest must emit valid JSON: {e}\nstdout:\n{stdout}")
-        });
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("write-selftest must emit valid JSON: {e}\nstdout:\n{stdout}"));
 
     assert_eq!(envelope["selftest"], "write_path");
-    assert_eq!(envelope["ok"], true, "overall verdict must be ok: {envelope}");
+    assert_eq!(
+        envelope["ok"], true,
+        "overall verdict must be ok: {envelope}"
+    );
 
     let result = &envelope["result"];
-    assert_eq!(
-        result["ok"], true,
-        "inner sequence must be ok: {result}"
-    );
+    assert_eq!(result["ok"], true, "inner sequence must be ok: {result}");
     assert_eq!(
         result["isolation_verified"], true,
         "isolation guard must have confirmed the scratch root"

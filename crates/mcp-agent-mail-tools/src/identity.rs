@@ -319,7 +319,11 @@ pub struct HealthVerdict {
 }
 
 impl HealthVerdict {
-    fn new(level: mcp_agent_mail_core::HealthLevel, critical: bool, detail: impl Into<String>) -> Self {
+    fn new(
+        level: mcp_agent_mail_core::HealthLevel,
+        critical: bool,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             status: level.as_str().to_string(),
             detail: detail.into(),
@@ -386,7 +390,10 @@ impl HealthVerdicts {
             }
         }
         named.sort_by_key(|entry| std::cmp::Reverse(entry.1 as u8));
-        named.into_iter().map(|(name, _)| name.to_string()).collect()
+        named
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
     }
 
     /// The strict roll-up level: the worst of all critical verdicts (so a red
@@ -468,7 +475,10 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
             root.display()
         ))
     } else {
-        Err(format!("storage root {} does not exist yet", root.display()))
+        Err(format!(
+            "storage root {} does not exist yet",
+            root.display()
+        ))
     }
 }
 
@@ -2214,18 +2224,33 @@ mod tests {
 
     #[test]
     fn classify_semantic_failure_routes_to_subsystems() {
-        assert_eq!(classify_semantic_failure("ok", "aligned"), SemanticVerdictKind::Ok);
-        assert_eq!(classify_semantic_failure("warn", "lock"), SemanticVerdictKind::Warn);
         assert_eq!(
-            classify_semantic_failure("fail", "sqlite schema missing required health_check tables: agents"),
+            classify_semantic_failure("ok", "aligned"),
+            SemanticVerdictKind::Ok
+        );
+        assert_eq!(
+            classify_semantic_failure("warn", "lock"),
+            SemanticVerdictKind::Warn
+        );
+        assert_eq!(
+            classify_semantic_failure(
+                "fail",
+                "sqlite schema missing required health_check tables: agents"
+            ),
             SemanticVerdictKind::SchemaMissing
         );
         assert_eq!(
-            classify_semantic_failure("fail", "archive inventory is ahead of the sqlite index (...)"),
+            classify_semantic_failure(
+                "fail",
+                "archive inventory is ahead of the sqlite index (...)"
+            ),
             SemanticVerdictKind::ArchiveParity
         );
         assert_eq!(
-            classify_semantic_failure("fail", "sqlite connectivity probe failed during health_check: disk I/O error"),
+            classify_semantic_failure(
+                "fail",
+                "sqlite connectivity probe failed during health_check: disk I/O error"
+            ),
             SemanticVerdictKind::DbConnectivity
         );
     }
@@ -2253,12 +2278,22 @@ mod tests {
         let verdicts = compute_health_verdicts(
             &config,
             true,
-            &semantic("fail", "sqlite schema missing required health_check tables: agents, messages"),
+            &semantic(
+                "fail",
+                "sqlite schema missing required health_check tables: agents, messages",
+            ),
         );
         assert_eq!(verdicts.write_health.status, "red");
         assert!(verdicts.write_health.critical);
-        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
-        assert!(verdicts.failing_names().contains(&"write_health".to_string()));
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+        assert!(
+            verdicts
+                .failing_names()
+                .contains(&"write_health".to_string())
+        );
     }
 
     #[test]
@@ -2267,10 +2302,16 @@ mod tests {
         let verdicts = compute_health_verdicts(
             &config,
             true,
-            &semantic("fail", "sqlite connectivity probe failed during health_check: file is not a database"),
+            &semantic(
+                "fail",
+                "sqlite connectivity probe failed during health_check: file is not a database",
+            ),
         );
         assert_eq!(verdicts.db_health.status, "red");
-        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
     }
 
     #[test]
@@ -2279,10 +2320,16 @@ mod tests {
         let verdicts = compute_health_verdicts(
             &config,
             true,
-            &semantic("fail", "archive inventory is ahead of the sqlite index (archive projects=2 ...)"),
+            &semantic(
+                "fail",
+                "archive inventory is ahead of the sqlite index (archive projects=2 ...)",
+            ),
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
-        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
     }
 
     #[test]
@@ -2294,7 +2341,10 @@ mod tests {
             &semantic("fail", "database pool bootstrap failed"),
         );
         assert_eq!(verdicts.db_health.status, "red");
-        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Red);
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
     }
 
     #[test]
@@ -2305,8 +2355,14 @@ mod tests {
         assert_eq!(verdicts.write_health.status, "green");
         assert_eq!(verdicts.transport_health.status, "green");
         assert_eq!(verdicts.archive_db_parity.status, "green");
-        assert_eq!(verdicts.rollup_level(), mcp_agent_mail_core::HealthLevel::Green);
-        assert!(verdicts.failing_names().is_empty() || !verdicts.failing_names().contains(&"db_health".to_string()));
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+        assert!(
+            verdicts.failing_names().is_empty()
+                || !verdicts.failing_names().contains(&"db_health".to_string())
+        );
     }
 
     #[test]

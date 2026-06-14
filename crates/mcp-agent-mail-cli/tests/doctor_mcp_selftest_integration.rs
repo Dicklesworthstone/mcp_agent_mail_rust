@@ -53,7 +53,10 @@ fn mcp_selftest_passes_decode_negotiation_and_round_trip() {
         .unwrap_or_else(|e| panic!("mcp-selftest must emit valid JSON: {e}\nstdout:\n{stdout}"));
 
     assert_eq!(envelope["selftest"], "mcp_decode");
-    assert_eq!(envelope["ok"], true, "overall verdict must be ok: {envelope}");
+    assert_eq!(
+        envelope["ok"], true,
+        "overall verdict must be ok: {envelope}"
+    );
 
     let result = &envelope["result"];
     assert_eq!(result["ok"], true, "inner mcp report must be ok: {result}");
