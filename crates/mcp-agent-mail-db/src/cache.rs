@@ -776,8 +776,19 @@ impl ReadCache {
         let removed_id = by_key_cache.remove(&key).and_then(|a| a.value.id);
 
         let mut agent_ids_to_remove = Vec::new();
-        if let Some(agent_id) = id.or(removed_id) {
+        if let Some(agent_id) = id {
             agent_ids_to_remove.push(agent_id);
+        }
+        // Always clear the by-id entry the by-key cache actually pointed at. If
+        // the caller's `id` hint differs from `removed_id` (e.g. a name was
+        // re-registered under a new row id while the by-key cache still held the
+        // old one), trusting only the hint would orphan the real by-id entry and
+        // leave a stale `get_agent_by_id` hit. Over-invalidation is always safe
+        // (it can only cause a benign cache miss), so include both.
+        if let Some(rid) = removed_id
+            && Some(rid) != id
+        {
+            agent_ids_to_remove.push(rid);
         }
 
         if id.is_none() {
@@ -1279,6 +1290,30 @@ mod tests {
             reaper_exempt: 0,
             registration_token: None,
         }
+    }
+
+    #[test]
+    fn invalidate_agent_with_mismatched_id_hint_clears_real_by_id_entry() {
+        // Regression: invalidating with an `id` hint that differs from the
+        // by-key cache's actual id must not orphan the real by-id entry.
+        let cache = ReadCache::new();
+        let agent = make_agent_with_id("BlueLake", 1, 10);
+        cache.put_agent(&agent);
+        assert!(cache.get_agent(1, "BlueLake").is_some());
+        assert!(cache.get_agent_by_id(10).is_some());
+
+        // Caller passes a stale/mismatched hint id (20) — not the cached id (10).
+        cache.invalidate_agent(1, "BlueLake", Some(20));
+
+        assert!(
+            cache.get_agent(1, "BlueLake").is_none(),
+            "by-key entry must be cleared"
+        );
+        assert!(
+            cache.get_agent_by_id(10).is_none(),
+            "the by-id entry for the actually-cached id (10) must not orphan when \
+             the invalidation hint (20) differs"
+        );
     }
 
     #[test]
