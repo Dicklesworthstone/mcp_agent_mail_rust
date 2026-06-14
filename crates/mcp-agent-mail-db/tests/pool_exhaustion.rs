@@ -445,6 +445,53 @@ fn pool_stats_reflect_usage() {
 }
 
 // =============================================================================
+// Test: Pool acquisitions are recorded in the global DB metrics surface
+// (bead K5 — `am robot metrics` reads `global_metrics().db.snapshot()`).
+// =============================================================================
+
+#[test]
+fn pool_acquire_records_global_db_metrics() {
+    // `global_metrics()` is a process-wide singleton shared across parallel
+    // tests, so assert only monotonic lower bounds (counters never decrease),
+    // never absolute values.
+    let before = mcp_agent_mail_core::global_metrics().db.snapshot();
+
+    // A tiny pool that forces queuing: 1 connection, several sequential acquires.
+    let (pool, _dir) = make_pool(1, 1);
+    block_on(|cx| async move {
+        for _ in 0..3 {
+            let conn = unwrap_acquire!(pool.acquire(&cx).await, "acquire for metrics");
+            conn.execute_raw("SELECT 1").expect("query should work");
+            drop(conn);
+        }
+        // Refresh the pool gauges into the global metrics surface.
+        pool.sample_pool_stats_now();
+    });
+
+    let after = mcp_agent_mail_core::global_metrics().db.snapshot();
+
+    // We performed at least one acquire between the two reads, and acquire
+    // counters are monotonic, so the total must have advanced.
+    assert!(
+        after.pool_acquires_total > before.pool_acquires_total,
+        "pool acquires must be counted: before={} after={}",
+        before.pool_acquires_total,
+        after.pool_acquires_total
+    );
+    // The acquire-latency histogram must have observed at least our acquires.
+    assert!(
+        after.pool_acquire_latency_us.count > before.pool_acquire_latency_us.count,
+        "pool acquire latency histogram must record samples"
+    );
+    // Utilization is always a valid 0..=100 percentage.
+    assert!(
+        after.pool_utilization_pct <= 100,
+        "pool utilization must be a clamped percentage, got {}",
+        after.pool_utilization_pct
+    );
+}
+
+// =============================================================================
 // Test: Warmup with pool_size=1 opens exactly 1 connection
 // =============================================================================
 

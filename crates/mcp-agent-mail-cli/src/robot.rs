@@ -1268,6 +1268,112 @@ pub struct MetricEntry {
     pub p99_ms: f64,
 }
 
+/// robot metrics — DB connection-pool and file-descriptor backpressure view
+/// (bead K5). The live `pool`/`fd` gauges describe the *process that ran this
+/// command*, not a remote server, so `scope` is surfaced explicitly to keep the
+/// reading honest: in a short-lived `am robot metrics` invocation the pool
+/// gauges are typically zero, while the configured pool limits and the inherited
+/// FD limits (`ulimit -n`) remain meaningful environment signals.
+#[derive(Debug, Serialize)]
+pub struct ResourcePressure {
+    /// Always `"current_process"` — a guard against reading the pool gauges as
+    /// if they reflected the long-running server.
+    pub scope: &'static str,
+    /// Configured maximum pooled connections (`DATABASE_POOL_SIZE` + overflow).
+    pub pool_max_connections: usize,
+    /// Configured minimum pooled connections.
+    pub pool_min_connections: usize,
+    /// Configured connection-acquire timeout in milliseconds.
+    pub pool_acquire_timeout_ms: u64,
+    /// Live pool gauges for this process (acquires, utilization, waiters, …).
+    pub pool: mcp_agent_mail_core::DbMetricsSnapshot,
+    /// Live file-descriptor pressure (soft/hard limits, open fds, utilization).
+    pub fd: mcp_agent_mail_core::FdMetricsSnapshot,
+    /// Entries in the storage repo-path cache (paths, not held descriptors).
+    pub repo_cache_entries: usize,
+}
+
+/// A derived backpressure alert (kept independent of `RobotEnvelope` so the
+/// guidance text is unit-testable without real pool/FD exhaustion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackpressureAlert {
+    pub severity: &'static str,
+    pub message: String,
+    pub action: Option<String>,
+}
+
+/// The specific, ordered next-step list for pool/FD backpressure (bead K5).
+/// Agents that merely retry on a busy/exhaustion error make the problem worse;
+/// this enumerates the real levers instead.
+pub const BACKPRESSURE_NEXT_STEPS: &str = "reduce concurrent agents, check for long-running \
+    readers (open inbox/thread queries), reduce TUI polling frequency, run `am doctor health`, \
+    and inspect the pool metrics above";
+
+/// Derive pool/FD backpressure alerts from already-sampled snapshots.
+///
+/// Pure and side-effect free so the guidance can be asserted deterministically.
+/// Thresholds: a pool acquire error is a hard exhaustion signal; >=80% pool
+/// utilization or any waiting request is pressure; FD utilization >=90% is
+/// imminent exhaustion and >=80% is a warning. When the repo-path cache is the
+/// only thing growing it is *not* flagged, because evicting it frees zero
+/// descriptors (the D3 "freed 0" footgun).
+#[must_use]
+pub fn derive_backpressure_alerts(
+    pool: &mcp_agent_mail_core::DbMetricsSnapshot,
+    fd: &mcp_agent_mail_core::FdMetricsSnapshot,
+) -> Vec<BackpressureAlert> {
+    let mut alerts = Vec::new();
+
+    if pool.pool_acquire_errors_total > 0 {
+        alerts.push(BackpressureAlert {
+            severity: "error",
+            message: format!(
+                "{} pool-acquire error(s) since start — the DB connection pool has been \
+                 exhausted (max {} connections). Do not blind-retry; instead {BACKPRESSURE_NEXT_STEPS}.",
+                pool.pool_acquire_errors_total, pool.pool_total_connections
+            ),
+            action: Some("am robot health --include-host".to_string()),
+        });
+    } else if pool.pool_utilization_pct >= 80 || pool.pool_pending_requests > 0 {
+        alerts.push(BackpressureAlert {
+            severity: "warn",
+            message: format!(
+                "DB pool under pressure ({}% utilization, {} request(s) waiting). To relieve it: \
+                 {BACKPRESSURE_NEXT_STEPS}.",
+                pool.pool_utilization_pct, pool.pool_pending_requests
+            ),
+            action: Some("am robot health --include-host".to_string()),
+        });
+    }
+
+    if let Some(util) = fd.utilization_pct {
+        let open = fd.open_fds.unwrap_or(0);
+        let soft = fd.soft_limit.unwrap_or(0);
+        if util >= 90 {
+            alerts.push(BackpressureAlert {
+                severity: "error",
+                message: format!(
+                    "Open file descriptors at {util}% of the soft limit ({open}/{soft}); FD \
+                     exhaustion is imminent. Raise `ulimit -n`, close stale Agent Mail processes, \
+                     then {BACKPRESSURE_NEXT_STEPS}."
+                ),
+                action: Some("am robot health --include-host".to_string()),
+            });
+        } else if util >= 80 {
+            alerts.push(BackpressureAlert {
+                severity: "warn",
+                message: format!(
+                    "Open file descriptors at {util}% of the soft limit ({open}/{soft}). Consider \
+                     raising `ulimit -n` or reducing concurrent agents before it becomes exhaustion."
+                ),
+                action: Some("am robot health --include-host".to_string()),
+            });
+        }
+    }
+
+    alerts
+}
+
 /// robot health — system probe entry.
 #[derive(Debug, Serialize)]
 pub struct HealthProbe {
@@ -12995,6 +13101,25 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // operators get trend visibility on integrity/classification events.
             let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
 
+            // K5 (br-bvq1x.11.5): surface DB pool + FD backpressure so agents can
+            // distinguish pool/FD exhaustion from corruption and follow specific
+            // next steps instead of blind-retrying. The live gauges are
+            // process-local (see `ResourcePressure::scope`); the configured pool
+            // limits and inherited FD limits are environment-wide signals.
+            let pool_snapshot = mcp_agent_mail_core::global_metrics().db.snapshot();
+            let fd_snapshot = mcp_agent_mail_core::fd_metrics_snapshot();
+            let pool_cfg = mcp_agent_mail_db::pool::DbPoolConfig::from_env();
+            let resources = ResourcePressure {
+                scope: "current_process",
+                pool_max_connections: pool_cfg.max_connections,
+                pool_min_connections: pool_cfg.min_connections,
+                pool_acquire_timeout_ms: pool_cfg.acquire_timeout_ms,
+                pool: pool_snapshot.clone(),
+                fd: fd_snapshot.clone(),
+                repo_cache_entries: mcp_agent_mail_storage::repo_cache_len(),
+            };
+            let backpressure = derive_backpressure_alerts(&pool_snapshot, &fd_snapshot);
+
             #[derive(Serialize)]
             struct MetricsData {
                 total_calls: u64,
@@ -13003,6 +13128,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 avg_latency_ms: f64,
                 tools: Vec<MetricEntry>,
                 corruption: mcp_agent_mail_core::CorruptionMetricsSnapshot,
+                resources: ResourcePressure,
             }
 
             let mut env = RobotEnvelope::new(
@@ -13015,8 +13141,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     avg_latency_ms: (avg_latency * 100.0).round() / 100.0,
                     tools,
                     corruption: corruption.clone(),
+                    resources,
                 },
             );
+
+            // Emit the specific pool/FD backpressure guidance (bead K5). These
+            // fire only on real threshold breaches, so a healthy process stays quiet.
+            for alert in &backpressure {
+                env = env.with_alert(alert.severity, alert.message.clone(), alert.action.clone());
+            }
 
             // Alert when real corruption-class events have occurred (edit-blocking
             // damage), and warn on any detection-source trips.
@@ -21527,6 +21660,166 @@ mod tests {
             host_probe.is_some(),
             "expected a host probe in {with_host:?}"
         );
+    }
+
+    // ---- K5 (br-bvq1x.11.5): pool/FD backpressure metrics ----
+
+    #[test]
+    fn robot_metrics_surfaces_pool_and_fd_resources() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_metrics_resources.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let value = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Metrics,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        let resources = value
+            .get("resources")
+            .expect("metrics output must carry a resources section (K5)");
+        assert_eq!(
+            resources["scope"], "current_process",
+            "live gauges must be honestly scoped to the querying process: {resources:?}"
+        );
+        // Configured pool limits are environment-wide and always present.
+        assert!(
+            resources["pool_max_connections"].as_u64().unwrap_or(0) > 0,
+            "configured pool max must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources.get("pool_acquire_timeout_ms").is_some(),
+            "configured acquire timeout must be surfaced: {resources:?}"
+        );
+        // Live pool gauges and FD pressure sub-objects must be present (even if
+        // zero / unavailable on this platform).
+        assert!(
+            resources["pool"].get("pool_utilization_pct").is_some(),
+            "pool gauges must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources.get("fd").is_some(),
+            "fd pressure must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources.get("repo_cache_entries").is_some(),
+            "repo-cache size must be surfaced: {resources:?}"
+        );
+    }
+
+    #[test]
+    fn derive_backpressure_alerts_quiet_when_healthy() {
+        let pool = mcp_agent_mail_core::DbMetricsSnapshot {
+            pool_total_connections: 10,
+            pool_active_connections: 1,
+            pool_utilization_pct: 10,
+            pool_pending_requests: 0,
+            pool_acquire_errors_total: 0,
+            ..Default::default()
+        };
+        let fd = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: Some(1024),
+            hard_limit: Some(4096),
+            open_fds: Some(40),
+            utilization_pct: Some(3),
+        };
+        assert!(
+            derive_backpressure_alerts(&pool, &fd).is_empty(),
+            "a healthy process must produce no backpressure alerts"
+        );
+    }
+
+    #[test]
+    fn derive_backpressure_alerts_flags_pool_and_fd_exhaustion_with_next_steps() {
+        // Pool acquire errors -> hard exhaustion alert with the specific list.
+        let pool = mcp_agent_mail_core::DbMetricsSnapshot {
+            pool_total_connections: 4,
+            pool_active_connections: 4,
+            pool_utilization_pct: 100,
+            pool_pending_requests: 6,
+            pool_acquire_errors_total: 3,
+            ..Default::default()
+        };
+        // FD at 95% of soft limit -> imminent-exhaustion error.
+        let fd = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: Some(1024),
+            hard_limit: Some(4096),
+            open_fds: Some(973),
+            utilization_pct: Some(95),
+        };
+        let alerts = derive_backpressure_alerts(&pool, &fd);
+        assert_eq!(alerts.len(), 2, "expected pool + fd alerts: {alerts:?}");
+
+        let pool_alert = &alerts[0];
+        assert_eq!(pool_alert.severity, "error");
+        assert!(
+            pool_alert
+                .message
+                .contains("connection pool has been exhausted"),
+            "pool alert must name the exhaustion: {pool_alert:?}"
+        );
+        assert!(
+            pool_alert.message.contains("reduce concurrent agents")
+                && pool_alert.message.contains("am doctor health")
+                && pool_alert.message.contains("TUI polling"),
+            "pool alert must carry the specific next-step list (K5): {pool_alert:?}"
+        );
+
+        let fd_alert = &alerts[1];
+        assert_eq!(fd_alert.severity, "error");
+        assert!(
+            fd_alert.message.contains("FD exhaustion is imminent")
+                && fd_alert.message.contains("ulimit -n"),
+            "fd alert must prescribe raising the fd limit: {fd_alert:?}"
+        );
+    }
+
+    #[test]
+    fn derive_backpressure_alerts_warns_on_pool_pressure_without_errors() {
+        let pool = mcp_agent_mail_core::DbMetricsSnapshot {
+            pool_total_connections: 10,
+            pool_active_connections: 9,
+            pool_utilization_pct: 90,
+            pool_pending_requests: 2,
+            pool_acquire_errors_total: 0,
+            ..Default::default()
+        };
+        let fd = mcp_agent_mail_core::FdMetricsSnapshot::default();
+        let alerts = derive_backpressure_alerts(&pool, &fd);
+        assert_eq!(alerts.len(), 1, "expected a single pool-pressure warning");
+        assert_eq!(alerts[0].severity, "warn");
+        assert!(
+            alerts[0].message.contains("under pressure")
+                && alerts[0].message.contains("reduce concurrent agents"),
+            "warning must carry the next-step list: {:?}",
+            alerts[0]
+        );
+    }
+
+    #[test]
+    fn fd_metrics_snapshot_is_self_consistent() {
+        // The core helper is best-effort; assert internal consistency rather than
+        // exact values (which depend on the host's ulimit).
+        let fd = mcp_agent_mail_core::fd_metrics_snapshot();
+        if let (Some(open), Some(soft), Some(util)) =
+            (fd.open_fds, fd.soft_limit, fd.utilization_pct)
+        {
+            assert!(soft > 0, "a present soft limit must be positive");
+            let expected = (open.saturating_mul(100) / soft).min(100);
+            assert_eq!(
+                util, expected,
+                "utilization must equal open/soft*100 clamped"
+            );
+        }
     }
 
     #[test]

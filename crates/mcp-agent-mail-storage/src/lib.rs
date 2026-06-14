@@ -4681,6 +4681,24 @@ fn repo_cache_insert(root: &Path) {
     map.insert(root.to_path_buf(), true);
 }
 
+/// Number of distinct git repo roots currently tracked in the path cache.
+///
+/// This cache stores repo *paths* so repeated lookups skip a filesystem scan;
+/// it does **not** hold open file descriptors. Its size is therefore an upper
+/// bound on distinct repos touched by this process, not a count of held FDs —
+/// evicting it frees zero descriptors. This distinction is why FD-exhaustion
+/// recovery must not advise a blind retry after a cache eviction that "frees 0"
+/// (see bead K5/D3 and the `am doctor` FD-exhaustion guidance). Surfaced by
+/// `am robot metrics` as an informational backpressure signal.
+#[must_use]
+pub fn repo_cache_len() -> usize {
+    let guard = REPO_CACHE.lock();
+    match guard.as_ref() {
+        Some(map) => map.len(),
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 fn repo_cache_clear_for_test() {
     let mut guard = REPO_CACHE.lock();

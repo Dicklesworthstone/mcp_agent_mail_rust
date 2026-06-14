@@ -905,12 +905,15 @@ fn fd_pressure_for(class: DbErrorClass, detail: &str) -> Option<DbFailureFdPress
     if class != DbErrorClass::FdExhaustion {
         return None;
     }
-    let (soft_limit, hard_limit) = read_fd_limits();
+    // FD limit / open-fd reads live in `mcp_agent_mail_core::metrics` so the
+    // doctor error envelope and the `am robot metrics` surface (K5) share one
+    // implementation rather than duplicating the `/proc` parsing.
+    let (soft_limit, hard_limit) = mcp_agent_mail_core::read_fd_limits();
     let eviction_freed = fd_eviction_freed(detail);
     Some(DbFailureFdPressure {
         soft_limit,
         hard_limit,
-        open_fds: count_open_fds(),
+        open_fds: mcp_agent_mail_core::count_open_fds(),
         eviction_freed,
         immediate_retry_useful: eviction_freed != Some(0),
         next_action: fd_next_action(eviction_freed),
@@ -951,39 +954,6 @@ pub fn fd_eviction_freed(detail: &str) -> Option<u64> {
         return None;
     }
     digits.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn read_fd_limits() -> (Option<u64>, Option<u64>) {
-    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
-        return (None, None);
-    };
-    for line in limits.lines() {
-        if let Some(rest) = line.strip_prefix("Max open files") {
-            let mut fields = rest.split_whitespace();
-            let soft = fields.next().and_then(|v| v.parse().ok());
-            let hard = fields.next().and_then(|v| v.parse().ok());
-            return (soft, hard);
-        }
-    }
-    (None, None)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_fd_limits() -> (Option<u64>, Option<u64>) {
-    (None, None)
-}
-
-#[cfg(target_os = "linux")]
-fn count_open_fds() -> Option<u64> {
-    std::fs::read_dir("/proc/self/fd")
-        .ok()
-        .and_then(|entries| u64::try_from(entries.count()).ok())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn count_open_fds() -> Option<u64> {
-    None
 }
 
 /// Check whether an error message indicates a database lock/busy condition.

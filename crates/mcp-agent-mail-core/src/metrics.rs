@@ -491,6 +491,92 @@ impl DbMetrics {
     }
 }
 
+/// File-descriptor pressure for the current process, sampled live from the OS.
+///
+/// Unlike the pool gauges in [`DbMetricsSnapshot`] (which accumulate over a
+/// process's lifetime), these are read on demand — from `/proc/self/limits`
+/// and `/proc/self/fd` on Linux — so they stay meaningful even in a fresh,
+/// short-lived CLI process. The soft/hard limits reflect the inherited
+/// `ulimit -n` of the environment, so they are useful even when this
+/// particular process holds few descriptors. On non-Linux platforms the
+/// fields are `None` (the readers are best-effort and never fatal).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FdMetricsSnapshot {
+    /// Soft `RLIMIT_NOFILE` — the limit that actually bites. `None` if unknown.
+    pub soft_limit: Option<u64>,
+    /// Hard `RLIMIT_NOFILE` ceiling. `None` if unknown.
+    pub hard_limit: Option<u64>,
+    /// Approximate count of open file descriptors for this process.
+    pub open_fds: Option<u64>,
+    /// `open_fds / soft_limit` as a 0..=100 percentage. `None` when either
+    /// input is unavailable or the soft limit is zero.
+    pub utilization_pct: Option<u64>,
+}
+
+/// Read the soft/hard `RLIMIT_NOFILE` for the current process.
+///
+/// Linux parses `/proc/self/limits`; other platforms (and unreadable files)
+/// return `(None, None)`.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return (None, None);
+    };
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            let mut fields = rest.split_whitespace();
+            let soft = fields.next().and_then(|v| v.parse().ok());
+            let hard = fields.next().and_then(|v| v.parse().ok());
+            return (soft, hard);
+        }
+    }
+    (None, None)
+}
+
+/// Read the soft/hard `RLIMIT_NOFILE` for the current process (non-Linux stub).
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub fn read_fd_limits() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+/// Count open file descriptors for the current process.
+///
+/// Linux counts `/proc/self/fd` entries; other platforms (and unreadable
+/// directories) return `None`.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn count_open_fds() -> Option<u64> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .and_then(|entries| u64::try_from(entries.count()).ok())
+}
+
+/// Count open file descriptors for the current process (non-Linux stub).
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub fn count_open_fds() -> Option<u64> {
+    None
+}
+
+/// Sample live file-descriptor pressure for the current process.
+#[must_use]
+pub fn fd_metrics_snapshot() -> FdMetricsSnapshot {
+    let (soft_limit, hard_limit) = read_fd_limits();
+    let open_fds = count_open_fds();
+    let utilization_pct = match (open_fds, soft_limit) {
+        (Some(open), Some(soft)) if soft > 0 => Some(percentage_clamped(open, soft)),
+        _ => None,
+    };
+    FdMetricsSnapshot {
+        soft_limit,
+        hard_limit,
+        open_fds,
+        utilization_pct,
+    }
+}
+
 #[inline]
 pub(crate) fn percentage_clamped(value: u64, total: u64) -> u64 {
     if total == 0 {
@@ -1874,6 +1960,36 @@ pub fn global_metrics() -> &'static GlobalMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fd_metrics_snapshot_shape_and_consistency() {
+        // K5 (br-bvq1x.11.5): the FD pressure snapshot feeds `am robot metrics`;
+        // keep its JSON shape stable and its utilization internally consistent.
+        let snap = fd_metrics_snapshot();
+        let json = serde_json::to_value(&snap).expect("serialize FdMetricsSnapshot");
+        for key in ["soft_limit", "hard_limit", "open_fds", "utilization_pct"] {
+            assert!(
+                json.get(key).is_some(),
+                "FdMetricsSnapshot must expose `{key}`: {json}"
+            );
+        }
+        if let (Some(open), Some(soft), Some(util)) =
+            (snap.open_fds, snap.soft_limit, snap.utilization_pct)
+        {
+            assert!(soft > 0, "a present soft limit must be positive");
+            assert_eq!(util, percentage_clamped(open, soft));
+            assert!(util <= 100, "utilization is a clamped percentage");
+        }
+    }
+
+    #[test]
+    fn fd_metrics_snapshot_default_is_all_none() {
+        let snap = FdMetricsSnapshot::default();
+        assert!(snap.soft_limit.is_none());
+        assert!(snap.hard_limit.is_none());
+        assert!(snap.open_fds.is_none());
+        assert!(snap.utilization_pct.is_none());
+    }
 
     #[test]
     fn log2_bucket_indexing_smoke() {

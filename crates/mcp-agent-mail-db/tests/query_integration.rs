@@ -654,6 +654,59 @@ fn fetch_inbox_for_nonexistent_agent_returns_empty() {
 }
 
 #[test]
+fn fetch_inbox_query_is_bounded_by_limit() {
+    // K5 (br-bvq1x.11.5): the inbox/poll read path must be bounded so a busy
+    // agent never pulls an unbounded result set that holds a connection and
+    // starves the pool. Verify the DB-level LIMIT actually clamps the row count.
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let sender = setup_agent(&pool, pid, "BlueLake");
+    let recipient = setup_agent(&pool, pid, "GreenStone");
+
+    let total = 8usize;
+    for i in 0..total {
+        let _ = send_msg(
+            &pool,
+            pid,
+            sender,
+            recipient,
+            &format!("msg {i}"),
+            "body",
+            None,
+        );
+    }
+
+    // A small limit must clamp the result set even though more messages exist.
+    let pool_limit = pool.clone();
+    let bounded = block_on(|cx| async move {
+        match queries::fetch_inbox(&cx, &pool_limit, pid, recipient, false, None, 3).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("fetch_inbox(limit=3) failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        bounded.len(),
+        3,
+        "fetch_inbox must return at most `limit` rows; got {}",
+        bounded.len()
+    );
+
+    // A limit above the message count returns everything (no spurious truncation).
+    let pool_all = pool.clone();
+    let all = block_on(|cx| async move {
+        match queries::fetch_inbox(&cx, &pool_all, pid, recipient, false, None, 100).await {
+            Outcome::Ok(rows) => rows,
+            other => panic!("fetch_inbox(limit=100) failed: {other:?}"),
+        }
+    });
+    assert_eq!(
+        all.len(),
+        total,
+        "fetch_inbox must return all messages when under the limit"
+    );
+}
+
+#[test]
 fn get_message_nonexistent_returns_not_found() {
     let (pool, _dir) = make_pool();
     let pool2 = pool.clone();
