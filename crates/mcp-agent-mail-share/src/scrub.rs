@@ -102,6 +102,12 @@ struct ScrubConfig {
     drop_recipient_metadata: bool,
     clear_file_reservations: bool,
     clear_agent_links: bool,
+    /// Drop the global `tool_metrics_snapshots` telemetry. This table is not
+    /// keyed by project, so it survives project scoping and would otherwise ship
+    /// cross-project tool usage (names, capabilities, latencies, call/error
+    /// counts) in a shared bundle. Cleared for sharing presets; kept for the
+    /// full-fidelity archive preset.
+    clear_tool_metrics: bool,
 }
 
 fn preset_config(preset: ScrubPreset) -> ScrubConfig {
@@ -117,6 +123,7 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             drop_recipient_metadata: false,
             clear_file_reservations: true,
             clear_agent_links: true,
+            clear_tool_metrics: true,
         },
         ScrubPreset::Strict => ScrubConfig {
             redact_body: true,
@@ -129,6 +136,7 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             drop_recipient_metadata: true,
             clear_file_reservations: true,
             clear_agent_links: true,
+            clear_tool_metrics: true,
         },
         ScrubPreset::Archive => ScrubConfig {
             redact_body: false,
@@ -141,6 +149,7 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             drop_recipient_metadata: false,
             clear_file_reservations: false,
             clear_agent_links: false,
+            clear_tool_metrics: false,
         },
     }
 }
@@ -268,6 +277,14 @@ pub fn scrub_snapshot(
         } else {
             0
         };
+
+        // Drop global tool telemetry. `tool_metrics_snapshots` is not keyed by
+        // project, so project scoping never filters it; left in place it would
+        // ship cross-project tool usage (names, capabilities, latencies, call /
+        // error counts) inside a shared bundle. Cleared for sharing presets.
+        if cfg.clear_tool_metrics && table_exists(&conn, "tool_metrics_snapshots")? {
+            exec_count(&conn, "DELETE FROM tool_metrics_snapshots", &[])?;
+        }
 
         let project_path_redactions = if cfg.redact_project_paths {
             redact_project_paths(&conn)?
@@ -1081,6 +1098,48 @@ mod tests {
         assert_eq!(summary.secrets_replaced, 0);
         assert_eq!(summary.bodies_redacted, 0);
         assert_eq!(summary.attachments_cleared, 0);
+    }
+
+    #[test]
+    fn scrub_clears_tool_metrics_for_sharing_presets_but_keeps_for_archive() {
+        // `tool_metrics_snapshots` is global, not project-keyed, so project
+        // scoping never filters it. A sharing export must drop it (it would
+        // otherwise leak cross-project tool telemetry); the full-fidelity
+        // archive preset must keep it.
+        fn seed_tool_metrics(db: &std::path::Path) {
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "CREATE TABLE tool_metrics_snapshots (id INTEGER PRIMARY KEY, tool_name TEXT, capabilities_json TEXT DEFAULT '', calls INTEGER DEFAULT 0)",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "INSERT INTO tool_metrics_snapshots (id, tool_name, capabilities_json, calls) VALUES (1, 'send_message', '[\"messaging\"]', 7)",
+            )
+            .unwrap();
+        }
+        fn tool_metrics_count(db: &std::path::Path) -> i64 {
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS cnt FROM tool_metrics_snapshots", &[])
+                .unwrap();
+            rows[0].get_named("cnt").unwrap_or(-1)
+        }
+
+        for (preset, expected, label) in [
+            (ScrubPreset::Standard, 0, "standard"),
+            (ScrubPreset::Strict, 0, "strict"),
+            (ScrubPreset::Archive, 1, "archive"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_tool_metrics(&db);
+            scrub_snapshot(&db, preset).unwrap();
+            assert_eq!(
+                tool_metrics_count(&db),
+                expected,
+                "tool_metrics_snapshots row count after {label} scrub"
+            );
+        }
     }
 
     #[test]
