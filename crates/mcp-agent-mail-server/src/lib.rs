@@ -3700,6 +3700,26 @@ async fn spawn_http_server_instance(
     let server_capabilities = server.capabilities().clone();
     let router = Arc::new(server.into_router());
     let addr = format!("{}:{}", config.http_host, config.http_port);
+    // am#149: warn loudly when bound beyond loopback with no auth configured.
+    // The loopback default is safe, but `HTTP_HOST=0.0.0.0`/a LAN IP with no
+    // bearer token or JWT exposes every route — including the mail UI's mutating
+    // POSTs — to the network unauthenticated.
+    let host_is_loopback = config.http_host.eq_ignore_ascii_case("localhost")
+        || config
+            .http_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    let auth_configured = config.http_bearer_token.is_some() || config.http_jwt_enabled;
+    if !host_is_loopback && !auth_configured {
+        tracing::warn!(
+            host = %config.http_host,
+            "binding to a non-loopback host with no bearer token or JWT configured: \
+             the mail server (including the web UI's mutating routes) is reachable \
+             unauthenticated from the network. Set a bearer token (http_bearer_token / \
+             the HTTP bearer-token env var) or enable JWT, or bind to 127.0.0.1."
+        );
+    }
     let request_diagnostics = Arc::new(HttpRequestRuntimeDiagnostics::default());
     let state = Arc::new(HttpState::new(
         router,
@@ -9755,7 +9775,8 @@ impl HttpState {
             (None, None, None)
         };
 
-        let resp = self.handle_inner(req).await;
+        let mut resp = self.handle_inner(req).await;
+        apply_security_headers(&mut resp);
         self.request_diagnostics
             .record_completed(&method_name, &path_for_diag, resp.status);
         let elapsed = start.elapsed();
@@ -10162,9 +10183,30 @@ impl HttpState {
         false
     }
 
+    /// CSRF protection for the mail web UI's mutating routes (am#149).
+    ///
+    /// Returns `Some(403)` for a POST request that fails the checks. The web UI
+    /// always issues its mutating POSTs with `Content-Type: application/json` and
+    /// a same-origin `Origin`, so this rejects only forged cross-site requests
+    /// (e.g. a `text/plain` form POST — a CORS "simple request" that needs no
+    /// preflight — which could otherwise reach the overseer-send route and inject
+    /// high-authority instructions into agent inboxes).
+    fn mail_csrf_rejection(&self, req: &Http1Request) -> Option<Http1Response> {
+        mail_csrf_reject_reason(req, &self.config.http_cors_origins)
+            .map(|detail| self.csrf_forbidden(req, detail))
+    }
+
+    fn csrf_forbidden(&self, req: &Http1Request, detail: &str) -> Http1Response {
+        let body = serde_json::json!({ "error": "forbidden", "detail": detail }).to_string();
+        self.raw_response(req, 403, "application/json", body.into_bytes())
+    }
+
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
         if !matches!(req.method, Http1Method::Get | Http1Method::Post) {
             return self.error_response(req, 405, "Method Not Allowed");
+        }
+        if let Some(rejection) = self.mail_csrf_rejection(req) {
+            return rejection;
         }
         let (_path_part, query_part) = split_path_query(&req.uri);
         let query_str = query_part.as_deref().unwrap_or("");
@@ -15266,6 +15308,43 @@ fn apply_cors_headers(
     }
 }
 
+/// Apply baseline security response headers to every HTTP response.
+///
+/// These are safe for both the server-rendered `/mail/` web UI and the
+/// JSON-RPC/API surface, and close the response-header gap flagged in the
+/// static security review (am#149). In particular, `Referrer-Policy:
+/// no-referrer` keeps a `?token=` query string (which browsers append for
+/// the web UI, since they cannot set an `Authorization` header) from leaking
+/// to the CDN scripts the UI loads via the `Referer` header (review item #10):
+///
+/// - `X-Content-Type-Options: nosniff` — defeats MIME sniffing.
+/// - `Referrer-Policy: no-referrer` — never emit a `Referer` header.
+/// - `X-Frame-Options: DENY` — the web UI is never meant to be framed.
+///
+/// A restrictive `Content-Security-Policy` is intentionally *not* set here:
+/// the web UI loads scripts from a CDN and relies on inline attributes, so a
+/// strict CSP would break it. That hardening belongs behind a vetted reverse
+/// proxy for any deployment exposed beyond loopback.
+///
+/// Headers are only added when absent so a specific route can still override
+/// them (none currently do).
+fn apply_security_headers(resp: &mut Http1Response) {
+    const SECURITY_HEADERS: [(&str, &str); 3] = [
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("x-frame-options", "DENY"),
+    ];
+    for (name, value) in SECURITY_HEADERS {
+        let already_present = resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name));
+        if !already_present {
+            resp.headers.push((name.to_string(), value.to_string()));
+        }
+    }
+}
+
 fn cors_list_value(values: &[String]) -> String {
     if values.is_empty() {
         return "*".to_string();
@@ -15289,6 +15368,61 @@ fn header_value<'a>(req: &'a Http1Request, name: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k.to_lowercase() == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// CSRF decision for a mutating mail-UI request (am#149). Returns `Some(reason)`
+/// when the request should be rejected with 403. Only POST requests are checked;
+/// the web UI always sends `Content-Type: application/json` with a same-origin
+/// `Origin`, so this rejects only forged cross-site requests (e.g. a `text/plain`
+/// form POST that stays a CORS "simple request" and skips the preflight).
+fn mail_csrf_reject_reason(req: &Http1Request, cors_origins: &[String]) -> Option<&'static str> {
+    if !matches!(req.method, Http1Method::Post) {
+        return None;
+    }
+    // 1. Require a JSON content type — a forged cross-site POST cannot set
+    //    `application/json` without triggering a CORS preflight.
+    let content_type_is_json = header_value(req, "content-type")
+        .and_then(|value| value.split(';').next())
+        .map(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false);
+    if !content_type_is_json {
+        return Some("mutating mail requests require Content-Type: application/json");
+    }
+    // 2. If a browser sent Origin (or Referer), it must be same-origin with the
+    //    request Host or an explicitly configured CORS origin. Requests with
+    //    neither header (non-browser API clients) pass — the CSRF threat is a
+    //    malicious page, which always sends Origin on a cross-origin POST.
+    if let Some(origin) = header_value(req, "origin").or_else(|| header_value(req, "referer"))
+        && !origin_is_trusted(req, origin, cors_origins)
+    {
+        return Some("cross-origin request rejected");
+    }
+    None
+}
+
+/// True when `origin` (an `Origin` value or a `Referer` URL) is same-origin with
+/// the request's `Host`, or is allowed by the configured CORS origin list.
+fn origin_is_trusted(req: &Http1Request, origin: &str, cors_origins: &[String]) -> bool {
+    // Reduce `scheme://host:port/maybe/path` (Referer carries a path) to `host:port`.
+    let origin_authority = origin
+        .split_once("://")
+        .map_or(origin, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if origin_authority.is_empty() {
+        return false;
+    }
+    if let Some(host) = header_value(req, "host")
+        && origin_authority.eq_ignore_ascii_case(host)
+    {
+        return true;
+    }
+    // Only an *explicitly* listed origin is trusted — NOT `cors_allows`, which
+    // treats an empty origin list (the dev default) or a `*` wildcard as
+    // allow-all. Honoring those here would defeat the CSRF guard in exactly the
+    // default configuration it's meant to protect (am#149).
+    cors_explicitly_allows(cors_origins, origin)
 }
 
 #[allow(dead_code)]
@@ -17780,6 +17914,114 @@ first body
             .map(|(_, v)| v.as_str())
     }
 
+    #[test]
+    fn csrf_guard_rejects_non_json_and_cross_origin_mutations() {
+        let no_cors: &[String] = &[];
+        let send = "/mail/p/overseer/send";
+
+        // GET is never a CSRF concern.
+        assert!(
+            mail_csrf_reject_reason(&make_request(Http1Method::Get, "/mail/p", &[]), no_cors)
+                .is_none()
+        );
+
+        // POST without application/json is rejected (the text/plain form-POST vector).
+        assert_eq!(
+            mail_csrf_reject_reason(
+                &make_request(
+                    Http1Method::Post,
+                    send,
+                    &[("content-type", "text/plain"), ("host", "localhost:8080")],
+                ),
+                no_cors,
+            ),
+            Some("mutating mail requests require Content-Type: application/json"),
+        );
+
+        // POST with no content-type at all is rejected.
+        assert!(
+            mail_csrf_reject_reason(
+                &make_request(Http1Method::Post, send, &[("host", "localhost:8080")]),
+                no_cors,
+            )
+            .is_some()
+        );
+
+        // Same-origin JSON POST passes (the legitimate web UI), via Origin or Referer.
+        for header in [
+            ("origin", "http://localhost:8080"),
+            ("referer", "http://localhost:8080/mail/p"),
+        ] {
+            assert!(
+                mail_csrf_reject_reason(
+                    &make_request(
+                        Http1Method::Post,
+                        send,
+                        &[
+                            ("content-type", "application/json"),
+                            ("host", "localhost:8080"),
+                            header
+                        ],
+                    ),
+                    no_cors,
+                )
+                .is_none(),
+                "same-origin {header:?} should pass",
+            );
+        }
+
+        // Cross-origin JSON POST is rejected even with the right content type.
+        assert_eq!(
+            mail_csrf_reject_reason(
+                &make_request(
+                    Http1Method::Post,
+                    send,
+                    &[
+                        ("content-type", "application/json"),
+                        ("host", "localhost:8080"),
+                        ("origin", "https://evil.example"),
+                    ],
+                ),
+                no_cors,
+            ),
+            Some("cross-origin request rejected"),
+        );
+
+        // JSON POST with no Origin/Referer passes (non-browser API client).
+        assert!(
+            mail_csrf_reject_reason(
+                &make_request(
+                    Http1Method::Post,
+                    send,
+                    &[
+                        ("content-type", "application/json"),
+                        ("host", "localhost:8080")
+                    ],
+                ),
+                no_cors,
+            )
+            .is_none()
+        );
+
+        // An explicitly configured CORS origin is honored.
+        let allowed = vec!["https://trusted.example".to_string()];
+        assert!(
+            mail_csrf_reject_reason(
+                &make_request(
+                    Http1Method::Post,
+                    send,
+                    &[
+                        ("content-type", "application/json"),
+                        ("host", "localhost:8080"),
+                        ("origin", "https://trusted.example"),
+                    ],
+                ),
+                &allowed,
+            )
+            .is_none()
+        );
+    }
+
     fn injected_pane_id(request: &JsonRpcRequest) -> Option<&str> {
         request
             .params
@@ -19271,6 +19513,45 @@ first body
             response_header(&resp, "access-control-allow-origin"),
             Some("*")
         );
+    }
+
+    #[test]
+    fn security_headers_present_on_every_response() {
+        // am#149: baseline security headers must ride on all responses,
+        // including auth-bypassed health routes, regardless of CORS config.
+        let state = build_state(mcp_agent_mail_core::Config::default());
+        let req = make_request(Http1Method::Get, "/health/liveness", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            response_header(&resp, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_header(&resp, "referrer-policy"),
+            Some("no-referrer")
+        );
+        assert_eq!(response_header(&resp, "x-frame-options"), Some("DENY"));
+    }
+
+    #[test]
+    fn security_headers_present_on_unauthorized_response() {
+        // The 401 path is built independently of the success path; make sure
+        // it is hardened too.
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/api/", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        assert_eq!(
+            response_header(&resp, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(response_header(&resp, "x-frame-options"), Some("DENY"));
     }
 
     #[test]
