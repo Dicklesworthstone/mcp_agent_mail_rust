@@ -75,6 +75,7 @@ pub mod search_service;
 pub mod search_updater;
 #[cfg(feature = "tantivy-engine")]
 pub mod search_v3;
+pub mod snapshot;
 pub mod sync;
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;

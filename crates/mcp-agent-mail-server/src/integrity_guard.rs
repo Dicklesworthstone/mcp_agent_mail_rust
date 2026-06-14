@@ -279,6 +279,20 @@ fn run_full_cycle(
     match pool.run_full_integrity_check() {
         Ok(_) => {
             tracing::info!("integrity guard: periodic full integrity check passed");
+            // Bead K2: a passing full check means the DB is verifiably clean —
+            // capture a last-known-healthy verified snapshot (best-effort; the
+            // call re-verifies and records metrics, and never fails the cycle).
+            match pool.create_verified_snapshot() {
+                Ok(Some(meta)) => tracing::debug!(
+                    snapshot = %meta.snapshot_path,
+                    "integrity guard: recorded verified snapshot"
+                ),
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "integrity guard: verified snapshot capture failed"
+                ),
+            }
             true
         }
         Err(err) => {

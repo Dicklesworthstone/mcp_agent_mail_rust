@@ -524,6 +524,63 @@ fn maintenance_ops_run_on_file_pool() {
     pool.vacuum().expect("repeat vacuum should succeed");
 }
 
+// =============================================================================
+// Test: Verified last-known-healthy snapshot (bead K2) via the pool wrapper.
+// =============================================================================
+
+#[test]
+fn create_verified_snapshot_records_metadata() {
+    let (pool, _dir) = make_pool(1, 2);
+
+    // Materialize + migrate the DB so the full integrity check has real content.
+    let setup_pool = pool.clone();
+    block_on(|cx| async move {
+        let key = format!("/tmp/k2_snap_{}", unique_suffix());
+        let _ = queries::ensure_project(&cx, &setup_pool, &key).await;
+    });
+
+    let before = mcp_agent_mail_core::global_metrics()
+        .db
+        .snapshot()
+        .snapshot_created_total;
+
+    let meta = pool
+        .create_verified_snapshot()
+        .expect("snapshot op should succeed")
+        .expect("a healthy DB must produce a verified snapshot");
+    assert!(
+        meta.integrity_verified,
+        "snapshot must be integrity-verified"
+    );
+    assert_eq!(meta.integrity_kind, "integrity_check");
+    assert!(meta.created_us > 0);
+
+    // The .bak + metadata sidecar exist next to the primary, and the snapshot is
+    // discoverable as the latest verified one.
+    let primary = std::path::Path::new(pool.sqlite_path());
+    assert!(
+        mcp_agent_mail_db::snapshot::snapshot_bak_path(primary).is_file(),
+        "verified snapshot .bak must exist"
+    );
+    assert!(
+        mcp_agent_mail_db::snapshot::snapshot_meta_path(primary).is_file(),
+        "verified snapshot metadata sidecar must exist"
+    );
+    assert!(
+        mcp_agent_mail_db::snapshot::latest_verified_snapshot(primary).is_some(),
+        "the recorded snapshot must be discoverable as latest-verified"
+    );
+
+    let after = mcp_agent_mail_core::global_metrics()
+        .db
+        .snapshot()
+        .snapshot_created_total;
+    assert!(
+        after > before,
+        "snapshot_created_total must advance: before={before} after={after}"
+    );
+}
+
 #[test]
 fn maintenance_ops_noop_on_memory_pool() {
     // :memory: databases have no file to checkpoint/vacuum; the ops must be

@@ -9826,6 +9826,38 @@ fn recover_sqlite_file_with_storage_root(
     // be honest about what recovery could and could not preserve.
     let salvage_before = count_salvage_rows(path);
 
+    // br-bvq1x.11.2 (K2): prefer the last-known-healthy VERIFIED snapshot — a
+    // backup that passed a full integrity check and carries metadata — as the
+    // fast, lossless recovery path before falling back to a generic backup or an
+    // archive rebuild. The restore re-verifies the snapshot before trusting it.
+    match mcp_agent_mail_db::snapshot::restore_from_verified_snapshot(path) {
+        Ok(Some(meta)) => {
+            reconcile_sqlite_file_with_archive(path, &storage_root)?;
+            let salvage_after = count_salvage_rows(path);
+            let suspect_rows = detect_salvage_suspect_typed_rows(path);
+            ftui_runtime::ftui_println!(
+                "Recovered from verified snapshot (taken {} UTC, full integrity-check verified, {} message rows).",
+                mcp_agent_mail_core::timestamps::micros_to_iso(meta.created_us),
+                meta.row_counts.get("messages").copied().unwrap_or(0),
+            );
+            emit_salvage_loss_report(
+                "verified-snapshot-restore",
+                &salvage_before,
+                &salvage_after,
+                &suspect_rows,
+            );
+            return Ok(());
+        }
+        Ok(None) => {
+            // No trustworthy verified snapshot; fall through to backup/archive.
+        }
+        Err(err) => {
+            ftui_runtime::ftui_eprintln!(
+                "Warning: verified-snapshot restore failed ({err}); falling back to backup/archive recovery."
+            );
+        }
+    }
+
     if let Some(backup_path) = backup {
         // Safety: copy backup to a temp path first, validate it, then
         // quarantine the original and swap in the validated copy.  This

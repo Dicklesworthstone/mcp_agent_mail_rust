@@ -445,6 +445,15 @@ pub struct DbMetrics {
     pub maintenance_last_vacuum_us: GaugeU64,
     /// Duration distribution across maintenance ops (microseconds).
     pub maintenance_duration_us: Log2Histogram,
+    /// Verified last-known-healthy snapshot lifecycle (bead K2): snapshots
+    /// recorded as known-healthy (a full integrity check passed first), attempts
+    /// where that pre-record check failed (nothing recorded), and recoveries
+    /// served from a verified snapshot instead of an archive rebuild.
+    pub snapshot_created_total: Counter,
+    pub snapshot_verify_failures_total: Counter,
+    pub snapshot_restored_total: Counter,
+    /// Wall-clock microsecond timestamp of the last verified snapshot recorded.
+    pub last_verified_snapshot_us: GaugeU64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -469,6 +478,10 @@ pub struct DbMetricsSnapshot {
     pub maintenance_last_analyze_us: u64,
     pub maintenance_last_vacuum_us: u64,
     pub maintenance_duration_us: HistogramSnapshot,
+    pub snapshot_created_total: u64,
+    pub snapshot_verify_failures_total: u64,
+    pub snapshot_restored_total: u64,
+    pub last_verified_snapshot_us: u64,
 }
 
 impl Default for DbMetrics {
@@ -493,6 +506,10 @@ impl Default for DbMetrics {
             maintenance_last_analyze_us: GaugeU64::new(),
             maintenance_last_vacuum_us: GaugeU64::new(),
             maintenance_duration_us: Log2Histogram::new(),
+            snapshot_created_total: Counter::new(),
+            snapshot_verify_failures_total: Counter::new(),
+            snapshot_restored_total: Counter::new(),
+            last_verified_snapshot_us: GaugeU64::new(),
         }
     }
 }
@@ -526,6 +543,10 @@ impl DbMetrics {
             maintenance_last_analyze_us: self.maintenance_last_analyze_us.load(),
             maintenance_last_vacuum_us: self.maintenance_last_vacuum_us.load(),
             maintenance_duration_us: self.maintenance_duration_us.snapshot(),
+            snapshot_created_total: self.snapshot_created_total.load(),
+            snapshot_verify_failures_total: self.snapshot_verify_failures_total.load(),
+            snapshot_restored_total: self.snapshot_restored_total.load(),
+            last_verified_snapshot_us: self.last_verified_snapshot_us.load(),
         }
     }
 }

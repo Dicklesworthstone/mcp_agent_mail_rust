@@ -3008,6 +3008,57 @@ impl DbPool {
         Ok(())
     }
 
+    /// Capture a *verified* last-known-healthy snapshot (bead K2).
+    ///
+    /// Runs a full `PRAGMA integrity_check` against the live database; only if
+    /// that passes does it refresh the proactive `.bak` (reusing
+    /// [`create_proactive_backup`](Self::create_proactive_backup)) and record a
+    /// metadata sidecar marking the snapshot as known-healthy (timestamp, row
+    /// counts, schema version). Returns `Ok(None)` — recording nothing — when
+    /// the live database is not verifiably clean, so a corrupt DB can never be
+    /// recorded as a known-good snapshot. No-ops for `:memory:` databases.
+    pub fn create_verified_snapshot(
+        &self,
+    ) -> DbResult<Option<crate::snapshot::VerifiedSnapshotMetadata>> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(None);
+        }
+        let primary = Path::new(&self.sqlite_path);
+        let db = &mcp_agent_mail_core::global_metrics().db;
+
+        // Verify the live DB is fully clean before trusting it as a snapshot.
+        let verdict =
+            crate::integrity::inspect_mailbox_integrity(primary, crate::integrity::CheckKind::Full);
+        if verdict.status != crate::integrity::MailboxIntegrityStatus::Healthy {
+            db.snapshot_verify_failures_total.inc();
+            tracing::debug!(
+                path = %self.sqlite_path,
+                status = ?verdict.status,
+                "verified snapshot skipped: live DB did not pass full integrity check"
+            );
+            return Ok(None);
+        }
+
+        // Refresh the .bak (reuses staged-copy + validate + atomic-swap). A zero
+        // max-age forces a fresh copy of the just-verified database.
+        let Some(bak) = self.create_proactive_backup(std::time::Duration::ZERO)? else {
+            return Ok(None);
+        };
+
+        let created_us = mcp_agent_mail_core::timestamps::now_micros();
+        let meta = crate::snapshot::record_snapshot_metadata(primary, created_us)?;
+        db.snapshot_created_total.inc();
+        db.last_verified_snapshot_us
+            .set(u64::try_from(created_us.max(0)).unwrap_or(0));
+        tracing::info!(
+            path = %self.sqlite_path,
+            snapshot = %bak.display(),
+            messages = meta.row_counts.get("messages").copied().unwrap_or(0),
+            "recorded verified last-known-healthy snapshot"
+        );
+        Ok(Some(meta))
+    }
+
     /// Attempt one-shot recovery from `SQLite` corruption detected at runtime.
     ///
     /// This should be called when a query returns a corruption error
@@ -4741,7 +4792,11 @@ fn os_string_with_suffix(value: &OsStr, suffix: &str) -> OsString {
 }
 
 #[must_use]
-fn sqlite_path_with_file_name_suffix(path: &Path, suffix: &str, fallback: &str) -> PathBuf {
+pub(crate) fn sqlite_path_with_file_name_suffix(
+    path: &Path,
+    suffix: &str,
+    fallback: &str,
+) -> PathBuf {
     match path.file_name() {
         Some(file_name) => path.with_file_name(os_string_with_suffix(file_name, suffix)),
         None => path.with_file_name(fallback),
