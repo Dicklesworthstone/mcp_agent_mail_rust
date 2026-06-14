@@ -430,6 +430,21 @@ pub struct DbMetrics {
     /// than re-spinning the futile recovery loop) so the caller surfaces a
     /// terminal error instead.
     pub bespoke_parser_only_rejections_total: Counter,
+    /// Periodic maintenance op counts (bead K4): successful background
+    /// passive WAL checkpoints, `ANALYZE` runs, and `VACUUM` runs.
+    pub maintenance_checkpoint_runs_total: Counter,
+    pub maintenance_analyze_runs_total: Counter,
+    pub maintenance_vacuum_runs_total: Counter,
+    /// Count of background maintenance ops that errored (logged + retried next
+    /// cycle; never fatal to the request path).
+    pub maintenance_failures_total: Counter,
+    /// Wall-clock microsecond timestamp of the last successful run, per op, so
+    /// operators can confirm maintenance is actually firing on schedule.
+    pub maintenance_last_checkpoint_us: GaugeU64,
+    pub maintenance_last_analyze_us: GaugeU64,
+    pub maintenance_last_vacuum_us: GaugeU64,
+    /// Duration distribution across maintenance ops (microseconds).
+    pub maintenance_duration_us: Log2Histogram,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -446,6 +461,14 @@ pub struct DbMetricsSnapshot {
     pub pool_over_80_since_us: u64,
     pub integrity_failures_total: u64,
     pub bespoke_parser_only_rejections_total: u64,
+    pub maintenance_checkpoint_runs_total: u64,
+    pub maintenance_analyze_runs_total: u64,
+    pub maintenance_vacuum_runs_total: u64,
+    pub maintenance_failures_total: u64,
+    pub maintenance_last_checkpoint_us: u64,
+    pub maintenance_last_analyze_us: u64,
+    pub maintenance_last_vacuum_us: u64,
+    pub maintenance_duration_us: HistogramSnapshot,
 }
 
 impl Default for DbMetrics {
@@ -462,6 +485,14 @@ impl Default for DbMetrics {
             pool_over_80_since_us: GaugeU64::new(),
             integrity_failures_total: Counter::new(),
             bespoke_parser_only_rejections_total: Counter::new(),
+            maintenance_checkpoint_runs_total: Counter::new(),
+            maintenance_analyze_runs_total: Counter::new(),
+            maintenance_vacuum_runs_total: Counter::new(),
+            maintenance_failures_total: Counter::new(),
+            maintenance_last_checkpoint_us: GaugeU64::new(),
+            maintenance_last_analyze_us: GaugeU64::new(),
+            maintenance_last_vacuum_us: GaugeU64::new(),
+            maintenance_duration_us: Log2Histogram::new(),
         }
     }
 }
@@ -487,6 +518,14 @@ impl DbMetrics {
             pool_over_80_since_us: self.pool_over_80_since_us.load(),
             integrity_failures_total: self.integrity_failures_total.load(),
             bespoke_parser_only_rejections_total: self.bespoke_parser_only_rejections_total.load(),
+            maintenance_checkpoint_runs_total: self.maintenance_checkpoint_runs_total.load(),
+            maintenance_analyze_runs_total: self.maintenance_analyze_runs_total.load(),
+            maintenance_vacuum_runs_total: self.maintenance_vacuum_runs_total.load(),
+            maintenance_failures_total: self.maintenance_failures_total.load(),
+            maintenance_last_checkpoint_us: self.maintenance_last_checkpoint_us.load(),
+            maintenance_last_analyze_us: self.maintenance_last_analyze_us.load(),
+            maintenance_last_vacuum_us: self.maintenance_last_vacuum_us.load(),
+            maintenance_duration_us: self.maintenance_duration_us.snapshot(),
         }
     }
 }

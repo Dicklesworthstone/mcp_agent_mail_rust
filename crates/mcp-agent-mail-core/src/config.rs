@@ -168,6 +168,13 @@ pub struct Config {
     pub archive_maintenance_enabled: bool,
     pub archive_maintenance_interval_secs: u64,
 
+    // Periodic SQLite maintenance (background, off the request hot path; bead K4)
+    pub db_maintenance_enabled: bool,
+    pub db_checkpoint_interval_secs: u64,
+    pub db_analyze_interval_secs: u64,
+    pub db_vacuum_interval_secs: u64,
+    pub db_journal_size_limit_bytes: u64,
+
     // Periodic git health sweep (read-only orphan-ref detection)
     pub health_sweep_enabled: bool,
     pub health_sweep_interval_seconds: u64,
@@ -1206,6 +1213,13 @@ impl Default for Config {
             archive_maintenance_enabled: true,
             archive_maintenance_interval_secs: 1800, // 30 minutes
 
+            // Periodic SQLite maintenance (bead K4)
+            db_maintenance_enabled: true,
+            db_checkpoint_interval_secs: 300, // passive WAL checkpoint every 5 min
+            db_analyze_interval_secs: 21_600, // refresh planner stats every 6 h
+            db_vacuum_interval_secs: 86_400,  // reclaim/defragment daily (0 disables)
+            db_journal_size_limit_bytes: 268_435_456, // 256 MiB WAL truncation cap
+
             // Periodic git health sweep
             health_sweep_enabled: true,
             health_sweep_interval_seconds: 900, // 15 minutes
@@ -1632,6 +1646,24 @@ impl Config {
         config.integrity_check_interval_hours = env_u64(
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,
+        );
+
+        // Periodic SQLite maintenance knobs (bead K4). Each interval is in
+        // seconds; 0 disables that op (and `DB_MAINTENANCE_ENABLED=false`
+        // disables the whole maintenance cycle).
+        config.db_maintenance_enabled =
+            env_bool("DB_MAINTENANCE_ENABLED", config.db_maintenance_enabled);
+        config.db_checkpoint_interval_secs = env_u64(
+            "DB_CHECKPOINT_INTERVAL_SECS",
+            config.db_checkpoint_interval_secs,
+        );
+        config.db_analyze_interval_secs =
+            env_u64("DB_ANALYZE_INTERVAL_SECS", config.db_analyze_interval_secs);
+        config.db_vacuum_interval_secs =
+            env_u64("DB_VACUUM_INTERVAL_SECS", config.db_vacuum_interval_secs);
+        config.db_journal_size_limit_bytes = env_u64(
+            "DB_JOURNAL_SIZE_LIMIT_BYTES",
+            config.db_journal_size_limit_bytes,
         );
 
         // FrankenSQLite MVCC / RaptorQ

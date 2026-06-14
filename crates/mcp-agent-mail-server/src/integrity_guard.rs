@@ -175,6 +175,14 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
 
     let mut last_full_attempt: Option<Instant> = None;
     let mut last_recovery_attempt: Option<Instant> = None;
+    // Bead K4: seed the maintenance schedule at "now" so the first checkpoint /
+    // analyze / vacuum fires only after one full interval — never a heavy
+    // startup VACUUM storm. These live on the integrity-guard worker thread, so
+    // maintenance always runs off the request/dispatch hot path.
+    let maintenance_start = Instant::now();
+    let mut last_checkpoint: Option<Instant> = Some(maintenance_start);
+    let mut last_analyze: Option<Instant> = Some(maintenance_start);
+    let mut last_vacuum: Option<Instant> = Some(maintenance_start);
     let mut skip_first_quick_cycle = SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel);
 
     loop {
@@ -207,6 +215,17 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             );
             last_full_attempt = Some(attempted_at);
         }
+
+        // Bead K4: bounded SQLite maintenance (checkpoint / analyze / vacuum /
+        // journal_size_limit) on independent cadences, off the hot path.
+        run_db_maintenance_cycle(
+            &pool,
+            config,
+            Instant::now(),
+            &mut last_checkpoint,
+            &mut last_analyze,
+            &mut last_vacuum,
+        );
 
         // Sleep in short increments so shutdown reacts quickly.
         let mut remaining = quick_every;
@@ -272,6 +291,116 @@ fn run_full_cycle(
             );
             false
         }
+    }
+}
+
+/// Whether a maintenance task with cadence `interval_secs` is due, given when
+/// it last ran (`last`) relative to `now`.
+///
+/// `interval_secs == 0` disables the task; a task that has never run is always
+/// due. Pure (no clock/IO) so the maintenance schedule is unit-testable without
+/// real time (bead K4).
+fn maintenance_task_due(interval_secs: u64, last: Option<Instant>, now: Instant) -> bool {
+    if interval_secs == 0 {
+        return false;
+    }
+    last.map_or(true, |last| {
+        now.saturating_duration_since(last) >= Duration::from_secs(interval_secs)
+    })
+}
+
+/// Run one maintenance op, timing it and recording per-op metrics.
+///
+/// Success bumps the op's run counter, records the duration in the shared
+/// maintenance-duration histogram, and stamps the op's last-run gauge. Failure
+/// bumps the shared failure counter and logs — maintenance never propagates an
+/// error to the worker loop or the request path.
+fn run_maintenance_op<F, E>(
+    op: &str,
+    run: F,
+    runs_total: &mcp_agent_mail_core::Counter,
+    last_run_us: &mcp_agent_mail_core::GaugeU64,
+) where
+    F: FnOnce() -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    let db = &mcp_agent_mail_core::global_metrics().db;
+    let started = Instant::now();
+    match run() {
+        Ok(()) => {
+            let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            db.maintenance_duration_us.record(elapsed_us);
+            runs_total.inc();
+            let now_us =
+                u64::try_from(mcp_agent_mail_core::timestamps::now_micros().max(0)).unwrap_or(0);
+            last_run_us.set(now_us);
+            tracing::debug!(op, elapsed_us, "db maintenance op completed");
+        }
+        Err(err) => {
+            db.maintenance_failures_total.inc();
+            tracing::warn!(op, error = %err, "db maintenance op failed; will retry next cycle");
+        }
+    }
+}
+
+/// Run any due background SQLite maintenance ops (bead K4): passive WAL
+/// checkpoint, `ANALYZE`, and `VACUUM`, each on its own configured cadence, plus
+/// re-applying the configured `journal_size_limit`.
+///
+/// Runs on the integrity-guard worker thread against its own connection, so it
+/// never touches the request/dispatch hot path. Each op is bounded and
+/// best-effort: failures are recorded and retried on the next cycle, never
+/// fatal. The `last_*` cursors are advanced whenever a task is attempted so a
+/// persistently-failing op still backs off to its interval instead of spinning.
+fn run_db_maintenance_cycle(
+    pool: &DbPool,
+    config: &Config,
+    now: Instant,
+    last_checkpoint: &mut Option<Instant>,
+    last_analyze: &mut Option<Instant>,
+    last_vacuum: &mut Option<Instant>,
+) {
+    if !config.db_maintenance_enabled {
+        return;
+    }
+    let db = &mcp_agent_mail_core::global_metrics().db;
+
+    // Bound WAL growth (cheap, idempotent) so a checkpoint truncates back to the
+    // configured cap.
+    if config.db_journal_size_limit_bytes > 0
+        && let Err(err) = pool.set_journal_size_limit(config.db_journal_size_limit_bytes)
+    {
+        tracing::debug!(error = %err, "db maintenance: journal_size_limit apply failed");
+    }
+
+    if maintenance_task_due(config.db_checkpoint_interval_secs, *last_checkpoint, now) {
+        run_maintenance_op(
+            "passive_wal_checkpoint",
+            || pool.wal_checkpoint_passive().map(|_frames| ()),
+            &db.maintenance_checkpoint_runs_total,
+            &db.maintenance_last_checkpoint_us,
+        );
+        *last_checkpoint = Some(now);
+    }
+
+    if maintenance_task_due(config.db_analyze_interval_secs, *last_analyze, now) {
+        run_maintenance_op(
+            "analyze",
+            || pool.analyze(),
+            &db.maintenance_analyze_runs_total,
+            &db.maintenance_last_analyze_us,
+        );
+        *last_analyze = Some(now);
+    }
+
+    if maintenance_task_due(config.db_vacuum_interval_secs, *last_vacuum, now) {
+        run_maintenance_op(
+            "vacuum",
+            || pool.vacuum(),
+            &db.maintenance_vacuum_runs_total,
+            &db.maintenance_last_vacuum_us,
+        );
+        *last_vacuum = Some(now);
     }
 }
 
@@ -631,6 +760,110 @@ mod tests {
         const _: () = assert!(
             BACKUP_MAX_AGE_SECS >= 600,
             "backup max age should be at least 10 minutes"
+        );
+    }
+
+    // ---- bead K4: periodic SQLite maintenance scheduling ----
+
+    #[test]
+    fn maintenance_task_due_disabled_when_interval_zero() {
+        let now = Instant::now();
+        assert!(
+            !maintenance_task_due(0, None, now),
+            "interval 0 disables the task"
+        );
+        assert!(!maintenance_task_due(0, Some(now), now));
+    }
+
+    #[test]
+    fn maintenance_task_due_when_never_run() {
+        let now = Instant::now();
+        assert!(
+            maintenance_task_due(300, None, now),
+            "a task that never ran is always due once enabled"
+        );
+    }
+
+    #[test]
+    fn maintenance_task_due_respects_interval() {
+        let now = Instant::now();
+        let recent = now
+            .checked_sub(Duration::from_secs(100))
+            .expect("recent instant");
+        let stale = now
+            .checked_sub(Duration::from_secs(400))
+            .expect("stale instant");
+        assert!(
+            !maintenance_task_due(300, Some(recent), now),
+            "100s elapsed < 300s interval: not due"
+        );
+        assert!(
+            maintenance_task_due(300, Some(stale), now),
+            "400s elapsed >= 300s interval: due"
+        );
+        assert!(
+            !maintenance_task_due(300, Some(now), now),
+            "just ran this instant: not due"
+        );
+    }
+
+    fn memory_maintenance_pool() -> DbPool {
+        let pool_config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..DbPoolConfig::default()
+        };
+        mcp_agent_mail_db::create_pool(&pool_config).expect("create in-memory maintenance pool")
+    }
+
+    #[test]
+    fn run_db_maintenance_cycle_noop_when_disabled() {
+        let config = Config {
+            db_maintenance_enabled: false,
+            ..Config::default()
+        };
+        let pool = memory_maintenance_pool();
+        let now = Instant::now();
+        let mut cp = None;
+        let mut an = None;
+        let mut va = None;
+        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va);
+        assert!(
+            cp.is_none() && an.is_none() && va.is_none(),
+            "disabled maintenance must not attempt or advance any task"
+        );
+    }
+
+    #[test]
+    fn run_db_maintenance_cycle_advances_due_tasks_and_backs_off() {
+        let config = Config {
+            db_maintenance_enabled: true,
+            db_checkpoint_interval_secs: 300,
+            db_analyze_interval_secs: 300,
+            db_vacuum_interval_secs: 300,
+            db_journal_size_limit_bytes: 268_435_456,
+            ..Config::default()
+        };
+        let pool = memory_maintenance_pool();
+        let now = Instant::now();
+
+        // All tasks never-run => all due => cursors advance to `now`. (Ops no-op
+        // on a :memory: pool but still record success and advance the cursor.)
+        let mut cp = None;
+        let mut an = None;
+        let mut va = None;
+        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va);
+        assert_eq!(cp, Some(now), "checkpoint cursor advanced");
+        assert_eq!(an, Some(now), "analyze cursor advanced");
+        assert_eq!(va, Some(now), "vacuum cursor advanced");
+
+        // Re-running at the same instant: cursors are fresh, so nothing is due
+        // and they must stay put (off-hot-path back-off).
+        let before = (cp, an, va);
+        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va);
+        assert_eq!(
+            (cp, an, va),
+            before,
+            "fresh cursors must not re-run within the interval"
         );
     }
 }

@@ -947,6 +947,7 @@ mod tests {
                 pool_over_80_since_us: 0,
                 integrity_failures_total: 0,
                 bespoke_parser_only_rejections_total: 0,
+                ..DbMetricsSnapshot::default()
             },
             storage: StorageMetricsSnapshot {
                 wbq_enqueued_total: 0,

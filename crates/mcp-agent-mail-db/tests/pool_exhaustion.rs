@@ -492,6 +492,61 @@ fn pool_acquire_records_global_db_metrics() {
 }
 
 // =============================================================================
+// Test: Periodic maintenance ops (bead K4) run on a real file-backed pool.
+// =============================================================================
+
+#[test]
+fn maintenance_ops_run_on_file_pool() {
+    let (pool, _dir) = make_pool(1, 2);
+
+    // Materialize the DB file + schema and write some rows so VACUUM/ANALYZE
+    // have real content to operate on.
+    let setup_pool = pool.clone();
+    block_on(|cx| async move {
+        let conn = unwrap_acquire!(setup_pool.acquire(&cx).await, "acquire to materialize db");
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS k4_probe (id INTEGER PRIMARY KEY, v TEXT)")
+            .expect("create probe table");
+        conn.execute_raw("INSERT INTO k4_probe (v) VALUES ('alpha'), ('beta'), ('gamma')")
+            .expect("insert probe rows");
+        drop(conn);
+    });
+
+    // Each K4 maintenance op must succeed against a real file-backed database.
+    pool.set_journal_size_limit(64 * 1024 * 1024)
+        .expect("set_journal_size_limit should succeed");
+    pool.wal_checkpoint_passive()
+        .expect("passive checkpoint should succeed");
+    pool.analyze().expect("analyze should succeed");
+    pool.vacuum().expect("vacuum should succeed");
+
+    // Ops are idempotent: a second pass also succeeds.
+    pool.analyze().expect("repeat analyze should succeed");
+    pool.vacuum().expect("repeat vacuum should succeed");
+}
+
+#[test]
+fn maintenance_ops_noop_on_memory_pool() {
+    // :memory: databases have no file to checkpoint/vacuum; the ops must be
+    // graceful no-ops rather than errors (bead K4).
+    let config = DbPoolConfig {
+        database_url: "sqlite:///:memory:".to_string(),
+        storage_root: None,
+        min_connections: 1,
+        max_connections: 1,
+        acquire_timeout_ms: 5_000,
+        max_lifetime_ms: 3_600_000,
+        run_migrations: true,
+        warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+    };
+    let pool = DbPool::new(&config).expect("create in-memory pool");
+    pool.set_journal_size_limit(1024)
+        .expect("memory journal_size_limit no-op");
+    pool.analyze().expect("memory analyze no-op");
+    pool.vacuum().expect("memory vacuum no-op");
+}
+
+// =============================================================================
 // Test: Warmup with pool_size=1 opens exactly 1 connection
 // =============================================================================
 

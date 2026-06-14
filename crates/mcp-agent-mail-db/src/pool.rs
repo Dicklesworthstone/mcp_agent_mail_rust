@@ -2949,6 +2949,65 @@ impl DbPool {
         Ok(Some(bak_path))
     }
 
+    /// Run `ANALYZE` to refresh the query planner's table/index statistics.
+    ///
+    /// Intended for the periodic maintenance worker (bead K4) running off the
+    /// latency-sensitive request path. Uses the canonical SQLite engine — the
+    /// same path `am doctor repair` uses for VACUUM/ANALYZE — and a bounded
+    /// `busy_timeout` so it backs off under write contention instead of erroring
+    /// immediately. No-ops for `:memory:` databases.
+    pub fn analyze(&self) -> DbResult<()> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(());
+        }
+        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("analyze: open failed: {e}")))?;
+        conn.execute_raw("PRAGMA busy_timeout = 5000;")
+            .map_err(|e| DbError::Sqlite(format!("analyze: busy_timeout: {e}")))?;
+        conn.execute_raw("ANALYZE;")
+            .map_err(|e| DbError::Sqlite(format!("analyze: {e}")))?;
+        Ok(())
+    }
+
+    /// Run `VACUUM` to reclaim free pages and defragment the database file.
+    ///
+    /// This rewrites the whole database, so it is a scheduled, infrequent,
+    /// off-hot-path operation (see the integrity guard's maintenance cycle, bead
+    /// K4). Uses the canonical SQLite engine and a generous `busy_timeout` so a
+    /// busy period defers the vacuum rather than failing the file. No-ops for
+    /// `:memory:` databases.
+    pub fn vacuum(&self) -> DbResult<()> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(());
+        }
+        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("vacuum: open failed: {e}")))?;
+        conn.execute_raw("PRAGMA busy_timeout = 30000;")
+            .map_err(|e| DbError::Sqlite(format!("vacuum: busy_timeout: {e}")))?;
+        conn.execute_raw("VACUUM;")
+            .map_err(|e| DbError::Sqlite(format!("vacuum: {e}")))?;
+        Ok(())
+    }
+
+    /// Apply a `journal_size_limit` (bytes) so the WAL is truncated back to the
+    /// configured cap after a checkpoint, bounding unbounded WAL growth.
+    ///
+    /// The schema already applies a default limit to every pooled connection;
+    /// the maintenance worker re-applies the operator-configured value on its
+    /// own connection each cycle (bead K4) so the cap is tunable via config
+    /// without threading it through the hot per-connection init path. No-ops for
+    /// `:memory:` databases.
+    pub fn set_journal_size_limit(&self, bytes: u64) -> DbResult<()> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(());
+        }
+        let conn = open_sqlite_file_with_lock_retry_canonical(&self.sqlite_path)
+            .map_err(|e| DbError::Sqlite(format!("journal_size_limit: open failed: {e}")))?;
+        conn.execute_raw(&format!("PRAGMA journal_size_limit = {bytes};"))
+            .map_err(|e| DbError::Sqlite(format!("journal_size_limit: {e}")))?;
+        Ok(())
+    }
+
     /// Attempt one-shot recovery from `SQLite` corruption detected at runtime.
     ///
     /// This should be called when a query returns a corruption error
