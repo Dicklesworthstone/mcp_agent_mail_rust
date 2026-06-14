@@ -79,6 +79,7 @@ pub mod snapshot;
 pub mod sync;
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
+pub mod wal_classify;
 
 #[cfg(not(feature = "tantivy-engine"))]
 pub mod search_v3 {
