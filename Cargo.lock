@@ -164,7 +164,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -175,7 +175,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1423,7 +1423,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1555,7 +1555,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2301,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-harness"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "ftui-core",
@@ -2339,11 +2339,11 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "ftui-layout"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "clap",
  "criterion",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "chrono",
  "criterion",
@@ -4320,7 +4320,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4362,7 +4362,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "chrono",
  "git2",
@@ -4378,7 +4378,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "chrono",
  "criterion",
@@ -4407,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4473,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4501,7 +4501,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "git2",
  "tempfile",
@@ -4510,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "arbitrary",
  "asupersync",
@@ -4764,7 +4764,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4968,7 +4968,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5753,7 +5753,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6208,7 +6208,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6615,7 +6615,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7477,7 +7477,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

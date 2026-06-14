@@ -12,6 +12,33 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.12](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.12) — 2026-06-14 **[Release]**
+
+Reliability-program (`br-bvq1x`) batch plus security-review hardening from [#149](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/149). All changes are in the trusted-local, single-user model; no behavior changes for the default loopback deployment.
+
+### Security review hardening ([#149](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/149))
+
+A thorough static security review (clean `cargo audit`; `#![forbid(unsafe_code)]` and fully-parameterized SQL confirmed) flagged a small set of self-contained, local-relevant hardening items. The prioritized ones are addressed:
+
+- **CSRF guard on the web UI (review #1).** Mutating `/mail/` POST routes (overseer-send, mark-read, …) now reject any request lacking `Content-Type: application/json` or carrying a cross-site `Origin`/`Referer`. The trust check uses an *exact* CORS-allowlist match (`cors_explicitly_allows`), not the permissive `cors_allows`, so the guard holds even under the dev-default empty origin list. The web UI always sends `application/json` + a same-origin `Origin`, so only forged cross-site requests are blocked; non-browser API clients (no `Origin`) pass.
+- **Baseline security response headers (review #10).** Every response — including auth-bypassed health routes and 401s — now carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` (so a browser `?token=` query string cannot leak via the `Referer` header to CDN scripts), and `X-Frame-Options: DENY`. A strict CSP is intentionally left to a reverse proxy, since the web UI loads CDN scripts.
+- **Non-loopback no-auth warning (review #2).** The server now logs a loud warning at startup when bound to a non-loopback host with no bearer token or JWT configured.
+- **`SECURITY.md` + Private Vulnerability Reporting.** Added a security policy documenting the trusted-local threat model, the confidential reporting channel (GitHub PVR, now enabled), the security posture, and the hardening knobs (`HTTP_BEARER_TOKEN`, `APP_ENVIRONMENT=production`, rate limiting, reverse proxy) for deployments exposed beyond loopback.
+
+The review's architectural items (self-asserted identity, client-chosen project keys, default-off auth/rate-limiting, permissive dev CORS) are by-design for the documented trusted-local model and are now explicitly documented as pre-exposure hardening steps rather than changed.
+
+### Reliability program (`br-bvq1x`)
+
+- **Corruption-specific circuit breaker (K3).** The DB layer distinguishes genuine corruption signatures from host-pressure-induced failures so the breaker no longer trips on transient overload.
+- **Loss-honest salvage/recover reporting (K1).** `am doctor` reconstruct/salvage paths report what was and was not recovered instead of implying a clean rebuild.
+- **Periodic SQLite maintenance (K4).** The off-hot-path integrity-guard worker now also runs passive WAL checkpoint + `ANALYZE` + `VACUUM` on independent cadences with a `journal_size_limit`, gated by `DB_MAINTENANCE_ENABLED` and per-op interval env vars.
+- **Pool/FD backpressure metrics (K5).** `am robot metrics` gains a `resources` section surfacing configured pool limits, live pool/FD gauges, and repo-cache size, with actionable backpressure alerts.
+- **Supervised-owner guard + `am doctor drain` (D4).** `am doctor repair`/`reconstruct` refuse (exit 3) when a live mailbox owner is present; `am doctor drain` reports `safe_to_mutate`. Startup self-heal passes `--allow-live-owner` internally, so boot behavior is unchanged.
+- **Host-pressure section in `am robot health` (J1).** Surfaces disk/inode/load/memory pressure so "Database corruption detected" under load can be correctly attributed to host overload rather than mailbox corruption.
+- **`health_check` decomposed into independent verdicts (C1)** plus **write-path + MCP-decode selftests (C2/C3).**
+
+---
+
 ## [v0.3.2](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.2) — 2026-05-21 **[Release]**
 
 **Fixes the `--no-auth` write regression that broke ntm-spawned sessions** ([#131](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/131)).
