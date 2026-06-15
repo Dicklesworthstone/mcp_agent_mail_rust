@@ -2538,64 +2538,33 @@ impl DbPool {
         conn: &DbConn,
         phase: &str,
     ) -> DbResult<integrity::IntegrityCheckResult> {
-        match integrity::quick_check(conn) {
-            Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { message, details }) => {
-                match sqlite_canonical_file_check_is_ok(
+        reconcile_with_canonical(
+            integrity::quick_check(conn),
+            integrity::CheckKind::Quick,
+            phase,
+            &self.sqlite_path,
+            || {
+                sqlite_canonical_file_check_is_ok(
                     Path::new(&self.sqlite_path),
                     integrity::CheckKind::Quick,
-                ) {
-                    Ok(true) => {
-                        tracing::warn!(
-                            phase,
-                            path = %self.sqlite_path,
-                            primary_error = %message,
-                            "integrity probe rejected the file but canonical SQLite accepted it; treating as healthy"
-                        );
-                        Ok(integrity::IntegrityCheckResult {
-                            ok: true,
-                            details: vec!["ok (canonical fallback)".to_string()],
-                            duration_us: 0,
-                            kind: integrity::CheckKind::Quick,
-                        })
-                    }
-                    Ok(false) => {
-                        tracing::warn!(
-                            phase,
-                            path = %self.sqlite_path,
-                            primary_error = %message,
-                            "integrity probe and canonical SQLite both rejected the file"
-                        );
-                        if !details.is_empty() {
-                            tracing::debug!(
-                                phase,
-                                path = %self.sqlite_path,
-                                primary_details = ?details,
-                                "primary probe details (canonical also rejected)"
-                            );
-                        }
-                        Err(DbError::IntegrityCorruption { message, details })
-                    }
-                    Err(canonical_error) => {
-                        tracing::warn!(
-                            phase,
-                            path = %self.sqlite_path,
-                            primary_error = %message,
-                            canonical_error = %canonical_error,
-                            "integrity probe rejected the file and canonical fallback could not run"
-                        );
-                        Err(DbError::IntegrityCorruption { message, details })
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        }
+                )
+            },
+        )
     }
 
     /// Run a full `PRAGMA integrity_check` on a dedicated connection.
     ///
     /// This can take seconds on large databases. Should be called from a
     /// background task, not from the request hot path.
+    ///
+    /// Like [`Self::run_startup_integrity_check`], a primary (frankensqlite)
+    /// corruption verdict is reconciled against a canonical SQLite second
+    /// opinion ([`reconcile_with_canonical`]) before it is surfaced. Without
+    /// this, the integrity guard's periodic full cycle false-positived on a
+    /// `COLLATE NOCASE` index frankensqlite dislikes (the ts2
+    /// `idx_agents_project_name_nocase` "entries are out of order" report),
+    /// logging spurious "recoverable corruption" the canonical engine and
+    /// `am doctor repair` both disprove (br-bvq1x.13.4).
     pub fn run_full_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
         if self.sqlite_path == ":memory:" {
             return Ok(integrity::IntegrityCheckResult {
@@ -2640,7 +2609,18 @@ impl DbPool {
             "full integrity check connection",
         );
 
-        integrity::full_check(&conn)
+        reconcile_with_canonical(
+            integrity::full_check(&conn),
+            integrity::CheckKind::Full,
+            "full-cycle",
+            &self.sqlite_path,
+            || {
+                sqlite_canonical_file_check_is_ok(
+                    Path::new(&self.sqlite_path),
+                    integrity::CheckKind::Full,
+                )
+            },
+        )
     }
 
     /// Sample the N most recent messages from the DB for consistency checking.
@@ -4589,6 +4569,88 @@ fn sqlite_canonical_incremental_check_is_ok(
     conn: &crate::CanonicalDbConn,
 ) -> Result<bool, SqlError> {
     sqlite_pragma_check_is_ok_canonical(conn, integrity::CheckKind::Incremental)
+}
+
+/// Reconcile a primary (bespoke / frankensqlite) integrity verdict against a
+/// canonical SQLite second opinion — the Track-M "never assert malformed from
+/// a divergent engine" contract (GH#114 / br-bvq1x.13.4).
+///
+/// If the primary probe reports [`DbError::IntegrityCorruption`] but the
+/// `canonical_probe` closure proves the file is acceptable to canonical
+/// SQLite, the verdict is reclassified as healthy
+/// (`details = ["ok (canonical fallback)"]`). When canonical *also* rejects
+/// the file, or the canonical probe cannot run, the original corruption
+/// verdict is preserved (fail-closed: we never silence a verdict both engines
+/// agree on, and we never invent health we could not confirm). `Ok` results
+/// and non-corruption errors pass through untouched and never invoke the
+/// canonical probe.
+///
+/// Used by both the quick-cycle ([`DbPool::quick_check_with_canonical_fallback`])
+/// and the periodic full-cycle ([`DbPool::run_full_integrity_check`]) so a
+/// `COLLATE NOCASE` index that frankensqlite dislikes cannot surface a false
+/// "entries are out of order" corruption verdict that the canonical engine
+/// disproves (the ts2 `idx_agents_project_name_nocase` false positive).
+///
+/// The `canonical_probe` is injected so the reconciliation policy is
+/// unit-testable without a real on-disk engine divergence.
+#[allow(clippy::result_large_err)]
+fn reconcile_with_canonical(
+    primary: DbResult<integrity::IntegrityCheckResult>,
+    kind: integrity::CheckKind,
+    phase: &str,
+    path_for_log: &str,
+    canonical_probe: impl FnOnce() -> Result<bool, SqlError>,
+) -> DbResult<integrity::IntegrityCheckResult> {
+    match primary {
+        Ok(res) => Ok(res),
+        Err(DbError::IntegrityCorruption { message, details }) => match canonical_probe() {
+            Ok(true) => {
+                tracing::warn!(
+                    phase,
+                    path = %path_for_log,
+                    check = %kind,
+                    primary_error = %message,
+                    "integrity probe rejected the file but canonical SQLite accepted it; treating as healthy"
+                );
+                Ok(integrity::IntegrityCheckResult {
+                    ok: true,
+                    details: vec!["ok (canonical fallback)".to_string()],
+                    duration_us: 0,
+                    kind,
+                })
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    phase,
+                    path = %path_for_log,
+                    check = %kind,
+                    primary_error = %message,
+                    "integrity probe and canonical SQLite both rejected the file"
+                );
+                if !details.is_empty() {
+                    tracing::debug!(
+                        phase,
+                        path = %path_for_log,
+                        primary_details = ?details,
+                        "primary probe details (canonical also rejected)"
+                    );
+                }
+                Err(DbError::IntegrityCorruption { message, details })
+            }
+            Err(canonical_error) => {
+                tracing::warn!(
+                    phase,
+                    path = %path_for_log,
+                    check = %kind,
+                    primary_error = %message,
+                    canonical_error = %canonical_error,
+                    "integrity probe rejected the file and canonical fallback could not run"
+                );
+                Err(DbError::IntegrityCorruption { message, details })
+            }
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// Size of a SQLite WAL file header, in bytes.
@@ -9611,6 +9673,134 @@ mod tests {
             result.kind,
             integrity::CheckKind::Full,
             "should be Full kind"
+        );
+    }
+
+    // ── br-bvq1x.13.4: canonical-fallback reconciliation policy (ts2) ──────
+    // These exercise `reconcile_with_canonical` directly with an injected
+    // canonical probe so the policy is proven without a real engine
+    // divergence. The full-cycle path now shares this helper with the quick
+    // cycle, so a frankensqlite COLLATE NOCASE false positive can no longer
+    // surface as a corruption verdict the canonical engine disproves.
+
+    #[test]
+    fn reconcile_canonical_passes_through_healthy_primary_without_probing() {
+        let probe_called = std::cell::Cell::new(false);
+        let primary = Ok(integrity::IntegrityCheckResult {
+            ok: true,
+            details: vec!["ok".to_string()],
+            duration_us: 42,
+            kind: integrity::CheckKind::Full,
+        });
+        let out = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Full,
+            "test",
+            "/tmp/storage.sqlite3",
+            || {
+                probe_called.set(true);
+                Ok(true)
+            },
+        )
+        .expect("healthy primary passes through");
+        assert!(out.ok);
+        assert_eq!(out.details, vec!["ok".to_string()]);
+        assert_eq!(out.duration_us, 42, "primary result preserved verbatim");
+        assert!(
+            !probe_called.get(),
+            "canonical probe must not run when the primary verdict is healthy"
+        );
+    }
+
+    #[test]
+    fn reconcile_canonical_reclassifies_when_canonical_accepts() {
+        // The exact ts2 false positive: frankensqlite full-check rejects the
+        // NOCASE index, canonical SQLite accepts the file.
+        let primary: DbResult<integrity::IntegrityCheckResult> =
+            Err(DbError::IntegrityCorruption {
+                message: "integrity_check detected corruption (1234us): row 5: entries are out of \
+                      order for index idx_agents_project_name_nocase"
+                    .to_string(),
+                details: vec![
+                    "row 5: entries are out of order for index idx_agents_project_name_nocase"
+                        .to_string(),
+                ],
+            });
+        let out = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Full,
+            "full-cycle",
+            "/tmp/storage.sqlite3",
+            || Ok(true),
+        )
+        .expect("canonical acceptance reclassifies to healthy");
+        assert!(out.ok, "canonical-accepted file must be reported healthy");
+        assert_eq!(out.details, vec!["ok (canonical fallback)".to_string()]);
+        assert_eq!(out.kind, integrity::CheckKind::Full);
+    }
+
+    #[test]
+    fn reconcile_canonical_preserves_corruption_when_canonical_agrees() {
+        let primary: DbResult<integrity::IntegrityCheckResult> =
+            Err(DbError::IntegrityCorruption {
+                message: "database disk image is malformed".to_string(),
+                details: vec!["*** malformed page 7 ***".to_string()],
+            });
+        let err = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Full,
+            "full-cycle",
+            "/tmp/storage.sqlite3",
+            || Ok(false),
+        )
+        .expect_err("both engines rejecting must stay a corruption verdict");
+        assert!(matches!(err, DbError::IntegrityCorruption { .. }));
+        assert!(
+            err.to_string().contains("malformed"),
+            "original corruption detail must be preserved: {err}"
+        );
+    }
+
+    #[test]
+    fn reconcile_canonical_preserves_corruption_when_probe_cannot_run() {
+        // Fail-closed: if we cannot get a canonical second opinion we do NOT
+        // invent health — the corruption verdict is preserved.
+        let primary: DbResult<integrity::IntegrityCheckResult> =
+            Err(DbError::IntegrityCorruption {
+                message: "database disk image is malformed".to_string(),
+                details: Vec::new(),
+            });
+        let err = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Quick,
+            "initial",
+            "/tmp/storage.sqlite3",
+            || Err(SqlError::Custom("canonical open failed".to_string())),
+        )
+        .expect_err("unprovable canonical fallback must preserve corruption");
+        assert!(matches!(err, DbError::IntegrityCorruption { .. }));
+    }
+
+    #[test]
+    fn reconcile_canonical_passes_through_non_corruption_errors() {
+        let probe_called = std::cell::Cell::new(false);
+        let primary: DbResult<integrity::IntegrityCheckResult> =
+            Err(DbError::Sqlite("disk i/o error".to_string()));
+        let err = reconcile_with_canonical(
+            primary,
+            integrity::CheckKind::Full,
+            "test",
+            "/tmp/storage.sqlite3",
+            || {
+                probe_called.set(true);
+                Ok(true)
+            },
+        )
+        .expect_err("non-corruption errors pass through unchanged");
+        assert!(matches!(err, DbError::Sqlite(_)));
+        assert!(
+            !probe_called.get(),
+            "canonical probe must only run for corruption-class verdicts"
         );
     }
 
