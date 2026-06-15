@@ -412,11 +412,16 @@ pub struct Config {
     pub atc_suspicion_k: f64,
     /// Experience write mode: `off` (suppress), `shadow` (trace-log only), `live` (persist).
     pub atc_write_mode: AtcWriteMode,
-    /// Hard ceiling on raw `atc_experiences` rows. When the table exceeds this,
-    /// the background maintenance worker rolls up and evicts the oldest terminal
-    /// (resolved/censored/expired) rows down to a hysteresis target — rollups and
-    /// open/unresolved rows are preserved. A safety bound against the ts2
-    /// unbounded-growth incident (859K rows / 3.36 GB corrupted `SQLite`). `0`
+    /// Hard ceiling on raw `atc_experiences` rows — a true upper bound the table
+    /// can never exceed. When the table exceeds this, the background maintenance
+    /// worker first rolls up and evicts the oldest TERMINAL
+    /// (resolved/censored/expired) rows down to a hysteresis target (rollups
+    /// preserved, the learning-friendly path). If a large OPEN/unresolved backlog
+    /// still leaves the table over the ceiling (e.g. the outcome-resolution
+    /// pipeline is starved), it then force-rotates the oldest rows regardless of
+    /// state — boundedness wins over preserving stale pending rows. A safety bound
+    /// against the unbounded-growth incidents (css 2026-06: 629K rows / 2.41 GB
+    /// that wedged startup; ts2: 859K rows / 3.36 GB corrupted `SQLite`). `0`
     /// disables the ceiling.
     pub atc_experience_max_rows: i64,
     /// Cadence (seconds) for the background ATC experience-ceiling sweep. `0`
@@ -1475,8 +1480,8 @@ impl Default for Config {
             atc_ledger_capacity: 1000,
             atc_suspicion_k: 3.0,
             atc_write_mode: AtcWriteMode::Off,
-            atc_experience_max_rows: 250_000,
-            atc_retention_sweep_interval_secs: 3_600,
+            atc_experience_max_rows: 50_000,
+            atc_retention_sweep_interval_secs: 900,
 
             // WBQ tuning
             wbq_channel_capacity: 8_192,
