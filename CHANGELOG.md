@@ -12,6 +12,55 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.13) — 2026-06-15 **[Release]**
+
+Reliability batch focused on a real multi-agent-host incident: the ATC experience
+ledger growing unbounded and wedging startup, plus TUI/service coexistence. All
+changes are in the trusted-local, single-user model.
+
+### ATC experience ledger can no longer bloat the DB or wedge startup
+
+- **Hard-cap rotation for `atc_experiences` (br-78c6m).** A host accumulated a
+  2.41 GB `atc_experiences` table (629K open/unresolved rows in 6 days) that
+  pegged startup (full-ledger replay) so the server never bound its port. Root
+  cause: the row-ceiling sweep only evicted *terminal* (resolved/censored/
+  expired) rows, so an open/unresolved backlog was never bounded. The ceiling is
+  now a true hard cap — it evicts terminal rows first (rollups preserved), then
+  **force-rotates the oldest rows regardless of state** when an open backlog
+  still exceeds the cap. The default ceiling drops 250 000 → **50 000** and the
+  sweep cadence 1 h → **15 min**.
+
+### TUI ↔ managed-service coexistence
+
+- **Bare `am` coexists with the systemd/launchd service (br-2y10g).** Previously,
+  launching the interactive TUI while a managed service was serving the same
+  storage root dead-ended ("connect to it") because the restart-coordination lock
+  made the take-over path unreachable. Bare `am` now stops the *managed* service
+  for the interactive session and **restarts it on exit** (every exit path),
+  giving true coexistence — the service is the always-on headless backend and the
+  TUI is the occasional cockpit. (Stopping/restarting a managed service is
+  reversible, unlike killing a foreground peer.)
+
+### Startup, recovery & integrity reliability (`br-bvq1x`, `br-5mnkl`)
+
+- **Bind the HTTP listener before unbounded DB recovery (`br-5mnkl`).** A
+  degraded/oversized DB no longer blocks the listener bind; `/healthz` stays live
+  within the bind deadline while the DB recovers in the background and `/health`
+  reports `warming_up`/`unavailable` honestly.
+- **Single-owner restart-coordination lock for `am serve-http` (D5).** Racing
+  (re)starts for one storage root no longer kill each other's freshly-bound
+  servers.
+- **Commit coalescer self-heals a broken archive HEAD** instead of wedging
+  forever; **doctor** detects a HEAD pointing at a missing/corrupt object.
+- **Hard row ceiling groundwork for `atc_experiences` (br-bvq1x.11.6)** and
+  **last-known-healthy verified snapshot + snapshot-preferred recovery (K2)**.
+- **Canonical full-check fallback** stops the integrity guard false-flagging
+  `COLLATE NOCASE` indexes.
+- **Reconstruct preserves canonical message IDs** (verified + locked with a
+  golden test, G5).
+
+---
+
 ## [v0.3.12](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.12) — 2026-06-14 **[Release]**
 
 Reliability-program (`br-bvq1x`) batch plus security-review hardening from [#149](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/149). All changes are in the trusted-local, single-user model; no behavior changes for the default loopback deployment.
