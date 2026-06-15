@@ -4218,6 +4218,11 @@ fn commit_paths_lockfree(
     let workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
 
+    // ts2 (br-bvq1x.9.7): if HEAD's tip object is missing/corrupt, reset the
+    // branch to unborn here too — this lock-free path is the commit-coalescer hot
+    // path, so it must self-heal rather than wedge on every drain.
+    heal_unloadable_head(repo)?;
+
     // Get parent commit and its tree
     let parent = resolve_head_commit_oid(repo)?
         .map(|oid| repo.find_commit(oid))
@@ -8756,6 +8761,65 @@ pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
 // Core git operations
 // ---------------------------------------------------------------------------
 
+/// Whether `HEAD` resolves to an OID whose object cannot be loaded from the ODB.
+///
+/// `refname_to_id("HEAD")` reads the ref chain without verifying the target
+/// object exists, so a branch pointing at a missing/corrupt commit (e.g. an
+/// interrupted `gc`/repack after a hard reboot — "fatal: bad object HEAD")
+/// resolves to an OID here, but `find_object` then fails. We treat *that* as an
+/// unreachable tip. If `HEAD` cannot be resolved to an OID at all, the tip is
+/// likewise unreachable. Returns `false` for a healthy HEAD so transient errors
+/// elsewhere are never misread as corruption.
+fn head_target_object_is_unloadable(repo: &Repository) -> bool {
+    match repo.refname_to_id("HEAD") {
+        Ok(oid) => repo.find_object(oid, None).is_err(),
+        Err(_) => true,
+    }
+}
+
+/// If `HEAD` points at a branch whose tip object is missing/corrupt, delete that
+/// branch reference so the branch becomes truly unborn.
+///
+/// libgit2 refuses a parentless (root) commit while the target ref still names a
+/// (bogus) tip — *"current tip is not the first parent"* — so simply treating the
+/// branch as unborn is not enough to recover: the broken ref must be cleared
+/// first. After this, the next commit re-roots onto the intact working tree.
+///
+/// Idempotent and conservative: only deletes a `refs/heads/*` reference whose
+/// target object genuinely cannot be loaded. A detached or unnamed HEAD is left
+/// untouched (the archive always uses a branch; the unsupported detached case
+/// surfaces its own error rather than risking a wrong mutation). Returns `true`
+/// when a broken ref was reset.
+fn heal_unloadable_head(repo: &Repository) -> Result<bool> {
+    if !head_target_object_is_unloadable(repo) {
+        return Ok(false);
+    }
+    let Some(refname) = repo
+        .head()
+        .ok()
+        .and_then(|h| h.name().ok().map(str::to_string))
+    else {
+        return Ok(false);
+    };
+    if !refname.starts_with("refs/heads/") {
+        return Ok(false);
+    }
+    match repo.find_reference(&refname) {
+        Ok(mut reference) => {
+            reference.delete()?;
+            tracing::error!(
+                repo = %repo.path().display(),
+                reference = %refname,
+                "reset archive branch with a missing/corrupt tip object to unborn so the commit \
+                 coalescer can re-root onto the intact working tree (ts2 broken-HEAD recovery)"
+            );
+            Ok(true)
+        }
+        Err(err) if matches!(err.code(), ErrorCode::NotFound) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn resolve_head_commit_oid(repo: &Repository) -> Result<Option<git2::Oid>> {
     fn load_head_commit_oid(repo: &Repository) -> std::result::Result<git2::Oid, git2::Error> {
         let head = repo.head()?;
@@ -8775,8 +8839,38 @@ fn resolve_head_commit_oid(repo: &Repository) -> Result<Option<git2::Oid>> {
                 {
                     Ok(None)
                 }
+                // The reopen still can't peel HEAD. If the branch tip is a
+                // missing/corrupt object, recover by treating the branch as
+                // unborn (see the unloadable-tip arm below).
+                Err(err2) if head_target_object_is_unloadable(repo) => {
+                    tracing::error!(
+                        repo = %repo.path().display(),
+                        error = %err2,
+                        "archive HEAD points at a missing/corrupt object; treating the branch \
+                         as unborn so the commit coalescer can re-root onto the intact working \
+                         tree instead of wedging on every drain"
+                    );
+                    Ok(None)
+                }
                 Err(err2) => Err(err2.into()),
             }
+        }
+        // br-bvq1x.9.7 (ts2): a HEAD that resolves to a ref whose target commit
+        // object is missing/corrupt in the ODB otherwise wedges the async commit
+        // coalescer forever (every `git commit` errors, so no new mail is ever
+        // persisted). When the tip is genuinely unloadable the history is already
+        // unreachable, so we treat the branch as unborn: the next commit re-roots
+        // onto the working tree (the mail files themselves are intact). Transient
+        // / other errors with a still-loadable tip propagate unchanged.
+        Err(err) if head_target_object_is_unloadable(repo) => {
+            tracing::error!(
+                repo = %repo.path().display(),
+                error = %err,
+                "archive HEAD points at a missing/corrupt object; treating the branch as unborn \
+                 so the commit coalescer can re-root onto the intact working tree instead of \
+                 wedging on every drain"
+            );
+            Ok(None)
         }
         Err(err) => Err(err.into()),
     }
@@ -8784,6 +8878,9 @@ fn resolve_head_commit_oid(repo: &Repository) -> Result<Option<git2::Oid>> {
 
 /// Refresh an index from `HEAD` so stale index state cannot leak between commits.
 fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()> {
+    // ts2 (br-bvq1x.9.7): clear a branch whose tip object is missing/corrupt so a
+    // subsequent root commit is accepted instead of erroring on every drain.
+    heal_unloadable_head(repo)?;
     if let Some(commit_oid) = resolve_head_commit_oid(repo)? {
         let commit = repo.find_commit(commit_oid)?;
         let tree_oid = commit.tree_id();
@@ -16292,6 +16389,96 @@ mod tests {
 
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert!(head.tree().unwrap().get_path(Path::new(&rel)).is_err());
+    }
+
+    /// br-bvq1x.9.7 (ts2): an interrupted gc/repack can leave the branch tip
+    /// pointing at a missing/corrupt object ("fatal: bad object HEAD"). The
+    /// commit coalescer must self-heal (re-root onto the intact working tree)
+    /// rather than erroring on every drain.
+    #[test]
+    fn commit_paths_recovers_when_head_tip_object_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "broken-head").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+
+        // Establish a real commit so HEAD is valid and peelable.
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent"}"#).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+        commit_paths(&repo, &config, "initial", &[rel.as_str()]).unwrap();
+        assert!(
+            resolve_head_commit_oid(&repo).unwrap().is_some(),
+            "a healthy HEAD must resolve to a commit"
+        );
+
+        // Corrupt the branch tip: point it at a SHA that is not in the ODB,
+        // mimicking the post-reboot "bad object HEAD" state. Writing the loose
+        // ref file bypasses object validation, exactly as on-disk corruption does.
+        let refname = repo
+            .head()
+            .unwrap()
+            .name()
+            .expect("head refname")
+            .to_string();
+        let bogus = "de".repeat(20); // 40 hex chars; almost-certainly-absent object
+        fs::write(repo.path().join(&refname), format!("{bogus}\n")).unwrap();
+
+        // Reopen so libgit2 does not serve a cached ref/object view.
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        assert!(
+            head_target_object_is_unloadable(&repo),
+            "the corrupted tip object must be unloadable"
+        );
+        assert!(
+            resolve_head_commit_oid(&repo)
+                .expect("resolver must not error on a missing tip")
+                .is_none(),
+            "a missing tip object must resolve as unborn (recoverable), not error"
+        );
+
+        // The commit-coalescer hot path (`commit_paths_lockfree`) must self-heal:
+        // it re-roots onto the intact working tree instead of erroring forever.
+        fs::write(&file_path, r#"{"name":"TestAgent","v":2}"#).unwrap();
+        commit_paths_lockfree(
+            &repo,
+            &config,
+            "recover re-root (lockfree)",
+            &[rel.as_str()],
+        )
+        .expect("lockfree commit must succeed after broken-HEAD recovery");
+        let head = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .expect("HEAD must be peelable again after lockfree recovery");
+        assert!(
+            head.tree().unwrap().get_path(Path::new(&rel)).is_ok(),
+            "the re-rooted commit preserves the working-tree mail file"
+        );
+
+        // The indexed path (`commit_paths` via `reset_index_to_head`) heals too:
+        // re-corrupt the freshly-rebuilt tip and commit again.
+        let refname2 = repo
+            .head()
+            .unwrap()
+            .name()
+            .expect("head refname")
+            .to_string();
+        fs::write(
+            repo.path().join(&refname2),
+            format!("{}\n", "ab".repeat(20)),
+        )
+        .unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        fs::write(&file_path, r#"{"name":"TestAgent","v":3}"#).unwrap();
+        commit_paths(&repo, &config, "recover re-root (indexed)", &[rel.as_str()])
+            .expect("indexed commit must succeed after broken-HEAD recovery");
+        assert!(
+            repo.head().unwrap().peel_to_commit().is_ok(),
+            "HEAD must be peelable after indexed-path recovery"
+        );
     }
 
     #[test]
