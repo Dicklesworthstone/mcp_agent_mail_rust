@@ -69,6 +69,13 @@ pub enum BrokenShape {
         repo_path: PathBuf,
         target_ref: String,
     },
+    /// `.git/HEAD` is structurally valid and its ref resolves, but the commit
+    /// object it names is missing/corrupt in the object store ("fatal: bad
+    /// object HEAD"). Left behind by an interrupted `gc`/repack after a hard
+    /// reboot (the ts2 incident). The commit coalescer self-heals this by
+    /// re-rooting onto the working tree (br-bvq1x.9.7); this is the proactive
+    /// detection surface.
+    HeadPointsToMissingObject { repo_path: PathBuf },
 }
 
 #[cfg(test)]
@@ -79,7 +86,8 @@ impl BrokenShape {
             | BrokenShape::HeadUnreadable { repo_path }
             | BrokenShape::HeadIsSymlink { repo_path }
             | BrokenShape::HeadEmpty { repo_path }
-            | BrokenShape::HeadDanglingRef { repo_path, .. } => repo_path,
+            | BrokenShape::HeadDanglingRef { repo_path, .. }
+            | BrokenShape::HeadPointsToMissingObject { repo_path } => repo_path,
         }
     }
 }
@@ -92,7 +100,7 @@ pub struct MissingHeadOrBrokenGitShapeFinding {
 impl MissingHeadOrBrokenGitShapeFinding {
     pub fn to_finding(&self) -> super::Finding {
         let title = format!(
-            "{} project archive(s) have broken .git shape (missing / empty / symlinked / dangling HEAD)",
+            "{} project archive(s) have broken .git shape (missing / empty / symlinked / dangling HEAD, or HEAD pointing at a missing object)",
             self.broken.len(),
         );
         super::Finding {
@@ -112,6 +120,7 @@ impl MissingHeadOrBrokenGitShapeFinding {
                     ],
                     "warning": "A symlinked HEAD is a SECURITY signal (attacker may be aliasing HEAD at an arbitrary file). Investigate the symlink target before reconstructing.",
                     "note": "Auto-fix via Op::WriteFile is intentionally not implemented — repairing a broken git shape needs operator judgment about which branch HEAD should point at.",
+                    "head_points_to_missing_object": "This variant ('fatal: bad object HEAD' after an interrupted gc/repack) self-heals: the commit coalescer re-roots onto the intact working tree on the next archive write (br-bvq1x.9.7). If new mail is not committing, run `am doctor reconstruct --project <repo_path>`.",
                 },
             }),
             remediation: FindingRemediation {
@@ -124,7 +133,8 @@ impl MissingHeadOrBrokenGitShapeFinding {
     }
 }
 
-/// Detector. PURE — reads disk only.
+/// Detector. Read-only: file-level HEAD/ref inspection, plus (when the repo
+/// opens) a read-only git2 probe that the HEAD tip object actually loads.
 ///
 /// `project_dirs` is typically `inputs.archive_roots` — each
 /// entry is a `<storage_root>/projects/<slug>/` directory. The
@@ -205,7 +215,21 @@ fn inspect_head(git_dir: &std::path::Path, repo_path: &std::path::Path) -> Optio
             });
         }
     }
-    // Detached HEAD (raw SHA) is valid; no finding.
+
+    // The HEAD file is structurally valid (and any `ref:` target resolves to a
+    // ref). Confirm the commit object that ref/SHA names is actually loadable —
+    // an interrupted gc/repack leaves HEAD pointing at a missing object
+    // ("fatal: bad object HEAD"; the ts2 incident). Gated on a successful git2
+    // open so the cheap file-level path is preserved and non-repos / minimal
+    // fixtures (no real object store) are skipped rather than mis-flagged.
+    if let Ok(repo) = git2::Repository::open(repo_path)
+        && let Ok(oid) = repo.refname_to_id("HEAD")
+        && repo.find_object(oid, None).is_err()
+    {
+        return Some(BrokenShape::HeadPointsToMissingObject {
+            repo_path: repo_path.to_path_buf(),
+        });
+    }
     None
 }
 
@@ -282,6 +306,49 @@ mod tests {
     #[test]
     fn detector_skips_empty_input() {
         assert!(detect(&[]).is_empty());
+    }
+
+    /// br-bvq1x.9.8 (ts2): a real repo whose HEAD tip object is missing
+    /// ("fatal: bad object HEAD" after an interrupted gc/repack) is flagged.
+    /// The negative cases above (fake `.git` with no object store) confirm the
+    /// git2 probe is gated on a successful repo open and never mis-flags them.
+    #[test]
+    fn detector_flags_head_pointing_at_missing_object() {
+        let td = TempDir::new().unwrap();
+        let repo_path = td.path().join("proj");
+        let repo = git2::Repository::init(&repo_path).expect("init repo");
+        {
+            let sig = git2::Signature::now("t", "t@example.com").expect("sig");
+            let tree_oid = {
+                let mut index = repo.index().expect("index");
+                index.write_tree().expect("write_tree")
+            };
+            let tree = repo.find_tree(tree_oid).expect("tree");
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .expect("commit");
+        }
+        // Healthy now: the tip object loads, so no finding.
+        assert!(detect(std::slice::from_ref(&repo_path)).is_empty());
+
+        // Corrupt the branch tip to a SHA that is not in the object store.
+        let refname = repo.head().unwrap().name().expect("refname").to_string();
+        drop(repo);
+        fs::write(
+            repo_path.join(".git").join(&refname),
+            format!("{}\n", "de".repeat(20)),
+        )
+        .unwrap();
+
+        let findings = detect(std::slice::from_ref(&repo_path));
+        assert_eq!(findings.len(), 1, "missing-tip-object HEAD must be flagged");
+        assert!(
+            matches!(
+                findings[0].broken[0],
+                BrokenShape::HeadPointsToMissingObject { .. }
+            ),
+            "unexpected shape: {:?}",
+            findings[0].broken
+        );
     }
 
     #[test]
