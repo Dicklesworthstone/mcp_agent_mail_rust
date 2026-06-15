@@ -1315,6 +1315,146 @@ pub async fn retention_compact(
     })
 }
 
+const COUNT_ALL_EXPERIENCES_SQL: &str = "SELECT COUNT(*) AS c FROM atc_experiences";
+
+const COUNT_TERMINAL_EXPERIENCES_SQL: &str = "\
+    SELECT COUNT(*) AS c FROM atc_experiences \
+    WHERE state IN ('resolved', 'censored', 'expired') AND resolved_ts IS NOT NULL";
+
+const EVICTION_CUTOFF_SQL: &str = "\
+    SELECT resolved_ts AS rts FROM atc_experiences \
+    WHERE state IN ('resolved', 'censored', 'expired') AND resolved_ts IS NOT NULL \
+    ORDER BY resolved_ts ASC, experience_id ASC LIMIT 1 OFFSET ?";
+
+fn experience_scalar_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::BigInt(n) => Some(*n),
+        Value::Int(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
+/// Hysteresis target for the experience ceiling: evict down to ~90% of the cap
+/// so a table hovering at the ceiling does not trigger a full eviction pass on
+/// every maintenance cycle. Pure (no IO) so it is unit-testable. Always strictly
+/// below `max_rows` for `max_rows >= 2`.
+fn experience_ceiling_target(max_rows: i64) -> i64 {
+    if max_rows <= 1 {
+        return 0;
+    }
+    let slack = (max_rows / 10).max(1);
+    (max_rows - slack).max(0)
+}
+
+fn count_atc_experiences(conn: &impl RollupConn, sql: &str) -> Result<i64, DbError> {
+    let rows = conn
+        .rollup_query_sync(sql, &[])
+        .map_err(|error| DbError::Sqlite(format!("atc experience ceiling count: {error}")))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_by_name("c"))
+        .and_then(experience_scalar_i64)
+        .unwrap_or(0))
+}
+
+fn experience_eviction_cutoff_ts(conn: &impl RollupConn, to_evict: i64) -> Result<i64, DbError> {
+    let offset = to_evict.saturating_sub(1).max(0);
+    let rows = conn
+        .rollup_query_sync(EVICTION_CUTOFF_SQL, &[Value::BigInt(offset)])
+        .map_err(|error| DbError::Sqlite(format!("atc experience ceiling cutoff: {error}")))?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get_by_name("rts"))
+        .and_then(experience_scalar_i64)
+        .unwrap_or(i64::MAX))
+}
+
+/// Roll up and evict the oldest terminal rows down to the hysteresis target when
+/// `atc_experiences` exceeds `max_rows`. See [`enforce_experience_row_ceiling`]
+/// for the contract; this is the connection-level core, factored out so it can be
+/// driven directly in tests.
+fn enforce_experience_row_ceiling_with_conn(
+    conn: &impl RollupConn,
+    max_rows: i64,
+) -> Result<usize, DbError> {
+    if max_rows <= 0 {
+        return Ok(0);
+    }
+    let total = count_atc_experiences(conn, COUNT_ALL_EXPERIENCES_SQL)?;
+    if total <= max_rows {
+        return Ok(0);
+    }
+
+    let target = experience_ceiling_target(max_rows);
+    let to_evict = total - target; // > 0 because total > max_rows >= target
+    let terminal = count_atc_experiences(conn, COUNT_TERMINAL_EXPERIENCES_SQL)?;
+    if terminal == 0 {
+        tracing::warn!(
+            total,
+            max_rows,
+            "atc experience ceiling exceeded but no terminal rows are evictable \
+             (outcome-resolution backlog); leaving the table unchanged"
+        );
+        return Ok(0);
+    }
+
+    // `retention_compact_with_conn` deletes terminal rows with
+    // `resolved_ts <= cutoff`. Pick a cutoff that captures (at least) the
+    // `to_evict` oldest terminal rows; ties at the cutoff timestamp evict a few
+    // extra rows, which only helps boundedness.
+    let cutoff = if to_evict >= terminal {
+        i64::MAX
+    } else {
+        experience_eviction_cutoff_ts(conn, to_evict)?
+    };
+
+    let evicted = retention_compact_with_conn(conn, cutoff)?;
+
+    let remaining = total.saturating_sub(i64::try_from(evicted).unwrap_or(i64::MAX));
+    if remaining > max_rows {
+        tracing::warn!(
+            total,
+            evicted,
+            remaining,
+            max_rows,
+            "atc experience ceiling still exceeded after evicting all eligible terminal \
+             rows; the surplus is open/unresolved (outcome-resolution backlog)"
+        );
+    } else {
+        tracing::info!(
+            total,
+            evicted,
+            target,
+            max_rows,
+            "atc experience ceiling enforced: rolled up and evicted oldest terminal rows"
+        );
+    }
+    Ok(evicted)
+}
+
+/// Enforce a hard row ceiling on `atc_experiences` for a file-backed pool.
+///
+/// When the table exceeds `max_rows`, the oldest TERMINAL (resolved/censored/
+/// expired) rows are folded into the rollups and deleted down to a hysteresis
+/// target — preserving rollups and all open/unresolved rows. This is a SAFETY
+/// bound (not a fidelity policy): unbounded raw-experience growth corrupted
+/// SQLite and OOM'd the host on ts2 (859K rows / 3.36 GB), so the ceiling takes
+/// precedence over the age-based 365-day drop window. Open rows are never
+/// evicted (they are needed for outcome resolution); if they alone exceed the
+/// cap, the function logs a backlog warning and leaves them in place.
+///
+/// No-op for `:memory:` pools and for `max_rows <= 0` (disabled). Returns the
+/// number of raw rows evicted.
+pub fn enforce_experience_row_ceiling(pool: &DbPool, max_rows: i64) -> Result<usize, DbError> {
+    if max_rows <= 0 || pool.sqlite_path() == ":memory:" {
+        return Ok(0);
+    }
+    let conn = crate::queries::open_canonical_atc_conn(pool, "experience_ceiling")?;
+    let result = enforce_experience_row_ceiling_with_conn(&conn, max_rows);
+    crate::queries::close_canonical_db_conn(conn, "experience_ceiling connection");
+    result
+}
+
 fn replay_canonical(pool: &DbPool, range: SequenceRange) -> Result<ExperienceStream, DbError> {
     let conn = crate::queries::open_canonical_atc_conn(pool, "replay_atc_experiences")?;
     let result = (|| {
@@ -2104,6 +2244,131 @@ mod tests {
         assert!(summary.preserved_rollups);
         assert_eq!(before_rollups, after_rollups);
         assert_eq!(ids, vec![3, 4]);
+    }
+
+    // ── br-bvq1x.11.6: count-based hard ceiling (ts2 unbounded-growth killer) ──
+
+    #[test]
+    fn experience_ceiling_target_uses_ten_percent_hysteresis() {
+        assert_eq!(experience_ceiling_target(250_000), 225_000);
+        assert_eq!(experience_ceiling_target(100), 90);
+        assert_eq!(experience_ceiling_target(10), 9);
+        assert_eq!(experience_ceiling_target(1), 0);
+        assert_eq!(experience_ceiling_target(0), 0);
+        for cap in [2_i64, 5, 50, 999, 1_000_000] {
+            let target = experience_ceiling_target(cap);
+            assert!(target < cap, "target {target} must be below cap {cap}");
+            assert!(target >= 0);
+        }
+    }
+
+    #[test]
+    fn enforce_experience_row_ceiling_evicts_oldest_terminal_rows_down_to_target() {
+        let pool = test_pool();
+        let base = crate::now_micros();
+        // 12 terminal (resolved) rows with strictly increasing resolved_ts.
+        for id in 1..=12i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "liveness".to_string(),
+                    effect_kind: "probe".to_string(),
+                    state: "resolved".to_string(),
+                    created_ts_micros: base + id * 1_000 - 500,
+                    resolved_ts_micros: Some(base + id * 1_000),
+                    correct: Some(true),
+                    actual_loss: Some(0.0),
+                    regret: Some(0.0),
+                },
+            );
+        }
+        // 2 open rows that must never be evicted.
+        for id in 13..=14i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "liveness".to_string(),
+                    effect_kind: "probe".to_string(),
+                    state: "open".to_string(),
+                    created_ts_micros: base + id * 1_000,
+                    resolved_ts_micros: None,
+                    correct: None,
+                    actual_loss: None,
+                    regret: None,
+                },
+            );
+        }
+
+        // cap=10 -> target=9; total=14 -> evict the 5 oldest terminal rows.
+        let evicted = enforce_experience_row_ceiling(&pool, 10).expect("ceiling sweep");
+        assert_eq!(
+            evicted, 5,
+            "should evict total(14) - target(9) oldest terminal rows"
+        );
+
+        let remaining: Vec<u64> = run_replay(&pool, SequenceRange::default())
+            .rows
+            .iter()
+            .map(|row| row.experience_id)
+            .collect();
+        assert_eq!(
+            remaining,
+            (6u64..=14).collect::<Vec<_>>(),
+            "oldest 5 terminal rows evicted; the rest plus open rows are preserved"
+        );
+
+        let open_ids: Vec<u64> = query_open_rows(&pool, OpenExperienceFilter::default())
+            .iter()
+            .map(|row| row.experience_id)
+            .collect();
+        assert!(
+            open_ids.contains(&13) && open_ids.contains(&14),
+            "open rows must be preserved: {open_ids:?}"
+        );
+
+        assert!(
+            !fetch_rollups(&pool).is_empty(),
+            "evicted rows must be folded into rollups (aggregate signal preserved)"
+        );
+
+        // Now under the cap, a second sweep is a no-op.
+        assert_eq!(
+            enforce_experience_row_ceiling(&pool, 10).expect("second sweep"),
+            0,
+            "ceiling sweep must be a no-op once the table is at/under target"
+        );
+    }
+
+    #[test]
+    fn enforce_experience_row_ceiling_no_ops_when_only_open_rows_exceed_cap() {
+        let pool = test_pool();
+        let base = crate::now_micros();
+        for id in 1..=5i64 {
+            insert_experience(
+                &pool,
+                &TestExperienceSpec {
+                    experience_id: id,
+                    subsystem: "conflict".to_string(),
+                    effect_kind: "release".to_string(),
+                    state: "open".to_string(),
+                    created_ts_micros: base + id * 1_000,
+                    resolved_ts_micros: None,
+                    correct: None,
+                    actual_loss: None,
+                    regret: None,
+                },
+            );
+        }
+        // cap below the open-row count: open rows are sacred, nothing is evictable.
+        let evicted = enforce_experience_row_ceiling(&pool, 2).expect("ceiling sweep");
+        assert_eq!(evicted, 0, "open rows must never be evicted");
+        assert_eq!(
+            run_replay(&pool, SequenceRange::default()).rows.len(),
+            5,
+            "all open rows preserved despite exceeding the cap"
+        );
     }
 
     #[test]

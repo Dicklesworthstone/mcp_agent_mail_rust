@@ -183,6 +183,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     let mut last_checkpoint: Option<Instant> = Some(maintenance_start);
     let mut last_analyze: Option<Instant> = Some(maintenance_start);
     let mut last_vacuum: Option<Instant> = Some(maintenance_start);
+    let mut last_atc_retention: Option<Instant> = Some(maintenance_start);
     let mut skip_first_quick_cycle = SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel);
 
     loop {
@@ -225,6 +226,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             &mut last_checkpoint,
             &mut last_analyze,
             &mut last_vacuum,
+            &mut last_atc_retention,
         );
 
         // Sleep in short increments so shutdown reacts quickly.
@@ -373,6 +375,7 @@ fn run_db_maintenance_cycle(
     last_checkpoint: &mut Option<Instant>,
     last_analyze: &mut Option<Instant>,
     last_vacuum: &mut Option<Instant>,
+    last_atc_retention: &mut Option<Instant>,
 ) {
     if !config.db_maintenance_enabled {
         return;
@@ -415,6 +418,46 @@ fn run_db_maintenance_cycle(
             &db.maintenance_last_vacuum_us,
         );
         *last_vacuum = Some(now);
+    }
+
+    // br-bvq1x.11.6: enforce the hard ATC experience-ledger row ceiling so the
+    // raw `atc_experiences` table cannot grow unbounded (the ts2 killer: 859K
+    // rows / 3.36 GB corrupted SQLite). Reuses the shared maintenance duration /
+    // failure metrics; evictions are logged at info so operators see the bound
+    // working. Open rows and rollups are preserved by the eviction itself.
+    if config.atc_experience_max_rows > 0
+        && maintenance_task_due(
+            config.atc_retention_sweep_interval_secs,
+            *last_atc_retention,
+            now,
+        )
+    {
+        let started = Instant::now();
+        match mcp_agent_mail_db::atc_queries::enforce_experience_row_ceiling(
+            pool,
+            config.atc_experience_max_rows,
+        ) {
+            Ok(evicted) => {
+                let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                db.maintenance_duration_us.record(elapsed_us);
+                if evicted > 0 {
+                    tracing::info!(
+                        evicted,
+                        max_rows = config.atc_experience_max_rows,
+                        elapsed_us,
+                        "atc experience-ceiling sweep evicted oldest terminal rows"
+                    );
+                }
+            }
+            Err(err) => {
+                db.maintenance_failures_total.inc();
+                tracing::warn!(
+                    error = %err,
+                    "atc experience-ceiling sweep failed; will retry next cycle"
+                );
+            }
+        }
+        *last_atc_retention = Some(now);
     }
 }
 
@@ -840,9 +883,10 @@ mod tests {
         let mut cp = None;
         let mut an = None;
         let mut va = None;
-        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va);
+        let mut atc = None;
+        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va, &mut atc);
         assert!(
-            cp.is_none() && an.is_none() && va.is_none(),
+            cp.is_none() && an.is_none() && va.is_none() && atc.is_none(),
             "disabled maintenance must not attempt or advance any task"
         );
     }
@@ -865,17 +909,19 @@ mod tests {
         let mut cp = None;
         let mut an = None;
         let mut va = None;
-        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va);
+        let mut atc = None;
+        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va, &mut atc);
         assert_eq!(cp, Some(now), "checkpoint cursor advanced");
         assert_eq!(an, Some(now), "analyze cursor advanced");
         assert_eq!(va, Some(now), "vacuum cursor advanced");
+        assert_eq!(atc, Some(now), "atc retention cursor advanced");
 
         // Re-running at the same instant: cursors are fresh, so nothing is due
         // and they must stay put (off-hot-path back-off).
-        let before = (cp, an, va);
-        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va);
+        let before = (cp, an, va, atc);
+        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va, &mut atc);
         assert_eq!(
-            (cp, an, va),
+            (cp, an, va, atc),
             before,
             "fresh cursors must not re-run within the interval"
         );

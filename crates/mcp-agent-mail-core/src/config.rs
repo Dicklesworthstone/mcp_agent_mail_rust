@@ -412,6 +412,16 @@ pub struct Config {
     pub atc_suspicion_k: f64,
     /// Experience write mode: `off` (suppress), `shadow` (trace-log only), `live` (persist).
     pub atc_write_mode: AtcWriteMode,
+    /// Hard ceiling on raw `atc_experiences` rows. When the table exceeds this,
+    /// the background maintenance worker rolls up and evicts the oldest terminal
+    /// (resolved/censored/expired) rows down to a hysteresis target — rollups and
+    /// open/unresolved rows are preserved. A safety bound against the ts2
+    /// unbounded-growth incident (859K rows / 3.36 GB corrupted `SQLite`). `0`
+    /// disables the ceiling.
+    pub atc_experience_max_rows: i64,
+    /// Cadence (seconds) for the background ATC experience-ceiling sweep. `0`
+    /// disables the periodic sweep (the ceiling is then never enforced).
+    pub atc_retention_sweep_interval_secs: u64,
 
     // Write-behind queue (WBQ) tuning
     /// Channel capacity for the write-behind queue (default 8192).
@@ -1465,6 +1475,8 @@ impl Default for Config {
             atc_ledger_capacity: 1000,
             atc_suspicion_k: 3.0,
             atc_write_mode: AtcWriteMode::Off,
+            atc_experience_max_rows: 250_000,
+            atc_retention_sweep_interval_secs: 3_600,
 
             // WBQ tuning
             wbq_channel_capacity: 8_192,
@@ -2431,6 +2443,15 @@ impl Config {
         if console_bool("ATC_LEARNING_DISABLED", false) {
             config.atc_write_mode = AtcWriteMode::Off;
         }
+        config.atc_experience_max_rows = i64::try_from(console_u64(
+            "AM_ATC_EXPERIENCE_MAX_ROWS",
+            u64::try_from(config.atc_experience_max_rows).unwrap_or(0),
+        ))
+        .unwrap_or(config.atc_experience_max_rows);
+        config.atc_retention_sweep_interval_secs = console_u64(
+            "AM_ATC_RETENTION_SWEEP_INTERVAL_SECS",
+            config.atc_retention_sweep_interval_secs,
+        );
 
         // WBQ tuning
         config.wbq_channel_capacity =
