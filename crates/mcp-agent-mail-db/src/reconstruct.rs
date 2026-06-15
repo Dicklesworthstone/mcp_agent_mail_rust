@@ -5691,6 +5691,76 @@ Hello Bob, this is a test message.
     }
 
     #[test]
+    fn reconstruct_preserves_nontrivial_canonical_message_id() {
+        // br-bvq1x.7.5 (G5) golden, before/after: a single archived message
+        // carrying a non-trivial canonical id (904) must land in a *fresh*
+        // (empty) DB under that exact id. Under AUTOINCREMENT the first
+        // inserted row would otherwise be re-keyed to 1, so asserting the row
+        // id == 904 cleanly distinguishes canonical-identity preservation
+        // (`INSERT OR REPLACE ... (id, ...)`) from SQLite reassigning the id.
+        // `reconstruct_with_message` only exercises id 1, which is ambiguous
+        // (autoincrement would also pick 1); this is the dedicated regression
+        // guard for the preservation path.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"test","model":"test","inception_ts":"2026-02-22T12:00:00Z","last_active_ts":"2026-02-22T12:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let msg_content = r#"---json
+{
+  "id": 904,
+  "from": "Alice",
+  "to": ["Bob"],
+  "thread_id": "TEST-904",
+  "subject": "Canonical id golden",
+  "importance": "normal",
+  "ack_required": false,
+  "created_ts": "2026-02-22T12:00:00Z",
+  "attachments": []
+}
+---
+
+Body for the canonical id golden test.
+"#;
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__canonical-id-golden__904.md"),
+            msg_content,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.parse_errors, 0);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT id, subject FROM messages", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one message should be reconstructed");
+        assert_eq!(
+            rows[0].get_named::<i64>("id").expect("message id"),
+            904,
+            "reconstruct must preserve the canonical message id, not re-key it via autoincrement"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("subject")
+                .expect("message subject"),
+            "Canonical id golden"
+        );
+    }
+
+    #[test]
     fn reconstruct_handles_malformed_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("test.db");
