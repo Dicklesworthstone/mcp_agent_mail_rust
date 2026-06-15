@@ -5623,6 +5623,210 @@ fn emit_pre_tui_startup_banner(config: &Config) {
     }
 }
 
+/// How long a non-takeover `am serve-http` will wait for the restart-coordination
+/// lock before proceeding unlocked (best-effort). While waiting it re-probes
+/// `/healthz`, so a peer that binds during the wait short-circuits this.
+const RESTART_COORD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Single-owner restart-coordination lock for one storage root.
+///
+/// Held for the serving process's lifetime so concurrent `am serve-http`
+/// invocations for the same storage root don't kill each other's freshly-bound
+/// servers (the ts2 "restart-fighting" wedge that left the mailbox in
+/// `degraded_read_only` with a stale lock). `flock`-based; auto-released on drop
+/// / process exit.
+struct RestartCoordinationLock {
+    _file: std::fs::File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartDecision {
+    /// We hold the restart lock; proceed with takeover + bind, holding it for the
+    /// server's lifetime.
+    Proceed,
+    /// A peer already won the restart and is answering `/healthz`; this
+    /// invocation is redundant and should exit without fighting.
+    PeerAlreadyServing,
+    /// Couldn't coordinate (lock contended past the wait / lock infra error) and
+    /// no live peer was seen — proceed best-effort without the lock. Never worse
+    /// than the pre-coordination behavior.
+    ProceedUnlocked,
+    /// Lock is contended but no peer is serving yet — keep waiting (loop-internal;
+    /// never returned to the caller).
+    KeepWaiting,
+}
+
+/// Pure restart-coordination policy. Factored out so the decision is unit-testable
+/// without a real lock, peer, or port.
+const fn decide_restart_coordination(
+    acquired: bool,
+    peer_healthz_live: bool,
+    takeover: bool,
+) -> RestartDecision {
+    if acquired {
+        RestartDecision::Proceed
+    } else if takeover {
+        // We were told to seize the port — don't wait on the current holder; the
+        // kill path will free its lock.
+        RestartDecision::ProceedUnlocked
+    } else if peer_healthz_live {
+        // A peer is up and we weren't asked to seize it: do not fight.
+        RestartDecision::PeerAlreadyServing
+    } else {
+        RestartDecision::KeepWaiting
+    }
+}
+
+fn restart_lock_path(storage_root: &Path) -> PathBuf {
+    storage_root.join(".am-restart.lock")
+}
+
+/// Coordinate a server (re)start for `config.storage_root`.
+///
+/// Returns the terminal [`RestartDecision`] and, when it is [`RestartDecision::Proceed`],
+/// the held lock guard (keep it alive for the server's lifetime). On any lock
+/// infrastructure failure this fails open to [`RestartDecision::ProceedUnlocked`]
+/// so coordination can never wedge a legitimate startup.
+fn coordinate_server_restart(
+    config: &Config,
+    takeover: bool,
+    wait: std::time::Duration,
+) -> (RestartDecision, Option<RestartCoordinationLock>) {
+    use fs2::FileExt;
+    use std::time::{Duration, Instant};
+
+    let path = restart_lock_path(&config.storage_root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return (RestartDecision::ProceedUnlocked, None);
+    };
+
+    let deadline = Instant::now() + wait;
+    loop {
+        if file.try_lock_exclusive().is_ok() {
+            return (
+                RestartDecision::Proceed,
+                Some(RestartCoordinationLock { _file: file }),
+            );
+        }
+        let peer_live = mcp_agent_mail_server::probe_http_healthz_blocking(config);
+        match decide_restart_coordination(false, peer_live, takeover) {
+            RestartDecision::PeerAlreadyServing => {
+                return (RestartDecision::PeerAlreadyServing, None);
+            }
+            RestartDecision::ProceedUnlocked => return (RestartDecision::ProceedUnlocked, None),
+            RestartDecision::KeepWaiting => {
+                if Instant::now() >= deadline {
+                    return (RestartDecision::ProceedUnlocked, None);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            RestartDecision::Proceed => unreachable!("acquired is handled above the probe"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod restart_coordination_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn test_config_with_unused_port(storage_root: &Path) -> Config {
+        Config {
+            storage_root: storage_root.to_path_buf(),
+            http_host: "127.0.0.1".to_string(),
+            // A port nothing is listening on, so the /healthz probe is a fast
+            // `false` and the test never depends on an ambient server.
+            http_port: 59_321,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn decide_acquired_always_proceeds() {
+        assert_eq!(
+            decide_restart_coordination(true, false, false),
+            RestartDecision::Proceed
+        );
+        assert_eq!(
+            decide_restart_coordination(true, true, true),
+            RestartDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_backs_off_for_live_peer_without_takeover() {
+        assert_eq!(
+            decide_restart_coordination(false, true, false),
+            RestartDecision::PeerAlreadyServing
+        );
+    }
+
+    #[test]
+    fn decide_takeover_seizes_without_waiting() {
+        assert_eq!(
+            decide_restart_coordination(false, true, true),
+            RestartDecision::ProceedUnlocked
+        );
+        assert_eq!(
+            decide_restart_coordination(false, false, true),
+            RestartDecision::ProceedUnlocked
+        );
+    }
+
+    #[test]
+    fn decide_waits_when_contended_and_no_peer() {
+        assert_eq!(
+            decide_restart_coordination(false, false, false),
+            RestartDecision::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn coordinate_acquires_when_lock_is_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_with_unused_port(dir.path());
+        let (decision, lock) =
+            coordinate_server_restart(&config, false, Duration::from_millis(200));
+        assert_eq!(decision, RestartDecision::Proceed);
+        assert!(lock.is_some(), "a free restart lock must be acquired");
+    }
+
+    #[test]
+    fn coordinate_takeover_proceeds_unlocked_when_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_with_unused_port(dir.path());
+        // First invocation holds the lock for the duration of the test.
+        let (first, _held) = coordinate_server_restart(&config, false, Duration::from_millis(200));
+        assert_eq!(first, RestartDecision::Proceed);
+        // A concurrent `--takeover` invocation must not block on the holder.
+        let (second, lock2) = coordinate_server_restart(&config, true, Duration::from_millis(200));
+        assert_eq!(second, RestartDecision::ProceedUnlocked);
+        assert!(lock2.is_none());
+    }
+
+    #[test]
+    fn coordinate_proceeds_unlocked_after_timeout_when_held_with_no_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_with_unused_port(dir.path());
+        let (first, _held) = coordinate_server_restart(&config, false, Duration::from_millis(100));
+        assert_eq!(first, RestartDecision::Proceed);
+        // No peer is serving (unused port), so a non-takeover contender waits the
+        // short deadline and then proceeds unlocked rather than wedging.
+        let (second, lock2) = coordinate_server_restart(&config, false, Duration::from_millis(250));
+        assert_eq!(second, RestartDecision::ProceedUnlocked);
+        assert!(lock2.is_none());
+    }
+}
+
 fn handle_serve_http(
     host: Option<String>,
     port: Option<u16>,
@@ -5638,6 +5842,26 @@ fn handle_serve_http(
     }
     let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
     apply_release_logging_defaults(suppress_runtime_logs_for_tui);
+
+    // ts2 (br-bvq1x.4.5): serialize concurrent (re)starts for this storage root
+    // so racing `am serve-http` invocations don't kill each other's freshly-bound
+    // servers and wedge the mailbox in degraded_read_only. The winner holds the
+    // lock for this server's lifetime; a late arrival that finds a live peer backs
+    // off instead of fighting. `--takeover` seizes immediately; lock-infra failure
+    // fails open (proceed unlocked = legacy behavior).
+    let (restart_decision, _restart_lock) =
+        coordinate_server_restart(&config, takeover, RESTART_COORD_WAIT);
+    if restart_decision == RestartDecision::PeerAlreadyServing {
+        return Err(CliError::Other(format!(
+            "another Agent Mail server is already serving this storage root ({}) and is \
+             answering /healthz on {}:{}; not restarting (avoiding restart-fighting). Connect \
+             to it, or pass `am serve-http --takeover` to forcibly seize the port.",
+            config.storage_root.display(),
+            config.http_host,
+            config.http_port,
+        )));
+    }
+
     maybe_stop_conflicting_managed_service(
         &config.http_host,
         config.http_port,
