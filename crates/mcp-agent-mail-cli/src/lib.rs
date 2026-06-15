@@ -25767,6 +25767,48 @@ fn doctor_orphaned_project_reference_exists_canonical(
         .is_some_and(|value| value != 0))
 }
 
+/// Build the effective runtime-identity block (J3, br-bvq1x.10.3).
+///
+/// Shared by `am robot health` and `am doctor check` so every health/diagnostic
+/// surface can name WHICH `am` binary, version, PID, and mailbox (storage_root +
+/// database_url + the opened db file), bind address, and live server PID(s) it
+/// resolved — the path/version-confusion failure mode (multiple binaries on
+/// PATH, a legacy Python shadow, recovered trees, a port held by a foreign
+/// process). `server_pids` is empty when no Agent Mail server holds the port.
+pub(crate) fn runtime_identity_json(
+    storage_root: &Path,
+    database_url: &str,
+    http_host: &str,
+    http_port: u16,
+    db_file: Option<&str>,
+) -> serde_json::Value {
+    let binary_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let server_pids = mcp_agent_mail_server::startup_checks::agent_mail_port_holder_pids_with_hint(
+        http_host, http_port,
+    );
+    let mut obj = serde_json::Map::new();
+    obj.insert("binary_path".to_string(), serde_json::json!(binary_path));
+    obj.insert(
+        "version".to_string(),
+        serde_json::json!(env!("CARGO_PKG_VERSION")),
+    );
+    obj.insert("pid".to_string(), serde_json::json!(std::process::id()));
+    obj.insert(
+        "storage_root".to_string(),
+        serde_json::json!(storage_root.display().to_string()),
+    );
+    obj.insert("database_url".to_string(), serde_json::json!(database_url));
+    if let Some(db) = db_file {
+        obj.insert("db_file".to_string(), serde_json::json!(db));
+    }
+    obj.insert("http_host".to_string(), serde_json::json!(http_host));
+    obj.insert("http_port".to_string(), serde_json::json!(http_port));
+    obj.insert("server_pids".to_string(), serde_json::json!(server_pids));
+    serde_json::Value::Object(obj)
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -27436,6 +27478,15 @@ fn handle_doctor_check_with(
     let payload = serde_json::json!({
         "healthy": all_ok,
         "summary": summary,
+        // J3 (br-bvq1x.10.3): always name the effective runtime identity so an
+        // agent/operator can tell which `am`/mailbox/server this report describes.
+        "runtime_identity": runtime_identity_json(
+            storage_root,
+            database_url,
+            &env_config.http_host,
+            env_config.http_port,
+            None,
+        ),
         "checks": checks,
         "diagnostic_payload": diagnostic_payload,
         "forensic_timeline": forensic_timeline,
@@ -56085,6 +56136,56 @@ startup_timeout_sec = 42
             ],
             f,
         )
+    }
+
+    #[test]
+    fn doctor_check_json_always_includes_runtime_identity() {
+        // J3 (br-bvq1x.10.3): `am doctor check --json` must always name the
+        // effective runtime identity (binary/version/pid/storage_root/
+        // database_url/host:port/server_pids) so an agent can tell exactly which
+        // `am`/mailbox/server this diagnostic report describes — the
+        // path/version-confusion failure mode.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root_s = dir.path().display().to_string();
+
+        let parsed = with_isolated_doctor_runtime_for_test(&storage_root_s, || {
+            let db_path = dir.path().join("doctor-check-identity.sqlite3");
+            seed_project_only_db(&db_path, "doctor-check-identity", "/doctor-check-identity");
+            let db_url = format!("sqlite:///{}", db_path.display());
+            run_doctor_check_json(&db_url, dir.path())
+        });
+
+        let id = parsed
+            .get("runtime_identity")
+            .and_then(serde_json::Value::as_object)
+            .expect("runtime_identity object must always be present in doctor check JSON");
+        for field in [
+            "binary_path",
+            "version",
+            "pid",
+            "storage_root",
+            "database_url",
+            "http_host",
+            "http_port",
+            "server_pids",
+        ] {
+            assert!(
+                id.contains_key(field),
+                "runtime_identity must carry `{field}`: {id:?}"
+            );
+        }
+        assert_eq!(
+            id.get("version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "runtime_identity.version must be the running binary's version"
+        );
+        assert!(
+            id.get("server_pids").and_then(|v| v.as_array()).is_some(),
+            "server_pids must be an array (empty when no server is bound): {id:?}"
+        );
     }
 
     #[test]

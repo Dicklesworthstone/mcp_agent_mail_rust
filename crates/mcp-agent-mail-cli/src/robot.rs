@@ -13497,29 +13497,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // J3 (br-bvq1x.10.3): always name the effective runtime identity so an
             // agent (or operator) can tell exactly WHICH `am` binary it invoked and
             // WHICH mailbox/server it is talking to — the path/version-confusion
-            // failure mode (multiple binaries on PATH, legacy Python shadow,
-            // recovered trees, a port held by a foreign/legacy process).
-            #[derive(Serialize)]
-            struct RuntimeIdentity {
-                binary_path: String,
-                version: String,
-                pid: u32,
-                storage_root: String,
-                database_url: String,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                db_file: Option<String>,
-                http_host: String,
-                http_port: u16,
-                /// PIDs of the Agent Mail server(s) currently holding the
-                /// configured port (empty = no live server bound here).
-                server_pids: Vec<u32>,
-            }
-
+            // failure mode. Shared with `am doctor check` via
+            // `crate::runtime_identity_json` so both surfaces stay in lockstep.
             #[derive(Serialize)]
             struct HealthData {
                 overall: String,
                 health_level: String,
-                runtime_identity: RuntimeIdentity,
+                runtime_identity: serde_json::Value,
                 probes: Vec<HealthProbe>,
                 circuits: Vec<CircuitEntry>,
                 #[serde(skip_serializing_if = "Option::is_none")]
@@ -13528,23 +13512,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
             }
 
-            let runtime_identity = RuntimeIdentity {
-                binary_path: std::env::current_exe()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "unknown".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                pid: std::process::id(),
-                storage_root: config.storage_root.display().to_string(),
-                database_url: config.database_url.clone(),
-                db_file,
-                http_host: config.http_host.clone(),
-                http_port: config.http_port,
-                server_pids:
-                    mcp_agent_mail_server::startup_checks::agent_mail_port_holder_pids_with_hint(
-                        &config.http_host,
-                        config.http_port,
-                    ),
-            };
+            let runtime_identity = crate::runtime_identity_json(
+                &config.storage_root,
+                &config.database_url,
+                &config.http_host,
+                config.http_port,
+                db_file.as_deref(),
+            );
 
             #[derive(Serialize)]
             struct CircuitEntry {
