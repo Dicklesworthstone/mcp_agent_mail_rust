@@ -13223,6 +13223,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let mut probes: Vec<HealthProbe> = Vec::new();
             let config = mcp_agent_mail_core::Config::from_env();
             let mut db_conn: Option<DbConn> = None;
+            // J3 (br-bvq1x.10.3): capture the *effective* DB file that was actually
+            // opened so the runtime-identity block can name it (path/version
+            // confusion: agents could not tell which mailbox `am` resolved).
+            let mut db_file: Option<String> = None;
 
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
@@ -13232,6 +13236,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 Ok((conn, opened_path)) => {
                     // Verify canonical DB reachability with a lightweight query.
                     let query_ok = conn.query_sync("SELECT 1", &[]).is_ok();
+                    db_file = Some(opened_path.clone());
                     if query_ok {
                         db_conn = Some(conn);
                     }
@@ -13489,10 +13494,32 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 "healthy"
             };
 
+            // J3 (br-bvq1x.10.3): always name the effective runtime identity so an
+            // agent (or operator) can tell exactly WHICH `am` binary it invoked and
+            // WHICH mailbox/server it is talking to — the path/version-confusion
+            // failure mode (multiple binaries on PATH, legacy Python shadow,
+            // recovered trees, a port held by a foreign/legacy process).
+            #[derive(Serialize)]
+            struct RuntimeIdentity {
+                binary_path: String,
+                version: String,
+                pid: u32,
+                storage_root: String,
+                database_url: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                db_file: Option<String>,
+                http_host: String,
+                http_port: u16,
+                /// PIDs of the Agent Mail server(s) currently holding the
+                /// configured port (empty = no live server bound here).
+                server_pids: Vec<u32>,
+            }
+
             #[derive(Serialize)]
             struct HealthData {
                 overall: String,
                 health_level: String,
+                runtime_identity: RuntimeIdentity,
                 probes: Vec<HealthProbe>,
                 circuits: Vec<CircuitEntry>,
                 #[serde(skip_serializing_if = "Option::is_none")]
@@ -13500,6 +13527,24 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 #[serde(skip_serializing_if = "Option::is_none")]
                 host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
             }
+
+            let runtime_identity = RuntimeIdentity {
+                binary_path: std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                pid: std::process::id(),
+                storage_root: config.storage_root.display().to_string(),
+                database_url: config.database_url.clone(),
+                db_file,
+                http_host: config.http_host.clone(),
+                http_port: config.http_port,
+                server_pids:
+                    mcp_agent_mail_server::startup_checks::agent_mail_port_holder_pids_with_hint(
+                        &config.http_host,
+                        config.http_port,
+                    ),
+            };
 
             #[derive(Serialize)]
             struct CircuitEntry {
@@ -13526,6 +13571,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 HealthData {
                     overall: overall.into(),
                     health_level: health_str,
+                    runtime_identity,
                     probes,
                     circuits: circuit_entries,
                     search_index: search_index_snapshot,
@@ -21588,6 +21634,80 @@ mod tests {
         assert!(
             rows.is_empty(),
             "robot health should not initialize schema tables in an uninitialized sqlite file"
+        );
+    }
+
+    #[test]
+    fn robot_health_always_emits_runtime_identity() {
+        // J3 (br-bvq1x.10.3): every `am robot health` output must name the
+        // effective runtime identity so an agent can tell WHICH `am` binary it
+        // invoked and WHICH mailbox/server it resolved — the path/version-confusion
+        // failure mode. Present unconditionally (no flag).
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_identity.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let out = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        let id = out
+            .get("runtime_identity")
+            .expect("runtime_identity block must always be present");
+        for field in [
+            "binary_path",
+            "version",
+            "pid",
+            "storage_root",
+            "database_url",
+            "http_host",
+            "http_port",
+            "server_pids",
+        ] {
+            assert!(
+                id.get(field).is_some(),
+                "runtime_identity must carry `{field}`: {id:?}"
+            );
+        }
+        assert_eq!(
+            id.get("version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "runtime_identity.version must be the running binary's version"
+        );
+        assert_eq!(
+            id.get("database_url").and_then(|v| v.as_str()),
+            Some(db_url.as_str()),
+            "runtime_identity.database_url must be the effective DATABASE_URL"
+        );
+        assert!(
+            id.get("db_file")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.contains("robot_health_identity.sqlite3")),
+            "runtime_identity.db_file must name the effective DB file: {id:?}"
+        );
+        assert!(
+            id.get("server_pids").and_then(|v| v.as_array()).is_some(),
+            "server_pids must be an array (empty when no server is bound): {id:?}"
         );
     }
 
