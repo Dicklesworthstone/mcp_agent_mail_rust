@@ -4156,6 +4156,31 @@ fn stop_launchd_service() -> CliResult<()> {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn start_launchd_service() -> CliResult<()> {
+    let uid = current_uid()?;
+    let Some(plist_path) = launchd_plist_path() else {
+        return Err(CliError::Other(
+            "failed to resolve LaunchAgent plist path".to_string(),
+        ));
+    };
+    run_cmd(
+        "launchctl",
+        &[
+            "bootstrap",
+            &format!("gui/{uid}"),
+            &plist_path.display().to_string(),
+        ],
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_launchd_service() -> CliResult<()> {
+    Err(CliError::Other(
+        "launchd service control is unavailable on this platform".to_string(),
+    ))
+}
+
 fn active_conflicting_managed_service(
     host: &str,
     port: u16,
@@ -4189,26 +4214,68 @@ fn stop_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
     }
 }
 
+fn start_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
+    match kind {
+        ManagedServiceKind::Systemd => {
+            run_cmd("systemctl", &["--user", "start", SYSTEMD_UNIT_NAME])
+        }
+        ManagedServiceKind::Launchd => start_launchd_service(),
+    }
+}
+
+/// Restarts a managed service that the interactive TUI temporarily stopped, when
+/// the TUI session ends — so the headless background server resumes (true
+/// coexistence). Implemented as a drop guard so the service is restored on EVERY
+/// exit path of `handle_serve_http` (normal quit, `?` early-return, or panic
+/// unwind), never leaving the operator's background service silently stopped.
+struct ManagedServiceRestoreGuard {
+    kind: Option<ManagedServiceKind>,
+}
+
+impl Drop for ManagedServiceRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(kind) = self.kind.take() {
+            let service_name = managed_service_display_name(kind);
+            eprintln!("[info] Restarting {service_name} (interactive Agent Mail session ended)");
+            if let Err(e) = start_managed_service(kind) {
+                eprintln!(
+                    "[warn] Failed to restart {service_name}: {e}. \
+                     Run `am service restart` to bring the background server back."
+                );
+            }
+        }
+    }
+}
+
+/// Stop a managed service (systemd/launchd) that is holding this storage root's
+/// port so the interactive TUI can take over for its session.
+///
+/// Returns `Some(kind)` when a managed service was stopped (so the caller can
+/// restart it on TUI exit — true coexistence), or `None` when there was nothing
+/// to stop (or the stop failed best-effort). Even when the port does not free
+/// after the stop it returns `Some(kind)` so the caller still restores the
+/// service on exit; the downstream port/preflight checks report the occupied
+/// port honestly rather than leaving the operator's background service stopped.
 fn maybe_stop_conflicting_managed_service(
     host: &str,
     port: u16,
     interactive_tui: bool,
-) -> CliResult<()> {
+) -> Option<ManagedServiceKind> {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
 
     if !interactive_tui {
-        return Ok(());
+        return None;
     }
     // The health probe may cause an old server sharing this terminal to emit
     // noise (e.g. "Bad request.") — that output is harmless and can be ignored.
     if !matches!(check_port_status(host, port), PortStatus::AgentMailServer) {
-        return Ok(());
+        return None;
     }
 
     if let Some((kind, binding)) = active_conflicting_managed_service(host, port) {
         let service_name = managed_service_display_name(kind);
         eprintln!(
-            "[info] {service_name} is active on {}:{} — stopping it before launching the interactive TUI",
+            "[info] {service_name} is active on {}:{} — stopping it for this interactive TUI session (it will be restarted when you quit)",
             binding.host, binding.port
         );
         if let Err(e) = stop_managed_service(kind) {
@@ -4216,16 +4283,23 @@ fn maybe_stop_conflicting_managed_service(
                 "[warn] Failed to stop {service_name}: {e}. \
                  You may need to stop it manually before relaunching interactive Agent Mail."
             );
+            // We did not stop it, so there is nothing to restore on exit.
+            return None;
         }
         if wait_for_port_release(host, port, std::time::Duration::from_secs(6)) {
-            return Ok(());
+            return Some(kind);
         }
-        return Err(CliError::Other(format!(
-            "Stopped {service_name}, but port {host}:{port} did not become free"
-        )));
+        // Stopped the service but the port is still held (a foreign process?).
+        // Return `Some` anyway so the caller's restore guard still restarts the
+        // service when the session ends.
+        eprintln!(
+            "[warn] Stopped {service_name} but {host}:{port} is still in use by another process; \
+             continuing — {service_name} will be restarted when this session ends"
+        );
+        return Some(kind);
     }
 
-    Ok(())
+    None
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -5849,6 +5923,25 @@ fn handle_serve_http(
     // lock for this server's lifetime; a late arrival that finds a live peer backs
     // off instead of fighting. `--takeover` seizes immediately; lock-infra failure
     // fails open (proceed unlocked = legacy behavior).
+    // Coexistence (br-bvq1x.9.4 / I4): if a managed service (systemd/launchd) is
+    // serving this storage root and we're launching the interactive TUI, stop it
+    // FIRST so it releases the restart-coordination lock + the port, then restore
+    // it when the TUI exits (via the drop guard). Without this, the
+    // `coordinate_server_restart` check below would see the service's live
+    // `/healthz` + held lock and dead-end with "connect to it" — but there is no
+    // client-attach mode, so the operator could never see the TUI while their
+    // background service runs. Stopping/restarting a *managed* service is fully
+    // reversible (unlike killing a foreground peer), which is what makes this
+    // take-over-and-restore safe. The guard restarts the service on every exit
+    // path (normal quit, `?` early-return, panic unwind).
+    let _managed_service_restore = ManagedServiceRestoreGuard {
+        kind: maybe_stop_conflicting_managed_service(
+            &config.http_host,
+            config.http_port,
+            config.tui_enabled,
+        ),
+    };
+
     let (restart_decision, _restart_lock) =
         coordinate_server_restart(&config, takeover, RESTART_COORD_WAIT);
     if restart_decision == RestartDecision::PeerAlreadyServing {
@@ -5862,11 +5955,6 @@ fn handle_serve_http(
         )));
     }
 
-    maybe_stop_conflicting_managed_service(
-        &config.http_host,
-        config.http_port,
-        config.tui_enabled,
-    )?;
     // Kill any existing Agent Mail server on the port FIRST — on macOS
     // we can't find processes by DB file handle (no /proc), but we CAN
     // find them by port.  This also handles Codex-spawned `am serve-http`.
