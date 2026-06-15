@@ -3102,6 +3102,131 @@ fn spawn_tui_readiness_warmup(
     }
 }
 
+/// Maximum time the headless startup will BLOCK on the database readiness
+/// warmup before binding the HTTP listener anyway.
+///
+/// On a healthy DB the warmup (migrations + integrity probe) finishes in well
+/// under a second; this deadline exists so a pathologically slow recovery — e.g.
+/// a corrupt DB triggering archive reconstruction that balloons memory — can no
+/// longer wedge the listener and make the server look dead to supervisors and
+/// the installer (br-5mnkl). Overridable via `STARTUP_READINESS_BIND_TIMEOUT_SECS`.
+fn startup_readiness_bind_deadline() -> Duration {
+    Duration::from_secs(parse_startup_readiness_bind_deadline_secs(
+        std::env::var("STARTUP_READINESS_BIND_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
+/// Pure parse for [`startup_readiness_bind_deadline`]. A missing, empty,
+/// non-numeric, or zero value falls back to the 20s default so a fat-fingered
+/// override can never disable the bind deadline (which would re-introduce the
+/// br-5mnkl wedge).
+fn parse_startup_readiness_bind_deadline_secs(raw: Option<&str>) -> u64 {
+    const DEFAULT_SECS: u64 = 20;
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_SECS)
+}
+
+/// Run the database readiness warmup (migrations + integrity/recovery probe)
+/// without letting it wedge the HTTP listener bind.
+///
+/// Historically the headless path blocked on `readiness_check(config)?` before
+/// binding, so a pathologically slow recovery on a degraded DB (archive
+/// reconstruction ballooning to multiple GB on a single thread) wedged the whole
+/// server BEFORE it ever opened the port: systemd reported `active (running)`
+/// while `/health` was unreachable and the installer reported failure
+/// (br-5mnkl). We now run the warmup on a bounded background thread:
+///
+///   * the listener binds within `startup_readiness_bind_deadline()` regardless,
+///     so `/healthz` (liveness, DB-independent) is always reachable and the
+///     installer's probe succeeds;
+///   * `/health` honestly reports `warming_up` / `service unavailable` (503)
+///     until the DB settles, then `ready` (200);
+///   * if the warmup is still running at the deadline it is left to finish in
+///     the background — never joined — and recovery/diagnosis stay available via
+///     `am doctor`.
+///
+/// No data is mutated beyond what `readiness_check` already does; this is the
+/// "bind-degraded + report" contract, not aggressive auto-remediation.
+fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
+    let cfg = config.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("am-db-readiness".to_string())
+        .spawn(move || {
+            let _ = tx.send(readiness_check(&cfg));
+        });
+    if let Err(error) = spawned {
+        // Could not even spawn the warmup thread; fall back to an inline
+        // (blocking) readiness so we never silently skip migrations. This path
+        // is the pre-br-5mnkl behavior and only triggers under thread
+        // exhaustion, which is itself a degraded host.
+        tracing::warn!(%error, "could not spawn background DB readiness thread; running inline");
+        if let Err(error) = readiness_check(config) {
+            tracing::warn!(%error, "database readiness warmup failed; binding in degraded mode");
+        }
+        return;
+    }
+    match rx.recv_timeout(startup_readiness_bind_deadline()) {
+        Ok(Ok(())) => {
+            tracing::debug!("database readiness warmup completed before listener bind");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %error,
+                db = %config.database_url,
+                storage_root = %config.storage_root.display(),
+                "database readiness warmup failed; binding the HTTP listener in DB-degraded mode. \
+                 /healthz stays live and /health reports unavailable until the DB recovers. \
+                 Run `am doctor --json` to diagnose/repair."
+            );
+        }
+        Err(_timeout) => {
+            tracing::warn!(
+                deadline_secs = startup_readiness_bind_deadline().as_secs(),
+                db = %config.database_url,
+                storage_root = %config.storage_root.display(),
+                "database readiness warmup still running after the bind deadline; binding the HTTP \
+                 listener NOW so the server is reachable (degraded). Recovery continues in the \
+                 background. If this persists, stop the service and run `am doctor --json`."
+            );
+            // Detach: let the warmup finish in the background; never join here.
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_readiness_bind_deadline_tests {
+    use super::parse_startup_readiness_bind_deadline_secs as parse;
+
+    #[test]
+    fn defaults_when_unset() {
+        assert_eq!(parse(None), 20);
+    }
+
+    #[test]
+    fn honors_a_valid_override() {
+        assert_eq!(parse(Some("30")), 30);
+        assert_eq!(parse(Some("  15 ")), 15);
+    }
+
+    #[test]
+    fn rejects_zero_so_the_deadline_cannot_be_disabled() {
+        // A zero deadline would re-introduce the br-5mnkl wedge; fall back to default.
+        assert_eq!(parse(Some("0")), 20);
+    }
+
+    #[test]
+    fn rejects_non_numeric_and_empty_values() {
+        assert_eq!(parse(Some("")), 20);
+        assert_eq!(parse(Some("abc")), 20);
+        assert_eq!(parse(Some("-5")), 20);
+        assert_eq!(parse(Some("12x")), 20);
+    }
+}
+
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
@@ -3119,11 +3244,11 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Safe to acquire now -- probes have confirmed we are the sole owner.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
-    readiness_check(config).map_err(|error| {
-        std::io::Error::other(format!(
-            "Database readiness warmup failed before starting HTTP background workers: {error}"
-        ))
-    })?;
+    // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
+    // pathologically slow recovery can never wedge the listener bind. The
+    // listener always comes up within the bind deadline; `/healthz` stays live
+    // and `/health` reports degraded honestly until the DB settles.
+    run_bounded_startup_readiness(config);
 
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
