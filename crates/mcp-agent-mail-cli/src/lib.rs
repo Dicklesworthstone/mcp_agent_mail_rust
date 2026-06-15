@@ -23,6 +23,7 @@ pub mod e2e_runner;
 pub mod golden;
 pub mod legacy;
 pub mod output;
+pub mod reliability_coverage;
 pub mod robot;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -1833,6 +1834,8 @@ pub enum VerifyLane {
     E2eStdio,
     /// `rch exec -- cargo bench -p mcp-agent-mail-cli -- --help`
     BenchQuick,
+    /// `rch exec -- cargo test -p mcp-agent-mail-cli --test reliability_coverage_ci`
+    ReliabilityCoverage,
 }
 
 #[derive(Subcommand, Debug)]
@@ -59935,6 +59938,7 @@ impl VerifyLane {
             Self::E2eList => "e2e-list",
             Self::E2eStdio => "e2e-stdio",
             Self::BenchQuick => "bench-quick",
+            Self::ReliabilityCoverage => "reliability-coverage",
         }
     }
 
@@ -59979,6 +59983,17 @@ impl VerifyLane {
                 "mcp-agent-mail-cli",
                 "--",
                 "--help",
+            ],
+            Self::ReliabilityCoverage => vec![
+                "rch",
+                "exec",
+                "--",
+                "cargo",
+                "test",
+                "-p",
+                "mcp-agent-mail-cli",
+                "--test",
+                "reliability_coverage_ci",
             ],
         }
         .into_iter()

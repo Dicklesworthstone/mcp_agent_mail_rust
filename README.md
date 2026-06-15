@@ -563,7 +563,7 @@ token values.
 | `golden` | `capture`, `verify`, `list` |
 | `flake-triage` | `scan`, `reproduce`, `detect` |
 | `robot` | `status`, `inbox`, `timeline`, `overview`, `thread`, `search`, `message`, `navigate`, `reservations`, `metrics`, `health`, `analytics`, `agents`, `contacts`, `projects`, `attachments`, `atc` |
-| `verify` | `cargo-fmt`, `cargo-check`, `cargo-clippy`, `cargo-test`, `e2e-list`, `e2e-stdio`, `bench-quick` |
+| `verify` | `cargo-fmt`, `cargo-check`, `cargo-clippy`, `cargo-test`, `e2e-list`, `e2e-stdio`, `bench-quick`, `reliability-coverage` |
 | `legacy` | `detect`, `import`, `status` |
 | `service` | `install`, `uninstall`, `status`, `logs`, `restart` |
 

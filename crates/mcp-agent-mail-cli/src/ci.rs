@@ -1904,6 +1904,20 @@ pub fn default_gates() -> Vec<GateConfig> {
             ],
         ),
         GateConfig::new(
+            "Reliability test-coverage matrix",
+            GateCategory::Quality,
+            [
+                "cargo",
+                "test",
+                "-p",
+                "mcp-agent-mail-cli",
+                "--test",
+                "reliability_coverage_ci",
+                "--",
+                "--nocapture",
+            ],
+        ),
+        GateConfig::new(
             "DB stress suite",
             GateCategory::Quality,
             [
