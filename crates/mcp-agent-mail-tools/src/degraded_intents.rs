@@ -684,4 +684,135 @@ mod tests {
         assert_ne!(r1.intent_id, r2.intent_id);
         assert_eq!(read_queued_ack_intents(&config).expect("read").len(), 2);
     }
+
+    /// Build a release-intent record byte-identical to the one
+    /// `crate::reservations::append_release_intent` writes, so the read-only
+    /// release view (`read_queued_release_intents`) is exercised + guarded
+    /// against regression (reservations.rs keeps the authoritative writer).
+    fn write_release_intent_fixture(
+        config: &Config,
+        created_ts: i64,
+        paths: Value,
+        file_reservation_ids: Value,
+    ) -> (String, String) {
+        let payload = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_KIND,
+            "created_ts": created_ts,
+            "project_key": "/abs/project",
+            "agent_name": "BlueLake",
+            "paths": paths,
+            "file_reservation_ids": file_reservation_ids,
+            "failure": { "stage": "release_reservations", "error_detail": "malformed" },
+        });
+        let content_sha256 = hash_json_value(&payload);
+        let intent_id: String = content_sha256.chars().take(16).collect();
+        let record = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_KIND,
+            "intent_id": intent_id,
+            "content_sha256": content_sha256,
+            "created_ts": created_ts,
+            "project_key": "/abs/project",
+            "agent_name": "BlueLake",
+            "paths": payload["paths"].clone(),
+            "file_reservation_ids": payload["file_reservation_ids"].clone(),
+            "failure": payload["failure"].clone(),
+        });
+        append_jsonl(
+            config,
+            RELEASE_INTENT_LOG_FILE,
+            ".release_file_reservations.jsonl.lock",
+            &record,
+        )
+        .expect("append release intent fixture");
+        (intent_id, content_sha256)
+    }
+
+    const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
+
+    #[test]
+    fn release_intent_reader_round_trip_and_replay_clear() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+
+        let (intent_id, content_sha256) =
+            write_release_intent_fixture(&config, 7777, json!(["src/**"]), Value::Null);
+        let queued = read_queued_release_intents(&config).expect("read release");
+        assert_eq!(queued.len(), 1, "a valid release intent must be surfaced");
+        assert_eq!(queued[0].agent_name, "BlueLake");
+        assert_eq!(
+            queued[0].paths.as_deref(),
+            Some(["src/**".to_string()].as_slice())
+        );
+        assert_eq!(queued[0].intent_id, intent_id);
+
+        // A terminal "replayed" marker (as reservations.rs writes) clears it.
+        let replay_payload = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_REPLAY_KIND,
+            "intent_id": intent_id,
+            "intent_content_sha256": content_sha256,
+            "replayed_ts": 8888,
+            "status": "replayed",
+            "released": 1,
+            "error_detail": Value::Null,
+        });
+        let replay_hash = hash_json_value(&replay_payload);
+        let replay_record = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_REPLAY_KIND,
+            "intent_id": intent_id,
+            "content_sha256": replay_hash,
+            "intent_content_sha256": content_sha256,
+            "replayed_ts": 8888,
+            "status": "replayed",
+            "released": 1,
+            "error_detail": Value::Null,
+        });
+        append_jsonl(
+            &config,
+            RELEASE_INTENT_LOG_FILE,
+            ".release_file_reservations.jsonl.lock",
+            &replay_record,
+        )
+        .expect("append replay marker");
+        assert!(
+            read_queued_release_intents(&config)
+                .expect("read after replay")
+                .is_empty(),
+            "a replayed release intent must be filtered out"
+        );
+    }
+
+    #[test]
+    fn release_intent_reader_skips_tampered_hash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        let bogus = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_KIND,
+            "intent_id": "0123456789abcdef",
+            "content_sha256": "0123456789abcdef".to_string() + &"0".repeat(48),
+            "created_ts": 1,
+            "project_key": "/p",
+            "agent_name": "X",
+            "paths": Value::Null,
+            "file_reservation_ids": json!([42]),
+            "failure": { "stage": "s", "error_detail": "e" },
+        });
+        append_jsonl(
+            &config,
+            RELEASE_INTENT_LOG_FILE,
+            ".release_file_reservations.jsonl.lock",
+            &bogus,
+        )
+        .expect("append");
+        assert!(
+            read_queued_release_intents(&config)
+                .expect("read")
+                .is_empty(),
+            "a release record with a mismatched content hash must be skipped"
+        );
+    }
 }

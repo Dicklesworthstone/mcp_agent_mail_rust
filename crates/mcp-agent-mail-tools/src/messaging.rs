@@ -3841,6 +3841,73 @@ mod tests {
     // ── Durable ack-intent replay (br-bvq1x.8.3 / H3) ────────────────────────
 
     #[test]
+    fn queued_ack_intent_response_reports_queued_ack() {
+        // The queue-on-corruption wrapper that `acknowledge_message` returns
+        // when the live mailbox is unavailable: it must persist a durable intent
+        // AND return a `queued` (not acknowledged) envelope with the intent's id.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::get();
+        config.storage_root = tmp.path().to_path_buf();
+
+        let payload = queued_ack_intent_response(
+            &config,
+            "/abs/project",
+            "BlueLake",
+            1234,
+            "acknowledge_message",
+            "database disk image is malformed",
+        )
+        .expect("queued ack response");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("queued ack JSON parses");
+        assert_eq!(parsed["message_id"].as_i64(), Some(1234));
+        assert_eq!(parsed["acknowledged"].as_bool(), Some(false));
+        assert!(parsed["acknowledged_at"].is_null());
+        assert!(parsed["read_at"].is_null());
+        assert_eq!(parsed["status"].as_str(), Some("queued"));
+        assert_eq!(parsed["queued"].as_bool(), Some(true));
+        assert!(
+            parsed["intent"]["id"]
+                .as_str()
+                .is_some_and(|s| s.len() == 16)
+        );
+        assert!(parsed["intent"]["content_sha256"].as_str().is_some());
+        assert!(
+            parsed["intent"]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("acknowledge_message.jsonl"))
+        );
+
+        let queued = crate::degraded_intents::read_queued_ack_intents(&config).expect("read");
+        assert_eq!(
+            queued.len(),
+            1,
+            "the queued response must persist the intent"
+        );
+        assert_eq!(queued[0].message_id, 1234);
+        assert_eq!(queued[0].agent_name, "BlueLake");
+    }
+
+    #[test]
+    fn db_error_classification_matches_queue_eligibility() {
+        // The ack-intent queue eligibility must mirror the corruption taxonomy:
+        // corruption/availability errors queue; a missing recipient does not.
+        assert!(db_error_supports_ack_intent(
+            &DbError::IntegrityCorruption {
+                message: "malformed".to_string(),
+                details: vec![],
+            }
+        ));
+        assert!(db_error_supports_ack_intent(&DbError::ResourceBusy(
+            "locked".to_string()
+        )));
+        assert!(!db_error_supports_ack_intent(&DbError::not_found(
+            "MessageRecipient",
+            "1:2",
+        )));
+    }
+
+    #[test]
     fn replay_queued_ack_intent_acks_once_on_success() {
         run_thread_validation_test("ack-intent-replay.db", |cx, pool| async move {
             let project = ensure_project_row(&cx, &pool, "/tmp/am-ack-intent-replay").await;

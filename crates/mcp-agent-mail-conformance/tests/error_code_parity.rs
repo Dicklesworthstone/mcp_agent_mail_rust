@@ -237,6 +237,7 @@ fn extract_slug_from_ensure_project_response(project_json: &str) -> String {
 fn error_code_catalog_is_stable() {
     let actual = collect_declared_error_codes();
     let expected: BTreeSet<String> = [
+        "ACK_INTENT_WRITE_FAILED",
         "AGENT_NOT_FOUND",
         "ARCHIVE_ERROR",
         "BROADCAST_DISABLED",
