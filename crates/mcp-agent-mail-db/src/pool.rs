@@ -4048,6 +4048,20 @@ pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<()
             }
         };
         if metadata.file_type().is_symlink() {
+            // J4 (br-bvq1x.10.4): macOS firmlinks (`/var` -> `/private/var`,
+            // `/tmp` -> `/private/tmp`, `/etc` -> `/private/etc`) are
+            // platform-canonical, not a symlink-escape. TMPDIRs live under
+            // `/var/folders/...`, so rejecting them broke archive reconstruction
+            // on macOS (no `TMPDIR=$(pwd -P)` wrapper should be required).
+            // Resolve a recognized firmlink and keep validating the REST of the
+            // path against its canonical location; genuine symlink-escapes
+            // anywhere else in the path are still refused.
+            if let Ok(resolved) = std::fs::canonicalize(&current)
+                && is_macos_temp_firmlink(&current, &resolved)
+            {
+                current = resolved;
+                continue;
+            }
             return Err(SqlError::Custom(format!(
                 "refusing {label} {} because it traverses symlinked path {}",
                 path.display(),
@@ -4057,6 +4071,30 @@ pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<()
     }
 
     Ok(())
+}
+
+/// J4 (br-bvq1x.10.4): recognize the fixed macOS firmlinks (`/var`, `/tmp`,
+/// `/etc` -> `/private/<name>`) that the sqlite path guard must treat as
+/// canonical rather than as a symlink-escape (TMPDIRs live under
+/// `/var/folders/...`).
+///
+/// Conservative on purpose: ONLY a top-level `/<name>` symlink whose canonical
+/// target is exactly `/private/<name>` (for the small fixed set of Apple
+/// firmlink roots) qualifies, so an attacker-planted symlink anywhere else is
+/// still refused. A no-op on Linux, where those paths are real directories (the
+/// `is_symlink()` branch that calls this is never taken).
+fn is_macos_temp_firmlink(link: &Path, resolved: &Path) -> bool {
+    let Some(name) = link.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !matches!(name, "var" | "tmp" | "etc") {
+        return false;
+    }
+    // Must be a top-level entry directly under `/` — `/var`, not `/foo/var`.
+    if link.parent() != Some(Path::new("/")) {
+        return false;
+    }
+    resolved == Path::new("/private").join(name)
 }
 
 pub struct CanonicalSnapshotTempDir {
@@ -7976,6 +8014,46 @@ mod tests {
             format!("---json\n{{\"id\": {id}, \"subject\": \"archived\"}}\n---\n\nbody\n"),
         )
         .expect("write canonical archive message");
+    }
+
+    #[test]
+    fn macos_temp_firmlink_detection_is_conservative() {
+        use std::path::Path;
+        // J4 (br-bvq1x.10.4): only the fixed top-level Apple firmlinks
+        // (`/var`,`/tmp`,`/etc` -> `/private/<name>`) are treated as canonical;
+        // every other symlink is still refused by `validate_sqlite_target_path`.
+        assert!(super::is_macos_temp_firmlink(
+            Path::new("/var"),
+            Path::new("/private/var")
+        ));
+        assert!(super::is_macos_temp_firmlink(
+            Path::new("/tmp"),
+            Path::new("/private/tmp")
+        ));
+        assert!(super::is_macos_temp_firmlink(
+            Path::new("/etc"),
+            Path::new("/private/etc")
+        ));
+        // Wrong canonical target -> not a firmlink (an escape attempt).
+        assert!(!super::is_macos_temp_firmlink(
+            Path::new("/var"),
+            Path::new("/evil/var")
+        ));
+        // A symlink pointing at a sensitive file is NOT a firmlink.
+        assert!(!super::is_macos_temp_firmlink(
+            Path::new("/tmp"),
+            Path::new("/etc/passwd")
+        ));
+        // Nested (not directly under `/`) -> not a firmlink.
+        assert!(!super::is_macos_temp_firmlink(
+            Path::new("/home/u/var"),
+            Path::new("/private/var")
+        ));
+        // Not one of the recognized temp roots.
+        assert!(!super::is_macos_temp_firmlink(
+            Path::new("/usr"),
+            Path::new("/private/usr")
+        ));
     }
 
     #[cfg(unix)]
