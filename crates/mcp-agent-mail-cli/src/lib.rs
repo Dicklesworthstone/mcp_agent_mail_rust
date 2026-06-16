@@ -25806,6 +25806,37 @@ pub(crate) fn runtime_identity_json(
     obj.insert("http_host".to_string(), serde_json::json!(http_host));
     obj.insert("http_port".to_string(), serde_json::json!(http_port));
     obj.insert("server_pids".to_string(), serde_json::json!(server_pids));
+
+    // J2 (br-bvq1x.10.2): offline known-bad/obsolete self-check of the RUNNING
+    // binary's version. The running `am` is the latest-locally-known reference
+    // to itself, so this surfaces a hard warning the moment a stale/known-bad
+    // build is live — exactly the css incident, where a systemd service kept
+    // running `am 0.3.12` (pre row-ceiling, pre bind-fix) and reproduced
+    // already-fixed bloat/wedge bugs. Ranges are bundled, so no network probe
+    // is needed; when actionable the block carries the exact repair command.
+    {
+        use mcp_agent_mail_core::am_version::{self, AmVersion};
+        let installed = AmVersion::current();
+        let verdict = am_version::classify_am_version(installed, installed);
+        let mut am_block = serde_json::Map::new();
+        am_block.insert(
+            "installed".to_string(),
+            serde_json::json!(installed.to_string()),
+        );
+        am_block.insert("state".to_string(), serde_json::json!(verdict.label()));
+        if verdict.is_actionable() {
+            am_block.insert(
+                "repair_command".to_string(),
+                serde_json::json!(am_version::AM_INSTALL_REPAIR_COMMAND),
+            );
+            am_block.insert("verdict".to_string(), serde_json::json!(verdict));
+        }
+        obj.insert(
+            "am_version".to_string(),
+            serde_json::Value::Object(am_block),
+        );
+    }
+
     serde_json::Value::Object(obj)
 }
 
@@ -56185,6 +56216,24 @@ startup_timeout_sec = 42
         assert!(
             id.get("server_pids").and_then(|v| v.as_array()).is_some(),
             "server_pids must be an array (empty when no server is bound): {id:?}"
+        );
+
+        // J2 (br-bvq1x.10.2): runtime_identity carries the offline am-version
+        // self-check. The running build must never classify itself as
+        // known-bad (a regression guard: a current version accidentally added
+        // to the known-bad catalog would trip this).
+        let amv = id
+            .get("am_version")
+            .and_then(serde_json::Value::as_object)
+            .expect("runtime_identity must carry the am_version self-check block");
+        assert!(
+            amv.contains_key("installed"),
+            "am_version must name the installed version: {amv:?}"
+        );
+        assert_eq!(
+            amv.get("state").and_then(|v| v.as_str()),
+            Some("current"),
+            "the running build must NOT be in the known-bad range: {amv:?}"
         );
     }
 

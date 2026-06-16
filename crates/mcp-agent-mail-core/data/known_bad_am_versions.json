@@ -1,0 +1,30 @@
+{
+  "$schema": "known_bad_am_versions_v1",
+  "comment": [
+    "Known-bad mcp_agent_mail (`am`/`mcp-agent-mail`) versions, embedded in",
+    "mcp-agent-mail-core. Classified OFFLINE (bundled ranges, no network).",
+    "Extend via AM_EXTRA_KNOWN_BAD_AM_JSON=<path> (user entries merge).",
+    "Suppress specific codes via AM_IGNORE_KNOWN_BAD_AM=CODE1,CODE2.",
+    "",
+    "Entry schema (identical to known_bad_git_versions.json):",
+    "  code              : UPPER_SNAKE_CASE, globally unique",
+    "  match.kind        : 'exact' or 'range'",
+    "  match.version     : 'X.Y.Z' (kind=exact)",
+    "  match.min         : 'X.Y.Z' inclusive (kind=range)",
+    "  match.max_exclusive: 'X.Y.Z' exclusive upper bound (kind=range)",
+    "  severity          : 'fail' or 'warn'",
+    "  summary           : single-line operator-facing description",
+    "  fingerprint       : optional runtime signature for grep",
+    "  remediation_ref   : doc path + anchor"
+  ],
+  "entries": [
+    {
+      "code": "AM_PRE_0_3_13_ATC_BLOAT_STARTUP_WEDGE",
+      "match": { "kind": "range", "min": "0.0.0", "max_exclusive": "0.3.13" },
+      "severity": "fail",
+      "summary": "am < 0.3.13 can wedge startup (serve-http blocks the listener bind on unbounded recovery; port never opens) and grow atc_experiences without bound (observed 2.41GB / 629k rows in 6 days). Upgrade to >= 0.3.13, then `am doctor reconstruct` to slim the DB.",
+      "fingerprint": "atc_experiences grows unbounded; 99% CPU during startup replay; HTTP port never bound",
+      "remediation_ref": "docs/RECOVERY_RUNBOOK.md#am-pre-0-3-13-atc-bloat-startup-wedge"
+    }
+  ]
+}

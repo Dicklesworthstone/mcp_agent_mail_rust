@@ -10,6 +10,7 @@
 
 pub mod agent_detect;
 pub mod agent_health;
+pub mod am_version;
 pub mod atc_adaptation;
 pub mod atc_admissibility;
 pub mod atc_assumptions;
