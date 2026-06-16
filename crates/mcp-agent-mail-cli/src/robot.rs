@@ -978,6 +978,10 @@ pub struct StatusData {
     pub reservation_forecast: Option<ReservationForecast>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryStatus>,
+    /// Degraded-mode intents (ack/release/send) queued for replay because the
+    /// mailbox was unavailable, each with how to replay it (br-bvq1x.8.3 / H3).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub queued_intents: Vec<QueuedIntentSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_index: Option<LexicalBackfillHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1018,6 +1022,31 @@ pub struct RecoveryStatus {
     /// Recovery admission controller status (consecutive failures, suppression, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<RecoveryAdmissionSnapshot>,
+}
+
+/// A degraded-mode intent queued for replay, surfaced in `am robot status`.
+///
+/// When a mutating verb cannot reach the live mailbox it persists a durable
+/// intent so the action is not silently dropped; this is the read-only view an
+/// agent uses to see what is pending and exactly how to flush it
+/// (br-bvq1x.8.3 / H3).
+#[derive(Debug, Clone, Serialize)]
+pub struct QueuedIntentSummary {
+    /// Verb the intent will replay: `acknowledge_message`, `send_message`, or
+    /// `release_file_reservations`.
+    pub kind: String,
+    /// Stable identifier (intent id or content hash).
+    pub id: String,
+    /// Agent that queued the intent, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// One-line human summary of what is queued.
+    pub summary: String,
+    /// How to replay: a copy-paste command, or the automatic mechanism.
+    pub replay: String,
+    /// Absolute path of the durable artifact backing this intent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Deferred-write backlog summary for operator-facing recovery status.
@@ -4103,6 +4132,125 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     })
 }
 
+/// Build the degraded-mode queued-intent list for `am robot status`
+/// (br-bvq1x.8.3 / H3).
+///
+/// Aggregates the three durable-intent surfaces: queued acknowledgements and
+/// reservation releases (auto-replayed on the next successful call) and queued
+/// UNSENT messages (replayed via an explicit command). Best-effort: any
+/// unreadable surface is skipped rather than failing the status command.
+fn build_queued_intents_for_robot() -> Vec<QueuedIntentSummary> {
+    build_queued_intents_for_config(&mcp_agent_mail_core::Config::get())
+}
+
+/// Config-taking core of [`build_queued_intents_for_robot`] (unit-testable).
+fn build_queued_intents_for_config(
+    config: &mcp_agent_mail_core::Config,
+) -> Vec<QueuedIntentSummary> {
+    use mcp_agent_mail_tools::degraded_intents as di;
+
+    let mut out: Vec<QueuedIntentSummary> = Vec::new();
+
+    // 1. Queued acknowledgements (auto-replay on next successful ack).
+    if let Ok(acks) = di::read_queued_ack_intents(config) {
+        let path = di::log_path(config, di::ACK_INTENT_LOG_FILE)
+            .display()
+            .to_string();
+        for intent in acks {
+            out.push(QueuedIntentSummary {
+                kind: "acknowledge_message".to_string(),
+                id: intent.intent_id,
+                agent: Some(intent.agent_name.clone()),
+                summary: format!(
+                    "ack of message {} by {} queued ({})",
+                    intent.message_id, intent.agent_name, intent.failure.stage
+                ),
+                replay: "automatic on next successful acknowledge_message".to_string(),
+                path: Some(path.clone()),
+            });
+        }
+    }
+
+    // 2. Queued reservation releases (auto-replay on next successful release).
+    if let Ok(releases) = di::read_queued_release_intents(config) {
+        let path = di::log_path(config, di::RELEASE_INTENT_LOG_FILE)
+            .display()
+            .to_string();
+        for intent in releases {
+            let target = match (&intent.paths, &intent.file_reservation_ids) {
+                (Some(paths), _) if !paths.is_empty() => paths.join(", "),
+                (_, Some(ids)) if !ids.is_empty() => format!(
+                    "reservation ids {}",
+                    ids.iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => "all reservations".to_string(),
+            };
+            out.push(QueuedIntentSummary {
+                kind: "release_file_reservations".to_string(),
+                id: intent.intent_id,
+                agent: Some(intent.agent_name.clone()),
+                summary: format!("release of {target} by {} queued", intent.agent_name),
+                replay: "automatic on next successful release_file_reservations".to_string(),
+                path: Some(path.clone()),
+            });
+        }
+    }
+
+    // 3. Queued UNSENT messages (explicit `am mail replay-queued` command).
+    out.extend(scan_pending_send_intents(config));
+
+    out
+}
+
+/// Scan `<storage_root>/pending_sends/` for UNSENT message artifacts that have
+/// not yet been replayed (no sibling `.sent.json` receipt).
+fn scan_pending_send_intents(config: &mcp_agent_mail_core::Config) -> Vec<QueuedIntentSummary> {
+    let dir = config.storage_root.join("pending_sends");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<QueuedIntentSummary> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only artifacts; skip ".sent.json" receipts and anything else.
+        if !name.ends_with(".json") || name.ends_with(".sent.json") {
+            continue;
+        }
+        // An artifact with a sibling receipt has already been sent.
+        if crate::pending_send_receipt_path(&path).exists() {
+            continue;
+        }
+        let Ok(artifact) = crate::load_pending_send_artifact(&path) else {
+            continue;
+        };
+        if artifact.status != crate::PENDING_SEND_UNSENT_STATUS {
+            continue;
+        }
+        out.push(QueuedIntentSummary {
+            kind: "send_message".to_string(),
+            id: artifact.content_hash.clone(),
+            agent: Some(artifact.envelope.sender.clone()),
+            summary: format!(
+                "UNSENT message \"{}\" from {} to {}",
+                artifact.envelope.subject,
+                artifact.envelope.sender,
+                artifact.envelope.to.join(", ")
+            ),
+            replay: artifact.replay_command.clone(),
+            path: Some(path.display().to_string()),
+        });
+    }
+    // Deterministic order for stable robot output.
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// Format a duration in seconds into a compact human-readable string.
 ///
 /// Examples: "12s", "2m 35s", "1h 12m", "2h 0m".
@@ -4650,6 +4798,10 @@ fn build_status_with_phase(
         .collect::<Result<Vec<_>, _>>()?;
     mark_tail_latency_phase(&mut phase, "sqlite_top_threads_materialization");
 
+    // Degraded-mode intents queued for replay (ack/release/send).
+    let queued_intents = build_queued_intents_for_robot();
+    mark_tail_latency_phase(&mut phase, "degraded_queued_intents");
+
     // 7. Build anomalies
     let mut anomalies = Vec::new();
     if ack_overdue > 0 {
@@ -4677,6 +4829,23 @@ fn build_status_with_phase(
             playbooks: vec![],
         });
     }
+    if !queued_intents.is_empty() {
+        anomalies.push(AnomalyCard {
+            severity: "warn".to_string(),
+            confidence: 1.0,
+            category: "degraded_intents".to_string(),
+            headline: format!(
+                "{} degraded-mode intent(s) queued for replay",
+                queued_intents.len()
+            ),
+            rationale: "Mutations were queued locally because the mailbox was unavailable; \
+                 acknowledgements/releases replay automatically on the next successful call, \
+                 sends replay via the listed command once the mailbox recovers"
+                .to_string(),
+            remediation: "am robot status --format json | jq '.queued_intents'".to_string(),
+            playbooks: vec![],
+        });
+    }
 
     // 8. Build suggested actions
     let mut actions = Vec::new();
@@ -4695,6 +4864,12 @@ fn build_status_with_phase(
             "am robot thread --project {project_slug} {}",
             top.id
         ));
+    }
+    // Surface explicit replay commands for queued UNSENT messages.
+    for qi in &queued_intents {
+        if qi.kind == "send_message" && !actions.contains(&qi.replay) {
+            actions.push(qi.replay.clone());
+        }
     }
     mark_tail_latency_phase(&mut phase, "downstream_actions");
 
@@ -4766,6 +4941,7 @@ fn build_status_with_phase(
         recommendations,
         reservation_forecast,
         recovery,
+        queued_intents,
         search_index: None,
         forensic_timeline: Some(forensic_timeline),
     };
@@ -4886,7 +5062,7 @@ fn build_recovery_only_status(
         Some(&recovery),
         now_us,
     );
-    let actions = recommendations
+    let mut actions = recommendations
         .iter()
         .map(|recommendation| recommendation.safe_command.clone())
         .fold(Vec::new(), |mut acc, action| {
@@ -4895,6 +5071,14 @@ fn build_recovery_only_status(
             }
             acc
         });
+    // Degraded-mode queued intents are read from disk, not the (possibly
+    // unreadable) live index, so they remain visible exactly when they matter.
+    let queued_intents = build_queued_intents_for_robot();
+    for qi in &queued_intents {
+        if qi.kind == "send_message" && !actions.contains(&qi.replay) {
+            actions.push(qi.replay.clone());
+        }
+    }
     let source_error = redact_recommendation_text(&source_error.to_string());
     let anomalies = vec![AnomalyCard {
         severity: if recovery.mode == "corrupt" {
@@ -4937,6 +5121,7 @@ fn build_recovery_only_status(
         recommendations,
         reservation_forecast: None,
         recovery: Some(recovery),
+        queued_intents,
         search_index: None,
         forensic_timeline: Some(forensic_timeline),
     };
@@ -14376,6 +14561,130 @@ mod tests {
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ROBOT_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    // ── Degraded-mode queued-intent surface (br-bvq1x.8.3 / H3) ──────────────
+
+    fn queued_intents_test_config(dir: &Path) -> mcp_agent_mail_core::Config {
+        let mut config = mcp_agent_mail_core::Config::get();
+        config.storage_root = dir.to_path_buf();
+        config
+    }
+
+    fn pending_send_artifact_json(content_hash: &str, subject: &str) -> Value {
+        serde_json::json!({
+            "schema_version": "am.pending_send.v1",
+            "status": "UNSENT_UNTIL_REPLAY",
+            "content_hash": content_hash,
+            "created_ts": "2026-06-16T00:00:00Z",
+            "replay_command": format!("am mail replay-queued --artifact /tmp/{content_hash}.json"),
+            "sender_token_was_provided": false,
+            "sender_token_stored": false,
+            "envelope": {
+                "project_key": "/abs/project",
+                "sender": "GreenCastle",
+                "to": ["BlueLake"],
+                "cc": [],
+                "bcc": [],
+                "subject": subject,
+                "body_md": "done",
+                "attachment_paths": [],
+                "convert_images": null,
+                "importance": "high",
+                "ack_required": false,
+                "thread_id": null
+            },
+            "failure": {
+                "class": "ConnectionOrConfigError",
+                "repairable": true,
+                "safe_to_retry": true,
+                "safe_to_continue_read_only": true,
+                "blocks_edits": false,
+                "recommended_command": "am doctor repair",
+                "message": "database is locked"
+            }
+        })
+    }
+
+    #[test]
+    fn build_queued_intents_surfaces_ack_and_send() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = queued_intents_test_config(tmp.path());
+
+        // No durable intents on disk yet.
+        assert!(build_queued_intents_for_config(&config).is_empty());
+
+        // Queue an ack intent through the real durable-intent writer.
+        mcp_agent_mail_tools::degraded_intents::append_ack_intent(
+            &config,
+            "/abs/project",
+            "BlueLake",
+            1234,
+            "acknowledge_message",
+            "database disk image is malformed",
+        )
+        .expect("append ack intent");
+
+        // Drop a pending-send (UNSENT) artifact on disk.
+        let pending_dir = tmp.path().join("pending_sends");
+        std::fs::create_dir_all(&pending_dir).expect("mkdir pending_sends");
+        std::fs::write(
+            pending_dir.join("deadbeef.json"),
+            serde_json::to_vec_pretty(&pending_send_artifact_json("deadbeef", "closeout summary"))
+                .expect("serialize artifact"),
+        )
+        .expect("write pending send");
+
+        let intents = build_queued_intents_for_config(&config);
+        assert_eq!(
+            intents.len(),
+            2,
+            "expected one ack + one send intent: {intents:?}"
+        );
+
+        let ack = intents
+            .iter()
+            .find(|i| i.kind == "acknowledge_message")
+            .expect("ack intent present");
+        assert_eq!(ack.agent.as_deref(), Some("BlueLake"));
+        assert!(ack.summary.contains("1234"), "summary: {}", ack.summary);
+        assert!(
+            ack.replay.contains("automatic"),
+            "ack replays automatically: {}",
+            ack.replay
+        );
+
+        let send = intents
+            .iter()
+            .find(|i| i.kind == "send_message")
+            .expect("send intent present");
+        assert_eq!(send.agent.as_deref(), Some("GreenCastle"));
+        assert!(send.summary.contains("closeout summary"));
+        assert_eq!(
+            send.replay,
+            "am mail replay-queued --artifact /tmp/deadbeef.json"
+        );
+    }
+
+    #[test]
+    fn scan_pending_sends_skips_already_sent_artifacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = queued_intents_test_config(tmp.path());
+        let pending_dir = tmp.path().join("pending_sends");
+        std::fs::create_dir_all(&pending_dir).expect("mkdir");
+        std::fs::write(
+            pending_dir.join("cafef00d.json"),
+            serde_json::to_vec(&pending_send_artifact_json("cafef00d", "x")).expect("serialize"),
+        )
+        .expect("write");
+        assert_eq!(scan_pending_send_intents(&config).len(), 1);
+
+        // A sibling `.sent.json` receipt marks the artifact as already sent.
+        std::fs::write(pending_dir.join("cafef00d.sent.json"), b"{}").expect("write receipt");
+        assert!(
+            scan_pending_send_intents(&config).is_empty(),
+            "a sent artifact must not appear as queued"
+        );
+    }
+
     fn setup_robot_status_snapshot_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_status_snapshot.sqlite3");
@@ -17207,6 +17516,7 @@ mod tests {
             recommendations: vec![],
             reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
             search_index: None,
             forensic_timeline: None,
         };
@@ -17242,6 +17552,7 @@ mod tests {
             recommendations: vec![],
             reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
             search_index: None,
             forensic_timeline: None,
         };
@@ -18128,6 +18439,7 @@ mod tests {
             recommendations: vec![],
             reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
             search_index: None,
             forensic_timeline: None,
         };
@@ -24375,6 +24687,7 @@ mod tests {
                 deferred_write_backlog: None,
                 admission: None,
             }),
+            queued_intents: Vec::new(),
             search_index: None,
             forensic_timeline: None,
         };

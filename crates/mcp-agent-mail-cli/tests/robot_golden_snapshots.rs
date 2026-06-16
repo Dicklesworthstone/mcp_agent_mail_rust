@@ -81,6 +81,7 @@ fn status_envelope() -> RobotEnvelope<StatusData> {
             recommendations: Vec::new(),
             reservation_forecast: None,
             recovery: None,
+            queued_intents: Vec::new(),
             search_index: None,
             forensic_timeline: None,
         },

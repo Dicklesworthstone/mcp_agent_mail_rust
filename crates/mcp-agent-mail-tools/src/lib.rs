@@ -25,6 +25,7 @@
 
 pub mod build_slots;
 pub mod contacts;
+pub mod degraded_intents;
 pub mod identity;
 pub mod llm;
 pub mod macros;

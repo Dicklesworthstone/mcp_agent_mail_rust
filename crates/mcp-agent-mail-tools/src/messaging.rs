@@ -3473,6 +3473,187 @@ pub async fn mark_message_read(
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
+// ── Durable ack intents (br-bvq1x.8.3 / H3) ──────────────────────────────────
+//
+// When `acknowledge_message` cannot reach the live mailbox (DB corrupt / busy /
+// pool-exhausted / circuit-open), the ack is recorded as a hash-witnessed
+// durable intent under
+// `<storage_root>/degraded_intents/acknowledge_message.jsonl` and replayed
+// automatically (idempotently) on the next successful call. This mirrors the
+// release-intent pattern in `reservations.rs`; both share the on-disk
+// primitives in `crate::degraded_intents`.
+//
+// The classification predicates below intentionally match the release-intent
+// ones (the A1 corruption/error taxonomy). They are duplicated here rather than
+// shared because the reservation predicates remain private to `reservations.rs`
+// pending the Track-F single-mutation-chokepoint work.
+
+const fn db_error_supports_ack_intent(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Pool(_)
+            | DbError::Sqlite(_)
+            | DbError::Schema(_)
+            | DbError::ResourceBusy(_)
+            | DbError::PoolExhausted { .. }
+            | DbError::CircuitBreakerOpen { .. }
+            | DbError::IntegrityCorruption { .. }
+    )
+}
+
+fn mcp_error_supports_ack_intent(error: &McpError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data["error"]["type"].as_str())
+        .is_some_and(|error_type| {
+            matches!(
+                error_type,
+                "DATABASE_CORRUPTION"
+                    | "DATABASE_ERROR"
+                    | "DATABASE_POOL_EXHAUSTED"
+                    | "RESOURCE_BUSY"
+            )
+        })
+}
+
+/// Build the `queued` response after persisting a durable ack intent.
+fn queued_ack_intent_response(
+    config: &Config,
+    project_key: &str,
+    agent_name: &str,
+    message_id: i64,
+    failure_stage: &str,
+    error_detail: &str,
+) -> McpResult<String> {
+    let receipt = crate::degraded_intents::append_ack_intent(
+        config,
+        project_key,
+        agent_name,
+        message_id,
+        failure_stage,
+        error_detail,
+    )
+    .map_err(|error| {
+        legacy_tool_error(
+            "ACK_INTENT_WRITE_FAILED",
+            format!(
+                "Could not acknowledge the message because the database is unavailable, and \
+                 writing the local ack-intent log also failed: {error}"
+            ),
+            false,
+            json!({ "error_detail": error.to_string() }),
+        )
+    })?;
+    serde_json::to_string(&json!({
+        "message_id": message_id,
+        "acknowledged": false,
+        "acknowledged_at": Value::Null,
+        "read_at": Value::Null,
+        "status": "queued",
+        "queued": true,
+        "message": "acknowledgement queued because DB unavailable",
+        "intent": {
+            "id": receipt.intent_id,
+            "path": receipt.intent_path.display().to_string(),
+            "content_sha256": receipt.content_sha256,
+            "replay": "automatic_on_next_successful_acknowledge_message_call",
+        },
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Replay a single queued ack intent against the now-reachable DB.
+///
+/// Returns `Err((detail, retryable))` where `retryable == false` marks the
+/// intent permanently un-replayable (e.g. the message no longer exists) so it
+/// is abandoned rather than retried forever.
+async fn replay_single_ack_intent(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    intent: &crate::degraded_intents::QueuedAckIntent,
+) -> Result<(), (String, bool)> {
+    let project = resolve_project(ctx, pool, &intent.project_key)
+        .await
+        .map_err(|error| (error.to_string(), mcp_error_supports_ack_intent(&error)))?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        pool,
+        project_id,
+        &intent.agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await
+    .map_err(|error| (error.to_string(), mcp_error_supports_ack_intent(&error)))?;
+    let agent_id = agent.id.unwrap_or(0);
+    match mcp_agent_mail_db::queries::acknowledge_message(
+        ctx.cx(),
+        pool,
+        agent_id,
+        intent.message_id,
+    )
+    .await
+    {
+        Outcome::Ok(_) => Ok(()),
+        Outcome::Err(error) => {
+            let retryable = db_error_supports_ack_intent(&error);
+            Err((error.to_string(), retryable))
+        }
+        Outcome::Cancelled(_) => Err(("ack replay cancelled".to_string(), true)),
+        Outcome::Panicked(_) => Err(("ack replay panicked".to_string(), true)),
+    }
+}
+
+/// Replay every queued ack intent (best-effort) now that the DB is reachable.
+async fn replay_queued_ack_intents(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    config: &Config,
+) {
+    let intents = match crate::degraded_intents::read_queued_ack_intents(config) {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read queued ack intents");
+            return;
+        }
+    };
+    for intent in intents {
+        match replay_single_ack_intent(ctx, pool, &intent).await {
+            Ok(()) => {
+                crate::degraded_intents::append_ack_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    crate::degraded_intents::REPLAY_STATUS_REPLAYED,
+                    None,
+                );
+            }
+            Err((detail, retryable)) => {
+                let status = if retryable {
+                    crate::degraded_intents::REPLAY_STATUS_FAILED
+                } else {
+                    crate::degraded_intents::REPLAY_STATUS_ABANDONED
+                };
+                crate::degraded_intents::append_ack_replay_record(
+                    config,
+                    &intent.intent_id,
+                    &intent.content_sha256,
+                    status,
+                    Some(&detail),
+                );
+                tracing::warn!(
+                    intent_id = intent.intent_id,
+                    retryable,
+                    error = %detail,
+                    "queued ack intent replay failed"
+                );
+            }
+        }
+    }
+}
+
 /// Acknowledge a message (also marks as read).
 ///
 /// # Parameters
@@ -3495,12 +3676,40 @@ pub async fn acknowledge_message(
     message_id: i64,
 ) -> McpResult<String> {
     let agent_name = normalize_agent_name_or_original(agent_name);
+    let config = Config::get();
 
-    let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Each step that can hit a corrupt/busy/unavailable DB queues a durable
+    // ack intent (fail-soft) rather than dropping a closeout acknowledgement.
+    let pool = match get_db_pool() {
+        Ok(pool) => pool,
+        Err(error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "get_db_pool",
+                &error.to_string(),
+            );
+        }
+    };
+    let project = match resolve_project(ctx, &pool, &project_key).await {
+        Ok(project) => project,
+        Err(error) if mcp_error_supports_ack_intent(&error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "resolve_project",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let project_id = project.id.unwrap_or(0);
 
-    let agent = resolve_agent(
+    let agent = match resolve_agent(
         ctx,
         &pool,
         project_id,
@@ -3508,15 +3717,50 @@ pub async fn acknowledge_message(
         &project.slug,
         &project.human_key,
     )
-    .await?;
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) if mcp_error_supports_ack_intent(&error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "resolve_agent",
+                &error.to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     let agent_id = agent.id.unwrap_or(0);
 
     // Authorization note: agent_id is globally unique (auto-increment), so
     // the DB query implicitly scopes to the correct project. See mark_message_read.
-    let (read_ts, ack_ts) = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::acknowledge_message(ctx.cx(), &pool, agent_id, message_id)
-            .await,
-    )?;
+    let (read_ts, ack_ts) = match mcp_agent_mail_db::queries::acknowledge_message(
+        ctx.cx(),
+        &pool,
+        agent_id,
+        message_id,
+    )
+    .await
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
+            return queued_ack_intent_response(
+                &config,
+                &project_key,
+                &agent_name,
+                message_id,
+                "acknowledge_message",
+                &error.to_string(),
+            );
+        }
+        other => db_outcome_to_mcp_result(other)?,
+    };
+
+    // The DB is reachable: opportunistically replay any previously-queued ack
+    // intents so degraded-mode acknowledgements land once the mailbox recovers.
+    replay_queued_ack_intents(ctx, &pool, &config).await;
 
     let response = AckStatusResponse {
         message_id,
@@ -3592,6 +3836,121 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
+    }
+
+    // ── Durable ack-intent replay (br-bvq1x.8.3 / H3) ────────────────────────
+
+    #[test]
+    fn replay_queued_ack_intent_acks_once_on_success() {
+        run_thread_validation_test("ack-intent-replay.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-ack-intent-replay").await;
+            let project_id = project.id.expect("project id");
+            let sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let recipient = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let recipient_id = recipient.id.expect("recipient id");
+
+            let message = match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "ack me",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+            let message_id = message.id.expect("message id");
+
+            // Isolated config: durable-intent files live in a tempdir, never the
+            // real mailbox storage root.
+            let intent_dir = tempfile::tempdir().expect("intent tempdir");
+            let mut config = Config::get();
+            config.storage_root = intent_dir.path().to_path_buf();
+
+            crate::degraded_intents::append_ack_intent(
+                &config,
+                &project.human_key,
+                &recipient.name,
+                message_id,
+                "injected_db_unavailable",
+                "database disk image is malformed",
+            )
+            .expect("append ack intent");
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .len(),
+                1
+            );
+
+            let ctx = McpContext::new(cx.clone(), 1);
+            // Idempotent: replaying twice must clear exactly once and never error.
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+
+            assert!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .is_empty(),
+                "successfully replayed ack intent should not remain queued"
+            );
+
+            let (read_ts, ack_ts) =
+                match queries::acknowledge_message(&cx, &pool, recipient_id, message_id).await {
+                    Outcome::Ok(value) => value,
+                    other => panic!("verify ack failed: {other:?}"),
+                };
+            assert!(ack_ts > 0, "message should be acknowledged after replay");
+            assert!(read_ts > 0, "message should be marked read after replay");
+        });
+    }
+
+    #[test]
+    fn replay_abandons_ack_intent_for_missing_message() {
+        run_thread_validation_test("ack-intent-abandon.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-ack-intent-abandon").await;
+            let project_id = project.id.expect("project id");
+            let agent = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+
+            let intent_dir = tempfile::tempdir().expect("intent tempdir");
+            let mut config = Config::get();
+            config.storage_root = intent_dir.path().to_path_buf();
+
+            // Queue an ack for a message that does not exist → not_found on
+            // replay → permanently abandoned (cleared), not retried forever.
+            crate::degraded_intents::append_ack_intent(
+                &config,
+                &project.human_key,
+                &agent.name,
+                999_999,
+                "injected_db_unavailable",
+                "database disk image is malformed",
+            )
+            .expect("append ack intent");
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .len(),
+                1
+            );
+
+            let ctx = McpContext::new(cx.clone(), 1);
+            replay_queued_ack_intents(&ctx, &pool, &config).await;
+            assert!(
+                crate::degraded_intents::read_queued_ack_intents(&config)
+                    .expect("read")
+                    .is_empty(),
+                "permanently-unreplayable ack intent should be abandoned, not retried forever"
+            );
+        });
     }
 
     #[test]
