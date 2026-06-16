@@ -596,19 +596,91 @@ pub struct RobotRemediation {
     pub safe_to_continue_read_only: bool,
     /// Writes/edits are blocked until remediation (agents should not edit).
     pub blocks_edits: bool,
+    /// H4 (br-bvq1x.8.4): the agent-safe degraded-mode verdict + fallback lane,
+    /// derived from the same A2 classification.
+    pub coordination: CoordinationContract,
+}
+
+/// H4 (br-bvq1x.8.4): the agent-safe degraded-mode coordination contract.
+///
+/// A single verdict distinguishing the three degraded scenarios an agent must
+/// react to differently: writes/reservations blocked ("do not edit"), reads
+/// degraded but writes safe, or `am doctor` blocked by a live mailbox owner.
+/// Each verdict carries a distinct message and the exact fallback coordination
+/// lane. Derived from A1/A2 (the typed error class + the read/write safety
+/// flags), so it never disagrees with the rest of the diagnosis.
+#[derive(Debug, Serialize)]
+pub struct CoordinationContract {
+    /// One of `writes_blocked` / `reads_degraded` / `doctor_blocked_by_live_owner`.
+    pub verdict: &'static str,
+    /// The distinct, agent-facing contract message for this degraded mode.
+    pub message: String,
+    /// The exact fallback coordination lane to use while degraded.
+    pub fallback_lane: &'static str,
+}
+
+impl CoordinationContract {
+    fn from_db_class(
+        class: mcp_agent_mail_db::error::DbErrorClass,
+        blocks_edits: bool,
+        reads_ok: bool,
+    ) -> Self {
+        use mcp_agent_mail_db::error::DbErrorClass;
+        // Scenario 3: a live owner holds the mailbox — doctor recovery refuses.
+        if matches!(class, DbErrorClass::LiveOwnerNoActivityLock) {
+            return Self {
+                verdict: "doctor_blocked_by_live_owner",
+                message: "A live mailbox owner holds the lock: do NOT run `am doctor repair`/`reconstruct` (they will refuse, exit 3). Drain/stop the owner via your supervisor (`am service restart`), or route writes through the running server."
+                    .to_string(),
+                fallback_lane:
+                    "route writes through the running Agent Mail server; do not run operator-only recovery",
+            };
+        }
+        if blocks_edits {
+            // Scenario 1 / 2b: reservation/edit writes are blocked.
+            let reads = if reads_ok {
+                " Reads still work, so you can keep reading mail/threads."
+            } else {
+                " Reads are also degraded."
+            };
+            return Self {
+                verdict: "writes_blocked",
+                message: format!(
+                    "Do NOT edit files that require a reservation: reservation writes are blocked ({}).{} Coordinate intent via direct agent messaging until writes recover.",
+                    class.as_str(),
+                    reads
+                ),
+                fallback_lane: "do not edit reserved files; coordinate intent via direct agent messaging (send_message)",
+            };
+        }
+        // Scenario 2a: reads degraded but writes are safe.
+        Self {
+            verdict: "reads_degraded",
+            message: format!(
+                "Reads are degraded but WRITES ARE SAFE ({}): you may still acquire reservations and edit; treat search/read results as possibly incomplete.",
+                class.as_str()
+            ),
+            fallback_lane: "writes safe; treat read/search results as possibly incomplete",
+        }
+    }
 }
 
 impl RobotRemediation {
-    /// Build the contract from a database error message, reusing the A2
-    /// corruption-diagnosis classifier so robot mode and the MCP/DB layers agree
-    /// on the same five facts. `operator_only` is derived from the recommended
-    /// command via [`remediation_command_is_operator_only`].
+    /// Build the contract from a database error message, reusing the A1/A2
+    /// classifier so robot mode and the MCP/DB layers agree on the same facts:
+    /// the five remediation flags, `operator_only` (E4), and the H4 degraded-mode
+    /// `coordination` verdict.
     pub fn from_db_error_message(message: &str) -> Self {
-        let policy = mcp_agent_mail_db::error::DbFailurePolicy::from(
-            mcp_agent_mail_db::error::classify_db_error_message(message),
-        );
+        let classification = mcp_agent_mail_db::error::classify_db_error_message(message);
+        let class = classification.class;
+        let policy = mcp_agent_mail_db::error::DbFailurePolicy::from(classification);
         let recommended_command = policy.recommended_command.to_string();
         let operator_only = remediation_command_is_operator_only(&recommended_command);
+        let coordination = CoordinationContract::from_db_class(
+            class,
+            policy.blocks_edits,
+            policy.safe_to_continue_read_only,
+        );
         Self {
             recommended_command,
             operator_only,
@@ -616,6 +688,7 @@ impl RobotRemediation {
             safe_to_retry: policy.safe_to_retry,
             safe_to_continue_read_only: policy.safe_to_continue_read_only,
             blocks_edits: policy.blocks_edits,
+            coordination,
         }
     }
 }
@@ -21852,6 +21925,53 @@ mod tests {
             !rem.operator_only,
             "a read-only diagnostic recommended_command must be agent-safe: {}",
             rem.recommended_command
+        );
+    }
+
+    #[test]
+    fn coordination_verdict_distinguishes_three_degraded_scenarios() {
+        // H4 (br-bvq1x.8.4): each degraded scenario yields a DISTINCT verdict +
+        // message + fallback lane, derived from the A1/A2 classification.
+
+        // Scenario 1 (writes blocked): main-DB corruption -> do-not-edit.
+        let blocked = RobotRemediation::from_db_error_message("database disk image is malformed");
+        assert_eq!(blocked.coordination.verdict, "writes_blocked");
+        assert!(
+            blocked.coordination.message.contains("Do NOT edit"),
+            "writes_blocked message: {}",
+            blocked.coordination.message
+        );
+        assert!(blocked.blocks_edits);
+
+        // Scenario 2a (reads degraded, writes SAFE): FTS index corruption.
+        let reads_deg =
+            RobotRemediation::from_db_error_message("fts5 search index integrity check failed");
+        assert_eq!(reads_deg.coordination.verdict, "reads_degraded");
+        assert!(
+            !reads_deg.blocks_edits,
+            "reads_degraded must not block edits"
+        );
+        assert!(reads_deg.coordination.message.contains("WRITES ARE SAFE"));
+
+        // Scenario 3 (doctor blocked by a live owner).
+        let owner = RobotRemediation::from_db_error_message(
+            "mailbox mutation refused: another Agent Mail server owns this mailbox",
+        );
+        assert_eq!(owner.coordination.verdict, "doctor_blocked_by_live_owner");
+        assert!(owner.coordination.message.contains("live mailbox owner"));
+
+        // The three fallback lanes are mutually distinct.
+        assert_ne!(
+            blocked.coordination.fallback_lane,
+            reads_deg.coordination.fallback_lane
+        );
+        assert_ne!(
+            blocked.coordination.fallback_lane,
+            owner.coordination.fallback_lane
+        );
+        assert_ne!(
+            reads_deg.coordination.fallback_lane,
+            owner.coordination.fallback_lane
         );
     }
 
