@@ -564,8 +564,95 @@ pub struct RobotEnvelope<T: Serialize> {
     pub _actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub _diagnostics: Option<TailLatencyPhaseLedger>,
+    /// E4 (br-bvq1x.5.4): present only when the command hit a classified failure
+    /// (e.g. a database error). Carries the safe-remediation contract so an agent
+    /// can decide what is safe to do — never present on a healthy response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _remediation: Option<RobotRemediation>,
     #[serde(flatten)]
     pub data: T,
+}
+
+/// E4 (br-bvq1x.5.4): the robot-mode safe-remediation contract.
+///
+/// Reuses A2's [`DbFailurePolicy`](mcp_agent_mail_db::error::DbFailurePolicy)
+/// fields and adds an explicit `operator_only` label so an agent knows whether
+/// `recommended_command` is something it may auto-apply (read-only / scoped fix)
+/// or something only a human operator should run (repair / reconstruct / service
+/// lifecycle / kill). Downstream AGENTS files forbid agents from running the
+/// operator-only commands; this makes that boundary machine-readable.
+#[derive(Debug, Serialize)]
+pub struct RobotRemediation {
+    /// The single recommended next command.
+    pub recommended_command: String,
+    /// True when `recommended_command` mutates state in a way only a human
+    /// operator should run; agents must NOT silently auto-apply it.
+    pub operator_only: bool,
+    /// A repair path exists (vs. nothing actionable / a source fix is required).
+    pub repairable: bool,
+    /// The failed operation can be safely retried as-is.
+    pub safe_to_retry: bool,
+    /// Reads can continue — the mailbox is still queryable read-only.
+    pub safe_to_continue_read_only: bool,
+    /// Writes/edits are blocked until remediation (agents should not edit).
+    pub blocks_edits: bool,
+}
+
+impl RobotRemediation {
+    /// Build the contract from a database error message, reusing the A2
+    /// corruption-diagnosis classifier so robot mode and the MCP/DB layers agree
+    /// on the same five facts. `operator_only` is derived from the recommended
+    /// command via [`remediation_command_is_operator_only`].
+    pub fn from_db_error_message(message: &str) -> Self {
+        let policy = mcp_agent_mail_db::error::DbFailurePolicy::from(
+            mcp_agent_mail_db::error::classify_db_error_message(message),
+        );
+        let recommended_command = policy.recommended_command.to_string();
+        let operator_only = remediation_command_is_operator_only(&recommended_command);
+        Self {
+            recommended_command,
+            operator_only,
+            repairable: policy.repairable,
+            safe_to_retry: policy.safe_to_retry,
+            safe_to_continue_read_only: policy.safe_to_continue_read_only,
+            blocks_edits: policy.blocks_edits,
+        }
+    }
+}
+
+/// E4 (br-bvq1x.5.4): classify a recommended next-command as OPERATOR-ONLY (a
+/// human must run it; agents must not silently auto-apply) vs agent-safe.
+///
+/// Operator-only = state-mutating recovery + lifecycle: `am doctor repair`,
+/// `am doctor reconstruct`, `am doctor restore`, `am doctor undo`, the legacy
+/// bare `am doctor fix` multi-detector mutate flow, `am service restart|stop|
+/// uninstall`, `am clear-and-reset-everything`, and any `kill`/`pkill`. Agent-safe
+/// = read-only diagnostics (`am doctor check|health|locks|--json`, `am robot *`),
+/// scoped per-FM fixes (`am doctor fix --only ...`), `--list`/`--dry-run`
+/// rehearsals, and "route the write through the running server" guidance.
+pub fn remediation_command_is_operator_only(cmd: &str) -> bool {
+    let c = cmd.trim();
+    if c.split_whitespace()
+        .any(|tok| tok == "kill" || tok == "pkill")
+    {
+        return true;
+    }
+    if c.starts_with("am doctor fix") {
+        // Scoped (`--only`), read-only enumerate (`--list`), and rehearsal
+        // (`--dry-run`) are agent-safe; the bare legacy mutate flow is not.
+        return !(c.contains("--only") || c.contains("--list") || c.contains("--dry-run"));
+    }
+    const OPERATOR_ONLY_PREFIXES: &[&str] = &[
+        "am doctor repair",
+        "am doctor reconstruct",
+        "am doctor restore",
+        "am doctor undo",
+        "am service restart",
+        "am service stop",
+        "am service uninstall",
+        "am clear-and-reset-everything",
+    ];
+    OPERATOR_ONLY_PREFIXES.iter().any(|p| c.starts_with(p))
 }
 
 /// Infrastructure metadata attached to every robot response.
@@ -607,8 +694,15 @@ impl<T: Serialize> RobotEnvelope<T> {
             _alerts: Vec::new(),
             _actions: Vec::new(),
             _diagnostics: None,
+            _remediation: None,
             data,
         }
+    }
+
+    /// Attach the E4 safe-remediation contract (present only on failures).
+    pub fn with_remediation(mut self, remediation: RobotRemediation) -> Self {
+        self._remediation = Some(remediation);
+        self
     }
 
     /// Add an alert to the envelope.
@@ -13227,6 +13321,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // opened so the runtime-identity block can name it (path/version
             // confusion: agents could not tell which mailbox `am` resolved).
             let mut db_file: Option<String> = None;
+            // E4 (br-bvq1x.5.4): on a DB failure, classify it (A2) and attach the
+            // safe-remediation contract so an agent knows what is safe to do.
+            let mut db_error_message: Option<String> = None;
 
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
@@ -13243,6 +13340,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     let detail = if query_ok {
                         format!("SQLite read-only connection healthy at {opened_path}")
                     } else {
+                        db_error_message =
+                            Some(format!("SQLite read-only query failed at {opened_path}"));
                         format!("SQLite read-only query failed at {opened_path}")
                     };
                     probes.push(HealthProbe {
@@ -13254,6 +13353,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     query_ok
                 }
                 Err(error) => {
+                    db_error_message = Some(error.to_string());
                     probes.push(HealthProbe {
                         name: "db_connectivity".into(),
                         status: "fail".into(),
@@ -13555,7 +13655,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             // Alerts
             if !db_ok {
-                env = env.with_alert("error", "Database connectivity probe failed", None);
+                // E4 (br-bvq1x.5.4): attach the safe-remediation contract derived
+                // from the classified DB failure (A2) and point the alert action at
+                // the recommended next command.
+                let remediation = db_error_message
+                    .as_deref()
+                    .map(RobotRemediation::from_db_error_message);
+                let action = remediation.as_ref().map(|r| r.recommended_command.clone());
+                env = env.with_alert("error", "Database connectivity probe failed", action);
+                if let Some(remediation) = remediation {
+                    env = env.with_remediation(remediation);
+                }
             }
             if host_dir_unwritable {
                 env = env.with_alert(
@@ -21682,6 +21792,122 @@ mod tests {
         assert!(
             id.get("server_pids").and_then(|v| v.as_array()).is_some(),
             "server_pids must be an array (empty when no server is bound): {id:?}"
+        );
+    }
+
+    #[test]
+    fn remediation_operator_only_classifier_tags_dangerous_commands() {
+        // E4 (br-bvq1x.5.4): operator-only commands (state-mutating recovery +
+        // lifecycle + kill) must be tagged so agents never silently auto-apply.
+        for c in [
+            "am doctor repair",
+            "am doctor reconstruct",
+            "am doctor restore /x.bak",
+            "am doctor undo latest",
+            "am service restart",
+            "am service stop",
+            "am service uninstall",
+            "am clear-and-reset-everything",
+            "am doctor fix",
+            "kill 123",
+            "pkill am",
+        ] {
+            assert!(
+                remediation_command_is_operator_only(c),
+                "should be operator-only: {c}"
+            );
+        }
+        // Agent-may-auto-apply: read-only diagnostics, scoped per-FM fixes,
+        // list/dry-run rehearsals, and route-through-server guidance.
+        for c in [
+            "am doctor health",
+            "am doctor check --json",
+            "am doctor locks",
+            "am doctor --json",
+            "am robot status",
+            "am doctor fix --only fm-db-state-files-world-readable-storage-db",
+            "am doctor fix --list --json",
+            "am doctor --dry-run --fix",
+            "am doctor migrate --check",
+            "route the write through the running Agent Mail server",
+        ] {
+            assert!(
+                !remediation_command_is_operator_only(c),
+                "should be agent-safe: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn robot_remediation_from_db_error_reuses_a2_policy() {
+        // E4: the remediation contract reuses A2's classifier; a corruption-class
+        // message yields a non-empty recommended command, and A2's corruption
+        // recommendations are read-only diagnostics (agent-safe).
+        let rem = RobotRemediation::from_db_error_message("database disk image is malformed");
+        assert!(
+            !rem.recommended_command.is_empty(),
+            "recommended_command must be set"
+        );
+        assert!(
+            !rem.operator_only,
+            "a read-only diagnostic recommended_command must be agent-safe: {}",
+            rem.recommended_command
+        );
+    }
+
+    #[test]
+    fn robot_envelope_serializes_remediation_when_present_and_omits_when_absent() {
+        // E4 (br-bvq1x.5.4): the robot envelope carries the safe-remediation
+        // contract when attached (failure path) and OMITS it on success — so a
+        // healthy response is never polluted. The robot-health DB-failure path is
+        // wired the same way (`with_remediation` when `!db_ok`), but is not
+        // unit-testable end-to-end: frankensqlite's `open_file` is lenient enough
+        // that the db_connectivity probe cannot be reliably forced to fail, so the
+        // contract logic is covered by the classifier + `from_db_error` tests above
+        // and the envelope serialization is covered here.
+        let with = RobotEnvelope::new(
+            "robot health",
+            OutputFormat::Json,
+            serde_json::json!({ "overall": "unhealthy" }),
+        )
+        .with_remediation(RobotRemediation::from_db_error_message(
+            "database disk image is malformed",
+        ));
+        let v = serde_json::to_value(&with).expect("serialize envelope");
+        let rem = v
+            .get("_remediation")
+            .and_then(serde_json::Value::as_object)
+            .expect("_remediation must serialize when attached");
+        for field in [
+            "recommended_command",
+            "operator_only",
+            "repairable",
+            "safe_to_retry",
+            "safe_to_continue_read_only",
+            "blocks_edits",
+        ] {
+            assert!(
+                rem.contains_key(field),
+                "_remediation must carry `{field}`: {rem:?}"
+            );
+        }
+        assert!(
+            rem.get("operator_only")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "operator_only must serialize as a bool: {rem:?}"
+        );
+
+        // Healthy envelope: no remediation attached -> the field is omitted.
+        let without = RobotEnvelope::new(
+            "robot health",
+            OutputFormat::Json,
+            serde_json::json!({ "overall": "healthy" }),
+        );
+        let v2 = serde_json::to_value(&without).expect("serialize envelope");
+        assert!(
+            v2.get("_remediation").is_none(),
+            "_remediation must be omitted on a healthy response: {v2}"
         );
     }
 
