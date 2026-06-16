@@ -16,9 +16,7 @@
 
 use std::path::PathBuf;
 
-use mcp_agent_mail_cli::reliability_coverage::{
-    scan_modules, workspace_root_from_manifest,
-};
+use mcp_agent_mail_cli::reliability_coverage::{scan_modules, workspace_root_from_manifest};
 
 fn workspace_root() -> PathBuf {
     workspace_root_from_manifest()
@@ -43,10 +41,7 @@ fn every_reliability_module_has_an_error_path_test() {
              unit-test coverage standard (each must carry >=1 inline error-path test):\n",
         );
         for m in report.gaps() {
-            let gap = m
-                .gap
-                .map(|g| g.describe())
-                .unwrap_or("unknown gap");
+            let gap = m.gap.map(|g| g.describe()).unwrap_or("unknown gap");
             msg.push_str(&format!(
                 "  - [{}] {} :: {} ({} tests found)\n",
                 m.track, m.rel_path, gap, m.scan.total_tests

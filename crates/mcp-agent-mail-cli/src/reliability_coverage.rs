@@ -638,9 +638,7 @@ pub fn analyze_source(src: &str) -> ModuleScan {
                     };
                     scan.total_tests += 1;
                     let fn_name = name.unwrap_or_default();
-                    if saw_should_panic
-                        || name_signals_error(&fn_name)
-                        || body_signals_error(body)
+                    if saw_should_panic || name_signals_error(&fn_name) || body_signals_error(body)
                     {
                         scan.error_path_tests.push(fn_name);
                     }
@@ -925,10 +923,7 @@ mod tests {
     #[test]
     fn coverage_report_detects_missing_file_gap() {
         // Scanning a registry against an empty temp dir yields FileMissing gaps.
-        let tmp = std::env::temp_dir().join(format!(
-            "amrc-missing-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("amrc-missing-{}", std::process::id()));
         let report = scan_modules(&tmp);
         assert!(!report.is_pass());
         let gaps = report.gaps();
