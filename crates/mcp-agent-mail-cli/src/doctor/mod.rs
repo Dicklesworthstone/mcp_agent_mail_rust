@@ -1504,6 +1504,49 @@ pub(crate) fn create_support_bundle(
         "reason": "attachment data and names are redacted by default",
     }));
 
+    // N2 (br-bvq1x.14.2): reliability snapshot. Capture the cheap,
+    // always-available diagnostic surfaces this reliability epic added —
+    // runtime identity (which `am`/mailbox/version/PID, plus the offline
+    // known-bad/obsolete `am_version` verdict, J2/J3) and the host-pressure
+    // section (J1) — inline, so an incident responder no longer has to
+    // reconstruct "which binary, which mailbox, was the host under pressure"
+    // from scattered notes. Non-mutating (a port probe + filesystem/loadavg
+    // syscalls); redaction-safe (paths/secrets are scrubbed by
+    // `redact_support_json`). Live coordination/lock state is intentionally
+    // left to the `am doctor drain --json` / `am doctor locks --json` replay
+    // commands rather than opened here — an incident DB may be wedged and a
+    // support bundle must never block. Heartbeats (I1) will join this snapshot
+    // once that surface lands.
+    let reliability_runtime_identity = crate::runtime_identity_json(
+        &config.storage_root,
+        database_url,
+        &config.http_host,
+        config.http_port,
+        Some(&database_path.display().to_string()),
+    );
+    let reliability_host = mcp_agent_mail_core::host_health::sample_host_health(config);
+    let reliability_snapshot = serde_json::json!({
+        "schema_version": "1.0",
+        "section": "reliability_snapshot",
+        "captured_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "field_schema": {
+            "runtime_identity": "binary_path, version, pid, storage_root, database_url, db_file, http_host, http_port, server_pids, am_version{installed,state[,repair_command,verdict]}",
+            "host": "status, host_pressure_likely, reasons[], disk_free_pct, inodes_free, load_per_cpu, mem_available_pct, db_file_bytes, db_dir_writable, ...",
+            "coordination_via_replay": "am doctor drain --json => {safe_to_mutate, read_only, owner_class}; am doctor locks --json => {owner_state, disposition, processes}",
+        },
+        "runtime_identity": reliability_runtime_identity,
+        "host": reliability_host,
+    });
+    let reliability_snapshot = redact_support_json(reliability_snapshot, &redaction, None);
+    write_support_json_file(
+        &bundle_dir,
+        "reports/reliability-snapshot.json",
+        &reliability_snapshot,
+        "sanitized_metadata",
+        "generated",
+        &mut files,
+    )?;
+
     let replay_commands = support_replay_commands();
     let summary = serde_json::json!({
         "schema_version": "1.0",
@@ -1530,6 +1573,17 @@ pub(crate) fn create_support_bundle(
         "latest_forensic": {
             "manifest_found": latest_forensic.is_some(),
             "observed_recovery_command": observed_recovery_command,
+        },
+        "reliability_snapshot": {
+            "file": "reports/reliability-snapshot.json",
+            "host_pressure_likely": reliability_snapshot
+                .pointer("/host/host_pressure_likely")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "am_version_state": reliability_snapshot
+                .pointer("/runtime_identity/am_version/state")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         },
         "redaction": support_redaction_policy(options.redact_subjects),
         "replay_commands": replay_commands,
@@ -2982,6 +3036,72 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
                 "support bundle manifest leaked {forbidden}: {manifest}"
             );
         }
+    }
+
+    #[test]
+    fn support_bundle_includes_reliability_snapshot() {
+        // N2 (br-bvq1x.14.2): the bundle must inline the reliability snapshot —
+        // runtime identity (binary/version + offline am_version verdict, J2/J3)
+        // and the host-pressure section (J1) — redaction-safe, with the field
+        // schema documented inline and an at-a-glance summary pointer.
+        let root = tempfile::tempdir().unwrap();
+        let storage_root = root.path().join("storage");
+        fs::create_dir_all(&storage_root).unwrap();
+        let config = Config {
+            storage_root: storage_root.clone(),
+            ..Default::default()
+        };
+        let result = create_support_bundle(
+            &config,
+            &format!("sqlite:///{}/storage.sqlite3", storage_root.display()),
+            SupportBundleOptions {
+                output_dir: Some(root.path().join("bundles")),
+                stdout_log: None,
+                stderr_log: None,
+                redact_subjects: true,
+            },
+        )
+        .unwrap();
+
+        let snap_path = Path::new(&result.bundle_path)
+            .join("reports")
+            .join("reliability-snapshot.json");
+        let snap_text = fs::read_to_string(&snap_path).expect("reliability-snapshot.json present");
+        let snap: serde_json::Value = serde_json::from_str(&snap_text).unwrap();
+        assert_eq!(snap["section"], "reliability_snapshot");
+        // Runtime identity names the binary/version + the offline am_version verdict.
+        assert!(
+            snap.pointer("/runtime_identity/version").is_some(),
+            "snapshot must carry runtime_identity.version: {snap}"
+        );
+        assert!(
+            snap.pointer("/runtime_identity/am_version/state").is_some(),
+            "snapshot must carry the am_version self-check: {snap}"
+        );
+        // Host-pressure section (J1) present with its verdict field.
+        assert!(
+            snap.pointer("/host/host_pressure_likely").is_some(),
+            "snapshot must carry the host-pressure section: {snap}"
+        );
+        // Field schema is documented inline (no out-of-band lookup needed).
+        assert!(snap.pointer("/field_schema/runtime_identity").is_some());
+
+        // The summary surfaces an at-a-glance reliability pointer.
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&result.summary_path).unwrap()).unwrap();
+        assert_eq!(
+            summary
+                .pointer("/reliability_snapshot/file")
+                .and_then(serde_json::Value::as_str),
+            Some("reports/reliability-snapshot.json")
+        );
+        assert!(summary.pointer("/reliability_snapshot/am_version_state").is_some());
+
+        // Redaction-safe: the absolute storage_root must not leak into the snapshot.
+        assert!(
+            !snap_text.contains(storage_root.to_string_lossy().as_ref()),
+            "reliability snapshot leaked storage_root: {snap_text}"
+        );
     }
 
     #[cfg(unix)]
