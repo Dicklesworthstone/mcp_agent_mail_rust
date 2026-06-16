@@ -310,6 +310,7 @@
     "schema": "forensic-timeline.v1"
   },
   "healthy": true,
+  "runtime_identity": "<RUNTIME_IDENTITY>",
   "summary": {
     "archive_hygiene": null,
     "category_breakdown": {

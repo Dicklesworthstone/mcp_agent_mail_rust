@@ -315,6 +315,17 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                         Value::String("<RUNNING_EXE>".to_string()),
                     );
                 }
+                // J3 (br-bvq1x.10.3): the runtime_identity block names the live
+                // binary_path/pid/version/server_pids — inherently non-deterministic
+                // per run/release. Its structure is asserted by the dedicated
+                // doctor_check_json_always_includes_runtime_identity test; redact it
+                // to a stable marker here so the JSON-stability snapshot stays stable.
+                if out.contains_key("runtime_identity") {
+                    out.insert(
+                        "runtime_identity".to_string(),
+                        Value::String("<RUNTIME_IDENTITY>".to_string()),
+                    );
+                }
                 Value::Object(out)
             }
             other => other,

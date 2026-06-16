@@ -51,6 +51,7 @@ pub mod orphan_foreign_key_rows;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
+pub mod recovered_tree_shadow;
 pub mod reservation_db_archive_parity;
 pub mod retained_autocommit_leak;
 pub mod runtime_pid_hint_symlink_toctou;
@@ -585,6 +586,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::path_order_shadows_am",
         },
         FixerSpec {
+            id: recovered_tree_shadow::FM_ID,
+            severity: "P2",
+            subsystem: "environment_toolchain",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Recovery-debris repo tree (`*_recovered_*`) in a common project root (path/version confusion; operator confirms canonical tree — never auto-deleted)",
+            source_module: "doctor::fixers::recovered_tree_shadow",
+        },
+        FixerSpec {
             id: stale_am_git_binary_cache::FM_ID,
             severity: "P2",
             subsystem: "environment_toolchain",
@@ -927,6 +937,29 @@ pub enum DispatchError {
     Mutate(#[from] crate::doctor::mutate::MutateError),
 }
 
+/// Common project roots scanned for recovery-debris repo trees
+/// (`recovered_tree_shadow`). Derived from the storage root's parent (where the
+/// archive sits next to the live repo), the current working directory and its
+/// parent, and `$HOME`. Shallow scans only; the detector dedupes by found path.
+fn recovered_tree_scan_roots(inputs: &DispatchInputs) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(parent) = inputs.storage_root.as_ref().and_then(|sr| sr.parent()) {
+        roots.push(parent.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(parent) = cwd.parent() {
+            roots.push(parent.to_path_buf());
+        }
+        roots.push(cwd);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(std::path::PathBuf::from(home));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// Dispatch a single registered FM's detect+fix through `mutate()`.
 ///
 /// Resolves `fm_id` against the registry and invokes the matching
@@ -1176,6 +1209,16 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = stale_python_server_shadow::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+            outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
+    } else if fm_id == recovered_tree_shadow::FM_ID {
+        let findings = recovered_tree_shadow::detect(&recovered_tree_scan_roots(inputs));
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = recovered_tree_shadow::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
@@ -1825,6 +1868,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .collect()
     } else if fm_id == stale_python_server_shadow::FM_ID {
         stale_python_server_shadow::detect(&inputs.pid_hint_candidates)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == recovered_tree_shadow::FM_ID {
+        recovered_tree_shadow::detect(&recovered_tree_scan_roots(inputs))
             .iter()
             .map(|f| f.to_finding())
             .collect()
