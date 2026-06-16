@@ -3095,7 +3095,11 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
                 .and_then(serde_json::Value::as_str),
             Some("reports/reliability-snapshot.json")
         );
-        assert!(summary.pointer("/reliability_snapshot/am_version_state").is_some());
+        assert!(
+            summary
+                .pointer("/reliability_snapshot/am_version_state")
+                .is_some()
+        );
 
         // Redaction-safe: the absolute storage_root must not leak into the snapshot.
         assert!(
