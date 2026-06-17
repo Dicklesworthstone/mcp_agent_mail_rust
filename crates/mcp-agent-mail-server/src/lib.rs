@@ -7061,11 +7061,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     if atc_db_pool.is_none() {
         tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
     }
-    let durable_writes_enabled = atc_durable_writes_enabled(
-        config.atc_write_mode,
-        executor_mode,
-        atc_db_pool.as_ref(),
-    );
+    let durable_writes_enabled =
+        atc_durable_writes_enabled(config.atc_write_mode, executor_mode, atc_db_pool.as_ref());
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();

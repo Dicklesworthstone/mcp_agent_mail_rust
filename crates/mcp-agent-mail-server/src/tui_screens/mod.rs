@@ -230,6 +230,35 @@ impl MailScreenId {
         let idx = if n == 0 { 10 } else { n };
         screen_from_display_index(idx)
     }
+
+    /// Total number of registered screens.
+    pub const COUNT: usize = ALL_SCREEN_IDS.len();
+
+    /// Stable machine-readable identifier (snake_case) for this screen.
+    ///
+    /// Used by diagnostic surfaces (System Health, robot health) that need a
+    /// parse-stable key distinct from the human-facing [`MailScreenMeta::title`].
+    #[must_use]
+    pub const fn as_slug(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Messages => "messages",
+            Self::Threads => "threads",
+            Self::Agents => "agents",
+            Self::Search => "search",
+            Self::Reservations => "reservations",
+            Self::ToolMetrics => "tool_metrics",
+            Self::SystemHealth => "system_health",
+            Self::Timeline => "timeline",
+            Self::Projects => "projects",
+            Self::Contacts => "contacts",
+            Self::Explorer => "explorer",
+            Self::Analytics => "analytics",
+            Self::Attachments => "attachments",
+            Self::ArchiveBrowser => "archive_browser",
+            Self::Atc => "atc",
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

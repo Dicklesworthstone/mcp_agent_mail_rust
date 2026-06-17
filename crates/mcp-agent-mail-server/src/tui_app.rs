@@ -1991,6 +1991,8 @@ impl MailAppModel {
                     self.screen_panics
                         .get_mut()
                         .insert(to, panic_payload_to_string(&payload));
+                } else {
+                    self.state.record_screen_tick(to);
                 }
             }
         }
@@ -4197,10 +4199,19 @@ impl MailAppModel {
                 screen.tick(tick_count, tick_state);
             }))
         });
-        if let Some(Err(payload)) = result {
-            self.screen_panics
-                .borrow_mut()
-                .insert(id, panic_payload_to_string(&payload));
+        match result {
+            Some(Ok(())) => {
+                // Stamp per-screen data-refresh liveness only on a successful
+                // (non-panicking) tick so a frozen/panicked screen does not
+                // masquerade as fresh on the System Health surface.
+                self.state.record_screen_tick(id);
+            }
+            Some(Err(payload)) => {
+                self.screen_panics
+                    .borrow_mut()
+                    .insert(id, panic_payload_to_string(&payload));
+            }
+            None => {}
         }
     }
 

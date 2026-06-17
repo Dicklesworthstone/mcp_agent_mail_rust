@@ -520,6 +520,117 @@ fn loop_heartbeat_now_micros() -> i64 {
         .unwrap_or(0)
 }
 
+/// Lock-free point-in-time snapshot of one TUI screen's data-refresh liveness.
+///
+/// Distinct from [`TuiLoopHeartbeatSnapshot`]: loop heartbeats prove the
+/// long-running *loops* are advancing, whereas this proves each *screen*
+/// is still applying freshly-generated data (and was not silently frozen
+/// or starved of ticks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiScreenRefreshSnapshot {
+    pub screen: crate::tui_screens::MailScreenId,
+    /// Wall-clock micros of this screen's most recent successful (non-panicking) tick.
+    pub last_tick_micros: i64,
+    /// Wall-clock micros of the most recent tick that observed newly-generated data.
+    pub last_refresh_micros: i64,
+    pub ticks_total: u64,
+    pub refreshes_total: u64,
+}
+
+#[derive(Debug)]
+struct ScreenRefreshSlot {
+    last_tick_micros: AtomicI64,
+    last_refresh_micros: AtomicI64,
+    ticks_total: AtomicU64,
+    refreshes_total: AtomicU64,
+    // Last data-generation channels observed by this screen. Initialized to
+    // the `DataGeneration::stale()` sentinel (all-MAX) so the first real tick
+    // always registers as a refresh, mirroring each screen's own
+    // `last_data_gen` bootstrap.
+    seen_event_total_pushed: AtomicU64,
+    seen_console_log_seq: AtomicU64,
+    seen_db_stats_gen: AtomicU64,
+    seen_request_gen: AtomicU64,
+}
+
+impl ScreenRefreshSlot {
+    fn new() -> Self {
+        Self {
+            last_tick_micros: AtomicI64::new(0),
+            last_refresh_micros: AtomicI64::new(0),
+            ticks_total: AtomicU64::new(0),
+            refreshes_total: AtomicU64::new(0),
+            seen_event_total_pushed: AtomicU64::new(u64::MAX),
+            seen_console_log_seq: AtomicU64::new(u64::MAX),
+            seen_db_stats_gen: AtomicU64::new(u64::MAX),
+            seen_request_gen: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScreenRefreshSlots {
+    slots: [ScreenRefreshSlot; crate::tui_screens::MailScreenId::COUNT],
+}
+
+impl ScreenRefreshSlots {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ScreenRefreshSlot::new()),
+        }
+    }
+
+    /// Record a successful screen tick. Returns `true` if the global data
+    /// generation advanced since this screen last ticked (i.e. fresh data was
+    /// available to apply).
+    fn record_tick_at(
+        &self,
+        id: crate::tui_screens::MailScreenId,
+        now_micros: i64,
+        current: crate::tui_screens::DataGeneration,
+    ) -> bool {
+        let slot = &self.slots[id.index()];
+        slot.last_tick_micros
+            .store(now_micros.max(0), Ordering::Relaxed);
+        slot.ticks_total.fetch_add(1, Ordering::Relaxed);
+        // Single-writer per slot (the TUI tick loop), so the per-field swaps
+        // cannot interleave with one another for a given screen.
+        let prev_event = slot
+            .seen_event_total_pushed
+            .swap(current.event_total_pushed, Ordering::Relaxed);
+        let prev_console = slot
+            .seen_console_log_seq
+            .swap(current.console_log_seq, Ordering::Relaxed);
+        let prev_db = slot
+            .seen_db_stats_gen
+            .swap(current.db_stats_gen, Ordering::Relaxed);
+        let prev_request = slot
+            .seen_request_gen
+            .swap(current.request_gen, Ordering::Relaxed);
+        let refreshed = prev_event != current.event_total_pushed
+            || prev_console != current.console_log_seq
+            || prev_db != current.db_stats_gen
+            || prev_request != current.request_gen;
+        if refreshed {
+            slot.last_refresh_micros
+                .store(now_micros.max(0), Ordering::Relaxed);
+            slot.refreshes_total.fetch_add(1, Ordering::Relaxed);
+        }
+        refreshed
+    }
+
+    fn snapshot(&self, id: crate::tui_screens::MailScreenId) -> TuiScreenRefreshSnapshot {
+        let slot = &self.slots[id.index()];
+        TuiScreenRefreshSnapshot {
+            screen: id,
+            last_tick_micros: slot.last_tick_micros.load(Ordering::Relaxed),
+            last_refresh_micros: slot.last_refresh_micros.load(Ordering::Relaxed),
+            ticks_total: slot.ticks_total.load(Ordering::Relaxed),
+            refreshes_total: slot.refreshes_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
 fn elapsed_micros_u64(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -633,6 +744,8 @@ pub struct TuiSharedState {
     request_gen: AtomicU64,
     /// Lock-free per-loop progress markers for freeze/stall diagnosis.
     loop_heartbeats: LoopHeartbeatSlots,
+    /// Lock-free per-screen data-refresh markers for freeze/stall diagnosis.
+    screen_refreshes: ScreenRefreshSlots,
     /// Startup latches used to stage heavyweight background work behind first
     /// paint and behind the initial DB readiness result.
     startup_signals: (Mutex<StartupSignalState>, Condvar),
@@ -684,6 +797,7 @@ impl TuiSharedState {
             next_active_reservation_expiry_micros: AtomicI64::new(0),
             request_gen: AtomicU64::new(0),
             loop_heartbeats: LoopHeartbeatSlots::new(),
+            screen_refreshes: ScreenRefreshSlots::new(),
             startup_signals: (Mutex::new(StartupSignalState::default()), Condvar::new()),
             web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore::new(),
         })
@@ -907,6 +1021,35 @@ impl TuiSharedState {
         TuiLoopHeartbeatKind::ALL
             .iter()
             .map(|kind| self.loop_heartbeat_snapshot(*kind))
+            .collect()
+    }
+
+    /// Record a successful (non-panicking) tick for `id`, stamping the screen's
+    /// data-refresh liveness markers. Returns `true` if newly-generated data was
+    /// available to apply on this tick.
+    ///
+    /// Called from the single TUI tick loop after each screen tick. Cheap:
+    /// reads four atomics ([`Self::data_generation`]) and updates a handful more.
+    pub fn record_screen_tick(&self, id: crate::tui_screens::MailScreenId) -> bool {
+        let current = self.data_generation();
+        self.screen_refreshes
+            .record_tick_at(id, loop_heartbeat_now_micros(), current)
+    }
+
+    #[must_use]
+    pub fn screen_refresh_snapshot(
+        &self,
+        id: crate::tui_screens::MailScreenId,
+    ) -> TuiScreenRefreshSnapshot {
+        self.screen_refreshes.snapshot(id)
+    }
+
+    /// Per-screen data-refresh liveness snapshots, in canonical display order.
+    #[must_use]
+    pub fn screen_refresh_snapshots(&self) -> Vec<TuiScreenRefreshSnapshot> {
+        crate::tui_screens::ALL_SCREEN_IDS
+            .iter()
+            .map(|&id| self.screen_refreshes.snapshot(id))
             .collect()
     }
 
@@ -1668,6 +1811,60 @@ mod tests {
         assert_eq!(input.failures_total, 0);
         assert_eq!(input.consecutive_failures, 0);
         assert_eq!(input.last_success_duration_micros, 800);
+    }
+
+    #[test]
+    fn screen_refresh_slots_detect_fresh_data_and_record_ticks() {
+        use crate::tui_screens::{DataGeneration, MailScreenId};
+
+        let slots = ScreenRefreshSlots::new();
+        let gen0 = DataGeneration {
+            event_total_pushed: 5,
+            console_log_seq: 2,
+            db_stats_gen: 1,
+            request_gen: 9,
+        };
+
+        // First tick bootstraps from the stale sentinel → always counts as a
+        // refresh, mirroring each screen's `last_data_gen` initialization.
+        assert!(slots.record_tick_at(MailScreenId::Dashboard, 1_000, gen0));
+        // Re-tick with the same generation → tick recorded, but NOT a refresh.
+        assert!(!slots.record_tick_at(MailScreenId::Dashboard, 2_000, gen0));
+        // Advance a single data channel → counts as a refresh again.
+        let gen1 = DataGeneration {
+            db_stats_gen: 2,
+            ..gen0
+        };
+        assert!(slots.record_tick_at(MailScreenId::Dashboard, 3_000, gen1));
+
+        let snap = slots.snapshot(MailScreenId::Dashboard);
+        assert_eq!(snap.screen, MailScreenId::Dashboard);
+        assert_eq!(snap.ticks_total, 3);
+        assert_eq!(snap.refreshes_total, 2);
+        assert_eq!(snap.last_tick_micros, 3_000);
+        // last_refresh holds the second refresh time, not the no-op tick at 2_000.
+        assert_eq!(snap.last_refresh_micros, 3_000);
+
+        // An independently-tracked, never-ticked screen stays zeroed.
+        let untouched = slots.snapshot(MailScreenId::Atc);
+        assert_eq!(untouched.ticks_total, 0);
+        assert_eq!(untouched.refreshes_total, 0);
+        assert_eq!(untouched.last_tick_micros, 0);
+        assert_eq!(untouched.last_refresh_micros, 0);
+    }
+
+    #[test]
+    fn screen_refresh_snapshots_cover_every_screen() {
+        let config = Config::default();
+        let state = TuiSharedState::new(&config);
+        let snapshots = state.screen_refresh_snapshots();
+        assert_eq!(snapshots.len(), crate::tui_screens::MailScreenId::COUNT);
+        let screens: Vec<_> = snapshots.iter().map(|s| s.screen).collect();
+        assert_eq!(
+            screens.as_slice(),
+            crate::tui_screens::ALL_SCREEN_IDS,
+            "screen refresh snapshots must be in canonical display order"
+        );
     }
 
     #[test]

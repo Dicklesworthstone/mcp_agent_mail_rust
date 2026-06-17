@@ -37,7 +37,8 @@ use serde_json::{Value, json};
 
 use crate::tui_bridge::{
     BootArchivePreflightSnapshot, ConfigSnapshot, ScreenDiagnosticSnapshot, TuiLoopHeartbeatKind,
-    TuiLoopHeartbeatSnapshot, TuiSharedState, query_params_explain_empty_state,
+    TuiLoopHeartbeatSnapshot, TuiScreenRefreshSnapshot, TuiSharedState,
+    query_params_explain_empty_state,
 };
 use crate::tui_events::MailEvent;
 use crate::tui_widgets::{
@@ -407,6 +408,45 @@ fn loop_heartbeat_json(snapshot: &TuiLoopHeartbeatSnapshot, now_micros: i64) -> 
         "successes_total": snapshot.successes_total,
         "failures_total": snapshot.failures_total,
         "consecutive_failures": snapshot.consecutive_failures,
+    })
+}
+
+fn screen_refresh_age_micros(at_micros: i64, now_micros: i64) -> Option<i64> {
+    if at_micros <= 0 {
+        return None;
+    }
+    Some(now_micros.saturating_sub(at_micros).max(0))
+}
+
+fn format_screen_refresh_detail(snapshot: &TuiScreenRefreshSnapshot, now_micros: i64) -> String {
+    let tick_age = screen_refresh_age_micros(snapshot.last_tick_micros, now_micros)
+        .map_or_else(|| "--".to_string(), |age| format!("{}s", age / 1_000_000));
+    let refresh_age = screen_refresh_age_micros(snapshot.last_refresh_micros, now_micros)
+        .map_or_else(|| "--".to_string(), |age| format!("{}s", age / 1_000_000));
+    let last_refresh = if snapshot.last_refresh_micros > 0 {
+        format_diag_timestamp_micros(snapshot.last_refresh_micros)
+    } else {
+        "--".to_string()
+    };
+    format!(
+        "ticks={} refreshes={} tick_age={} refresh_age={} last_refresh={}",
+        snapshot.ticks_total, snapshot.refreshes_total, tick_age, refresh_age, last_refresh,
+    )
+}
+
+fn screen_refresh_json(snapshot: &TuiScreenRefreshSnapshot, now_micros: i64) -> Value {
+    json!({
+        "screen": snapshot.screen.as_slug(),
+        "observed": snapshot.ticks_total > 0,
+        "last_tick_micros": snapshot.last_tick_micros,
+        "last_refresh_micros": snapshot.last_refresh_micros,
+        "last_tick_age_micros": screen_refresh_age_micros(snapshot.last_tick_micros, now_micros),
+        "last_refresh_age_micros": screen_refresh_age_micros(
+            snapshot.last_refresh_micros,
+            now_micros,
+        ),
+        "ticks_total": snapshot.ticks_total,
+        "refreshes_total": snapshot.refreshes_total,
     })
 }
 
@@ -883,6 +923,7 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
     let boot_archive_preflight = state.boot_archive_preflight_snapshot();
     let now_micros = mcp_agent_mail_db::now_micros();
     let loop_heartbeats = state.loop_heartbeats_snapshot();
+    let screen_refreshes = state.screen_refresh_snapshots();
     let query_tracker_snapshot = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
     let metrics_snapshot = mcp_agent_mail_core::global_metrics().snapshot();
 
@@ -891,6 +932,10 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
         "loop_heartbeats": loop_heartbeats
             .iter()
             .map(|snapshot| loop_heartbeat_json(snapshot, now_micros))
+            .collect::<Vec<_>>(),
+        "screen_refreshes": screen_refreshes
+            .iter()
+            .map(|snapshot| screen_refresh_json(snapshot, now_micros))
             .collect::<Vec<_>>(),
         "db_latency_histograms": {
             "query_latency_us": histogram_snapshot_json(&query_tracker_snapshot.latency_us),
@@ -1674,6 +1719,29 @@ impl SystemHealthScreen {
                     &tp,
                     heartbeat.kind.as_str().to_string(),
                     format_loop_heartbeat_detail(heartbeat, now_micros),
+                ));
+            }
+        }
+
+        let screen_refreshes = state.screen_refresh_snapshots();
+        if screen_refreshes.iter().any(|s| s.ticks_total > 0) {
+            let now_micros = mcp_agent_mail_db::now_micros();
+            lines.push(Line::raw(String::new()));
+            lines.push(Line::from_spans([Span::styled(
+                "\u{2500}\u{2500} Screen Data Refresh \u{2500}\u{2500}",
+                section_style,
+            )]));
+            // Informational only: background screens legitimately refresh on a
+            // slower cadence, so this surface never escalates overall health.
+            for refresh in &screen_refreshes {
+                if refresh.ticks_total == 0 {
+                    continue;
+                }
+                lines.push(level_styled_line(
+                    Level::Ok,
+                    &tp,
+                    refresh.screen.as_slug().to_string(),
+                    format_screen_refresh_detail(refresh, now_micros),
                 ));
             }
         }
@@ -5715,6 +5783,117 @@ mod tests {
             ..db_poll
         };
         assert_eq!(loop_heartbeat_level(&render, now_micros), Level::Warn);
+    }
+
+    #[test]
+    fn loop_heartbeat_is_stale_flips_true_under_injected_stall() {
+        let now_micros = mcp_agent_mail_db::now_micros();
+
+        // A render loop that ticked within the staleness window is fresh.
+        let fresh = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::Render,
+            last_tick_micros: now_micros.saturating_sub(1_000_000),
+            last_success_micros: now_micros.saturating_sub(1_000_000),
+            last_failure_micros: 0,
+            last_gap_micros: 250_000,
+            last_success_duration_micros: 1_000,
+            ticks_total: 10,
+            successes_total: 10,
+            failures_total: 0,
+            consecutive_failures: 0,
+        };
+        assert!(!loop_heartbeat_is_stale(&fresh, now_micros));
+        assert_eq!(loop_heartbeat_level(&fresh, now_micros), Level::Ok);
+
+        // Inject a stall (L3): no tick for well over the staleness threshold.
+        // The periodic loop's heartbeat must flip stale and escalate to Warn.
+        let stall_age = LOOP_HEARTBEAT_STALE_MICROS + 5_000_000;
+        let stalled = TuiLoopHeartbeatSnapshot {
+            last_tick_micros: now_micros.saturating_sub(stall_age),
+            last_success_micros: now_micros.saturating_sub(stall_age),
+            ..fresh
+        };
+        assert!(loop_heartbeat_is_stale(&stalled, now_micros));
+        assert_eq!(loop_heartbeat_level(&stalled, now_micros), Level::Warn);
+
+        // The same stall on the DB-poll loop (also periodic) is likewise stale.
+        let db_stalled = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::DbPoll,
+            ..stalled
+        };
+        assert!(loop_heartbeat_is_stale(&db_stalled, now_micros));
+
+        // Non-periodic loops (MCP/API) only tick on demand, so an idle gap must
+        // NOT be reported as stale — that would be a false freeze alarm.
+        let idle_mcp = TuiLoopHeartbeatSnapshot {
+            kind: TuiLoopHeartbeatKind::McpApi,
+            ..stalled
+        };
+        assert!(!loop_heartbeat_is_stale(&idle_mcp, now_micros));
+    }
+
+    #[test]
+    fn ws_state_payload_includes_screen_refreshes() {
+        use crate::tui_screens::MailScreenId;
+
+        let state = test_state();
+        // First tick bootstraps from the stale sentinel → registers a refresh.
+        assert!(state.record_screen_tick(MailScreenId::Dashboard));
+        // Tick a second screen too.
+        state.record_screen_tick(MailScreenId::SystemHealth);
+
+        let payload = ws_state_system_health_payload(&state);
+        let refreshes = payload["screen_refreshes"]
+            .as_array()
+            .expect("screen refresh array");
+        assert_eq!(refreshes.len(), MailScreenId::COUNT);
+
+        let dashboard = refreshes
+            .iter()
+            .find(|entry| entry["screen"].as_str() == Some("dashboard"))
+            .expect("dashboard refresh entry");
+        assert_eq!(dashboard["observed"].as_bool(), Some(true));
+        assert_eq!(dashboard["ticks_total"].as_u64(), Some(1));
+        assert_eq!(dashboard["refreshes_total"].as_u64(), Some(1));
+        assert!(dashboard["last_refresh_micros"].as_i64().unwrap_or(0) > 0);
+
+        // An un-ticked screen is present but reports as not yet observed.
+        let atc = refreshes
+            .iter()
+            .find(|entry| entry["screen"].as_str() == Some("atc"))
+            .expect("atc refresh entry");
+        assert_eq!(atc["observed"].as_bool(), Some(false));
+        assert_eq!(atc["ticks_total"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn system_health_text_view_renders_screen_refreshes() {
+        use crate::tui_screens::MailScreenId;
+
+        let state = test_state();
+        state.record_screen_tick(MailScreenId::Dashboard);
+
+        let screen = test_screen(DiagnosticsSnapshot {
+            checked_at: Some(Utc::now()),
+            ..Default::default()
+        });
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 80, &mut pool);
+        screen.render_text_view(&mut frame, Rect::new(0, 0, 120, 80), &state);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Screen Data Refresh"),
+            "expected screen refresh section, got:\n{text}"
+        );
+        assert!(
+            text.contains("dashboard"),
+            "expected dashboard refresh row, got:\n{text}"
+        );
+        assert!(
+            text.contains("refreshes=1"),
+            "expected refresh counter, got:\n{text}"
+        );
     }
 
     #[test]
