@@ -1318,14 +1318,25 @@ impl SystemHealthScreen {
             Span::styled(
                 {
                     let (observed_label, observed_micros) = atc_budget_observed(&snap.atc);
+                    let overruns = if snap.atc.budget_overruns_consecutive > 0 {
+                        format!(
+                            "  overruns={}x (worst {}us)",
+                            snap.atc.budget_overruns_consecutive,
+                            snap.atc.worst_tick_overrun_micros
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{observed_label}={}us / {}us  p95≈{}us",
+                        "{observed_label}={}us / {}us  p95≈{}us{overruns}",
                         observed_micros,
                         snap.atc.last_tick_budget_micros,
                         atc_tick_p95_micros(&snap.atc)
                     )
                 },
-                if snap.atc.last_tick_budget_exceeded {
+                if crate::atc_budget_watchdog_tripped(snap.atc.budget_overruns_consecutive) {
+                    crate::tui_theme::text_error(&tp)
+                } else if snap.atc.last_tick_budget_exceeded {
                     crate::tui_theme::text_warning(&tp)
                 } else {
                     value_style
@@ -3418,6 +3429,26 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
             remediation: Some(
                 "Profile the ATC hot path before increasing the tick interval or budget.".into(),
+            ),
+        });
+    }
+
+    // I3 (br-bvq1x.9.3): a SUSTAINED run of consecutive overruns is the
+    // freeze-adjacent "running-but-over-budget" loop ts1 hit — escalate it
+    // distinctly from a one-off overrun above.
+    if crate::atc_budget_watchdog_tripped(out.atc.budget_overruns_consecutive) {
+        out.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "atc-budget-watchdog",
+            detail: format!(
+                "ATC operator persistently over budget: {} consecutive tick overrun(s) (worst {}us over {}us budget; {} total)",
+                out.atc.budget_overruns_consecutive,
+                out.atc.worst_tick_overrun_micros,
+                out.atc.last_tick_budget_micros,
+                out.atc.budget_overruns_total,
+            ),
+            remediation: Some(
+                "ATC ticks are starving the operator loop. Profile the ATC hot path, reduce experience churn (AM_ATC_* knobs), or disable ATC (AM_ATC_ENABLED=false) until resolved.".into(),
             ),
         });
     }
@@ -6040,6 +6071,63 @@ mod tests {
                 .iter()
                 .any(|line| { line.name == "atc-stale" && line.detail.contains("no heartbeat") })
         );
+    }
+
+    #[test]
+    fn atc_budget_watchdog_finding_trips_only_on_sustained_overruns() {
+        // I3 (br-bvq1x.9.3): a sub-threshold streak surfaces only the routine
+        // single-tick "atc-budget" warning; a sustained streak escalates to the
+        // distinct "atc-budget-watchdog" Fail finding.
+        let mut transient = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                last_tick_micros: mcp_agent_mail_db::now_micros(),
+                last_tick_budget_micros: 5_000,
+                last_tick_budget_exceeded: true,
+                budget_overruns_total: 1,
+                budget_overruns_consecutive: 1,
+                worst_tick_overrun_micros: 3_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        add_atc_findings(&mut transient);
+        assert!(
+            transient.lines.iter().any(|line| line.name == "atc-budget"),
+            "a single overrun still emits the routine budget warning"
+        );
+        assert!(
+            !transient
+                .lines
+                .iter()
+                .any(|line| line.name == "atc-budget-watchdog"),
+            "a single overrun must NOT trip the watchdog"
+        );
+
+        let mut sustained = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                last_tick_micros: mcp_agent_mail_db::now_micros(),
+                last_tick_budget_micros: 5_000,
+                last_tick_budget_exceeded: true,
+                budget_overruns_total: 9,
+                budget_overruns_consecutive: 6,
+                worst_tick_overrun_micros: 181_887,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        add_atc_findings(&mut sustained);
+        let watchdog = sustained
+            .lines
+            .iter()
+            .find(|line| line.name == "atc-budget-watchdog")
+            .expect("sustained overruns must trip the watchdog");
+        assert_eq!(watchdog.level, Level::Fail);
+        assert!(watchdog.detail.contains("6 consecutive"));
+        assert!(watchdog.detail.contains("181887us"));
     }
 
     #[test]

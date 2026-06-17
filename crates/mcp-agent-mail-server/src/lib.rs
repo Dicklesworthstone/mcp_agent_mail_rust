@@ -4964,6 +4964,18 @@ fn atc_operator_tick_budget_status(
     (exceeded, note)
 }
 
+/// Consecutive ATC tick-budget overruns before the I3 watchdog trips. A single
+/// overrun (e.g. a one-off rollup-heavy tick) is routine; a sustained streak is
+/// the freeze-adjacent "running-but-over-budget" loop that must surface in health.
+const ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD: u64 = 3;
+
+/// I3 (br-bvq1x.9.3): the budget-overrun watchdog trips once the operator has
+/// overrun its tick budget on `>= ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD`
+/// consecutive ticks.
+pub(crate) const fn atc_budget_watchdog_tripped(consecutive_overruns: u64) -> bool {
+    consecutive_overruns >= ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD
+}
+
 fn next_atc_rollup_refresh_micros(now_micros: i64) -> i64 {
     now_micros.saturating_add(ATC_ROLLUP_REFRESH_INTERVAL_MICROS)
 }
@@ -4992,6 +5004,14 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) last_tick_duration_micros: u64,
     pub(crate) last_tick_budget_micros: u64,
     pub(crate) last_tick_budget_exceeded: bool,
+    /// I3 (br-bvq1x.9.3) budget-overrun watchdog accumulators. A single overrun
+    /// is routine (the existing `last_tick_budget_exceeded` line); a *sustained*
+    /// run of consecutive overruns is the freeze-adjacent "running-but-starved"
+    /// state ts1 hit, so the watchdog tracks the streak separately.
+    pub(crate) budget_overruns_total: u64,
+    pub(crate) budget_overruns_consecutive: u64,
+    /// Largest observed kernel/tick overrun (`observed - budget`) in micros.
+    pub(crate) worst_tick_overrun_micros: u64,
     pub(crate) outer_loop_overhead_micros: u64,
     pub(crate) executor_mode: String,
     pub(crate) executor_pending_effects: usize,
@@ -6923,6 +6943,11 @@ fn build_atc_operator_snapshot(
             last_tick_duration_micros,
             last_tick_budget_micros,
             last_tick_budget_exceeded,
+            // Watchdog accumulators are overwritten by the caller (the operator
+            // loop owns the cross-tick streak state); 0 here is a placeholder.
+            budget_overruns_total: 0,
+            budget_overruns_consecutive: 0,
+            worst_tick_overrun_micros: 0,
             outer_loop_overhead_micros,
             executor_mode: executor_mode.to_string(),
             executor_pending_effects,
@@ -7067,6 +7092,11 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
     let mut last_summary_log_micros = 0_i64;
+    // I3 (br-bvq1x.9.3) budget-overrun watchdog accumulators. Loop-local so they
+    // persist across ticks and feed the published snapshot / health surface.
+    let mut budget_overruns_total = 0_u64;
+    let mut budget_overruns_consecutive = 0_u64;
+    let mut worst_tick_overrun_micros = 0_u64;
     /// Maximum pending effects before backpressure drops oldest.
     const MAX_PENDING_EFFECTS: usize = 512;
     /// Refresh durable ATC population state once per minute to avoid cold-start
@@ -7330,7 +7360,18 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             tick_duration_micros,
             tick_budget_micros,
         );
-        let snapshot = build_atc_operator_snapshot(
+        // I3 watchdog accumulators: track the consecutive-overrun streak (a
+        // sustained run is freeze-adjacent) and the worst observed overrun.
+        if tick_budget_exceeded {
+            budget_overruns_total = budget_overruns_total.saturating_add(1);
+            budget_overruns_consecutive = budget_overruns_consecutive.saturating_add(1);
+            let observed_micros = kernel_total_micros.unwrap_or(tick_duration_micros);
+            worst_tick_overrun_micros =
+                worst_tick_overrun_micros.max(observed_micros.saturating_sub(tick_budget_micros));
+        } else {
+            budget_overruns_consecutive = 0;
+        }
+        let mut snapshot = build_atc_operator_snapshot(
             live_summary,
             &recent_actions,
             &recent_executions,
@@ -7343,6 +7384,9 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             pending_effects.len(),
             note.clone(),
         );
+        snapshot.budget_overruns_total = budget_overruns_total;
+        snapshot.budget_overruns_consecutive = budget_overruns_consecutive;
+        snapshot.worst_tick_overrun_micros = worst_tick_overrun_micros;
         set_atc_operator_snapshot(snapshot.clone());
 
         if let Some(state) = tui_state_handle() {
@@ -16373,6 +16417,23 @@ mod tests {
             note.as_deref(),
             Some("ATC tick exceeded budget: 8000us > 5000us")
         );
+    }
+
+    #[test]
+    fn atc_budget_watchdog_trips_only_on_sustained_overrun_streak() {
+        // I3 (br-bvq1x.9.3): a one-off overrun must NOT trip the watchdog; a
+        // sustained consecutive streak (the freeze-adjacent state) must.
+        assert!(!atc_budget_watchdog_tripped(0));
+        assert!(!atc_budget_watchdog_tripped(1));
+        assert!(!atc_budget_watchdog_tripped(
+            ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD - 1
+        ));
+        assert!(atc_budget_watchdog_tripped(
+            ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD
+        ));
+        assert!(atc_budget_watchdog_tripped(
+            ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD + 5
+        ));
     }
 
     #[test]
