@@ -2446,7 +2446,16 @@ impl Config {
             config.atc_write_mode = AtcWriteMode::from_str_lossy(&v);
         }
         if console_bool("ATC_LEARNING_DISABLED", false) {
+            // ATC_LEARNING_DISABLED is the documented kill switch, so it must
+            // fully disable the learning subsystem — NOT merely flip the write
+            // mode. Durable ATC experience writes (the atc_experiences ledger)
+            // are driven by the operator loop, which is gated by `atc_enabled`
+            // and AM_ATC_EXECUTOR_MODE (default Live) — NOT by atc_write_mode.
+            // Setting only the write mode silently leaves the Live operator
+            // churning the ledger, whose index corrupts under sustained load.
+            // Force the master gate off so the documented switch truly stops it.
             config.atc_write_mode = AtcWriteMode::Off;
+            config.atc_enabled = false;
         }
         config.atc_experience_max_rows = i64::try_from(console_u64(
             "AM_ATC_EXPERIENCE_MAX_ROWS",
@@ -3770,6 +3779,12 @@ mod tests {
         assert!(
             config.atc_write_mode.is_off(),
             "ATC_LEARNING_DISABLED=1 must force write mode to off even when AM_ATC_WRITE_MODE=live"
+        );
+        assert!(
+            !config.atc_enabled,
+            "ATC_LEARNING_DISABLED=1 must fully disable ATC (atc_enabled=false), not just the \
+             write mode — otherwise the Live operator keeps writing the experience ledger and \
+             corrupts its index"
         );
     }
 
