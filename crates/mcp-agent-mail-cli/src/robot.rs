@@ -13539,7 +13539,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         env = env.with_alert(
                             "warn",
                             format!(
-                                "TUI/runtime loop appears frozen while the server is still running ({liveness_detail}). The live snapshot above is your read-out; the process is still serving MCP/API."
+                                "TUI/runtime loop appears frozen while the server is still running ({liveness_detail}). The live snapshot in this response is your read-out; the process is still serving MCP/API."
                             ),
                             fallback_cmd.clone(),
                         );
@@ -13558,42 +13558,79 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     let live_error = error.to_string();
                     match resolve_robot_scope(args.project.as_deref(), args.agent.as_deref()) {
                         Ok(scope) => {
-                            tracing::debug!(
-                                event = "tui_dump.snapshot_source",
-                                source = "local_db"
-                            );
                             let agent_name = scope.agent.as_ref().map(|(_, name)| name.clone());
-                            let (status, actions) = build_status_with_phase(
+                            let project_slug = scope.project_slug.clone();
+                            // Never exit non-zero on the freeze escape hatch: if the
+                            // DB opened/scope resolved but the situational snapshot
+                            // build itself fails, still return a structured read-out.
+                            match build_status_with_phase(
                                 scope.conn(),
                                 scope.project_id,
                                 &scope.project_slug,
                                 scope.agent.clone(),
                                 None,
-                            )?;
-                            let mut env = RobotEnvelope::new(
-                                cmd_name,
-                                format,
-                                TuiDumpData {
-                                    source: "local-fallback".into(),
-                                    tui_liveness: TuiLivenessReport::unreachable(format!(
-                                        "live server not reachable: {live_error}"
-                                    )),
-                                    live_error: Some(live_error.clone()),
-                                    ws_state: None,
-                                    status: Some(Box::new(status)),
-                                },
-                            );
-                            env._meta.project = Some(scope.project_slug.clone());
-                            env._meta.agent = agent_name;
-                            env = env.with_alert(
-                                "warn",
-                                "Live TUI snapshot unavailable; surfaced the local SQLite situational snapshot instead",
-                                Some(live_error.clone()),
-                            );
-                            for action in actions {
-                                env = env.with_action(action);
+                            ) {
+                                Ok((status, actions)) => {
+                                    tracing::debug!(
+                                        event = "tui_dump.snapshot_source",
+                                        source = "local_db"
+                                    );
+                                    let mut env = RobotEnvelope::new(
+                                        cmd_name,
+                                        format,
+                                        TuiDumpData {
+                                            source: "local-fallback".into(),
+                                            tui_liveness: TuiLivenessReport::unreachable(format!(
+                                                "live server not reachable: {live_error}"
+                                            )),
+                                            live_error: Some(live_error.clone()),
+                                            ws_state: None,
+                                            status: Some(Box::new(status)),
+                                        },
+                                    );
+                                    env._meta.project = Some(project_slug);
+                                    env._meta.agent = agent_name;
+                                    env = env.with_alert(
+                                        "warn",
+                                        "Live TUI snapshot unavailable; surfaced the local SQLite situational snapshot instead",
+                                        Some(live_error.clone()),
+                                    );
+                                    for action in actions {
+                                        env = env.with_action(action);
+                                    }
+                                    format_output(&env, format)?
+                                }
+                                Err(status_error) => {
+                                    tracing::warn!(
+                                        error = %status_error,
+                                        "tui-dump local status build failed; returning degraded read-out"
+                                    );
+                                    let mut env = RobotEnvelope::new(
+                                        cmd_name,
+                                        format,
+                                        TuiDumpData {
+                                            source: "local-fallback".into(),
+                                            tui_liveness: TuiLivenessReport::unreachable(format!(
+                                                "live server not reachable: {live_error}"
+                                            )),
+                                            live_error: Some(live_error.clone()),
+                                            ws_state: None,
+                                            status: None,
+                                        },
+                                    );
+                                    env._meta.project = Some(project_slug);
+                                    env._meta.agent = agent_name;
+                                    env = env.with_alert(
+                                        "warn",
+                                        "Live TUI snapshot unavailable and the local situational snapshot could not be built",
+                                        Some(status_error.to_string()),
+                                    );
+                                    env = env.with_action(
+                                        "Inspect mailbox health: am doctor check --json",
+                                    );
+                                    format_output(&env, format)?
+                                }
                             }
-                            format_output(&env, format)?
                         }
                         Err(scope_error) => {
                             // No live snapshot and no plain scope: try the

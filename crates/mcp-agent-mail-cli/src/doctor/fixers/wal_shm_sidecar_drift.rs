@@ -81,7 +81,9 @@ pub const WAL_HEADER_BYTES: u64 = 32;
 pub enum Signal {
     /// WAL exists but SHM doesn't (or vice versa).
     AsymmetricSidecars { wal_exists: bool, shm_exists: bool },
-    /// WAL file size in `1..=WAL_HEADER_BYTES` — no committed frames.
+    /// A header-only WAL that is a genuine truncation/corruption artifact: a
+    /// sub-header (1..=31 byte) WAL, or a 32-byte header with an INVALID magic.
+    /// A valid 32-byte header (a frameless idle WAL) is benign and not flagged.
     HeaderOnlyWal { wal_size_bytes: u64 },
     /// DB mtime is `drift_secs` ahead of WAL mtime; threshold
     /// crossed.
