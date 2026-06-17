@@ -10,6 +10,23 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+### `am tui-dump` — non-interactive freeze escape hatch (br-bvq1x.9.6, I6)
+
+- **New `am tui-dump` command (also `am robot tui-dump`).** When the interactive
+  TUI looks frozen, agents previously had no safe read-out — and killing the
+  process is forbidden. `am tui-dump --format json` returns the *same*
+  situational snapshot the TUI renders: it fetches the live `/mail/ws-state`
+  payload (with `system_health=1`, so the per-loop heartbeat liveness verdict is
+  included and names the stalled loop) and falls back to a local SQLite
+  situational read when the whole process is wedged or unreachable. It is
+  read-only, classified so it **bypasses the mailbox-ownership refusal** (it must
+  work precisely when a live server owns the mailbox), and **always exits 0** so
+  an agent can always read state instead of resorting to a kill.
+- **Heartbeat surfaces now point at the read-out first.** The I1/I2 TUI
+  loop-liveness report (`am robot health`) carries a new `readout_command`
+  field and, on a suspected freeze, directs agents to run `am tui-dump` *before*
+  the headless restart (`mcp-agent-mail serve --no-tui`).
+
 ---
 
 ## [v0.3.13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.13) — 2026-06-15 **[Release]**

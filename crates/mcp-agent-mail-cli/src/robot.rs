@@ -2446,6 +2446,14 @@ pub enum RobotSubcommand {
     /// Dashboard synthesis: health, inbox counts, activity, anomalies, reservations, top threads.
     Status,
 
+    /// Non-interactive TUI snapshot dump — the I6 freeze escape hatch.
+    ///
+    /// Returns the live `/mail/ws-state` snapshot the interactive TUI renders
+    /// (including per-loop liveness), falling back to a local SQLite read when
+    /// the server/TUI is frozen or unreachable. Always exits 0 so an agent can
+    /// read state instead of killing the process.
+    TuiDump,
+
     /// Actionable inbox with priority ordering, urgency/ack synthesis.
     Inbox {
         /// Show only urgent messages.
@@ -2641,6 +2649,7 @@ impl RobotSubcommand {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Status => "robot status",
+            Self::TuiDump => "tui-dump",
             Self::Inbox { .. } => "robot inbox",
             Self::Timeline { .. } => "robot timeline",
             Self::Overview => "robot overview",
@@ -11482,6 +11491,13 @@ fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRo
 /// MCP/API surface responsive while the render/input stall is investigated.
 pub(crate) const TUI_HEADLESS_FALLBACK_COMMAND: &str = "mcp-agent-mail serve --no-tui";
 
+/// Canonical non-interactive read-out an agent should run FIRST when the TUI
+/// looks frozen: `am tui-dump` returns the live situational snapshot the TUI
+/// renders (or a local SQLite fallback when the server is wedged) WITHOUT
+/// killing the process. This is the I6 (br-bvq1x.9.6) escape hatch the I1/I2
+/// heartbeat work points agents to.
+pub(crate) const TUI_FROZEN_READOUT_COMMAND: &str = "am tui-dump --format json";
+
 /// Liveness of one long-running server loop, derived from a `loop_heartbeats[]`
 /// entry of the `/mail/ws-state?system_health=1` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -11509,6 +11525,11 @@ pub(crate) struct TuiLivenessReport {
     /// Set only when a freeze is suspected, so an agent has an immediate escape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headless_fallback_command: Option<String>,
+    /// Non-interactive read-out an agent should run FIRST when a freeze is
+    /// suspected (I6: `am tui-dump`), set alongside `headless_fallback_command`
+    /// so the heartbeat surface points at the read-out *before* the restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readout_command: Option<String>,
     pub detail: String,
 }
 
@@ -11520,6 +11541,7 @@ impl TuiLivenessReport {
             loops: Vec::new(),
             stalled_loops: Vec::new(),
             headless_fallback_command: None,
+            readout_command: None,
             detail: detail.into(),
         }
     }
@@ -11591,6 +11613,7 @@ pub(crate) fn tui_liveness_report_from_loop_heartbeats(
             loops: Vec::new(),
             stalled_loops: Vec::new(),
             headless_fallback_command: None,
+            readout_command: None,
             detail: "server reachable but reported no loop heartbeats".into(),
         };
     }
@@ -11610,6 +11633,14 @@ pub(crate) fn tui_liveness_report_from_loop_heartbeats(
     } else {
         Some(TUI_HEADLESS_FALLBACK_COMMAND.to_string())
     };
+    // I6 (br-bvq1x.9.6): when a freeze is suspected, point agents at the
+    // non-interactive read-out FIRST (it returns state without killing the
+    // process) and only then at the headless restart.
+    let readout_command = if stalled_loops.is_empty() {
+        None
+    } else {
+        Some(TUI_FROZEN_READOUT_COMMAND.to_string())
+    };
     let detail = if stalled_loops.is_empty() {
         format!("{} loop(s) advancing", loops.len())
     } else {
@@ -11621,6 +11652,7 @@ pub(crate) fn tui_liveness_report_from_loop_heartbeats(
         loops,
         stalled_loops,
         headless_fallback_command,
+        readout_command,
         detail,
     }
 }
@@ -13442,6 +13474,199 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 }
             }
         }
+        RobotSubcommand::TuiDump => {
+            // I6 (br-bvq1x.9.6): the non-interactive freeze escape hatch. An
+            // agent that suspects the interactive TUI is frozen runs this to get
+            // the SAME situational snapshot WITHOUT killing the process (RULE 1).
+            //
+            // Strategy mirrors `am robot atc`: try the live `/mail/ws-state`
+            // snapshot the TUI itself renders (with `system_health=1` so the
+            // per-loop heartbeats are included), and fall back to a local SQLite
+            // read when the server/TUI is wedged or unreachable. The command is
+            // read-only and ALWAYS exits 0 so an agent can always read state.
+            #[derive(Serialize)]
+            struct TuiDumpData {
+                /// `live` | `local-fallback` | `unavailable`.
+                source: String,
+                /// Per-loop liveness verdict derived from the live snapshot (I1/I2).
+                tui_liveness: TuiLivenessReport,
+                /// Transport/auth/parse error that forced the local fallback.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                live_error: Option<String>,
+                /// Raw `/mail/ws-state` snapshot the TUI renders (source == live).
+                #[serde(skip_serializing_if = "Option::is_none")]
+                ws_state: Option<serde_json::Value>,
+                /// Local situational snapshot (source == local-fallback).
+                #[serde(skip_serializing_if = "Option::is_none")]
+                status: Option<Box<StatusData>>,
+            }
+
+            let config = mcp_agent_mail_core::Config::from_env();
+            let base = atc_live_endpoint_from_config(&config);
+            let endpoint = AtcLiveEndpoint {
+                url: ws_state_url_with_system_health(&base.url),
+                bearer_token: base.bearer_token,
+            };
+
+            match fetch_ws_state_payload(&endpoint) {
+                Ok(payload) => {
+                    // LIVE: the server (and its HTTP loop) is answering even if
+                    // the render/input loop is frozen. Dump the exact snapshot
+                    // and classify each loop so the agent sees which one stalled.
+                    tracing::debug!(event = "tui_dump.snapshot_source", source = "live_server");
+                    let entries = payload
+                        .get("system_health")
+                        .and_then(|section| section.get("loop_heartbeats"))
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let liveness = tui_liveness_report_from_loop_heartbeats(&entries);
+                    let stalled = liveness.is_stalled();
+                    let liveness_detail = liveness.detail.clone();
+                    let fallback_cmd = liveness.headless_fallback_command.clone();
+                    let mut env = RobotEnvelope::new(
+                        cmd_name,
+                        format,
+                        TuiDumpData {
+                            source: "live".into(),
+                            tui_liveness: liveness,
+                            live_error: None,
+                            ws_state: Some(payload),
+                            status: None,
+                        },
+                    );
+                    if stalled {
+                        env = env.with_alert(
+                            "warn",
+                            format!(
+                                "TUI/runtime loop appears frozen while the server is still running ({liveness_detail}). The live snapshot above is your read-out; the process is still serving MCP/API."
+                            ),
+                            fallback_cmd.clone(),
+                        );
+                        if let Some(command) = fallback_cmd.as_deref() {
+                            env = env.with_action(format!(
+                                "Snapshot captured without killing the process. If the freeze persists, restart headless with `{command}`"
+                            ));
+                        }
+                    }
+                    format_output(&env, format)?
+                }
+                Err(error) => {
+                    // FROZEN/UNREACHABLE: the live snapshot is gone (whole-process
+                    // wedge, timeout, or no server). Fall back to the local SQLite
+                    // situational snapshot so the agent still gets a read-out.
+                    let live_error = error.to_string();
+                    match resolve_robot_scope(args.project.as_deref(), args.agent.as_deref()) {
+                        Ok(scope) => {
+                            tracing::debug!(
+                                event = "tui_dump.snapshot_source",
+                                source = "local_db"
+                            );
+                            let agent_name = scope.agent.as_ref().map(|(_, name)| name.clone());
+                            let (status, actions) = build_status_with_phase(
+                                scope.conn(),
+                                scope.project_id,
+                                &scope.project_slug,
+                                scope.agent.clone(),
+                                None,
+                            )?;
+                            let mut env = RobotEnvelope::new(
+                                cmd_name,
+                                format,
+                                TuiDumpData {
+                                    source: "local-fallback".into(),
+                                    tui_liveness: TuiLivenessReport::unreachable(format!(
+                                        "live server not reachable: {live_error}"
+                                    )),
+                                    live_error: Some(live_error.clone()),
+                                    ws_state: None,
+                                    status: Some(Box::new(status)),
+                                },
+                            );
+                            env._meta.project = Some(scope.project_slug.clone());
+                            env._meta.agent = agent_name;
+                            env = env.with_alert(
+                                "warn",
+                                "Live TUI snapshot unavailable; surfaced the local SQLite situational snapshot instead",
+                                Some(live_error.clone()),
+                            );
+                            for action in actions {
+                                env = env.with_action(action);
+                            }
+                            format_output(&env, format)?
+                        }
+                        Err(scope_error) => {
+                            // No live snapshot and no plain scope: try the
+                            // recovery-only path (degraded/corrupt DB) before
+                            // declaring the read-out fully unavailable.
+                            if let Some((status, actions, project_slug, agent_name)) =
+                                build_recovery_only_status(
+                                    args.project.as_deref(),
+                                    args.agent.as_deref(),
+                                    &scope_error,
+                                )
+                            {
+                                tracing::debug!(
+                                    event = "tui_dump.snapshot_source",
+                                    source = "local_recovery"
+                                );
+                                let mut env = RobotEnvelope::new(
+                                    cmd_name,
+                                    format,
+                                    TuiDumpData {
+                                        source: "local-fallback".into(),
+                                        tui_liveness: TuiLivenessReport::unreachable(format!(
+                                            "live server not reachable: {live_error}"
+                                        )),
+                                        live_error: Some(live_error.clone()),
+                                        ws_state: None,
+                                        status: Some(Box::new(status)),
+                                    },
+                                );
+                                env._meta.project = Some(project_slug);
+                                env._meta.agent = agent_name;
+                                env = env.with_alert(
+                                    "warn",
+                                    "Live TUI snapshot unavailable; surfaced a recovery-only local snapshot",
+                                    Some(live_error.clone()),
+                                );
+                                for action in actions {
+                                    env = env.with_action(action);
+                                }
+                                format_output(&env, format)?
+                            } else {
+                                tracing::debug!(
+                                    event = "tui_dump.snapshot_source",
+                                    source = "unavailable"
+                                );
+                                let mut env = RobotEnvelope::new(
+                                    cmd_name,
+                                    format,
+                                    TuiDumpData {
+                                        source: "unavailable".into(),
+                                        tui_liveness: TuiLivenessReport::unreachable(format!(
+                                            "live server not reachable: {live_error}"
+                                        )),
+                                        live_error: Some(live_error.clone()),
+                                        ws_state: None,
+                                        status: None,
+                                    },
+                                );
+                                env = env.with_alert(
+                                    "warn",
+                                    "No live TUI snapshot and no resolvable local mailbox for a fallback read-out",
+                                    Some(live_error.clone()),
+                                );
+                                env = env.with_action(
+                                    "Point at a project with --project <abs-path>, or start the server: am serve-http",
+                                );
+                                format_output(&env, format)?
+                            }
+                        }
+                    }
+                }
+            }
+        }
         RobotSubcommand::Inbox {
             urgent,
             ack_overdue,
@@ -14120,6 +14345,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // the envelope payload.
             let tui_liveness_detail = tui_liveness.detail.clone();
             let tui_liveness_fallback = tui_liveness.headless_fallback_command.clone();
+            // I6 (br-bvq1x.9.6): the non-interactive read-out an agent should run
+            // FIRST when a freeze is suspected (returns state without a kill).
+            let tui_liveness_readout = tui_liveness.readout_command.clone();
 
             let mut env = RobotEnvelope::new(
                 cmd_name,
@@ -14248,8 +14476,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
             }
             if tui_liveness_stalled && let Some(command) = tui_liveness_fallback.as_deref() {
+                let readout = tui_liveness_readout
+                    .as_deref()
+                    .unwrap_or(TUI_FROZEN_READOUT_COMMAND);
                 env = env.with_action(format!(
-                    "Suspected TUI freeze (server alive): read state now with `am robot status --format json`, then restart headless with `{command}`"
+                    "Suspected TUI freeze (server alive): read state now with `{readout}` (no process kill), then restart headless with `{command}`"
                 ));
             }
             if host_pressure_likely || host_dir_unwritable {
@@ -15784,6 +16015,8 @@ mod tests {
         assert_eq!(report.overall, "alive");
         assert!(report.stalled_loops.is_empty());
         assert!(report.headless_fallback_command.is_none());
+        // I6: no freeze ⇒ no read-out escape hatch is advertised.
+        assert!(report.readout_command.is_none());
         assert!(!report.is_stalled());
     }
 
@@ -15803,6 +16036,12 @@ mod tests {
             report.headless_fallback_command.as_deref(),
             Some(TUI_HEADLESS_FALLBACK_COMMAND)
         );
+        // I6 (br-bvq1x.9.6): a suspected freeze points agents at the
+        // non-interactive read-out FIRST (state without a process kill).
+        assert_eq!(
+            report.readout_command.as_deref(),
+            Some(TUI_FROZEN_READOUT_COMMAND)
+        );
     }
 
     #[test]
@@ -15811,6 +16050,7 @@ mod tests {
         assert_eq!(report.source, "live");
         assert_eq!(report.overall, "unknown");
         assert!(report.headless_fallback_command.is_none());
+        assert!(report.readout_command.is_none());
         assert!(!report.is_stalled());
     }
 
@@ -15820,6 +16060,7 @@ mod tests {
         assert_eq!(report.source, "unreachable");
         assert_eq!(report.overall, "unknown");
         assert!(report.headless_fallback_command.is_none());
+        assert!(report.readout_command.is_none());
         // An unreachable server must NOT read as a frozen TUI.
         assert!(!report.is_stalled());
     }
@@ -22585,6 +22826,81 @@ mod tests {
             Some("skip"),
             "unreachable liveness probe must not degrade health"
         );
+    }
+
+    #[test]
+    fn tui_dump_returns_structured_snapshot_when_server_unreachable() {
+        // I6 (br-bvq1x.9.6): the freeze escape hatch MUST return a structured
+        // read-out and exit 0 regardless of TUI/server state. With the resolved
+        // endpoint pinned to an unused port (run_robot_json_capture forces
+        // HTTP_PORT=47351) the live `/mail/ws-state` fetch deterministically
+        // fails, so the command falls back to a local read-out instead of
+        // erroring or hanging — the agent never has to kill the process.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("tui_dump_fallback.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        // `run_robot_json_capture` asserts the command returned Ok (exit 0).
+        let out = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::TuiDump,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(
+            out.get("_meta")
+                .and_then(|m| m.get("command"))
+                .and_then(|v| v.as_str()),
+            Some("tui-dump"),
+        );
+        // No live server ⇒ never the "live" source, and never a raw ws_state dump.
+        let source = out
+            .get("source")
+            .and_then(|v| v.as_str())
+            .expect("tui-dump output must carry a source");
+        assert!(
+            matches!(source, "local-fallback" | "unavailable"),
+            "expected a local read-out source, got {source:?}"
+        );
+        assert!(
+            out.get("ws_state").is_none(),
+            "no live snapshot ⇒ ws_state must be absent"
+        );
+        // The transport failure that forced the fallback is always surfaced.
+        assert!(
+            out.get("live_error").and_then(|v| v.as_str()).is_some(),
+            "tui-dump must report the live_error that forced the fallback: {out:?}"
+        );
+        // The liveness verdict degrades to a non-fatal "unreachable"/"unknown".
+        let liveness = out
+            .get("tui_liveness")
+            .expect("tui-dump must carry a tui_liveness block");
+        assert_eq!(
+            liveness.get("source").and_then(|v| v.as_str()),
+            Some("unreachable")
+        );
+        assert_eq!(
+            liveness.get("overall").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+        // An unreachable server is not a frozen TUI ⇒ no escape-hatch noise.
+        assert!(liveness.get("readout_command").is_none());
+        assert!(liveness.get("headless_fallback_command").is_none());
     }
 
     #[test]

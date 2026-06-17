@@ -490,6 +490,27 @@ pub enum Commands {
         #[arg(long)]
         include_host: bool,
     },
+    /// Non-interactive TUI snapshot dump — the freeze escape hatch (I6).
+    ///
+    /// Returns the same situational snapshot the interactive TUI renders,
+    /// fetched live from `/mail/ws-state` when the server is reachable and
+    /// falling back to a local SQLite read when the TUI/server appears frozen.
+    /// Always exits 0 so an agent can read state instead of killing the process.
+    #[command(name = "tui-dump")]
+    TuiDump {
+        /// Output format: toon or json.
+        #[arg(long, value_parser = parse_robot_snapshot_output_format)]
+        format: Option<robot::OutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Direct alias for `am robot thread`.
     #[command(name = "thread")]
     Thread {
@@ -3228,6 +3249,11 @@ fn command_is_read_only(command: &Commands) -> bool {
         | Commands::Health { .. }
         | Commands::CheckInbox { .. }
         | Commands::Status { .. }
+        // `tui-dump` only reads `/mail/ws-state` over HTTP and (on fallback)
+        // runs the read-only situational status builder — never mutates. It
+        // MUST be read-only so the freeze escape hatch bypasses the
+        // mailbox-ownership refusal exactly when a live server owns the mailbox.
+        | Commands::TuiDump { .. }
         | Commands::Capabilities { .. }
         | Commands::Reservations { .. } => true,
 
@@ -3405,6 +3431,18 @@ fn execute(cli: Cli) -> CliResult<()> {
             project,
             agent,
             robot::RobotSubcommand::Health { include_host },
+        )),
+        Commands::TuiDump {
+            format,
+            json,
+            project,
+            agent,
+        } => robot::handle_robot(robot_alias_args(
+            format,
+            json,
+            project,
+            agent,
+            robot::RobotSubcommand::TuiDump,
         )),
         Commands::Thread {
             id,

@@ -1434,6 +1434,7 @@ What `check` inspects:
 | Auth errors with JWT | Include bearer token with matching `kid` in the request header |
 | Port 8765 already in use | `am serve-http --port 9000` or stop the existing server |
 | TUI not rendering | Check `TUI_ENABLED=true` and that your terminal supports 256 colors |
+| TUI appears **frozen** (render/input stuck, but the process is still serving MCP/API) | Do **not** kill the process. Run the non-interactive freeze escape hatch `am tui-dump --format json`: it returns the same situational snapshot the TUI renders, fetched live from `/mail/ws-state` (including a per-loop liveness verdict that names the stalled loop) and falling back to a local SQLite read if the whole process is wedged. Always exits 0. `am robot health --format json` also classifies the stall and points at the same read-out. If the freeze persists, restart headless: `mcp-agent-mail serve --no-tui`. |
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
