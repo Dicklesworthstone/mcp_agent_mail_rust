@@ -7,4 +7,5 @@ Options:
       --json               Output JSON (shorthand for --format json)
       --project <PROJECT>  Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
       --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
+      --include-host       Include the bounded host-pressure section (disk/inodes/load/memory)
   -h, --help               Print help

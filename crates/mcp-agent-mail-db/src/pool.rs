@@ -292,7 +292,7 @@ impl RecoveryAction {
                 "Only removes locks whose owning PID no longer exists; idempotent"
             }
             Self::EmptyWalSidecarCleanup => {
-                "Quarantines non-empty header-only/truncated (1..=32 byte) WAL files that prevent clean open; a 0-byte WAL is a valid idle state and is left attached; idempotent"
+                "Quarantines truncation/corruption WAL artifacts that prevent clean open (a sub-header 1..=31 byte WAL, or a 32-byte header with an invalid magic); a 0-byte WAL and a valid 32-byte header are benign idle states and are left attached; idempotent"
             }
             Self::ConnectionPoolRefresh => {
                 "Closes stale file descriptors and opens fresh connections; no data mutation"
@@ -4722,11 +4722,13 @@ pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
 /// Quarantine corrupt or truncated WAL/SHM sidecars that cause "WAL file too
 /// small for header" errors during SQLite open.
 ///
-/// The SQLite WAL header is 32 bytes. A non-empty WAL shorter than that is
-/// pathological and cannot be used; a header-only 32-byte WAL has no committed
-/// frame data and is equally safe to move out of the live DB family. A 0-byte
-/// WAL is a valid idle/checkpointed state and is left attached. A truncated WAL
-/// can be left behind when:
+/// The SQLite WAL header is 32 bytes. A non-empty WAL shorter than that is a
+/// partial, unreadable header and cannot be used; a 32-byte header with an
+/// INVALID magic is a garbage artifact and is moved out of the live DB family.
+/// A 0-byte WAL and a VALID 32-byte header (a frameless idle WAL the engine
+/// opens as-is) are benign and are left attached — the magic-aware decision
+/// lives in [`crate::wal_classify::wal_sidecar_is_truncation_artifact`]. A
+/// truncated WAL can be left behind when:
 /// - A crash occurs during the `DELETE` -> `WAL` journal mode transition
 /// - A `PRAGMA journal_size_limit` triggers truncation racing with a reader
 /// - The process is killed between WAL creation and first header write

@@ -11,6 +11,7 @@ Commands:
   inbox                       Direct alias for `am robot inbox`
   reservations                Direct alias for `am robot reservations`
   health                      Direct alias for `am robot health`
+  tui-dump                    Non-interactive TUI snapshot dump — the freeze escape hatch (I6)
   thread                      Direct alias for `am robot thread`
   check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
   check                       Run the unified local pre-release quality gate

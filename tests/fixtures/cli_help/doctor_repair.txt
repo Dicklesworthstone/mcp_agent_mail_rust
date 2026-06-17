@@ -21,5 +21,10 @@ Options:
 
           Intentionally **not** implied by `--yes`: this flag drops data and must be requested explicitly.
 
+      --allow-live-owner
+          Override the supervised-owner safety guard and repair even while a live mailbox owner is present.
+
+          By default `am doctor repair` REFUSES (exit 3) when a live `am` owner, a wedged process, or unreconciled split-brain ownership holds the mailbox — repairing under a live writer can corrupt state. The safe path is to gracefully drain/stop the owner via your supervisor (never `kill -9 am`), confirm with `am doctor drain`, then re-run. Pass this flag only when you have already drained the owner.
+
   -h, --help
           Print help (see a summary with '-h')
