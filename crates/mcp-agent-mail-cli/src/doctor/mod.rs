@@ -2237,6 +2237,28 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         );
     }
 
+    // I2 (br-bvq1x.9.2): when a live server is reachable, surface its per-loop
+    // TUI/runtime liveness so a "freeze but still running" symptom classifies
+    // without gdb. Quiet (no line) when no server is reachable, matching the
+    // "stay silent on a clean slate" ethos above. The mailbox verdict (and exit
+    // code) is unaffected — a frozen TUI is an operability finding, not mailbox
+    // corruption — but the headless fallback command is printed for recovery.
+    let tui_liveness = crate::robot::fetch_live_tui_liveness(&config);
+    if tui_liveness.source == "live" {
+        let loops = tui_liveness
+            .loops
+            .iter()
+            .map(|entry| format!("{}={}", entry.loop_name, entry.state))
+            .collect::<Vec<_>>()
+            .join(" ");
+        ftui_runtime::ftui_println!("tui_liveness: {} ({loops})", tui_liveness.overall);
+        if let Some(command) = tui_liveness.headless_fallback_command.as_deref() {
+            ftui_runtime::ftui_println!(
+                "tui_liveness: suspected freeze (server alive); next: {command}"
+            );
+        }
+    }
+
     match crate::open_db_for_doctor_check_read_only_with_context(&cfg.database_url).and_then(
         |opened| {
             check_reservation_parity_with_canonical_conn(&opened.conn, &config.storage_root)
@@ -2492,7 +2514,14 @@ mod tests {
 
         let storage_root_s = storage_root.path().display().to_string();
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                // Pin to an unused port so the I2 TUI-liveness probe sees
+                // "unreachable" (stays silent) rather than contacting a real
+                // server bound on the default 8765 during the test.
+                ("HTTP_PORT", "47351"),
+            ],
             || handle_health(target.path()),
         );
 
@@ -2516,7 +2545,14 @@ mod tests {
         let storage_root_s = storage_root.path().display().to_string();
         let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                // Pin to an unused port so the I2 TUI-liveness probe sees
+                // "unreachable" (stays silent) rather than contacting a real
+                // server bound on the default 8765 during the test.
+                ("HTTP_PORT", "47351"),
+            ],
             || handle_health(target.path()),
         );
         let output = capture.drain_to_string();
@@ -2559,7 +2595,14 @@ mod tests {
 
         let storage_root_s = storage_root.path().display().to_string();
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                // Pin to an unused port so the I2 TUI-liveness probe sees
+                // "unreachable" (stays silent) rather than contacting a real
+                // server bound on the default 8765 during the test.
+                ("HTTP_PORT", "47351"),
+            ],
             || handle_health(target.path()),
         );
 
@@ -2594,7 +2637,14 @@ mod tests {
 
         let storage_root_s = storage_root.path().display().to_string();
         let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                // Pin to an unused port so the I2 TUI-liveness probe sees
+                // "unreachable" (stays silent) rather than contacting a real
+                // server bound on the default 8765 during the test.
+                ("HTTP_PORT", "47351"),
+            ],
             || handle_health(target.path()),
         );
 

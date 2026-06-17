@@ -11395,7 +11395,12 @@ fn atc_live_endpoint_from_config(config: &mcp_agent_mail_core::Config) -> AtcLiv
     atc_live_endpoint_from_reader(|key| std::env::var(key).ok(), config)
 }
 
-fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
+/// Fetch and parse the raw `/mail/ws-state` JSON payload from a live server.
+///
+/// Shared transport for the ATC snapshot and the TUI loop-liveness probe
+/// (I2). All error messages name the resolved URL so an operator can tell
+/// exactly which endpoint was contacted.
+fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_json::Value> {
     let ws_state_url = endpoint.url.clone();
     let bearer_token = endpoint.bearer_token.clone();
     crate::context::run_async(async move {
@@ -11449,23 +11454,208 @@ fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRo
             )));
         }
 
-        let payload: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|error| {
-                CliError::Other(format!(
-                    "invalid JSON in ws-state response from {ws_state_url}: {error}"
-                ))
-            })?;
-        let atc_payload = payload.get("atc").cloned().ok_or_else(|| {
+        serde_json::from_slice(&response.body).map_err(|error| {
             CliError::Other(format!(
-                "ws-state response from {ws_state_url} missing atc payload"
-            ))
-        })?;
-        serde_json::from_value(atc_payload).map_err(|error| {
-            CliError::Other(format!(
-                "invalid ATC snapshot payload from {ws_state_url}: {error}"
+                "invalid JSON in ws-state response from {ws_state_url}: {error}"
             ))
         })
     })
+}
+
+fn fetch_live_atc_snapshot(endpoint: &AtcLiveEndpoint) -> crate::CliResult<AtcRobotSnapshot> {
+    let ws_state_url = endpoint.url.clone();
+    let payload = fetch_ws_state_payload(endpoint)?;
+    let atc_payload = payload.get("atc").cloned().ok_or_else(|| {
+        CliError::Other(format!(
+            "ws-state response from {ws_state_url} missing atc payload"
+        ))
+    })?;
+    serde_json::from_value(atc_payload).map_err(|error| {
+        CliError::Other(format!(
+            "invalid ATC snapshot payload from {ws_state_url}: {error}"
+        ))
+    })
+}
+
+/// Canonical headless fallback when the interactive TUI is frozen but the
+/// server process is still alive: running the server without the TUI keeps the
+/// MCP/API surface responsive while the render/input stall is investigated.
+pub(crate) const TUI_HEADLESS_FALLBACK_COMMAND: &str = "mcp-agent-mail serve --no-tui";
+
+/// Liveness of one long-running server loop, derived from a `loop_heartbeats[]`
+/// entry of the `/mail/ws-state?system_health=1` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LoopLivenessEntry {
+    #[serde(rename = "loop")]
+    pub loop_name: String,
+    /// `alive` | `stalled` | `failing` | `unobserved`.
+    pub state: String,
+    pub stale: bool,
+    pub periodic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_seconds: Option<i64>,
+    pub consecutive_failures: u64,
+}
+
+/// Operator-ready classification of the live TUI/runtime loops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TuiLivenessReport {
+    /// `live` (server reachable) | `unreachable` (no live server / probe failed).
+    pub source: String,
+    /// `alive` | `stalled` | `unknown`.
+    pub overall: String,
+    pub loops: Vec<LoopLivenessEntry>,
+    pub stalled_loops: Vec<String>,
+    /// Set only when a freeze is suspected, so an agent has an immediate escape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless_fallback_command: Option<String>,
+    pub detail: String,
+}
+
+impl TuiLivenessReport {
+    fn unreachable(detail: impl Into<String>) -> Self {
+        Self {
+            source: "unreachable".into(),
+            overall: "unknown".into(),
+            loops: Vec::new(),
+            stalled_loops: Vec::new(),
+            headless_fallback_command: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// `true` when a live server reports a frozen render/input/db-poll loop.
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.source == "live" && self.overall == "stalled"
+    }
+}
+
+/// Classify a single server `loop_heartbeats[]` JSON entry into a liveness state.
+pub(crate) fn classify_loop_liveness_entry(entry: &serde_json::Value) -> LoopLivenessEntry {
+    let loop_name = entry
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let periodic = entry
+        .get("periodic")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let observed = entry
+        .get("observed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let stale = entry
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let consecutive_failures = entry
+        .get("consecutive_failures")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let age_seconds = entry
+        .get("age_micros")
+        .and_then(serde_json::Value::as_i64)
+        .map(|micros| micros / 1_000_000);
+    let state = if consecutive_failures > 0 {
+        "failing"
+    } else if !observed {
+        "unobserved"
+    } else if stale {
+        "stalled"
+    } else {
+        "alive"
+    }
+    .to_string();
+    LoopLivenessEntry {
+        loop_name,
+        state,
+        stale,
+        periodic,
+        age_seconds,
+        consecutive_failures,
+    }
+}
+
+/// Build a single operator-ready liveness verdict from the server's
+/// `loop_heartbeats` array. A render/input/db-poll loop that has gone stale or
+/// is failing flips `overall` to `stalled` and attaches the exact headless
+/// fallback command.
+pub(crate) fn tui_liveness_report_from_loop_heartbeats(
+    entries: &[serde_json::Value],
+) -> TuiLivenessReport {
+    if entries.is_empty() {
+        return TuiLivenessReport {
+            source: "live".into(),
+            overall: "unknown".into(),
+            loops: Vec::new(),
+            stalled_loops: Vec::new(),
+            headless_fallback_command: None,
+            detail: "server reachable but reported no loop heartbeats".into(),
+        };
+    }
+    let loops: Vec<LoopLivenessEntry> = entries.iter().map(classify_loop_liveness_entry).collect();
+    let stalled_loops: Vec<String> = loops
+        .iter()
+        .filter(|entry| entry.state == "stalled" || entry.state == "failing")
+        .map(|entry| entry.loop_name.clone())
+        .collect();
+    let overall = if stalled_loops.is_empty() {
+        "alive"
+    } else {
+        "stalled"
+    };
+    let headless_fallback_command = if stalled_loops.is_empty() {
+        None
+    } else {
+        Some(TUI_HEADLESS_FALLBACK_COMMAND.to_string())
+    };
+    let detail = if stalled_loops.is_empty() {
+        format!("{} loop(s) advancing", loops.len())
+    } else {
+        format!("stalled/failing loop(s): {}", stalled_loops.join(", "))
+    };
+    TuiLivenessReport {
+        source: "live".into(),
+        overall: overall.into(),
+        loops,
+        stalled_loops,
+        headless_fallback_command,
+        detail,
+    }
+}
+
+/// Append `system_health=1` so the ws-state response carries the loop
+/// heartbeats (the default poll payload omits the System Health section).
+fn ws_state_url_with_system_health(atc_url: &str) -> String {
+    if atc_url.contains("system_health=") {
+        atc_url.to_string()
+    } else {
+        format!("{atc_url}&system_health=1")
+    }
+}
+
+/// Best-effort fetch of the live server's TUI loop liveness. Never errors:
+/// transport/auth/parse failures map to an `unreachable` report so health
+/// surfaces stay non-fatal when no server is running.
+pub(crate) fn fetch_live_tui_liveness(config: &mcp_agent_mail_core::Config) -> TuiLivenessReport {
+    let base = atc_live_endpoint_from_config(config);
+    let endpoint = AtcLiveEndpoint {
+        url: ws_state_url_with_system_health(&base.url),
+        bearer_token: base.bearer_token,
+    };
+    match fetch_ws_state_payload(&endpoint) {
+        Ok(payload) => {
+            let entries = payload
+                .get("system_health")
+                .and_then(|section| section.get("loop_heartbeats"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            tui_liveness_report_from_loop_heartbeats(&entries)
+        }
+        Err(error) => TuiLivenessReport::unreachable(format!("live server not reachable: {error}")),
+    }
 }
 
 fn maybe_resolve_robot_scope(
@@ -13829,6 +14019,33 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     None
                 };
 
+            // 7. TUI/runtime loop liveness (I2, br-bvq1x.9.2). Best-effort probe
+            // of the live server's per-loop heartbeats so a "freeze but still
+            // sort of running" symptom classifies into render/input/db-poll/
+            // mcp-api/coalescer state WITHOUT gdb. Unreachable (no live server)
+            // is NOT a mailbox fault and never degrades the verdict — only a
+            // reachable-but-stalled server does.
+            let tui_liveness = fetch_live_tui_liveness(&config);
+            let tui_liveness_stalled = tui_liveness.is_stalled();
+            let tui_liveness_status = if tui_liveness.source != "live" {
+                "skip"
+            } else if tui_liveness_stalled {
+                "degraded"
+            } else if tui_liveness.overall == "alive" {
+                "ok"
+            } else {
+                "skip"
+            };
+            probes.push(HealthProbe {
+                name: "tui_liveness".into(),
+                status: tui_liveness_status.into(),
+                latency_ms: 0.0,
+                detail: format!(
+                    "source={} overall={}; {}",
+                    tui_liveness.source, tui_liveness.overall, tui_liveness.detail
+                ),
+            });
+
             // Overall health
             let overall = if !db_ok
                 || db_file_sanity_unhealthy
@@ -13846,6 +14063,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || backpressure_degraded
                 || disk_probe_failed
                 || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok
+                || tui_liveness_stalled
             {
                 "degraded"
             } else {
@@ -13868,6 +14086,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 search_index: Option<LexicalBackfillHealth>,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
+                tui_liveness: TuiLivenessReport,
             }
 
             let runtime_identity = crate::runtime_identity_json(
@@ -13897,6 +14116,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 .as_ref()
                 .is_some_and(|r| r.db_dir_writable == Some(false));
 
+            // Capture TUI-liveness alert inputs before the report is moved into
+            // the envelope payload.
+            let tui_liveness_detail = tui_liveness.detail.clone();
+            let tui_liveness_fallback = tui_liveness.headless_fallback_command.clone();
+
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -13908,6 +14132,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     circuits: circuit_entries,
                     search_index: search_index_snapshot,
                     host: host_report,
+                    tui_liveness,
                 },
             );
 
@@ -14008,10 +14233,24 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     None,
                 );
             }
+            if tui_liveness_stalled {
+                env = env.with_alert(
+                    "warn",
+                    format!(
+                        "TUI/runtime loop appears frozen while the server is still running ({tui_liveness_detail}). Use the headless fallback to keep the MCP/API surface responsive."
+                    ),
+                    tui_liveness_fallback.clone(),
+                );
+            }
 
             // Actions
             if !db_ok {
                 env = env.with_action("Check DATABASE_URL env var and SQLite file accessibility");
+            }
+            if tui_liveness_stalled && let Some(command) = tui_liveness_fallback.as_deref() {
+                env = env.with_action(format!(
+                    "Suspected TUI freeze (server alive): read state now with `am robot status --format json`, then restart headless with `{command}`"
+                ));
             }
             if host_pressure_likely || host_dir_unwritable {
                 env = env.with_action(
@@ -14886,6 +15125,11 @@ mod tests {
             &[
                 ("DATABASE_URL", database_url),
                 ("STORAGE_ROOT", storage_root),
+                // Pin the resolved server endpoint to an unused port so robot
+                // commands that best-effort probe a live server (e.g. `health`'s
+                // I2 TUI-liveness probe) deterministically see "unreachable"
+                // instead of contacting whatever real server is bound on 8765.
+                ("HTTP_PORT", "47351"),
             ],
             || handle_robot(args),
         );
@@ -15481,6 +15725,103 @@ mod tests {
             url,
             "https://example.test:9999/mail/ws-state?limit=1&token=a%2Bb%2Fc"
         );
+    }
+
+    #[test]
+    fn ws_state_url_with_system_health_appends_flag_once() {
+        assert_eq!(
+            ws_state_url_with_system_health("https://h:1/mail/ws-state?limit=1"),
+            "https://h:1/mail/ws-state?limit=1&system_health=1"
+        );
+        // Idempotent: never double-appends.
+        assert_eq!(
+            ws_state_url_with_system_health("https://h:1/mail/ws-state?limit=1&system_health=1"),
+            "https://h:1/mail/ws-state?limit=1&system_health=1"
+        );
+    }
+
+    #[test]
+    fn classify_loop_liveness_entry_maps_server_heartbeat_states() {
+        let alive = serde_json::json!({
+            "kind": "render", "periodic": true, "observed": true,
+            "stale": false, "age_micros": 1_000_000, "consecutive_failures": 0,
+        });
+        let entry = classify_loop_liveness_entry(&alive);
+        assert_eq!(entry.loop_name, "render");
+        assert_eq!(entry.state, "alive");
+        assert_eq!(entry.age_seconds, Some(1));
+
+        let stalled = serde_json::json!({
+            "kind": "render", "periodic": true, "observed": true,
+            "stale": true, "age_micros": 15_000_000, "consecutive_failures": 0,
+        });
+        assert_eq!(classify_loop_liveness_entry(&stalled).state, "stalled");
+
+        let failing = serde_json::json!({
+            "kind": "db_poll", "periodic": true, "observed": true,
+            "stale": false, "age_micros": 2_000_000, "consecutive_failures": 3,
+        });
+        assert_eq!(classify_loop_liveness_entry(&failing).state, "failing");
+
+        let unobserved = serde_json::json!({
+            "kind": "commit_coalescer", "periodic": false, "observed": false,
+            "stale": false, "age_micros": null, "consecutive_failures": 0,
+        });
+        let unobserved_entry = classify_loop_liveness_entry(&unobserved);
+        assert_eq!(unobserved_entry.state, "unobserved");
+        assert_eq!(unobserved_entry.age_seconds, None);
+    }
+
+    #[test]
+    fn tui_liveness_report_alive_when_all_loops_advance() {
+        let entries = vec![
+            serde_json::json!({"kind":"render","periodic":true,"observed":true,"stale":false,"age_micros":500_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"input","periodic":false,"observed":true,"stale":false,"age_micros":500_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"db_poll","periodic":true,"observed":true,"stale":false,"age_micros":3_000_000,"consecutive_failures":0}),
+        ];
+        let report = tui_liveness_report_from_loop_heartbeats(&entries);
+        assert_eq!(report.source, "live");
+        assert_eq!(report.overall, "alive");
+        assert!(report.stalled_loops.is_empty());
+        assert!(report.headless_fallback_command.is_none());
+        assert!(!report.is_stalled());
+    }
+
+    #[test]
+    fn tui_liveness_report_flags_stall_and_recommends_headless_fallback() {
+        // L3 stall fixture: the render loop has gone stale while input still ticks.
+        let entries = vec![
+            serde_json::json!({"kind":"render","periodic":true,"observed":true,"stale":true,"age_micros":20_000_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"input","periodic":false,"observed":true,"stale":false,"age_micros":300_000,"consecutive_failures":0}),
+            serde_json::json!({"kind":"db_poll","periodic":true,"observed":true,"stale":false,"age_micros":2_000_000,"consecutive_failures":0}),
+        ];
+        let report = tui_liveness_report_from_loop_heartbeats(&entries);
+        assert_eq!(report.overall, "stalled");
+        assert_eq!(report.stalled_loops, vec!["render".to_string()]);
+        assert!(report.is_stalled());
+        assert_eq!(
+            report.headless_fallback_command.as_deref(),
+            Some(TUI_HEADLESS_FALLBACK_COMMAND)
+        );
+    }
+
+    #[test]
+    fn tui_liveness_report_unknown_when_no_heartbeats() {
+        let report = tui_liveness_report_from_loop_heartbeats(&[]);
+        assert_eq!(report.source, "live");
+        assert_eq!(report.overall, "unknown");
+        assert!(report.headless_fallback_command.is_none());
+        assert!(!report.is_stalled());
+    }
+
+    #[test]
+    fn tui_liveness_unreachable_is_non_fatal_with_no_recommendation() {
+        let report = TuiLivenessReport::unreachable("connection refused");
+        assert_eq!(report.source, "unreachable");
+        assert_eq!(report.overall, "unknown");
+        assert!(report.headless_fallback_command.is_none());
+        // An unreachable server must NOT read as a frozen TUI.
+        assert!(!report.is_stalled());
     }
 
     #[test]
@@ -22177,6 +22518,72 @@ mod tests {
         assert!(
             id.get("server_pids").and_then(|v| v.as_array()).is_some(),
             "server_pids must be an array (empty when no server is bound): {id:?}"
+        );
+    }
+
+    #[test]
+    fn robot_health_emits_tui_liveness_block_non_fatal_when_no_server() {
+        // I2 (br-bvq1x.9.2): `am robot health` always carries a tui_liveness
+        // block + probe. With no reachable server (test endpoint pinned to an
+        // unused port) it must report "unreachable"/"unknown" and NEVER flip the
+        // verdict to unhealthy — an absent server is not a frozen TUI.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_liveness.sqlite3");
+        let storage_root = temp_dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let seed_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        seed_conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("materialize sqlite file");
+        drop(seed_conn);
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let out = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                json: false,
+                project: None,
+                agent: None,
+                command: RobotSubcommand::Health {
+                    include_host: false,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        let liveness = out
+            .get("tui_liveness")
+            .expect("health output must carry a tui_liveness block");
+        assert_eq!(
+            liveness.get("source").and_then(|v| v.as_str()),
+            Some("unreachable")
+        );
+        assert_eq!(
+            liveness.get("overall").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
+        // No freeze recommendation when there is simply no server.
+        assert!(liveness.get("headless_fallback_command").is_none());
+
+        // The liveness probe itself must be a non-degrading "skip" when the
+        // server is unreachable (an absent server is not a frozen TUI). Other
+        // probes may legitimately mark this minimal mailbox degraded/unhealthy;
+        // that is unrelated to I2.
+        let probes = out
+            .get("probes")
+            .and_then(|v| v.as_array())
+            .expect("probes array");
+        let liveness_probe = probes
+            .iter()
+            .find(|p| p.get("name").and_then(|v| v.as_str()) == Some("tui_liveness"))
+            .expect("tui_liveness probe must be present");
+        assert_eq!(
+            liveness_probe.get("status").and_then(|v| v.as_str()),
+            Some("skip"),
+            "unreachable liveness probe must not degrade health"
         );
     }
 
