@@ -4818,16 +4818,19 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
         wal_os.push("-wal");
         let wal_path = PathBuf::from(wal_os);
         match std::fs::symlink_metadata(&wal_path) {
-            // Quarantine non-empty WAL files that are header-only or smaller
-            // (1..=32 bytes).
-            // GH#99: a 32-byte header-only WAL sidecar was
-            // tripping "WAL file too small for header during rebuild" on
-            // checkpoint, which the verdict engine used to escalate to
-            // Broken/corrupt. Moving it out of the live DB family prevents
-            // that cycle without losing forensic evidence.
+            // Quarantine WAL files that are a genuine truncation/corruption
+            // artifact: a sub-header (1..=31 byte) WAL, or a 32-byte header whose
+            // magic is INVALID.
+            // GH#99/#119: an all-zeros (invalid-magic) 32-byte WAL sidecar tripped
+            // "WAL file too small for header during rebuild" on checkpoint, which
+            // the verdict engine escalated to Broken/corrupt. Moving it out of the
+            // live DB family prevents that cycle without losing forensic evidence.
+            // A VALID 32-byte header (a frameless idle WAL) is left attached: the
+            // engine opens it as-is, and quarantining it false-failed health and
+            // churned this self-heal on every restart (ts1/css, 2026-06-17).
             Ok(meta)
                 if meta.file_type().is_file()
-                    && sqlite_wal_is_header_only_or_truncated(meta.len()) =>
+                    && crate::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path) =>
             {
                 wal_quarantined = quarantine_sqlite_cleanup_sidecar(
                     &wal_path,
@@ -13281,10 +13284,11 @@ mod tests {
 
     #[test]
     fn cleanup_empty_wal_sidecar_quarantines_header_only_wal_and_companion_shm() {
-        // GH#99: a 32-byte header-only WAL sidecar was
-        // causing "WAL file too small for header during rebuild" on
-        // checkpoint. Moving it out of the live DB family short-circuits
-        // that cycle without destroying the evidence.
+        // GH#99/#119: an all-zeros (INVALID-magic) 32-byte WAL sidecar was
+        // causing "WAL file too small for header during rebuild" on checkpoint.
+        // It is genuine garbage and must still move out of the live DB family.
+        // (A *valid* 32-byte header is preserved — see
+        // `cleanup_empty_wal_sidecar_preserves_valid_32_byte_header`.)
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header_only_test.db");
         let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
@@ -13293,7 +13297,7 @@ mod tests {
         drop(conn);
 
         let wal_path = dir.path().join("header_only_test.db-wal");
-        std::fs::write(&wal_path, [0x00; 32]).expect("create header-only wal");
+        std::fs::write(&wal_path, [0x00; 32]).expect("create garbage 32-byte wal");
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
         let shm_path = dir.path().join("header_only_test.db-shm");
         std::fs::write(&shm_path, b"stale-shm").expect("create companion shm");
@@ -13329,6 +13333,53 @@ mod tests {
         assert_eq!(
             std::fs::read(&shm_quarantines[0]).expect("read quarantined SHM"),
             b"stale-shm"
+        );
+    }
+
+    #[test]
+    fn cleanup_empty_wal_sidecar_preserves_valid_32_byte_header() {
+        // ts1/css regression (2026-06-17): a VALID engine-written 32-byte header
+        // (zero frames) is a benign frameless idle WAL the engine opens as-is.
+        // The startup self-heal must LEAVE it attached — quarantining it churned
+        // every restart and cascaded into spurious archive reconstructs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("valid_header_test.db");
+
+        // Capture a real engine-written 32-byte WAL header, then checkpoint so the
+        // primary holds the committed data.
+        let header = {
+            let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
+            conn.execute_raw("PRAGMA journal_mode = WAL;").expect("wal");
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+                .expect("no autockpt");
+            conn.execute_raw("CREATE TABLE t (x INTEGER)")
+                .expect("create table");
+            conn.execute_raw("INSERT INTO t (x) VALUES (1)")
+                .expect("seed");
+            let wal_path = dir.path().join("valid_header_test.db-wal");
+            let mut buf = [0u8; 32];
+            {
+                use std::io::Read as _;
+                let mut f = std::fs::File::open(&wal_path).expect("open wal");
+                f.read_exact(&mut buf).expect("read 32-byte header");
+            }
+            let _ = wal_checkpoint_truncate_path(&db_path);
+            buf
+        };
+
+        let wal_path = dir.path().join("valid_header_test.db-wal");
+        std::fs::write(&wal_path, header).expect("write valid 32-byte header");
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
+
+        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+
+        assert!(
+            wal_path.exists(),
+            "a valid 32-byte header WAL must be left attached, not quarantined"
+        );
+        assert!(
+            sqlite_cleanup_quarantines(dir.path(), "valid_header_test.db-wal").is_empty(),
+            "a valid 32-byte header WAL must not produce a quarantine artifact"
         );
     }
 

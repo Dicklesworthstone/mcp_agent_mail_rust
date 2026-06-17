@@ -233,10 +233,15 @@ pub fn detect(inputs: &DetectInputs) -> Vec<WalShmSidecarDriftFinding> {
                 shm_exists,
             });
         }
+        // Magic-aware: a VALID 32-byte header is a frameless idle WAL the engine
+        // opens as-is — it is NOT drift and must not be flagged (ts1/css
+        // false-positive, 2026-06-17). Only a sub-header (1..=31) WAL or a
+        // 32-byte header with INVALID magic is a genuine header-only artifact.
         if let Ok(meta) = &wal_meta
             && meta.file_type().is_file()
             && meta.len() > 0
             && meta.len() <= WAL_HEADER_BYTES
+            && mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal)
         {
             signals.push(Signal::HeaderOnlyWal {
                 wal_size_bytes: meta.len(),

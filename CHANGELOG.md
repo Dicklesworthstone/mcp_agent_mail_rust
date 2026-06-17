@@ -10,6 +10,36 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+### Fixed: 32-byte WAL false positive (doctor FAIL + startup re-quarantine + reconstruct cascade)
+
+Two real multi-agent-host incidents (ts1 + css, 2026-06-17) traced to the same
+root cause: a healthy live `serve-http` leaves an **idle 32-byte WAL** (exactly
+the SQLite WAL header, zero frames) between writes, and the size-only check
+treated any `1..=32` byte WAL as "header-only/truncated".
+
+- `am doctor health`/`check` **FALSE-FAILED** ("live mailbox needs repair: SQLite
+  WAL sidecar is header-only/truncated (32 bytes)") on a database the live server
+  opens and serves fine.
+- The startup self-heal **re-quarantined the valid WAL on every restart**, and on
+  one host the quarantine + a failed probe **cascaded into a full
+  reconstruct-from-archive**; repeated recovery events left ~19 GB of `doctor/`
+  diagnostic dumps.
+
+**Root cause:** a complete 32-byte WAL header with a *valid magic* is a frameless
+idle WAL the current engine opens **and checkpoints** without error (now pinned by
+`engine_opens_and_checkpoints_a_32_byte_header_only_wal`). The historical
+GH#99/#119 workaround that quarantined 32-byte WALs was guarding a *garbage*
+(all-zeros, **invalid-magic**) 32-byte WAL — the size check conflated the two.
+
+**Fix:** magic-aware classification. New
+`wal_classify::wal_sidecar_is_truncation_artifact(path)` treats `0`-byte and
+valid-magic-32-byte WALs as benign, and only `1..=31`-byte or invalid-magic
+32-byte WALs as removable artifacts. All six WAL quarantine/refusal sites (the
+pool startup self-heal, the five CLI startup/doctor sites including the
+"needs repair" health gate, and the `wal_shm_sidecar_drift` detector) plus
+`classify_wal_sidecar` now route through it. GH#99 is preserved — an invalid-magic
+32-byte WAL is still quarantined.
+
 ### `am tui-dump` — non-interactive freeze escape hatch (br-bvq1x.9.6, I6)
 
 - **New `am tui-dump` command (also `am robot tui-dump`).** When the interactive

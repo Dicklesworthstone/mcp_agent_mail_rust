@@ -4580,15 +4580,16 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
                 quarantined.display()
             );
             wal_detached = true;
-        } else if mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len()) {
-            // Header-only or truncated WAL: by definition no committed
-            // frames, so detaching it from the live DB is non-destructive.
-            // Quarantine it instead of deleting it so recovery remains
-            // forensics-first.
+        } else if mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path) {
+            // Truncated (sub-header) or invalid-magic 32-byte WAL: by definition
+            // no usable committed frames, so detaching it from the live DB is
+            // non-destructive. Quarantine instead of deleting so recovery remains
+            // forensics-first. A VALID 32-byte header is NOT matched here — it is
+            // a frameless idle WAL the engine opens as-is (ts1/css, 2026-06-17).
             let quarantined =
                 quarantine_startup_sqlite_sidecar(&wal_path, "header-only/truncated WAL")?;
             eprintln!(
-                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; <= {} byte WAL header)",
+                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; < {} byte WAL header or invalid magic)",
                 wal_path.display(),
                 quarantined.display(),
                 meta.len(),
@@ -4622,8 +4623,8 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
                     if let Ok(after_meta) = std::fs::symlink_metadata(&wal_path)
                         && after_meta.file_type().is_file()
                         && (after_meta.len() == 0
-                            || mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(
-                                after_meta.len(),
+                            || mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(
+                                &wal_path,
                             ))
                         && let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
                             &wal_path,
@@ -6184,14 +6185,14 @@ fn run_startup_doctor_repair_subprocess(
     if let Some(db_path) = sqlite_file_path_from_database_url(database_url) {
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         if let Ok(meta) = std::fs::metadata(&wal_path)
-            && mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len())
+            && mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path)
             && let Some(quarantined) = quarantine_startup_sqlite_sidecar_if_exists(
                 &wal_path,
                 "header-only/truncated WAL before startup doctor repair",
             )?
         {
             eprintln!(
-                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; <= {} byte WAL header) before startup doctor repair",
+                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; < {} byte WAL header or invalid magic) before startup doctor repair",
                 wal_path.display(),
                 quarantined.display(),
                 meta.len(),
@@ -16362,7 +16363,7 @@ fn doctor_quarantine_header_only_wal_sidecars(db_path: &Path) -> CliResult<()> {
         return Ok(());
     };
     if !wal_meta.file_type().is_file()
-        || !mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(wal_meta.len())
+        || !mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path)
     {
         return Ok(());
     }
@@ -24541,8 +24542,12 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
     wal_os.push("-wal");
     let wal_path = PathBuf::from(wal_os);
     let meta = std::fs::symlink_metadata(&wal_path).ok()?;
+    // Magic-aware: a VALID 32-byte header is a frameless idle WAL the engine
+    // opens as-is, so it must NOT be reported as "needs repair" (ts1/css
+    // false-positive, 2026-06-17). Only a sub-header (1..=31 byte) WAL or a
+    // 32-byte header with INVALID magic (GH#99) is a real truncation artifact.
     if meta.file_type().is_file()
-        && mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len())
+        && mcp_agent_mail_db::wal_classify::wal_sidecar_is_truncation_artifact(&wal_path)
     {
         Some(format!(
             "SQLite WAL sidecar is header-only/truncated at {} ({} bytes)",

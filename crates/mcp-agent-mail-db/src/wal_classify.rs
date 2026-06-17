@@ -11,12 +11,21 @@
 //! and never checkpoints while another live writer owns the DB**:
 //!
 //! - benign 0-byte / idle WAL                       → no action
-//! - header-only / truncated WAL (1..=32 bytes)     → quarantine (cannot rebuild)
-//! - malformed WAL (>32 bytes, bad magic/checksum)  → quarantine (would corrupt)
+//! - valid 32-byte header (frameless idle WAL)      → no action (opens as-is)
+//! - truncated WAL (1..=31 bytes, partial header)   → quarantine (cannot rebuild)
+//! - malformed WAL (bad magic/checksum, incl. a     → quarantine (would corrupt)
+//!   32-byte all-zeros garbage header — GH#99)
 //! - stale WAL with committed frames                → checkpoint *only when safe*
 //! - WAL/SHM symlink                                → quarantine (never follow)
 //! - orphan sidecar (primary gone)                  → quarantine
 //! - a live writer owning the DB                    → refuse all mutation
+//!
+//! NOTE: a complete 32-byte WAL header with a VALID magic is a frameless idle
+//! WAL that the current engine opens and checkpoints without error (proven by
+//! `engine_opens_and_checkpoints_a_32_byte_header_only_wal`). Treating it as a
+//! truncation artifact false-failed `am doctor health` and cascaded into
+//! spurious archive reconstructs (ts1/css incidents, 2026-06-17), so it is
+//! classified `IdleEmpty`, not `HeaderOnlyOrTruncated`.
 //!
 //! It reuses [`crate::pool`] for sidecar inspection, live-owner detection
 //! (D2/D4), and the underlying truncate checkpoint, rather than forking a
@@ -54,13 +63,16 @@ const MTIME_DRIFT_THRESHOLD_SECS: i64 = 3600;
 pub enum WalSidecarState {
     /// No WAL sidecar present (clean WAL-mode-idle or non-WAL database).
     NoSidecar,
-    /// 0-byte WAL — the normal idle/just-checkpointed state. Benign.
+    /// A benign, openable WAL: a 0-byte WAL (idle/just-checkpointed) OR an
+    /// exactly-32-byte header with a valid magic (a frameless idle WAL the
+    /// engine opens as-is). Neither is a truncation artifact.
     IdleEmpty,
-    /// Non-empty WAL of at most the 32-byte header size: too small to hold any
-    /// committed frame. Opening it triggers "WAL file too small for header".
+    /// Non-empty WAL SHORTER than the 32-byte header (1..=31 bytes): a partial,
+    /// unreadable header. Opening it triggers "WAL file too small for header".
     HeaderOnlyOrTruncated,
-    /// WAL larger than the header but with an invalid magic or header checksum.
-    /// Checkpointing it risks producing a malformed image.
+    /// WAL with an invalid magic or header checksum — either larger than the
+    /// header, or an exactly-32-byte garbage header (e.g. the all-zeros WAL from
+    /// GH#99). Checkpointing it risks producing a malformed image.
     MalformedHeader,
     /// WAL larger than the header with a valid header — carries committed frames
     /// and should be checkpointed (when no live writer owns the DB).
@@ -221,6 +233,51 @@ fn mtime_drift_secs(primary: &Path, wal_path: &Path) -> Option<i64> {
     }
 }
 
+/// Magic-aware test of whether a WAL sidecar FILE is a removable artifact.
+///
+/// Returns `true` for a WAL that blocks a clean open/rebuild (and should be
+/// quarantined), `false` for a valid WAL that SQLite opens as-is. This is the
+/// boolean the startup self-heal and doctor probes gate quarantine (and the
+/// "needs repair" refusal) on. It refines the size-only
+/// [`crate::pool::sqlite_wal_is_header_only_or_truncated`] by reading the 32-byte
+/// header when one is fully present:
+///
+/// - `0` bytes → `false` (valid idle / just-checkpointed).
+/// - `1..=31` bytes → `true` (incomplete, unreadable, truncated header).
+/// - `32` bytes, **valid** magic → `false` (frameless idle WAL; opens as-is — ts1/css).
+/// - `32` bytes, **invalid** magic → `true` (garbage header — GH#99/#119).
+/// - `> 32` bytes → `false` (carries frames; checkpoint it, never quarantine).
+///
+/// Non-files (symlinks) return `false` here — they are handled by the dedicated
+/// symlink-quarantine path and never dereferenced.
+#[must_use]
+pub fn wal_sidecar_is_truncation_artifact(wal_path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(wal_path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    let len = meta.len();
+    if len == 0 || len > SQLITE_WAL_HEADER_BYTES {
+        return false;
+    }
+    if len < SQLITE_WAL_HEADER_BYTES {
+        // 1..=31 bytes: a partial header that cannot even be read — SQLite
+        // surfaces this as "WAL file too small for header".
+        return true;
+    }
+    // Exactly the 32-byte header: a removable artifact ONLY when the magic /
+    // checksum is invalid (a garbage header, e.g. the all-zeros WAL from GH#99).
+    // A valid engine-written header is a benign frameless idle WAL that the
+    // engine opens and checkpoints without error (proven by
+    // `engine_opens_and_checkpoints_a_32_byte_header_only_wal`).
+    !matches!(
+        read_wal_header(wal_path).map(|header| wal_header_verdict(&header)),
+        Some(WalHeaderVerdict::Valid)
+    )
+}
+
 /// Classify a database's WAL/SHM sidecars from the filesystem alone.
 ///
 /// This is filesystem-pure (no DB connection, no `/proc` scan): the live-writer
@@ -291,16 +348,29 @@ pub fn classify_wal_sidecar(primary: &Path) -> WalSidecarClassification {
             WalSidecarState::IdleEmpty,
             "0-byte WAL: benign idle/just-checkpointed state".to_string(),
         )
-    } else if wal_bytes <= SQLITE_WAL_HEADER_BYTES {
+    } else if wal_bytes < SQLITE_WAL_HEADER_BYTES {
+        // 1..=31 bytes: a partial header that cannot even be read. SQLite
+        // surfaces this as "WAL file too small for header" — a genuine
+        // truncation artifact.
         (
             WalSidecarState::HeaderOnlyOrTruncated,
             format!(
-                "WAL is {wal_bytes} bytes (<= 32-byte header): no committed frames, too small to rebuild"
+                "WAL is {wal_bytes} bytes (< 32-byte header): incomplete/truncated header, no committed frames"
             ),
         )
     } else {
+        // >= 32 bytes: a complete header is present — validate its magic. A WAL
+        // that is EXACTLY the 32-byte header with a valid magic is a frameless
+        // idle WAL that SQLite opens without error (a freshly-created or
+        // just-checkpointed WAL-mode DB sits here between writes — ts1 incident,
+        // 2026-06-17). It is NOT a truncation artifact. Only an invalid-magic
+        // 32-byte header (e.g. an all-zeros garbage WAL, GH#99) is malformed.
         match read_wal_header(&wal_path) {
             Some(header) => match wal_header_verdict(&header) {
+                WalHeaderVerdict::Valid if wal_bytes == SQLITE_WAL_HEADER_BYTES => (
+                    WalSidecarState::IdleEmpty,
+                    "WAL is exactly the 32-byte header with a valid magic: frameless idle WAL, openable as-is".to_string(),
+                ),
                 WalHeaderVerdict::Valid => (
                     WalSidecarState::StaleNeedsCheckpoint,
                     format!("WAL ({wal_bytes} bytes) has a valid header and committed frames"),
@@ -489,6 +559,93 @@ mod tests {
     }
 
     #[test]
+    fn classify_valid_32_byte_header_is_idle_not_truncated() {
+        // ts1/css regression (2026-06-17): a valid engine-written 32-byte header
+        // (zero frames) is a benign frameless idle WAL that the engine opens
+        // as-is — it must classify as IdleEmpty (NoOp), NOT HeaderOnlyOrTruncated
+        // (quarantine). Quarantining it false-failed `am doctor health` and
+        // churned the startup self-heal on every restart.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let header = {
+            let conn = crate::DbConn::open_file(primary.display().to_string()).expect("open");
+            conn.execute_raw("PRAGMA journal_mode = WAL;").expect("wal");
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+                .expect("no autockpt");
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .expect("schema");
+            conn.execute_raw("INSERT INTO t (id) VALUES (1);")
+                .expect("seed");
+            let h = read_wal_header(&sidecar_path(&primary, "-wal")).expect("32-byte header");
+            let _ = wal_checkpoint_truncate_path(&primary);
+            h
+        };
+        std::fs::write(sidecar_path(&primary, "-wal"), header).expect("write 32-byte wal");
+        let c = classify_wal_sidecar(&primary);
+        assert_eq!(c.wal_bytes, 32);
+        assert_eq!(
+            c.state,
+            WalSidecarState::IdleEmpty,
+            "valid 32-byte header must be IdleEmpty: {}",
+            c.detail
+        );
+        assert_eq!(recommended_action(&c), SidecarAction::NoOp);
+        // And the magic-aware predicate must agree it is NOT a removable artifact.
+        assert!(!wal_sidecar_is_truncation_artifact(&sidecar_path(
+            &primary, "-wal"
+        )));
+    }
+
+    #[test]
+    fn classify_garbage_32_byte_header_is_malformed_and_quarantined() {
+        // GH#99/#119: an all-zeros 32-byte WAL has an INVALID magic — it is a
+        // genuine garbage header that trips the rebuild path and must still be
+        // quarantined. The magic check is what separates it from the valid case.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = make_wal_db(dir.path());
+        let _ = wal_checkpoint_truncate_path(&primary);
+        std::fs::write(sidecar_path(&primary, "-wal"), [0x00u8; 32]).unwrap();
+        let c = classify_wal_sidecar(&primary);
+        assert_eq!(c.wal_bytes, 32);
+        assert_eq!(
+            c.state,
+            WalSidecarState::MalformedHeader,
+            "garbage 32-byte header must be MalformedHeader: {}",
+            c.detail
+        );
+        assert_eq!(recommended_action(&c), SidecarAction::QuarantineWal);
+        assert!(wal_sidecar_is_truncation_artifact(&sidecar_path(
+            &primary, "-wal"
+        )));
+    }
+
+    #[test]
+    fn wal_sidecar_is_truncation_artifact_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = make_wal_db(dir.path());
+        let _ = wal_checkpoint_truncate_path(&primary);
+        let wal = sidecar_path(&primary, "-wal");
+
+        // 0 bytes → valid idle, not an artifact.
+        std::fs::write(&wal, b"").unwrap();
+        assert!(!wal_sidecar_is_truncation_artifact(&wal));
+        // 1..=31 bytes → incomplete header, a genuine artifact.
+        std::fs::write(&wal, [0xABu8; 16]).unwrap();
+        assert!(wal_sidecar_is_truncation_artifact(&wal));
+        std::fs::write(&wal, [0xABu8; 31]).unwrap();
+        assert!(wal_sidecar_is_truncation_artifact(&wal));
+        // 32 bytes, garbage magic → artifact.
+        std::fs::write(&wal, [0x00u8; 32]).unwrap();
+        assert!(wal_sidecar_is_truncation_artifact(&wal));
+        // >32 bytes (garbage) → NOT a "header-only" artifact (handled elsewhere).
+        std::fs::write(&wal, [0x00u8; 64]).unwrap();
+        assert!(!wal_sidecar_is_truncation_artifact(&wal));
+        // Missing WAL → not an artifact.
+        std::fs::remove_file(&wal).unwrap();
+        assert!(!wal_sidecar_is_truncation_artifact(&wal));
+    }
+
+    #[test]
     fn classify_stale_wal_with_real_committed_frames() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -542,6 +699,57 @@ mod tests {
     fn wal_header_verdict_rejects_bad_magic_and_short() {
         assert_eq!(wal_header_verdict(&[0u8; 16]), WalHeaderVerdict::TooShort);
         assert_eq!(wal_header_verdict(&[0u8; 32]), WalHeaderVerdict::BadMagic);
+    }
+
+    #[test]
+    fn engine_opens_and_checkpoints_a_32_byte_header_only_wal() {
+        // EMPIRICAL probe (ts1 incident, 2026-06-17): a live 0.3.13 server creates
+        // a 32-byte idle WAL and reopens it cleanly across restarts, yet
+        // `am doctor health` false-failed ("needs repair: WAL sidecar
+        // header-only/truncated (32 bytes)"). The historical GH#99/#119 workaround
+        // quarantines any <=32-byte WAL because the engine once tripped "WAL file
+        // too small for header during rebuild". This test pins the CURRENT engine
+        // behavior: it must OPEN, QUERY, and CHECKPOINT a DB whose WAL is exactly
+        // the engine-written 32-byte header (zero frames) without error. If this
+        // ever regresses, the classification change below is unsafe.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+
+        // 1. Build a real WAL-mode DB, capture an engine-written 32-byte header,
+        //    then checkpoint+truncate so all committed data lives in the primary.
+        let header = {
+            let conn = crate::DbConn::open_file(primary.display().to_string()).expect("open");
+            conn.execute_raw("PRAGMA journal_mode = WAL;").expect("wal");
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 0;")
+                .expect("disable autockpt");
+            conn.execute_raw("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                .expect("schema");
+            conn.execute_raw("INSERT INTO t (v) VALUES ('a'), ('b');")
+                .expect("seed");
+            let h = read_wal_header(&sidecar_path(&primary, "-wal"))
+                .expect("a real WAL must carry a 32-byte header");
+            let _ = wal_checkpoint_truncate_path(&primary);
+            h
+        };
+        assert_eq!(
+            header.len(),
+            32,
+            "engine WAL header must be exactly 32 bytes"
+        );
+
+        // 2. Lay down EXACTLY the 32-byte header as the WAL (valid magic, 0 frames).
+        std::fs::write(sidecar_path(&primary, "-wal"), header).expect("write 32-byte wal");
+
+        // 3. The engine must OPEN + QUERY + CHECKPOINT it without the GH#99/#119
+        //    "WAL file too small for header" error.
+        let conn = crate::DbConn::open_file(primary.display().to_string())
+            .expect("engine must open a DB with a 32-byte header-only WAL");
+        let rows = conn
+            .query_sync("SELECT v FROM t ORDER BY id", &[])
+            .expect("query over a 32-byte-WAL DB must succeed");
+        assert_eq!(rows.len(), 2, "committed rows must remain readable");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint over a 32-byte header-only WAL must succeed");
     }
 
     #[test]
