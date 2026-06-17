@@ -945,6 +945,15 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
             // I3 (br-bvq1x.9.3): SQLite connections dropped without an explicit
             // close() (a rising count is connection-lifecycle debt).
             "drop_close_total": metrics_snapshot.db.drop_close_total,
+            // I5 (br-bvq1x.9.5): commit-coalescer worker liveness (null until a
+            // coalescer starts). alive < expected => a worker died, stalling
+            // git archive durability.
+            "commit_coalescer_workers": mcp_agent_mail_storage::commit_coalescer_worker_liveness()
+                .map(|liveness| json!({
+                    "expected": liveness.expected,
+                    "alive": liveness.alive,
+                    "dead": liveness.dead_workers(),
+                })),
         },
         "git_ref_integrity": {
             "enabled": sweep.enabled(),
@@ -995,6 +1004,9 @@ struct DiagnosticsSnapshot {
     /// I3 (br-bvq1x.9.3): SQLite connections dropped without an explicit
     /// `close()` (snapshot of the global `db.drop_close_total` counter).
     drop_close_total: u64,
+    /// I5 (br-bvq1x.9.5): commit-coalescer worker liveness, or `None` when no
+    /// coalescer is running (so a healthy boot never false-alarms).
+    coalescer_worker_liveness: Option<mcp_agent_mail_storage::CommitCoalescerWorkerLiveness>,
     git_ref_integrity: GitRefIntegritySweepState,
     boot_archive_preflight: Option<BootArchivePreflightSnapshot>,
     /// Tailscale remote-access URL with token, if Tailscale is active.
@@ -3209,6 +3221,7 @@ fn run_diagnostics(
         .db
         .drop_close_total
         .load();
+    out.coalescer_worker_liveness = mcp_agent_mail_storage::commit_coalescer_worker_liveness();
     let db_snapshot = state.db_stats_snapshot();
     if let Some(db_snapshot) = &db_snapshot {
         let mut attention_agents = db_snapshot
@@ -3355,6 +3368,26 @@ fn add_db_connection_findings(out: &mut DiagnosticsSnapshot) {
             ),
             remediation: Some(
                 "Connection-lifecycle debt (paired with ATC tick overruns in the ts1 incident). Inspect pooled-connection teardown and the ATC operator's DB usage.".into(),
+            ),
+        });
+    }
+
+    // I5 (br-bvq1x.9.5): a dead commit-coalescer worker silently stalls
+    // durability (git writes stop being committed) while the rest of the
+    // process looks alive — escalate to Fail.
+    if let Some(liveness) = out.coalescer_worker_liveness
+        && liveness.any_dead()
+    {
+        out.lines.push(ProbeLine {
+            level: Level::Fail,
+            name: "commit-coalescer-thread-died",
+            detail: format!(
+                "commit coalescer: {} of {} worker thread(s) dead — git archive writes are stalling",
+                liveness.dead_workers(),
+                liveness.expected
+            ),
+            remediation: Some(
+                "A coalescer worker panicked; queued git commits are no longer draining. Restart the server to respawn workers, then check recent logs for the panic.".into(),
             ),
         });
     }
@@ -6193,6 +6226,58 @@ mod tests {
             .expect("nonzero drop_close must surface a finding");
         assert_eq!(finding.level, Level::Warn);
         assert!(finding.detail.contains("4 SQLite connection"));
+    }
+
+    #[test]
+    fn commit_coalescer_death_finding_surfaces_only_when_a_worker_is_dead() {
+        // I5 (br-bvq1x.9.5): None (no coalescer) and all-alive => no finding.
+        let mut none = DiagnosticsSnapshot {
+            coalescer_worker_liveness: None,
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut none);
+        assert!(
+            !none
+                .lines
+                .iter()
+                .any(|line| line.name == "commit-coalescer-thread-died")
+        );
+
+        let mut healthy = DiagnosticsSnapshot {
+            coalescer_worker_liveness: Some(
+                mcp_agent_mail_storage::CommitCoalescerWorkerLiveness {
+                    expected: 4,
+                    alive: 4,
+                },
+            ),
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut healthy);
+        assert!(
+            !healthy
+                .lines
+                .iter()
+                .any(|line| line.name == "commit-coalescer-thread-died"),
+            "all workers alive => no death finding"
+        );
+
+        let mut dead = DiagnosticsSnapshot {
+            coalescer_worker_liveness: Some(
+                mcp_agent_mail_storage::CommitCoalescerWorkerLiveness {
+                    expected: 4,
+                    alive: 1,
+                },
+            ),
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut dead);
+        let finding = dead
+            .lines
+            .iter()
+            .find(|line| line.name == "commit-coalescer-thread-died")
+            .expect("a dead coalescer worker must surface a Fail finding");
+        assert_eq!(finding.level, Level::Fail);
+        assert!(finding.detail.contains("3 of 4"));
     }
 
     #[test]

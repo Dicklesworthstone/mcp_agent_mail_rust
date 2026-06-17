@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 // `Stdio` is referenced fully-qualified in the two remaining sites
 // (lines ~1290); removed the bare `use` after bead C5 deleted the
 // read-tree shell-out.
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -341,6 +341,78 @@ pub fn commit_coalescer_heartbeat_snapshot() -> Option<CommitCoalescerHeartbeatS
     let snapshot = COMMIT_COALESCER_HEARTBEAT.snapshot();
     (snapshot.ticks_total > 0 || snapshot.successes_total > 0 || snapshot.failures_total > 0)
         .then_some(snapshot)
+}
+
+// ── I5 (br-bvq1x.9.5): commit-coalescer worker liveness ─────────────────
+//
+// A panicked worker thread silently stalls durability (writes stop being
+// committed to the archive) while the rest of the process looks alive. The
+// heartbeat alone cannot distinguish "idle (no work)" from "dead": the
+// coalescer is non-periodic, so a quiet heartbeat is normal. We track the
+// live worker count directly via a panic-safe RAII guard whose `Drop` runs
+// during unwinding, so `alive < expected` proves a worker died.
+
+/// Number of commit-coalescer worker threads currently alive.
+static COMMIT_COALESCER_WORKERS_ALIVE: AtomicUsize = AtomicUsize::new(0);
+/// Number of commit-coalescer worker threads the running coalescer expects to
+/// be alive (0 before any coalescer has started).
+static COMMIT_COALESCER_WORKERS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that increments a live-worker counter on construction and
+/// decrements it on `Drop` — including when the thread is unwinding from a
+/// panic, which is exactly the death we need to detect.
+struct CoalescerAliveGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> CoalescerAliveGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for CoalescerAliveGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Live-vs-expected commit-coalescer worker counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitCoalescerWorkerLiveness {
+    /// Workers the running coalescer expects to be alive.
+    pub expected: usize,
+    /// Workers currently alive (decremented when a worker exits or panics).
+    pub alive: usize,
+}
+
+impl CommitCoalescerWorkerLiveness {
+    /// Workers that have died (panicked) and not been replaced.
+    #[must_use]
+    pub const fn dead_workers(&self) -> usize {
+        self.expected.saturating_sub(self.alive)
+    }
+
+    /// `true` when at least one expected worker is no longer alive.
+    #[must_use]
+    pub const fn any_dead(&self) -> bool {
+        self.alive < self.expected
+    }
+}
+
+/// Worker-liveness for the running commit coalescer, or `None` if no coalescer
+/// has started yet (so callers don't false-alarm before boot).
+#[must_use]
+pub fn commit_coalescer_worker_liveness() -> Option<CommitCoalescerWorkerLiveness> {
+    let expected = COMMIT_COALESCER_WORKERS_EXPECTED.load(Ordering::Relaxed);
+    if expected == 0 {
+        return None;
+    }
+    Some(CommitCoalescerWorkerLiveness {
+        expected,
+        alive: COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed),
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2317,6 +2389,10 @@ impl CommitCoalescer {
             std::thread::Builder::new()
                 .name(format!("commit-coalescer-{worker_idx}"))
                 .spawn(move || {
+                    // I5 (br-bvq1x.9.5): mark this worker alive for its whole
+                    // lifetime. The guard's Drop decrements even on panic unwind,
+                    // so a dead worker is detectable via `alive < expected`.
+                    let _alive = CoalescerAliveGuard::new(&COMMIT_COALESCER_WORKERS_ALIVE);
                     coalescer_pool_worker(
                         w_repos,
                         w_cv,
@@ -2333,6 +2409,10 @@ impl CommitCoalescer {
                     panic!("failed to spawn commit-coalescer-{worker_idx} thread: {error}")
                 });
         }
+
+        // I5: record how many workers should stay alive so health can detect
+        // a silent worker death (`alive < expected`).
+        COMMIT_COALESCER_WORKERS_EXPECTED.store(worker_count, Ordering::Relaxed);
 
         mcp_agent_mail_core::global_metrics()
             .storage
@@ -2623,6 +2703,10 @@ impl Drop for CommitCoalescer {
         // preserve the same graceful-shutdown contract as the server signal path.
         self.flush_sync();
         self.shutdown.store(true, Ordering::Release);
+        // I5 (br-bvq1x.9.5): a graceful shutdown is not a worker death. Clear the
+        // expected count so liveness reports "not running" (None) instead of
+        // flagging the soon-to-exit workers as dead.
+        COMMIT_COALESCER_WORKERS_EXPECTED.store(0, Ordering::Relaxed);
         let (_, cvar) = &*self.work_cv;
         cvar.notify_all();
     }
@@ -9738,6 +9822,68 @@ mod tests {
         assert_eq!(recovered.last_success_micros, 250);
         assert_eq!(recovered.last_success_duration_micros, 30);
         assert_eq!(recovered.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn coalescer_alive_guard_decrements_even_on_panic() {
+        // I5 (br-bvq1x.9.5): the guard must decrement on Drop during a panic
+        // unwind — that is precisely the "leader panicked" death we detect.
+        // A local counter + scoped thread keeps this isolated from the global.
+        let counter = AtomicUsize::new(0);
+        let result = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _alive = CoalescerAliveGuard::new(&counter);
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    1,
+                    "guard increments on new"
+                );
+                panic!("inject leader panic");
+            });
+            handle.join()
+        });
+        assert!(result.is_err(), "worker thread must have panicked");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "guard must decrement during panic unwind so a dead worker is detectable"
+        );
+    }
+
+    #[test]
+    fn commit_coalescer_worker_liveness_flags_dead_workers() {
+        // Pure logic over the snapshot counts (no globals).
+        let healthy = CommitCoalescerWorkerLiveness {
+            expected: 4,
+            alive: 4,
+        };
+        assert!(!healthy.any_dead());
+        assert_eq!(healthy.dead_workers(), 0);
+
+        let degraded = CommitCoalescerWorkerLiveness {
+            expected: 4,
+            alive: 2,
+        };
+        assert!(degraded.any_dead());
+        assert_eq!(degraded.dead_workers(), 2);
+
+        // Over-count (e.g. a transient extra) never underflows or false-alarms.
+        let extra = CommitCoalescerWorkerLiveness {
+            expected: 4,
+            alive: 5,
+        };
+        assert!(!extra.any_dead());
+        assert_eq!(extra.dead_workers(), 0);
+    }
+
+    #[test]
+    fn commit_coalescer_worker_liveness_is_none_before_any_coalescer() {
+        // Fresh process / before boot: expected is 0 => no false alarm.
+        // (Other tests may start a real coalescer; only assert the None gate
+        // holds when expected is 0.)
+        if COMMIT_COALESCER_WORKERS_EXPECTED.load(Ordering::Relaxed) == 0 {
+            assert!(commit_coalescer_worker_liveness().is_none());
+        }
     }
 
     #[test]
