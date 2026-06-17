@@ -454,6 +454,12 @@ pub struct DbMetrics {
     pub snapshot_restored_total: Counter,
     /// Wall-clock microsecond timestamp of the last verified snapshot recorded.
     pub last_verified_snapshot_us: GaugeU64,
+    /// I3 (br-bvq1x.9.3): count of `SQLite` connections dropped WITHOUT an
+    /// explicit `close()` (the engine emits a `fsqlite::runtime` `drop_close`
+    /// warning). A rising count is connection-lifecycle debt — the ts1 incident
+    /// paired it with ATC tick-budget overruns. Incremented by a tracing layer
+    /// in the server/CLI binaries; `0` until one is registered.
+    pub drop_close_total: Counter,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -482,6 +488,7 @@ pub struct DbMetricsSnapshot {
     pub snapshot_verify_failures_total: u64,
     pub snapshot_restored_total: u64,
     pub last_verified_snapshot_us: u64,
+    pub drop_close_total: u64,
 }
 
 impl Default for DbMetrics {
@@ -510,6 +517,7 @@ impl Default for DbMetrics {
             snapshot_verify_failures_total: Counter::new(),
             snapshot_restored_total: Counter::new(),
             last_verified_snapshot_us: GaugeU64::new(),
+            drop_close_total: Counter::new(),
         }
     }
 }
@@ -547,6 +555,7 @@ impl DbMetrics {
             snapshot_verify_failures_total: self.snapshot_verify_failures_total.load(),
             snapshot_restored_total: self.snapshot_restored_total.load(),
             last_verified_snapshot_us: self.last_verified_snapshot_us.load(),
+            drop_close_total: self.drop_close_total.load(),
         }
     }
 }

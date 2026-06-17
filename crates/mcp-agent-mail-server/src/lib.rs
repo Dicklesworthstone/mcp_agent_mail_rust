@@ -7489,6 +7489,61 @@ pub fn emit_git_segfault_retry_trace_event(
     ));
 }
 
+/// Tracing target frankensqlite uses for its connection-lifecycle warnings.
+pub const FSQLITE_RUNTIME_TRACE_TARGET: &str = "fsqlite::runtime";
+
+/// Pure match for the frankensqlite `drop_close` warning field.
+///
+/// A `drop_close` marks a `SQLite` connection dropped without an explicit
+/// `close()`. The value is checked with `contains` so it matches both the
+/// `record_str` ("drop_close") and `record_debug` ("\"drop_close\"") rendering.
+#[must_use]
+pub fn is_fsqlite_drop_close_field(field_name: &str, value: &str) -> bool {
+    field_name == "event" && value.contains("drop_close")
+}
+
+#[derive(Default)]
+struct DropCloseEventVisitor {
+    is_drop_close: bool,
+}
+
+impl tracing::field::Visit for DropCloseEventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if is_fsqlite_drop_close_field(field.name(), &format!("{value:?}")) {
+            self.is_drop_close = true;
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if is_fsqlite_drop_close_field(field.name(), value) {
+            self.is_drop_close = true;
+        }
+    }
+}
+
+/// Count a frankensqlite `drop_close` warning into `db.drop_close_total`.
+///
+/// I3 (br-bvq1x.9.3): when `event` is the `drop_close` warning, bump the global
+/// counter so the health surface can report connection-lifecycle debt (the ts1
+/// incident paired it with ATC tick-budget overruns). The detection logic lives
+/// here once; the `mcp-agent-mail` and `am` binaries each register a thin
+/// tracing layer that delegates to this function (they have independent
+/// subscriber inits). Cheap: a target compare gates the field visit to
+/// `fsqlite::runtime` events only.
+pub fn note_possible_drop_close_event(event: &tracing::Event<'_>) {
+    if event.metadata().target() != FSQLITE_RUNTIME_TRACE_TARGET {
+        return;
+    }
+    let mut visitor = DropCloseEventVisitor::default();
+    event.record(&mut visitor);
+    if visitor.is_drop_close {
+        mcp_agent_mail_core::global_metrics()
+            .db
+            .drop_close_total
+            .inc();
+    }
+}
+
 /// Asynchronous version of [`emit_tui_event`] that uses non-blocking retry.
 ///
 /// No-op when TUI mode is not active.
@@ -16434,6 +16489,19 @@ mod tests {
         assert!(atc_budget_watchdog_tripped(
             ATC_BUDGET_OVERRUN_WATCHDOG_THRESHOLD + 5
         ));
+    }
+
+    #[test]
+    fn is_fsqlite_drop_close_field_matches_event_field_only() {
+        // record_str rendering.
+        assert!(is_fsqlite_drop_close_field("event", "drop_close"));
+        // record_debug rendering (quoted).
+        assert!(is_fsqlite_drop_close_field("event", "\"drop_close\""));
+        // Other fields of the same event must not match.
+        assert!(!is_fsqlite_drop_close_field("db_path", "drop_close"));
+        assert!(!is_fsqlite_drop_close_field("msg", "Connection dropped"));
+        // Other fsqlite::runtime events must not match.
+        assert!(!is_fsqlite_drop_close_field("event", "open"));
     }
 
     #[test]

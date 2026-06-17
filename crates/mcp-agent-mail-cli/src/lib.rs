@@ -3729,19 +3729,51 @@ fn is_project_not_found_error(err: &CliError) -> bool {
     )
 }
 
+/// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
+///
+/// I3 (br-bvq1x.9.3): thin delegator; the detection logic lives in
+/// `mcp_agent_mail_server`. Registered UNFILTERED so it still observes
+/// connection-lifecycle warnings even when the TUI suppresses fmt logs (the
+/// exact freeze scenario where `drop_close` matters most).
+struct DropCloseCounterLayer;
+
+impl<S> tracing_subscriber::Layer<S> for DropCloseCounterLayer
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        mcp_agent_mail_server::note_possible_drop_close_event(event);
+    }
+}
+
 fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
         let filter = build_release_log_filter(suppress_runtime_logs_for_tui);
 
-        // Ignore double-init errors when tests or host processes already set a subscriber.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        // The env filter is scoped to the fmt layer ONLY so the drop_close
+        // counter keeps observing fsqlite warnings even when the filter is
+        // "off" (TUI active). Preserves the prior fmt behaviour exactly.
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_target(false)
             .with_ansi(crate::output::is_tty())
             .compact()
+            .with_filter(filter);
+
+        // Ignore double-init errors when tests or host processes already set a subscriber.
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(DropCloseCounterLayer)
             .try_init();
     });
 }

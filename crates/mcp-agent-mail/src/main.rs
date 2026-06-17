@@ -266,6 +266,21 @@ where
     }
 }
 
+/// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
+///
+/// I3 (br-bvq1x.9.3): a `SQLite` connection dropped without explicit `close()`.
+/// Thin delegator; the detection logic lives in `mcp_agent_mail_server`.
+struct DropCloseCounterLayer;
+
+impl<S> Layer<S> for DropCloseCounterLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        mcp_agent_mail_server::note_possible_drop_close_event(event);
+    }
+}
+
 fn git_segfault_retry_trace_event_from_fields(
     target: &str,
     fields: &GitSegfaultRetryTraceFields,
@@ -699,6 +714,7 @@ fn main() {
     tracing_subscriber::registry()
         .with(fmt_layer)
         .with(GitSegfaultRetryTuiLayer)
+        .with(DropCloseCounterLayer)
         .init();
 
     if cli.verbose {

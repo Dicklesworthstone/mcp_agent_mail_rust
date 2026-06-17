@@ -941,6 +941,11 @@ pub(crate) fn ws_state_system_health_payload(state: &TuiSharedState) -> Value {
             "query_latency_us": histogram_snapshot_json(&query_tracker_snapshot.latency_us),
             "pool_acquire_latency_us": histogram_snapshot_json(&metrics_snapshot.db.pool_acquire_latency_us),
         },
+        "db_connection_hygiene": {
+            // I3 (br-bvq1x.9.3): SQLite connections dropped without an explicit
+            // close() (a rising count is connection-lifecycle debt).
+            "drop_close_total": metrics_snapshot.db.drop_close_total,
+        },
         "git_ref_integrity": {
             "enabled": sweep.enabled(),
             "interval_seconds": sweep.interval_seconds(),
@@ -987,6 +992,9 @@ struct DiagnosticsSnapshot {
     atc_canary: Option<AtcCanaryReportSummary>,
     agent_attention_count: usize,
     agent_attention_summary: String,
+    /// I3 (br-bvq1x.9.3): SQLite connections dropped without an explicit
+    /// `close()` (snapshot of the global `db.drop_close_total` counter).
+    drop_close_total: u64,
     git_ref_integrity: GitRefIntegritySweepState,
     boot_archive_preflight: Option<BootArchivePreflightSnapshot>,
     /// Tailscale remote-access URL with token, if Tailscale is active.
@@ -3197,6 +3205,10 @@ fn run_diagnostics(
         remote_url,
         ..Default::default()
     };
+    out.drop_close_total = mcp_agent_mail_core::global_metrics()
+        .db
+        .drop_close_total
+        .load();
     let db_snapshot = state.db_stats_snapshot();
     if let Some(db_snapshot) = &db_snapshot {
         let mut attention_agents = db_snapshot
@@ -3319,9 +3331,33 @@ fn run_diagnostics(
     add_base_path_findings(&mut out);
     add_auth_findings(&mut out);
     add_atc_findings(&mut out);
+    add_db_connection_findings(&mut out);
     out.operator_recommendations = build_system_health_recommendations(db_snapshot.as_ref(), &out);
 
     out
+}
+
+/// Connection-lifecycle health findings (NOT gated on ATC).
+///
+/// I3 (br-bvq1x.9.3): a `drop_close` is a DB-engine signal that must surface
+/// even when ATC is off (it is off-by-default), unlike [`add_atc_findings`].
+fn add_db_connection_findings(out: &mut DiagnosticsSnapshot) {
+    // SQLite connections dropped without an explicit close(). The count is a
+    // snapshot of the global counter fed by the binaries' tracing layers (0
+    // until one is registered — e.g. in unit tests — so this stays quiet).
+    if out.drop_close_total > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "db-drop-close",
+            detail: format!(
+                "{} SQLite connection(s) dropped without explicit close()",
+                out.drop_close_total
+            ),
+            remediation: Some(
+                "Connection-lifecycle debt (paired with ATC tick overruns in the ts1 incident). Inspect pooled-connection teardown and the ATC operator's DB usage.".into(),
+            ),
+        });
+    }
 }
 
 fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
@@ -6128,6 +6164,35 @@ mod tests {
         assert_eq!(watchdog.level, Level::Fail);
         assert!(watchdog.detail.contains("6 consecutive"));
         assert!(watchdog.detail.contains("181887us"));
+    }
+
+    #[test]
+    fn db_drop_close_finding_surfaces_only_when_nonzero() {
+        // I3 (br-bvq1x.9.3): zero drop_close => no finding (the common case).
+        // ATC is disabled in these snapshots on purpose: drop_close must surface
+        // independently of ATC (the finding lives outside add_atc_findings).
+        let mut clean = DiagnosticsSnapshot {
+            drop_close_total: 0,
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut clean);
+        assert!(
+            !clean.lines.iter().any(|line| line.name == "db-drop-close"),
+            "no drop_close means no connection-hygiene finding"
+        );
+
+        let mut leaky = DiagnosticsSnapshot {
+            drop_close_total: 4,
+            ..Default::default()
+        };
+        add_db_connection_findings(&mut leaky);
+        let finding = leaky
+            .lines
+            .iter()
+            .find(|line| line.name == "db-drop-close")
+            .expect("nonzero drop_close must surface a finding");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(finding.detail.contains("4 SQLite connection"));
     }
 
     #[test]

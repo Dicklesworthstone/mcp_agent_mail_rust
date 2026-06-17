@@ -35,8 +35,7 @@ use std::sync::OnceLock;
 ///
 /// Carried verbatim in every drift warning so an operator (or agent) can repair
 /// without guessing. Offline-printable; running it is the operator's next step.
-pub const AM_INSTALL_REPAIR_COMMAND: &str =
-    "curl -LsSf https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash";
+pub const AM_INSTALL_REPAIR_COMMAND: &str = "curl -LsSf https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash";
 
 /// Parsed semver triple for an `am` binary. Lightweight (no `semver` dep) — we
 /// only need ordered-tuple comparison for the known-bad ranges. Mirrors
@@ -86,7 +85,10 @@ impl AmVersion {
     #[must_use]
     pub fn parse_lax(s: &str) -> Option<Self> {
         let head = s.trim().trim_start_matches('v');
-        let head = head.split_terminator(['-', '+', ' ']).next().unwrap_or(head);
+        let head = head
+            .split_terminator(['-', '+', ' '])
+            .next()
+            .unwrap_or(head);
         let mut it = head.split('.');
         let major = it.next()?.parse().ok()?;
         let minor = it.next()?.parse().ok()?;
@@ -340,7 +342,10 @@ mod tests {
 
     #[test]
     fn parse_lax_handles_plain_and_decorated() {
-        assert_eq!(AmVersion::parse_lax("0.3.13"), Some(AmVersion::new(0, 3, 13)));
+        assert_eq!(
+            AmVersion::parse_lax("0.3.13"),
+            Some(AmVersion::new(0, 3, 13))
+        );
         assert_eq!(
             AmVersion::parse_lax("v0.3.12"),
             Some(AmVersion::new(0, 3, 12))
