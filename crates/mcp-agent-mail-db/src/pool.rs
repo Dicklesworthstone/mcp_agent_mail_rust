@@ -436,6 +436,20 @@ struct RecoveryAdmissionState {
     /// Ring buffer of failed-attempt timestamps within the current suppression window.
     window_attempts: std::collections::VecDeque<Instant>,
 
+    /// Path whose *successful* recoveries currently own the convergence
+    /// window (independent of `failure_path`, which tracks failures).
+    success_path: Option<PathBuf>,
+
+    /// Ring buffer of *successful* recovery timestamps within the current
+    /// convergence window. Unlike `window_attempts` (failures), this exists to
+    /// catch a non-convergent reconstruct loop: a recovery that keeps
+    /// *succeeding* (produces a structurally valid DB) but whose result
+    /// re-corrupts within seconds under concurrent write load, so the DB is
+    /// rebuilt over and over without ever making progress. Failure-based
+    /// backoff never engages for that loop because every attempt reports
+    /// success and resets the failure counters.
+    recent_successes: std::collections::VecDeque<Instant>,
+
     /// If `Some`, the controller has entered suppression mode and will not
     /// admit new attempts until this instant.
     suppressed_until: Option<Instant>,
@@ -450,6 +464,26 @@ impl RecoveryAdmissionController {
 
     /// The sliding window over which [`MAX_ATTEMPTS_IN_WINDOW`] is tracked.
     pub const SUPPRESSION_WINDOW: Duration = Duration::from_mins(5);
+
+    /// Maximum *successful* recoveries for one path allowed within
+    /// [`SUPPRESSION_WINDOW`] before the controller treats the situation as a
+    /// non-convergent reconstruct loop and suppresses further attempts.
+    ///
+    /// A reconstruct that succeeds and then re-corrupts within seconds (e.g.
+    /// the page/freelist allocator race under ~10+ concurrent writers reported
+    /// in mcp_agent_mail_rust#152) keeps producing structurally valid
+    /// databases, so failure-based backoff never engages — every attempt calls
+    /// [`report_success`](Self::report_success), which resets the failure
+    /// counters. Counting *successes* per path lets us detect "succeeded but
+    /// the result did not stick" and back off, so the daemon stops thrashing in
+    /// `degraded_read_only` (which is what times out every concurrent write at
+    /// 30s) and instead leaves the DB in a stable degraded state until the
+    /// underlying corruption is addressed.
+    ///
+    /// Headroom over a single one-shot recovery is intentional: a legitimately
+    /// recurring-but-self-healing situation (rare) still gets several free
+    /// repairs before suppression engages.
+    pub const MAX_SUCCESSFUL_RECONSTRUCTS_IN_WINDOW: usize = 5;
 
     /// Base delay for exponential backoff (doubles on each consecutive failure).
     pub const BACKOFF_BASE: Duration = Duration::from_secs(2);
@@ -467,6 +501,8 @@ impl RecoveryAdmissionController {
                 consecutive_failures: 0,
                 last_attempt: None,
                 window_attempts: std::collections::VecDeque::new(),
+                success_path: None,
+                recent_successes: std::collections::VecDeque::new(),
                 suppressed_until: None,
             }),
         }
@@ -559,16 +595,69 @@ impl RecoveryAdmissionController {
         Some(RecoveryGuard { controller: self })
     }
 
-    /// Record a successful recovery. Resets consecutive-failure count,
-    /// clears any active suppression, and forgets the prior failure window.
-    pub fn report_success(&self) {
+    /// Record a successful recovery for `primary_path`.
+    ///
+    /// A single success resets the consecutive-failure count, clears any active
+    /// failure backoff, and forgets the prior failure window — the normal,
+    /// healthy outcome.
+    ///
+    /// It ALSO tracks how often this path's recovery *succeeds* within
+    /// [`SUPPRESSION_WINDOW`]. If a path keeps succeeding
+    /// ([`MAX_SUCCESSFUL_RECONSTRUCTS_IN_WINDOW`] times in the window), the
+    /// recovery is not converging — the rebuilt database re-corrupts almost
+    /// immediately under concurrent write load (mcp_agent_mail_rust#152) — so
+    /// the controller arms loop suppression exactly as it would for repeated
+    /// failures. Without this, failure-based backoff never engages for a
+    /// succeed-then-recorrupt loop (every attempt resets the failure counters),
+    /// and the daemon thrashes the mailbox in `degraded_read_only`, timing out
+    /// every concurrent write at 30s.
+    pub fn report_success(&self, primary_path: &Path) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        state.failure_path = None;
+
+        // Track recurring *successes* per path. A different path starting to
+        // succeed means the prior path's loop (if any) is no longer the
+        // concern, so rotate the success window to the new path.
+        if state
+            .success_path
+            .as_deref()
+            .is_none_or(|path| path != primary_path)
+        {
+            state.success_path = Some(primary_path.to_path_buf());
+            state.recent_successes.clear();
+        }
+        Self::prune_window(&mut state.recent_successes, now);
+        state.recent_successes.push_back(now);
+
+        // Normal failure-tracking reset: a success means we are not in a
+        // failure backoff for this path.
         state.consecutive_failures = 0;
         state.last_attempt = Some(now);
-        state.suppressed_until = None;
         state.window_attempts.clear();
+        state.failure_path = None;
+
+        if state.recent_successes.len() >= Self::MAX_SUCCESSFUL_RECONSTRUCTS_IN_WINDOW {
+            // Non-convergent reconstruct loop: the rebuilt DB keeps succeeding
+            // then re-corrupting. Suppress further attempts for the window so
+            // the mailbox settles into a stable degraded state instead of
+            // thrashing. Key the suppression on this path via `failure_path`
+            // (the field `try_acquire` consults) so subsequent attempts are
+            // refused until the window expires.
+            let suppress_until = now + Self::SUPPRESSION_WINDOW;
+            state.failure_path = Some(primary_path.to_path_buf());
+            state.suppressed_until = Some(suppress_until);
+            tracing::error!(
+                successes_in_window = state.recent_successes.len(),
+                suppressed_for_secs = Self::SUPPRESSION_WINDOW.as_secs(),
+                path = %primary_path.display(),
+                "non-convergent recovery loop detected — recovery keeps succeeding then re-corrupting; \
+                 suppressing further automatic reconstructs (the underlying corruption needs \
+                 'am doctor repair'/'am doctor reconstruct' with writers quiesced)"
+            );
+        } else {
+            // Isolated / converging success: clear any prior suppression.
+            state.suppressed_until = None;
+        }
     }
 
     /// Record a failed recovery. Increments consecutive-failure count,
@@ -633,6 +722,7 @@ impl RecoveryAdmissionController {
             in_progress: self.in_progress.load(std::sync::atomic::Ordering::SeqCst),
             consecutive_failures: state.consecutive_failures,
             attempts_in_window: state.window_attempts.len(),
+            successes_in_window: state.recent_successes.len(),
             suppressed: state.suppressed_until.is_some_and(|until| now < until),
             current_backoff: Self::backoff_delay(state.consecutive_failures),
         }
@@ -658,6 +748,8 @@ impl RecoveryAdmissionController {
         state.consecutive_failures = 0;
         state.last_attempt = None;
         state.window_attempts.clear();
+        state.success_path = None;
+        state.recent_successes.clear();
         state.suppressed_until = None;
     }
 }
@@ -690,6 +782,10 @@ pub struct RecoveryAdmissionStatus {
     pub consecutive_failures: u32,
     /// Number of failed recovery attempts within the current sliding window.
     pub attempts_in_window: usize,
+    /// Number of *successful* recoveries for the active path within the current
+    /// sliding window. A high count indicates a non-convergent reconstruct loop
+    /// (recovery keeps succeeding then re-corrupting).
+    pub successes_in_window: usize,
     /// Whether loop suppression is currently active.
     pub suppressed: bool,
     /// Current backoff delay (zero if no failures).
@@ -742,6 +838,15 @@ fn recovery_admission_blocked_error(primary_path: &Path, action: &str) -> SqlErr
             "{action} for {} is already in progress in another caller",
             primary_path.display()
         )
+    } else if status.suppressed
+        && status.consecutive_failures == 0
+        && status.successes_in_window > 1
+    {
+        format!(
+            "{action} for {} is temporarily suppressed after a non-convergent reconstruct loop ({} successful rebuilds re-corrupted in the window); quiesce writers, then run 'am doctor reconstruct'/'am doctor repair'",
+            primary_path.display(),
+            status.successes_in_window
+        )
     } else if status.suppressed {
         format!(
             "{action} for {} is temporarily suppressed after {} consecutive failures ({} failed attempts in window)",
@@ -784,7 +889,7 @@ where
     let _depth_guard = RecoveryAdmissionDepthGuard::enter();
     let result = operation();
     match &result {
-        Ok(_) => recovery_admission().report_success(),
+        Ok(_) => recovery_admission().report_success(primary_path),
         Err(_) => recovery_admission().report_failure(primary_path),
     }
     result
@@ -14450,6 +14555,100 @@ mod tests {
         assert!(
             controller.try_acquire(failed_path).is_none(),
             "refused different-path caller must not clear the failed path's backoff"
+        );
+    }
+
+    #[test]
+    fn recovery_admission_suppresses_non_convergent_success_loop() {
+        // mcp_agent_mail_rust#152: a reconstruct that keeps SUCCEEDING (a
+        // structurally valid DB) but re-corrupts within seconds under
+        // concurrent writers must eventually be suppressed. Failure-based
+        // backoff never engages because every attempt reports success.
+        let controller = RecoveryAdmissionController::new();
+        let path = Path::new("/tmp/non-convergent-mailbox.sqlite3");
+
+        // The first MAX-1 successes are isolated/converging — never suppressed,
+        // and a fresh acquire is always admitted between them.
+        for _ in 0..(RecoveryAdmissionController::MAX_SUCCESSFUL_RECONSTRUCTS_IN_WINDOW - 1) {
+            let guard = controller
+                .try_acquire(path)
+                .expect("non-suppressed path must admit recovery");
+            drop(guard);
+            controller.report_success(path);
+            assert!(
+                !controller.status().suppressed,
+                "must not suppress before the success-loop threshold is reached"
+            );
+        }
+
+        // The threshold-th success within the window trips suppression even
+        // though there were zero failures.
+        let guard = controller
+            .try_acquire(path)
+            .expect("final pre-suppression acquire must be admitted");
+        drop(guard);
+        controller.report_success(path);
+
+        let status = controller.status();
+        assert!(
+            status.suppressed,
+            "a non-convergent succeed-then-recorrupt loop must arm suppression"
+        );
+        assert_eq!(
+            status.consecutive_failures, 0,
+            "success-loop suppression must not invent phantom failures"
+        );
+        assert!(
+            status.successes_in_window
+                >= RecoveryAdmissionController::MAX_SUCCESSFUL_RECONSTRUCTS_IN_WINDOW,
+            "the success window must reflect the recurring rebuilds"
+        );
+        assert!(
+            controller.try_acquire(path).is_none(),
+            "further reconstruct attempts on the looping path must be refused while suppressed"
+        );
+    }
+
+    #[test]
+    fn recovery_admission_isolated_success_does_not_suppress() {
+        // A single (or sparse) successful recovery is the normal healthy
+        // outcome and must never suppress.
+        let controller = RecoveryAdmissionController::new();
+        let path = Path::new("/tmp/healthy-mailbox.sqlite3");
+
+        let guard = controller.try_acquire(path).expect("admit");
+        drop(guard);
+        controller.report_success(path);
+
+        let status = controller.status();
+        assert!(!status.suppressed, "one success must never suppress");
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(
+            controller.try_acquire(path).is_some(),
+            "a converging path must keep admitting recovery"
+        );
+    }
+
+    #[test]
+    fn recovery_admission_success_on_new_path_resets_success_window() {
+        // Successes that rotate to a different path must not accumulate into a
+        // false non-convergence verdict on the new path.
+        let controller = RecoveryAdmissionController::new();
+        let path_a = Path::new("/tmp/mailbox-a.sqlite3");
+        let path_b = Path::new("/tmp/mailbox-b.sqlite3");
+
+        for _ in 0..(RecoveryAdmissionController::MAX_SUCCESSFUL_RECONSTRUCTS_IN_WINDOW - 1) {
+            let guard = controller.try_acquire(path_a).expect("admit a");
+            drop(guard);
+            controller.report_success(path_a);
+        }
+        // Switch to a different path: its window starts fresh.
+        let guard = controller.try_acquire(path_b).expect("admit b");
+        drop(guard);
+        controller.report_success(path_b);
+        assert!(
+            !controller.status().suppressed,
+            "a single success on a newly-seen path must not inherit another path's count"
         );
     }
 

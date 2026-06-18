@@ -1075,7 +1075,12 @@ pub struct RecoveryAdmissionSnapshot {
     pub consecutive_failures: u32,
     /// Number of recovery attempts within the current sliding window.
     pub attempts_in_window: usize,
-    /// Whether loop suppression is active (too many failures).
+    /// Number of *successful* recoveries for the active path within the current
+    /// sliding window. A high count signals a non-convergent reconstruct loop
+    /// (recovery keeps succeeding then re-corrupting under concurrent writers).
+    pub successes_in_window: usize,
+    /// Whether loop suppression is active (too many failures, or a
+    /// non-convergent succeed-then-recorrupt loop).
     pub suppressed: bool,
 }
 
@@ -4009,11 +4014,13 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
         || adm.suppressed
         || adm.in_progress
         || adm.attempts_in_window > 0
+        || adm.successes_in_window > 1
     {
         Some(RecoveryAdmissionSnapshot {
             in_progress: adm.in_progress,
             consecutive_failures: adm.consecutive_failures,
             attempts_in_window: adm.attempts_in_window,
+            successes_in_window: adm.successes_in_window,
             suppressed: adm.suppressed,
         })
     } else {
@@ -4037,7 +4044,12 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     }
     if adm.suppressed {
         stall_detected = true;
-        stall_reasons.push("admission controller suppressed after repeated failures");
+        if adm.consecutive_failures == 0 && adm.successes_in_window > 1 {
+            stall_reasons
+                .push("admission controller suppressed after a non-convergent reconstruct loop");
+        } else {
+            stall_reasons.push("admission controller suppressed after repeated failures");
+        }
     }
     if matches!(
         dw_status.pressure,
@@ -4067,10 +4079,17 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
                     "Recovery lock is stale (process exited); run `am doctor repair` to restart"
                         .to_string()
                 } else if adm.suppressed {
-                    format!(
-                        "Recovery suppressed after {} consecutive failures; run `am doctor repair --yes` to override",
-                        adm.consecutive_failures,
-                    )
+                    if adm.consecutive_failures == 0 && adm.successes_in_window > 1 {
+                        format!(
+                            "Recovery suppressed after a non-convergent reconstruct loop ({} successful rebuilds re-corrupted in the window); quiesce writers, then run `am doctor reconstruct --yes` / `am doctor repair --yes`",
+                            adm.successes_in_window,
+                        )
+                    } else {
+                        format!(
+                            "Recovery suppressed after {} consecutive failures; run `am doctor repair --yes` to override",
+                            adm.consecutive_failures,
+                        )
+                    }
                 } else if let Some(age) = elapsed_secs {
                     format!(
                         "Recovery has been running for {} without completing; investigate lock holder or run `am doctor repair --yes`",
@@ -25351,6 +25370,7 @@ mod tests {
                 in_progress: true,
                 consecutive_failures: 2,
                 attempts_in_window: 3,
+                successes_in_window: 0,
                 suppressed: false,
             }),
         };
@@ -25437,6 +25457,7 @@ mod tests {
                 in_progress: false,
                 consecutive_failures: 5,
                 attempts_in_window: 5,
+                successes_in_window: 0,
                 suppressed: true,
             }),
         };
