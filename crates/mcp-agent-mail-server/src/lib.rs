@@ -19579,9 +19579,12 @@ first body
             "file-backed conflict resolution should remove the row from open/executed lookup; got {open:?}",
         );
 
-        let verify =
-            mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
-                .expect("open canonical verification connection");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7), so the
+        // raw verification reads it rather than the primary mailbox file.
+        let atc_sidecar_path =
+            mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&db_path.to_string_lossy());
+        let verify = mcp_agent_mail_db::CanonicalDbConn::open_file(atc_sidecar_path.as_str())
+            .expect("open canonical verification connection");
         let rows = verify
             .query_sync(
                 "SELECT state, outcome_json FROM atc_experiences WHERE experience_id = ?",

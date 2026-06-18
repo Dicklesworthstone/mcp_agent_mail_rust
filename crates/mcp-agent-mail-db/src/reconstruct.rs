@@ -169,17 +169,6 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
     apply_snapshot_migrations(conn, schema::schema_migrations_base(), "base")
 }
 
-fn apply_atc_runtime_followup_after_snapshot(conn: &DbConn) -> DbResult<()> {
-    apply_snapshot_migrations(
-        conn,
-        schema::schema_migrations_runtime_canonical_followup()
-            .into_iter()
-            .filter(|migration| schema::is_atc_runtime_canonical_migration(&migration.id))
-            .collect(),
-        "ATC runtime followup",
-    )
-}
-
 /// Statistics returned after a reconstruction attempt.
 #[derive(Debug, Clone, Default)]
 pub struct ReconstructStats {
@@ -1323,12 +1312,12 @@ fn reconstruct_from_archive_impl(
             }
         }
 
-        // Replay only the ATC runtime follow-up subset after the archive
-        // payload is loaded. Reconstruct intentionally leaves FTS-backed
-        // message trigger follow-ups to the next live startup, but the ATC
-        // schema family must exist immediately so the rebuilt database matches
-        // the live-server ATC contract.
-        apply_atc_runtime_followup_after_snapshot(&conn)?;
+        // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
+        // is NOT part of the Git archive (br-bvq1x.11.7). Reconstruct rebuilds
+        // only the primary mailbox DB from the archive, so it intentionally
+        // materializes NO atc_* tables here — the sidecar is independent and
+        // untouched by reconstruct/quarantine. Reconstruct intentionally also
+        // leaves FTS-backed message trigger follow-ups to the next live startup.
 
         // Rebuild all index b-trees to ensure consistency after bulk inserts.
         conn.execute_raw("REINDEX;")
@@ -3776,78 +3765,12 @@ fn merge_salvaged_database(
             sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
         }
 
-        if table_exists(&salvage_conn, "atc_experience_rollups")? {
-            let rollup_cols = table_columns(&salvage_conn, "atc_experience_rollups")?;
-            let has_stratum = rollup_cols
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case("stratum_key"));
-            if has_stratum {
-                let rollup_rows = salvage_conn
-                    .query_sync(
-                        "SELECT stratum_key, total_count, resolved_count, censored_count, \
-                         expired_count, correct_count, incorrect_count, total_regret, total_loss, \
-                         ewma_loss, ewma_weight FROM atc_experience_rollups ORDER BY stratum_key",
-                        &[],
-                    )
-                    .unwrap_or_default();
-                let now_ts = crate::timestamps::now_micros();
-                for row in &rollup_rows {
-                    let stratum_key = row.get_named::<String>("stratum_key").unwrap_or_default();
-                    if stratum_key.is_empty() {
-                        continue;
-                    }
-                    let total = row.get_named::<i64>("total_count").unwrap_or(0);
-                    let resolved = row.get_named::<i64>("resolved_count").unwrap_or(0);
-                    let censored = row.get_named::<i64>("censored_count").unwrap_or(0);
-                    let expired = row.get_named::<i64>("expired_count").unwrap_or(0);
-                    let correct = row.get_named::<i64>("correct_count").unwrap_or(0);
-                    let incorrect = row.get_named::<i64>("incorrect_count").unwrap_or(0);
-                    let regret = row.get_named::<f64>("total_regret").unwrap_or(0.0);
-                    let loss = row.get_named::<f64>("total_loss").unwrap_or(0.0);
-                    let ewma = row.get_named::<f64>("ewma_loss").unwrap_or(0.0);
-                    let weight = row.get_named::<f64>("ewma_weight").unwrap_or(0.0);
-                    let upsert_result = target_conn.execute_sync(
-                        "INSERT INTO atc_experience_rollups \
-                         (stratum_key, subsystem, effect_kind, risk_tier, \
-                          total_count, resolved_count, censored_count, expired_count, \
-                          correct_count, incorrect_count, total_regret, total_loss, \
-                          ewma_loss, ewma_weight, delay_sum_micros, delay_count, delay_max_micros, \
-                          last_updated_ts) \
-                         VALUES (?, '', '', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?) \
-                         ON CONFLICT(stratum_key) DO UPDATE SET \
-                          total_count = MAX(total_count, excluded.total_count), \
-                          resolved_count = MAX(resolved_count, excluded.resolved_count), \
-                          censored_count = MAX(censored_count, excluded.censored_count), \
-                          expired_count = MAX(expired_count, excluded.expired_count), \
-                          correct_count = MAX(correct_count, excluded.correct_count), \
-                          incorrect_count = MAX(incorrect_count, excluded.incorrect_count), \
-                          total_regret = MAX(total_regret, excluded.total_regret), \
-                          total_loss = MAX(total_loss, excluded.total_loss), \
-                          ewma_loss = CASE WHEN excluded.ewma_weight > ewma_weight \
-                                      THEN excluded.ewma_loss ELSE ewma_loss END, \
-                          ewma_weight = MAX(ewma_weight, excluded.ewma_weight), \
-                          last_updated_ts = MAX(last_updated_ts, excluded.last_updated_ts)",
-                        &[
-                            Value::Text(stratum_key),
-                            Value::BigInt(total),
-                            Value::BigInt(resolved),
-                            Value::BigInt(censored),
-                            Value::BigInt(expired),
-                            Value::BigInt(correct),
-                            Value::BigInt(incorrect),
-                            Value::Double(regret),
-                            Value::Double(loss),
-                            Value::Double(ewma),
-                            Value::Double(weight),
-                            Value::BigInt(now_ts),
-                        ],
-                    );
-                    if upsert_result.is_ok() {
-                        stats.rollups_salvaged += 1;
-                    }
-                }
-            }
-        }
+        // ATC telemetry now lives in the independent sidecar DB (atc.sqlite3),
+        // which salvage/reconstruct never replaces (br-bvq1x.11.7). The rebuilt
+        // primary mailbox DB has no atc_* tables, so there is nothing to salvage
+        // here; the sidecar's rollups persist untouched across recovery and ATC
+        // telemetry is, by design, droppable/resettable. `rollups_salvaged`
+        // therefore stays 0.
 
         target_conn
             .execute_raw("REINDEX;")
@@ -4750,10 +4673,17 @@ mod tests {
             "reconstructed database should be healthy for canonical sqlite",
         );
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        // ATC telemetry now lives in the dedicated sidecar DB (atc.sqlite3),
+        // which is independent of the Git archive and untouched by reconstruct
+        // (br-bvq1x.11.7). The rebuilt primary mailbox DB must therefore contain
+        // NO atc_* tables.
+        // `_` in LIKE matches the literal underscore here (no ESCAPE needed);
+        // there are no non-`atc_` tables that would be falsely matched, and the
+        // assertion only cares that the set is empty.
         let atc_tables = conn
             .query_sync(
                 "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('atc_experiences', 'atc_experience_rollups') \
+                 WHERE type = 'table' AND name LIKE 'atc_%' \
                  ORDER BY name",
                 &[],
             )
@@ -4761,32 +4691,11 @@ mod tests {
             .into_iter()
             .filter_map(|row| row.get_named::<String>("name").ok())
             .collect::<Vec<_>>();
-        assert_eq!(
-            atc_tables,
-            vec![
-                "atc_experience_rollups".to_string(),
-                "atc_experiences".to_string()
-            ],
-            "reconstruct should materialize ATC base tables required by the live server"
+        assert!(
+            atc_tables.is_empty(),
+            "reconstruct must NOT materialize atc_* tables in the primary mailbox DB \
+             (ATC telemetry is isolated in the atc.sqlite3 sidecar); found: {atc_tables:?}"
         );
-        let rollup_columns = conn
-            .query_sync("PRAGMA table_info(atc_experience_rollups)", &[])
-            .expect("query ATC rollup columns")
-            .into_iter()
-            .filter_map(|row| row.get_named::<String>("name").ok())
-            .collect::<HashSet<_>>();
-        for required in [
-            "ewma_loss",
-            "ewma_weight",
-            "delay_sum_micros",
-            "delay_count",
-            "delay_max_micros",
-        ] {
-            assert!(
-                rollup_columns.contains(required),
-                "reconstruct should preserve ATC rollup column {required}"
-            );
-        }
     }
 
     #[test]

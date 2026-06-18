@@ -13507,8 +13507,10 @@ fn format_atc_json_value(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string())
 }
 
+// ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); this reads
+// them through a canonical connection to that sidecar.
 fn query_atc_decision_rows(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
     decision_id: u64,
 ) -> CliResult<Vec<mcp_agent_mail_db::sqlmodel_core::Row>> {
     let sql_decision_id = i64::try_from(decision_id).map_err(|_| {
@@ -14039,8 +14041,10 @@ fn parse_atc_simulation_timestamp(value: &str, end_of_day: bool) -> CliResult<(i
     )))
 }
 
+// ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); the
+// sequence-range probe reads them through a canonical sidecar connection.
 fn query_atc_simulation_sequence_range(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
     since_micros: i64,
     until_micros: Option<i64>,
 ) -> CliResult<Option<mcp_agent_mail_db::SequenceRange>> {
@@ -14407,8 +14411,20 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
     match action {
         AtcCommand::Explain { decision_id, json } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-            let opened = open_atc_explain_read_db_with_database_url(&cfg.database_url)?;
-            let rows = query_atc_decision_rows(opened.conn(), decision_id)?;
+            // Preserve the precondition that the mailbox DB is openable (fail
+            // fast with the usual diagnostics if not), but read ATC telemetry
+            // from the sidecar, which is independent of the mailbox DB
+            // (br-bvq1x.11.7). No sidecar => no ATC history => decision not found.
+            let _opened = open_atc_explain_read_db_with_database_url(&cfg.database_url)?;
+            let atc_conn = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                .ok()
+                .and_then(|resolved| {
+                    mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(&resolved.canonical_path)
+                });
+            let rows = match atc_conn.as_ref() {
+                Some(conn) => query_atc_decision_rows(conn, decision_id)?,
+                None => Vec::new(),
+            };
             if rows.is_empty() {
                 let payload = serde_json::json!({
                     "decision_id": decision_id,
@@ -14457,12 +14473,20 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
                 &cfg.database_url,
                 Some(config.storage_root.as_path()),
             )?;
-            let range = query_atc_simulation_sequence_range(
-                read_db.conn(),
-                since_micros,
-                until_pair.as_ref().map(|(micros, _)| *micros),
-            )?
-            .unwrap_or_default();
+            // The replay below reads ATC through the pool's chokepoint (sidecar),
+            // but the experience-id range probe needs the sidecar directly
+            // (br-bvq1x.11.7). No sidecar => empty range.
+            let range = match mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(
+                read_db.pool().sqlite_path(),
+            ) {
+                Some(atc_conn) => query_atc_simulation_sequence_range(
+                    &atc_conn,
+                    since_micros,
+                    until_pair.as_ref().map(|(micros, _)| *micros),
+                )?
+                .unwrap_or_default(),
+                None => mcp_agent_mail_db::SequenceRange::default(),
+            };
 
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
@@ -14509,12 +14533,43 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
             let config = Config::from_env();
             let _mailbox_mutation_locks =
                 acquire_cli_mailbox_mutation_locks(&cfg.database_url, Some(&config.storage_root))?;
-            let conn = open_db_sync_with_database_url_and_storage_root_locked(
+            // Preserve the mailbox-openable precondition (recovery/diagnostics),
+            // but reprocess ATC payloads in the sidecar DB, which is independent
+            // of the mailbox DB (br-bvq1x.11.7).
+            let _conn = open_db_sync_with_database_url_and_storage_root_locked(
                 &cfg.database_url,
                 Some(&config.storage_root),
             )?;
+            let atc_conn = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                .ok()
+                .and_then(|resolved| {
+                    mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(&resolved.canonical_path)
+                });
+            let Some(atc_conn) = atc_conn else {
+                // No ATC sidecar (telemetry never written) => nothing to reprocess.
+                if json {
+                    output::emit_output(
+                        &serde_json::json!({
+                            "project_key": project_key.clone(),
+                            "subject": subject.clone(),
+                            "limit": limit,
+                            "summary": {
+                                "scanned": 0, "updated": 0, "unchanged": 0, "dry_run": dry_run,
+                            },
+                            "note": "no ATC telemetry sidecar present; nothing to reprocess",
+                        }),
+                        output::CliOutputFormat::Json,
+                        || {},
+                    );
+                } else {
+                    ftui_runtime::ftui_println!(
+                        "ATC feature reprocess: no ATC telemetry sidecar present; nothing to reprocess."
+                    );
+                }
+                return Ok(());
+            };
             let summary = mcp_agent_mail_db::queries::reprocess_atc_feature_schema(
-                &conn,
+                &atc_conn,
                 project_key.as_deref(),
                 subject.as_deref(),
                 limit,

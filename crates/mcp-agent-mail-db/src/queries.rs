@@ -782,9 +782,8 @@ pub const ACTIVE_RESERVATION_PREDICATE: &str = "(
               '0',''),'1',''),'2',''),'3',''),'4',''),'5',''),'6',''),'7',''),'8',''),'9',''),'.',''),'+',''),'-','') = '' \
         AND CAST(trim(file_reservations.released_ts) AS REAL) <= 0)
     ) \
-    AND NOT EXISTS (
-        SELECT 1 FROM file_reservation_releases
-        WHERE reservation_id = file_reservations.id
+    AND file_reservations.id NOT IN (
+        SELECT reservation_id FROM file_reservation_releases
     )
 )";
 
@@ -1191,8 +1190,10 @@ pub struct AtcFeatureSchemaReprocessSummary {
 }
 
 /// Reprocess persisted ATC feature payloads to the current schema contract.
+// ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); the
+// reprocess operates on a canonical connection to that sidecar.
 pub fn reprocess_atc_feature_schema(
-    conn: &crate::DbConn,
+    conn: &crate::CanonicalDbConn,
     project_key: Option<&str>,
     subject: Option<&str>,
     limit: usize,
@@ -1339,6 +1340,32 @@ pub(crate) async fn ensure_file_backed_atc_pool_initialized(
         Ok(conn) => conn,
         Err(error) => return Outcome::Err(error),
     };
+    // On first init the sidecar is a brand-new on-disk file; place it in WAL
+    // mode to match the mail DB's durability/concurrency posture. journal_mode
+    // is DB-wide and is intentionally omitted from PRAGMA_CONN_SETTINGS_SQL, so
+    // it must be applied here once during sidecar creation.
+    if let Err(error) = conn.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL) {
+        close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
+        return Outcome::Err(DbError::Sqlite(format!(
+            "initialize canonical ATC schema: set sidecar db pragmas failed: {error}"
+        )));
+    }
+    // Keep the sidecar private (0600): like storage.sqlite3 it carries project
+    // keys, subjects, and evidence summaries (br-bvq1x.11.7). Best-effort — a
+    // chmod failure must not block ATC telemetry.
+    #[cfg(unix)]
+    if let Some(atc_path) = pool.atc_sqlite_path() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(&atc_path, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!(
+                path = %atc_path,
+                error = %error,
+                "failed to restrict ATC sidecar permissions to 0600"
+            );
+        }
+    }
     let migration_result = crate::schema::migrate_atc_runtime_canonical_followup(cx, &conn).await;
     close_canonical_db_conn(conn, "initialize canonical ATC schema connection");
 
@@ -1921,7 +1948,17 @@ pub(crate) fn open_canonical_atc_conn(
     pool: &DbPool,
     purpose: &'static str,
 ) -> std::result::Result<crate::CanonicalDbConn, DbError> {
-    let conn = crate::CanonicalDbConn::open_file(pool.sqlite_path())
+    // ATC telemetry tables are isolated into a sidecar DB (atc.sqlite3), a
+    // sibling of the mailbox DB, so ATC churn/bloat/corruption can never reach
+    // storage.sqlite3's VACUUM/integrity/backup/size (br-bvq1x.11.7). The
+    // sidecar is opened only through canonical SQLite, which sidesteps the
+    // FrankenConnection page-corruption bug (br-q37ep) entirely.
+    let atc_path = pool.atc_sqlite_path().ok_or_else(|| {
+        DbError::Internal(format!(
+            "{purpose}: canonical ATC connection requested for an in-memory pool"
+        ))
+    })?;
+    let conn = crate::CanonicalDbConn::open_file(atc_path.as_str())
         .map_err(|error| DbError::Sqlite(format!("{purpose}: open failed: {error}")))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
         .map_err(|error| DbError::Sqlite(format!("{purpose}: init pragmas failed: {error}")))?;
@@ -14041,22 +14078,18 @@ mod tests {
                 "store-assigned id must be populated"
             );
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(41), Value::BigInt(99)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7); count them
+            // through a canonical connection to it.
+            let atc_conn = open_canonical_atc_conn(&pool, "count idempotent atc experiences")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(41), Value::BigInt(99)],
+                "count idempotent atc experiences",
             )
-            .into_result()
             .expect("count atc experiences");
+            close_canonical_db_conn(atc_conn, "count idempotent atc experiences");
 
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
@@ -14132,22 +14165,17 @@ mod tests {
                 })
             ));
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(777), Value::BigInt(888)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7).
+            let atc_conn = open_canonical_atc_conn(&pool, "count after rejected insert")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(777), Value::BigInt(888)],
+                "count after rejected insert",
             )
-            .into_result()
             .expect("count experiences after rejected insert");
+            close_canonical_db_conn(atc_conn, "count after rejected insert");
             assert_eq!(rows.first().and_then(row_first_i64), Some(0));
         });
     }
@@ -14180,22 +14208,17 @@ mod tests {
 
             assert_eq!(first, second, "duplicate insert must return the same id");
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(901), Value::BigInt(902)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7).
+            let atc_conn = open_canonical_atc_conn(&pool, "count duplicate inserts")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(901), Value::BigInt(902)],
+                "count duplicate inserts",
             )
-            .into_result()
             .expect("count duplicate inserts");
+            close_canonical_db_conn(atc_conn, "count duplicate inserts");
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
     }
@@ -14318,7 +14341,12 @@ mod tests {
             );
         });
 
-        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7); seed
+        // and verify them through a canonical connection to that sidecar.
+        let conn = crate::CanonicalDbConn::open_file(
+            crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref()).as_str(),
+        )
+        .expect("open ATC sidecar");
         let rows = conn
             .query_sync(
                 "SELECT feature_schema_version, features_json, feature_ext_json \
@@ -14355,7 +14383,12 @@ mod tests {
         let (cx, pool, dir) = setup_test_pool("fetch_legacy_atc_feature_schema.db");
         let db_path = dir.path().join("fetch_legacy_atc_feature_schema.db");
 
-        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7); seed
+        // and verify them through a canonical connection to that sidecar.
+        let conn = crate::CanonicalDbConn::open_file(
+            crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref()).as_str(),
+        )
+        .expect("open ATC sidecar");
         conn.execute_sync(
             "INSERT INTO atc_experiences (\
                 experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
@@ -14448,7 +14481,12 @@ mod tests {
     fn reprocess_atc_feature_schema_rewrites_legacy_rows() {
         let (_cx, _pool, dir) = setup_test_pool("reprocess_atc_feature_schema.db");
         let db_path = dir.path().join("reprocess_atc_feature_schema.db");
-        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        // ATC experiences are isolated in the sidecar DB (br-bvq1x.11.7); seed
+        // and verify them through a canonical connection to that sidecar.
+        let conn = crate::CanonicalDbConn::open_file(
+            crate::pool::atc_sidecar_sqlite_path(db_path.to_string_lossy().as_ref()).as_str(),
+        )
+        .expect("open ATC sidecar");
 
         conn.execute_sync(
             "INSERT INTO atc_experiences (\
@@ -14702,24 +14740,20 @@ mod tests {
             .into_result()
             .expect("same-state suppressed retry");
 
-            let conn = acquire_conn(&cx, &pool)
-                .await
-                .into_result()
-                .expect("acquire verify conn");
-            let tracked = tracked(&*conn);
-            let rows = map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &tracked,
-                    &format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1"),
-                    &[Value::BigInt(
-                        i64::try_from(stored.experience_id).expect("experience id"),
-                    )],
-                )
-                .await,
+            // ATC experiences are isolated in the sidecar (br-bvq1x.11.7); verify
+            // through a canonical connection to it.
+            let atc_conn = open_canonical_atc_conn(&pool, "verify transition merged context")
+                .expect("open atc sidecar verify conn");
+            let rows = canonical_query_atc_rows(
+                &atc_conn,
+                &format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1"),
+                &[Value::BigInt(
+                    i64::try_from(stored.experience_id).expect("experience id"),
+                )],
+                "verify transition merged context",
             )
-            .into_result()
             .expect("query stored experience");
+            close_canonical_db_conn(atc_conn, "verify transition merged context");
             let stored = decode_atc_experience_row(rows.first().expect("stored row"))
                 .expect("decode stored experience");
 
@@ -14766,8 +14800,6 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 Some("suppressed")
             );
-
-            drop(conn);
 
             let invalid = transition_atc_experience(
                 &cx,
@@ -14855,23 +14887,21 @@ mod tests {
                 .into_result()
                 .expect("append seed experience");
 
-            let stale_conn = acquire_conn(&cx, &stale_pool)
-                .await
-                .into_result()
-                .expect("acquire stale snapshot connection");
-            let stale_tracked = tracked(&*stale_conn);
-            map_sql_outcome(
-                traw_query(
-                    &cx,
-                    &stale_tracked,
-                    "SELECT experience_id FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
-                    &[Value::BigInt(900), Value::BigInt(900)],
-                )
-                .await,
+            // ATC experiences live in the sidecar (br-bvq1x.11.7); prime a prior
+            // reader against it. Canonical connections are opened fresh per ATC
+            // op, so the transition below cannot inherit a stale snapshot from
+            // this reader — but we still exercise a prior reader to confirm the
+            // later transition observes the committed seed.
+            let stale_conn = open_canonical_atc_conn(&stale_pool, "prime stale atc reader")
+                .expect("open atc sidecar stale reader");
+            canonical_query_atc_rows(
+                &stale_conn,
+                "SELECT experience_id FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(900), Value::BigInt(900)],
+                "prime stale atc reader",
             )
-            .into_result()
             .expect("seed stale snapshot");
-            drop(stale_conn);
+            close_canonical_db_conn(stale_conn, "prime stale atc reader");
 
             let target = ExperienceRow {
                 experience_id: 0,
@@ -15307,6 +15337,143 @@ mod tests {
                 .expect("sqlite quick_check should succeed"),
             "reconstructed database must stay healthy after runtime ATC writes"
         );
+    }
+
+    /// br-bvq1x.11.7: ATC telemetry is isolated in the `atc.sqlite3` sidecar.
+    /// Verifies the chokepoint redirect (create + write + read on the sidecar),
+    /// that the primary mailbox DB never holds `atc_*` tables, and that the
+    /// sidecar is created with private (0600) permissions.
+    #[test]
+    fn atc_telemetry_is_isolated_in_sidecar_and_absent_from_main_db() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        // The sidecar path is the sibling atc.sqlite3.
+        let atc_path = pool
+            .atc_sqlite_path()
+            .expect("file-backed pool exposes a sidecar path");
+        assert!(
+            atc_path.ends_with("atc.sqlite3"),
+            "sidecar path should be atc.sqlite3: {atc_path}"
+        );
+        assert_ne!(atc_path, db_path.display().to_string());
+
+        let list_atc_tables = |path: &str| -> Vec<String> {
+            let conn =
+                crate::CanonicalDbConn::open_file(path).expect("open db for atc table probe");
+            let rows = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name LIKE 'atc\\_%' ESCAPE '\\' ORDER BY name",
+                    &[],
+                )
+                .expect("query atc tables");
+            rows.into_iter()
+                .filter_map(|r| r.get_named::<String>("name").ok())
+                .collect()
+        };
+
+        // After init, the primary mailbox DB must have NO atc_* tables.
+        assert!(
+            list_atc_tables(db_path.to_str().expect("utf8 db path")).is_empty(),
+            "primary mailbox DB must not contain atc_* tables after init"
+        );
+
+        let row = ExperienceRow {
+            experience_id: 0,
+            decision_id: 777,
+            effect_id: 888,
+            trace_id: "trc-sidecar-iso".to_string(),
+            claim_id: "clm-sidecar-iso".to_string(),
+            evidence_id: "evi-sidecar-iso".to_string(),
+            state: ExperienceState::Planned,
+            subsystem: ExperienceSubsystem::Liveness,
+            decision_class: "liveness_transition".to_string(),
+            subject: "TealOtter".to_string(),
+            project_key: Some("/tmp/sidecar-iso".to_string()),
+            policy_id: Some("liveness-incumbent-r1".to_string()),
+            effect_kind: EffectKind::Probe,
+            action: "ProbeAgent".to_string(),
+            posterior: vec![("Alive".to_string(), 0.6), ("Dead".to_string(), 0.4)],
+            expected_loss: 1.0,
+            runner_up_action: Some("DeferProbe".to_string()),
+            runner_up_loss: Some(1.4),
+            evidence_summary: "sidecar isolation probe".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: None,
+            created_ts_micros: 1_700_000_300_000_000,
+            dispatched_ts_micros: None,
+            executed_ts_micros: None,
+            resolved_ts_micros: None,
+            features: Some(FeatureVector::zeroed()),
+            feature_ext: None,
+            context: None,
+        };
+        let stored_id = rt
+            .block_on(insert_experience(&cx, &pool, row))
+            .into_result()
+            .expect("insert ATC experience");
+        assert!(stored_id > 0, "experience id should be assigned");
+
+        // The write must land in the sidecar, which now exists with the schema.
+        assert!(
+            std::path::Path::new(&atc_path).exists(),
+            "sidecar file must exist after the first ATC write"
+        );
+        let sidecar_tables = list_atc_tables(&atc_path);
+        assert!(
+            sidecar_tables.contains(&"atc_experiences".to_string()),
+            "sidecar must contain atc_experiences: {sidecar_tables:?}"
+        );
+
+        // Read back through the chokepoint (also targets the sidecar).
+        let fetched = rt
+            .block_on(fetch_durable_atc_experience_by_id(
+                &cx,
+                &pool,
+                i64::try_from(stored_id).expect("id fits i64"),
+            ))
+            .into_result()
+            .expect("fetch ATC experience");
+        assert!(
+            fetched.is_some(),
+            "experience must be readable from the sidecar"
+        );
+
+        // The primary mailbox DB stays free of atc_* tables after ATC writes.
+        assert!(
+            list_atc_tables(db_path.to_str().expect("utf8 db path")).is_empty(),
+            "primary mailbox DB must remain free of atc_* tables after ATC writes"
+        );
+
+        // The sidecar is created private (0600) — same sensitivity as the mail DB.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&atc_path)
+                .expect("stat sidecar")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "ATC sidecar must be created with 0600 perms");
+        }
     }
 
     #[test]
@@ -22306,15 +22473,34 @@ mod tests {
         );
         assert!(select_sql.contains("expires_ts <= ?"));
         assert!(!select_sql.contains("expires_ts < ?"));
-        assert!(select_sql.contains("NOT EXISTS"));
+        // #154 item 1: the release-ledger exclusion is an uncorrelated anti-join
+        // (`id NOT IN (SELECT reservation_id ...)`), not a correlated `NOT EXISTS`
+        // subquery FrankenSQLite routes to its slow in-memory interpreter.
+        assert!(select_sql.contains("NOT IN"));
+        assert!(!select_sql.contains("NOT EXISTS"));
     }
 
     #[test]
     fn active_reservation_predicate_for_alias_retargets_release_ledger_probe() {
         let aliased = active_reservation_predicate_for("fr");
-        assert!(aliased.contains("reservation_id = fr.id"));
-        assert!(!aliased.contains("reservation_id = file_reservations.id"));
+        // The uncorrelated ledger anti-join is retargeted to the alias.
+        assert!(aliased.contains("fr.id NOT IN"));
+        assert!(!aliased.contains("file_reservations.id NOT IN"));
+        assert!(aliased.contains("SELECT reservation_id FROM file_reservation_releases"));
         assert!(aliased.contains("fr.released_ts IS NULL"));
+    }
+
+    #[test]
+    fn active_reservation_predicate_avoids_correlated_subquery() {
+        // The correlated `NOT EXISTS (... WHERE reservation_id = file_reservations.id)`
+        // form degraded to ~5s on a 30k-row mailbox under FrankenSQLite (#154
+        // item 1: routed to the in-memory interpreter). The uncorrelated set
+        // form materializes the released set once.
+        assert!(ACTIVE_RESERVATION_PREDICATE.contains(
+            "file_reservations.id NOT IN (\n        SELECT reservation_id FROM file_reservation_releases"
+        ));
+        assert!(!ACTIVE_RESERVATION_PREDICATE.contains("NOT EXISTS"));
+        assert!(!ACTIVE_RESERVATION_PREDICATE.contains("WHERE reservation_id ="));
     }
 
     #[test]

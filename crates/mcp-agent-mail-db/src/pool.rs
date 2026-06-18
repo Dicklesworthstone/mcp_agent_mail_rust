@@ -2201,6 +2201,24 @@ impl DbPool {
         &self.sqlite_path
     }
 
+    /// Path to the ATC telemetry sidecar database (`atc.sqlite3`), a sibling of
+    /// the primary mailbox DB.
+    ///
+    /// ATC experience/rollup/lease/snapshot tables are isolated into this
+    /// separate SQLite file (br-bvq1x.11.7) so that ATC churn, bloat, or
+    /// corruption can never affect the mail DB's VACUUM/integrity/backup/size.
+    /// The sidecar is pure telemetry: trivially droppable and rebuildable.
+    ///
+    /// Returns `None` for `:memory:` pools, where ATC tables remain co-located
+    /// in the in-memory mailbox database.
+    #[must_use]
+    pub fn atc_sqlite_path(&self) -> Option<String> {
+        if self.sqlite_path == ":memory:" {
+            return None;
+        }
+        Some(atc_sidecar_sqlite_path(&self.sqlite_path))
+    }
+
     #[must_use]
     pub fn storage_root(&self) -> &std::path::Path {
         &self.storage_root
@@ -3459,6 +3477,42 @@ fn sqlite_init_gate(sqlite_path: &str, storage_root: &Path) -> Arc<OnceCell<()>>
     gate
 }
 
+/// The legacy ATC telemetry tables that, as of br-bvq1x.11.7, are isolated into
+/// the sidecar DB (`atc.sqlite3`) and must not remain in the primary mailbox DB.
+pub(crate) const LEGACY_ATC_MAIN_TABLES: [&str; 4] = [
+    "atc_experiences",
+    "atc_experience_rollups",
+    "atc_leader_lease",
+    "atc_rollup_snapshots",
+];
+
+/// Drop the legacy ATC telemetry tables from the primary mailbox DB.
+///
+/// As of br-bvq1x.11.7, ATC experience/rollup/lease/snapshot tables live in a
+/// dedicated sidecar (`atc.sqlite3`). On existing installs the primary DB may
+/// still hold these tables — frequently the dominant on-disk bloat. Dropping
+/// them frees the pages on the next VACUUM and keeps the primary DB free of
+/// `atc_*` tables. Returns `true` if any table was present and dropped.
+/// Idempotent: a no-op (returning `false`) once the tables are gone.
+#[allow(clippy::result_large_err)]
+fn drop_legacy_atc_tables_from_canonical(conn: &crate::CanonicalDbConn) -> Result<bool, SqlError> {
+    let mut dropped_any = false;
+    for table in LEGACY_ATC_MAIN_TABLES {
+        let rows = conn
+            .query_sync(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[Value::Text(table.to_string())],
+            )
+            .map_err(|err| SqlError::Custom(format!("probe legacy atc table {table}: {err}")))?;
+        if !rows.is_empty() {
+            conn.execute_raw(&format!("DROP TABLE IF EXISTS {table}"))
+                .map_err(|err| SqlError::Custom(format!("drop legacy atc table {table}: {err}")))?;
+            dropped_any = true;
+        }
+    }
+    Ok(dropped_any)
+}
+
 #[allow(clippy::result_large_err)]
 async fn run_sqlite_init_once(
     cx: &Cx,
@@ -3571,11 +3625,25 @@ async fn run_sqlite_init_once(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
 
+        // ATC telemetry now lives in the sidecar DB (atc.sqlite3); drop any
+        // legacy atc_* tables from the primary mailbox DB so existing installs
+        // reclaim their (often dominant) on-disk space on the next VACUUM and
+        // the main DB stays free of atc_* tables (br-bvq1x.11.7). Idempotent.
+        let dropped_legacy_atc = match drop_legacy_atc_tables_from_canonical(&canonical_conn) {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=drop_legacy_atc_tables failed: {err}"
+                )));
+            }
+        };
+
         drop(canonical_conn);
 
-        if full_applied
-            .iter()
-            .any(|id| schema::is_atc_runtime_canonical_migration(id))
+        if (dropped_legacy_atc
+            || full_applied
+                .iter()
+                .any(|id| schema::is_atc_runtime_canonical_migration(id)))
             && let Err(err) = wal_checkpoint_truncate_path(Path::new(sqlite_path))
         {
             return Outcome::Err(SqlError::Custom(format!(
@@ -5011,6 +5079,41 @@ pub(crate) fn sqlite_path_with_file_name_suffix(
         Some(file_name) => path.with_file_name(os_string_with_suffix(file_name, suffix)),
         None => path.with_file_name(fallback),
     }
+}
+
+/// Filename of the ATC telemetry sidecar database (br-bvq1x.11.7).
+pub const ATC_SIDECAR_FILE_NAME: &str = "atc.sqlite3";
+
+/// Derive the ATC sidecar database path from the primary mailbox DB path.
+///
+/// The sidecar lives next to the primary DB (same directory), named
+/// [`ATC_SIDECAR_FILE_NAME`]. Callers must guard against `:memory:`; this
+/// helper assumes a real on-disk primary path.
+#[must_use]
+pub fn atc_sidecar_sqlite_path(primary: &str) -> String {
+    let path = Path::new(primary);
+    let sidecar = path.with_file_name(ATC_SIDECAR_FILE_NAME);
+    sidecar.to_string_lossy().into_owned()
+}
+
+/// Open a canonical (real-SQLite) read connection to the ATC telemetry sidecar
+/// for a given primary mailbox DB path (br-bvq1x.11.7).
+///
+/// ATC experience/rollup tables are isolated in the sidecar, so non-pool
+/// consumers (TUI poller, CLI ATC views, robot fallback) must read them from
+/// there rather than the mailbox connection. Returns `None` for `:memory:`
+/// pools or when the sidecar file does not exist yet (ATC never wrote) — callers
+/// then report empty ATC telemetry.
+#[must_use]
+pub fn open_atc_sidecar_read_conn(primary_sqlite_path: &str) -> Option<crate::CanonicalDbConn> {
+    if primary_sqlite_path == ":memory:" {
+        return None;
+    }
+    let atc_path = atc_sidecar_sqlite_path(primary_sqlite_path);
+    if !Path::new(&atc_path).exists() {
+        return None;
+    }
+    crate::CanonicalDbConn::open_file(atc_path.as_str()).ok()
 }
 
 #[must_use]

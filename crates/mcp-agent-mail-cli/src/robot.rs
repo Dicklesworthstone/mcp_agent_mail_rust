@@ -10668,35 +10668,59 @@ fn fetch_robot_agent_decision_counts(
     if agent_ids.is_empty() {
         return HashMap::new();
     }
+    // ATC experiences live in the sidecar (br-bvq1x.11.7), but agent identity
+    // lives in the mailbox DB — so the historic single-statement JOIN is split:
+    // count decisions per subject in the sidecar, then map subjects to the
+    // requested agent ids via the mailbox connection (preserving the original
+    // exact `agents.name = atc_experiences.subject` match). No sidecar => no
+    // decision history => empty map.
+    let Some(atc_conn) = open_local_atc_sidecar_conn() else {
+        return HashMap::new();
+    };
+    let subject_rows = match atc_conn.query_sync(
+        "SELECT subject, COUNT(*) AS decision_count \
+         FROM atc_experiences \
+         WHERE created_ts >= ? \
+         GROUP BY subject",
+        &[Value::BigInt(window_start)],
+    ) {
+        Ok(rows) => rows,
+        Err(_) => return HashMap::new(),
+    };
+    let mut counts_by_subject: HashMap<String, u64> = HashMap::new();
+    for row in &subject_rows {
+        let subject: String = row.get_named("subject").unwrap_or_default();
+        if subject.is_empty() {
+            continue;
+        }
+        let count = row.get_named::<i64>("decision_count").unwrap_or(0).max(0) as u64;
+        *counts_by_subject.entry(subject).or_insert(0) += count;
+    }
+    if counts_by_subject.is_empty() {
+        return HashMap::new();
+    }
+
     let agent_ids_sql = agent_ids
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT a.id AS agent_id, COUNT(*) AS decision_count \
-         FROM atc_experiences e \
-         JOIN agents a ON a.name = e.subject AND a.project_id = ? \
-         WHERE a.id IN ({agent_ids_sql}) \
-           AND e.created_ts >= ? \
-         GROUP BY a.id"
+        "SELECT id AS agent_id, name FROM agents \
+         WHERE project_id = ? AND id IN ({agent_ids_sql})"
     );
-    conn.query_sync(
-        &sql,
-        &[Value::BigInt(project_id), Value::BigInt(window_start)],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| {
-                (
-                    row.get_named::<i64>("agent_id").unwrap_or(0),
-                    row.get_named::<i64>("decision_count").unwrap_or(0).max(0) as u64,
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    conn.query_sync(&sql, &[Value::BigInt(project_id)])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
+                    let name: String = row.get_named("name").unwrap_or_default();
+                    counts_by_subject.get(&name).map(|count| (agent_id, *count))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn median_micros(values: &mut [u64]) -> u64 {
@@ -11764,6 +11788,27 @@ fn fallback_atc_liveness(silence_secs: i64, probe_interval_secs: i64) -> (&'stat
     }
 }
 
+/// Open a read-only canonical connection to the ATC telemetry sidecar
+/// (`atc.sqlite3`) for `am robot atc` local-fallback queries (br-bvq1x.11.7).
+///
+/// ATC experience/rollup tables are isolated in the sidecar (a sibling of the
+/// mailbox DB), so the local fallback must read them from there rather than the
+/// mailbox connection. Returns `None` when the sidecar does not exist (ATC never
+/// wrote, or the DB is `:memory:`) — callers then report empty ATC telemetry.
+fn open_local_atc_sidecar_conn() -> Option<mcp_agent_mail_db::CanonicalDbConn> {
+    let config = mcp_agent_mail_core::Config::from_env();
+    let resolved =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+    if resolved.canonical_path == ":memory:" {
+        return None;
+    }
+    let atc_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(&resolved.canonical_path);
+    if !Path::new(&atc_path).exists() {
+        return None;
+    }
+    mcp_agent_mail_db::CanonicalDbConn::open_file(atc_path.as_str()).ok()
+}
+
 fn build_local_atc_fallback_snapshot(
     scope: &ResolvedRobotScope,
     focus_agent: Option<&str>,
@@ -11826,7 +11871,12 @@ fn build_local_atc_fallback_snapshot(
     });
 
     let reservation_conflicts = atc_reservation_conflicts(scope, focus_agent)?;
-    let observability = atc_rollup_observability_from_conn(scope.conn())?;
+    // ATC rollups live in the sidecar (br-bvq1x.11.7); read them from there.
+    // No sidecar => no ATC telemetry yet => empty observability.
+    let observability = match open_local_atc_sidecar_conn() {
+        Some(atc_conn) => atc_rollup_observability_from_conn(&atc_conn)?,
+        None => AtcRobotObservability::default(),
+    };
     let note = if config.atc_enabled {
         format!(
             "Live ATC snapshot unavailable; using local DB heuristics with a {}s probe interval.",
@@ -11861,7 +11911,9 @@ fn build_local_atc_fallback_snapshot(
     ))
 }
 
-fn atc_rollup_observability_from_conn(conn: &DbConn) -> Result<AtcRobotObservability, CliError> {
+fn atc_rollup_observability_from_conn(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> Result<AtcRobotObservability, CliError> {
     let rows = match conn.query_sync(
         "SELECT stratum_key, total_count, resolved_count, censored_count, expired_count \
          FROM atc_experience_rollups ORDER BY stratum_key",
@@ -12082,7 +12134,9 @@ fn atc_privacy_count(row: &sqlmodel_core::Row, name: &str) -> u64 {
     row.get_named::<i64>(name).unwrap_or(0).max(0) as u64
 }
 
-fn atc_privacy_report_from_conn(conn: &DbConn) -> Result<AtcPrivacyReportData, CliError> {
+fn atc_privacy_report_from_conn(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> Result<AtcPrivacyReportData, CliError> {
     let candidate_sql = "CASE WHEN \
         contained_suspected_secret = 1 \
         OR privacy_classification IN ('legacy_unclassified', 'redacted_due_to_secret') \
@@ -14940,8 +14994,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let live_endpoint = atc_live_endpoint_from_config(&config);
             let maybe_scope =
                 maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
-            let privacy_report = maybe_scope.as_ref().and_then(|scope| {
-                match atc_privacy_report_from_conn(scope.conn()) {
+            // ATC experiences live in the sidecar (br-bvq1x.11.7); the privacy
+            // report reads them from there. No sidecar => no report.
+            let privacy_report = maybe_scope.as_ref().and_then(|_scope| {
+                let atc_conn = open_local_atc_sidecar_conn()?;
+                match atc_privacy_report_from_conn(&atc_conn) {
                     Ok(report) => Some(report),
                     Err(error) => {
                         tracing::warn!(%error, "failed to build ATC privacy report");
@@ -16483,10 +16540,14 @@ mod tests {
         );
     }
 
-    fn setup_atc_privacy_test_db() -> (tempfile::TempDir, DbConn) {
+    fn setup_atc_privacy_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::CanonicalDbConn) {
+        // ATC experiences live in the sidecar, read via canonical SQLite
+        // (br-bvq1x.11.7), so the privacy report is exercised against a
+        // canonical connection here.
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_path = temp_dir.path().join("atc_privacy.sqlite3");
-        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
+        let db_path = temp_dir.path().join("atc.sqlite3");
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
         conn.query_sync(
             "CREATE TABLE atc_experiences (

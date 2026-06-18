@@ -1648,7 +1648,7 @@ fn fetch_agent_health_inputs(
     } else {
         HashMap::new()
     };
-    let decision_counts = fetch_agent_decision_counts(conn, agents, window_start);
+    let decision_counts = fetch_agent_decision_counts(agents, window_start);
 
     agents
         .iter()
@@ -1951,14 +1951,24 @@ fn fetch_agent_contact_stats(
         .unwrap_or_default()
 }
 
-fn fetch_agent_decision_counts(
-    conn: &DbConn,
-    agents: &[AgentListRow],
-    window_start: i64,
-) -> HashMap<String, u64> {
+fn fetch_agent_decision_counts(agents: &[AgentListRow], window_start: i64) -> HashMap<String, u64> {
     if agents.is_empty() {
         return HashMap::new();
     }
+    // ATC experiences live in the dedicated sidecar DB (br-bvq1x.11.7); read
+    // per-agent decision counts from there. No sidecar (ATC never wrote, or the
+    // DB is in-memory) => no telemetry => empty counts.
+    let config = mcp_agent_mail_core::Config::from_env();
+    let Some(resolved) =
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()
+    else {
+        return HashMap::new();
+    };
+    let Some(atc_conn) =
+        mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(&resolved.canonical_path)
+    else {
+        return HashMap::new();
+    };
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
     for agent in agents {
         *name_counts.entry(agent.name.as_str()).or_insert(0) += 1;
@@ -1988,7 +1998,8 @@ fn fetch_agent_decision_counts(
            AND subject IN ({placeholders}) \
          GROUP BY subject"
     );
-    conn.query_sync(&sql, &params)
+    atc_conn
+        .query_sync(&sql, &params)
         .ok()
         .map(|rows| {
             rows.into_iter()

@@ -1745,7 +1745,7 @@ mod tests {
             .expect("apply ATC canonical follow-up schema");
         crate::queries::close_canonical_db_conn(init_conn, "ATC rollup test init connection");
 
-        crate::create_pool(&crate::pool::DbPoolConfig {
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 1,
             max_connections: 1,
@@ -1760,7 +1760,18 @@ mod tests {
                 .expect("lock test tempdir registry")
                 .push(dir);
         })
-        .expect("create file-backed ATC test pool")
+        .expect("create file-backed ATC test pool");
+
+        // ATC telemetry now lives in the dedicated sidecar DB (br-bvq1x.11.7);
+        // canonical ATC IO opens the sidecar, so its schema must be initialized
+        // there (the schema applied to the primary file above is now unused).
+        runtime
+            .block_on(crate::queries::ensure_file_backed_atc_pool_initialized(
+                &cx, &pool,
+            ))
+            .into_result()
+            .expect("initialize ATC sidecar schema for test pool");
+        pool
     }
 
     fn encode_outcome(spec: &TestExperienceSpec) -> Option<String> {
