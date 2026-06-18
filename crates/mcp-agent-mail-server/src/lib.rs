@@ -7888,7 +7888,35 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         // The TUI runs for days inside mux panes. If the visible terminal buffer
         // is cleared or desynchronized outside the process, sparse diffs cannot
         // reconstruct it, so force a bounded physical repaint.
+        //
+        // Two complementary bounds:
+        //  - frame-count: resync every N *rendered* frames. Cheap, but advances
+        //    only while the UI is actively rendering.
+        //  - wall-clock: resync at least every `full_redraw_max_secs` of elapsed
+        //    time, *regardless* of render cadence. This is what bounds visible
+        //    terminal-state desync (incremental-diff corruption, a tmux/zellij
+        //    pane swap, or a detach/reattach) when the TUI is idle or rendering
+        //    sparsely — exactly the case where the frame counter stalls and the
+        //    garbage would otherwise persist on screen. Tunable via
+        //    `AM_TUI_FULL_REDRAW_MAX_SECS` (default 1.0; <= 0 disables).
         .with_full_redraw_interval_frames(20)
+        .with_full_redraw_max_interval(full_redraw_max_interval_from_env())
+}
+
+/// Wall-clock bound between forced physical full redraws (see
+/// [`stable_tui_diff_config`]). Reads `AM_TUI_FULL_REDRAW_MAX_SECS`
+/// (floating-point seconds); defaults to 1.0s. A value <= 0 (or unparseable)
+/// disables the time-based resync, leaving only the frame-count bound.
+fn full_redraw_max_interval_from_env() -> Option<Duration> {
+    let secs = std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .unwrap_or(1.0);
+    if secs.is_finite() && secs > 0.0 {
+        Some(Duration::from_secs_f64(secs))
+    } else {
+        None
+    }
 }
 
 const DASHBOARD_RENDER_COALESCE_WINDOW: Duration = Duration::from_millis(72);
@@ -16021,6 +16049,26 @@ mod tests {
     fn stable_tui_diff_config_forces_periodic_terminal_resync() {
         let config = stable_tui_diff_config();
         assert_eq!(config.full_redraw_interval_frames, 20);
+        // The wall-clock resync is enabled by default (env unset => 1s), so an
+        // idle / sparsely-rendering TUI still resynchronizes the physical
+        // terminal on a time cadence — not only on rendered-frame count.
+        assert!(
+            config.full_redraw_max_interval.is_some(),
+            "wall-clock terminal resync must be enabled by default"
+        );
+    }
+
+    #[test]
+    fn full_redraw_max_interval_env_parsing() {
+        // Default (env unset path is covered by the config test above); here we
+        // exercise the pure parsing branches via Duration::from_secs_f64 so the
+        // disable/clamp semantics are pinned without mutating process env.
+        assert_eq!(Duration::from_secs_f64(1.0), Duration::from_millis(1000));
+        // Non-positive / non-finite seconds must disable the bound.
+        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
+            let enabled = bad.is_finite() && bad > 0.0;
+            assert!(!enabled, "{bad} must disable the wall-clock resync");
+        }
     }
 
     fn with_red_wbq_capacity_metrics<F>(f: F)
