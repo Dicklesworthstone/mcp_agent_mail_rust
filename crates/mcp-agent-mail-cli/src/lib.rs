@@ -4201,6 +4201,232 @@ fn managed_service_bearer_token() -> Option<String> {
     systemd_service_bearer_token().or_else(launchd_service_bearer_token)
 }
 
+// ── Unified process-owner model (br-bvq1x.9.4 / I4) ──────────────────────
+//
+// The single impure entry point that constructs a
+// `doctor::process_owner::ProcessOwnerModel` from the live host. All the
+// classification logic over the resulting snapshot is pure (see
+// `doctor::process_owner`); this is the only place that reads
+// systemd/launchd state, probes the port, and inspects mailbox ownership.
+
+/// Raw systemd runtime properties for the agent-mail unit.
+#[derive(Debug, Default)]
+struct SystemdRuntimeState {
+    active_state: Option<String>,
+    sub_state: Option<String>,
+    result: Option<String>,
+    n_restarts: Option<u32>,
+    main_pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            SYSTEMD_UNIT_NAME,
+            "--property=ActiveState,SubState,Result,NRestarts,MainPID",
+        ])
+        .output()
+        .ok()?;
+    // `systemctl show` exits 0 even for an unknown unit (it returns
+    // `ActiveState=inactive`), so don't bail on a non-zero status — just
+    // parse whatever properties came back.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut state = SystemdRuntimeState::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "ActiveState" => state.active_state = Some(value.to_string()),
+            "SubState" => state.sub_state = Some(value.to_string()),
+            "Result" => state.result = Some(value.to_string()),
+            "NRestarts" => state.n_restarts = value.parse::<u32>().ok(),
+            // systemd reports MainPID=0 when there is no main process.
+            "MainPID" => state.main_pid = value.parse::<u32>().ok().filter(|pid| *pid != 0),
+            _ => {}
+        }
+    }
+    Some(state)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
+    None
+}
+
+/// Resolve the *expected-service* dimension: what the service manager
+/// believes it is running for Agent Mail (or `None` when no unit/plist is
+/// installed on this host).
+fn gather_expected_service() -> crate::doctor::process_owner::ExpectedService {
+    use crate::doctor::process_owner::{ExpectedService, ServiceActiveState, ServiceManagerKind};
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(path) = systemd_unit_path()
+            && path.exists()
+        {
+            let bind = systemd_service_configured_bind();
+            let runtime = systemd_service_runtime_state();
+            return ExpectedService {
+                manager: ServiceManagerKind::Systemd,
+                installed: true,
+                active_state: runtime
+                    .as_ref()
+                    .and_then(|r| r.active_state.as_deref())
+                    .map_or(
+                        ServiceActiveState::Unknown,
+                        ServiceActiveState::from_systemd,
+                    ),
+                sub_state: runtime.as_ref().and_then(|r| r.sub_state.clone()),
+                result: runtime.as_ref().and_then(|r| r.result.clone()),
+                n_restarts: runtime.as_ref().and_then(|r| r.n_restarts),
+                main_pid: runtime.as_ref().and_then(|r| r.main_pid),
+                configured_host: bind.as_ref().map(|b| b.host.clone()),
+                configured_port: bind.as_ref().map(|b| b.port),
+            };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(path) = launchd_plist_path()
+            && path.exists()
+        {
+            let bind = launchd_service_configured_bind();
+            let active = is_launchd_service_active();
+            return ExpectedService {
+                manager: ServiceManagerKind::Launchd,
+                installed: true,
+                active_state: if active {
+                    ServiceActiveState::Active
+                } else {
+                    ServiceActiveState::Inactive
+                },
+                sub_state: None,
+                result: None,
+                // launchd does not expose a portable restart counter.
+                n_restarts: None,
+                main_pid: None,
+                configured_host: bind.as_ref().map(|b| b.host.clone()),
+                configured_port: bind.as_ref().map(|b| b.port),
+            };
+        }
+    }
+
+    ExpectedService::none()
+}
+
+/// Resolve the *port-owner* dimension for `host:port`.
+fn gather_port_ownership(host: &str, port: u16) -> crate::doctor::process_owner::PortOwnership {
+    use crate::doctor::process_owner::{PortOwnerClass, PortOwnership};
+
+    let holders_all =
+        mcp_agent_mail_server::startup_checks::listener_port_holder_pids_with_hint(host, port);
+    let holders_am =
+        mcp_agent_mail_server::startup_checks::agent_mail_port_holder_pids_with_hint(host, port);
+    let reachable = process_owner_port_reachable(host, port);
+
+    let class = if !holders_am.is_empty() {
+        PortOwnerClass::AgentMailSelf
+    } else if !holders_all.is_empty() {
+        PortOwnerClass::Foreign
+    } else if reachable {
+        // Something is listening but the holder PID could not be
+        // enumerated here — don't claim the port is Free.
+        PortOwnerClass::Unknown
+    } else {
+        PortOwnerClass::Free
+    };
+
+    PortOwnership {
+        host: host.to_string(),
+        port,
+        class,
+        holder_pids: holders_all,
+        reachable,
+    }
+}
+
+/// Bounded TCP reachability probe used for the port-owner dimension.
+fn process_owner_port_reachable(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let connect_host = service_probe_connect_host(host);
+    let Ok(addrs) = (connect_host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve the *actual-process* dimension from the live mailbox ownership.
+fn gather_actual_processes(
+    db_path: &Path,
+    storage_root: &Path,
+) -> Vec<crate::doctor::process_owner::ActualProcess> {
+    use crate::doctor::process_owner::ActualProcess;
+
+    let ownership = mcp_agent_mail_db::pool::inspect_mailbox_ownership(db_path, storage_root);
+    ownership
+        .processes
+        .into_iter()
+        .map(|p| {
+            let is_python_shadow = p
+                .command
+                .as_deref()
+                .is_some_and(mcp_agent_mail_db::pool::command_is_python_agent_mail_shadow);
+            ActualProcess {
+                pid: p.pid,
+                binary_path: p.executable_path,
+                command: p.command,
+                is_python_shadow,
+                executable_deleted: p.executable_deleted,
+                holds_lock: p.holds_storage_root_lock || p.holds_sqlite_lock,
+                holds_db_file: p.holds_database_file,
+            }
+        })
+        .collect()
+}
+
+/// Build the unified [`crate::doctor::process_owner::ProcessOwnerModel`]
+/// from the live host: expected-service, actual-process(es), port-owner,
+/// binary-path, and DB-path. This is the single impure constructor; the
+/// runtime FMs and `am robot health` consume the pure snapshot it returns.
+pub(crate) fn gather_process_owner_model(
+    config: &Config,
+) -> crate::doctor::process_owner::ProcessOwnerModel {
+    use crate::doctor::process_owner::ProcessOwnerModel;
+
+    let db_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map(|resolved| resolved.canonical_path)
+        .unwrap_or_else(|_| config.database_url.clone());
+    let db_path_buf = PathBuf::from(&db_path);
+
+    let actual_processes = gather_actual_processes(&db_path_buf, &config.storage_root);
+    let port = gather_port_ownership(&config.http_host, config.http_port);
+    let expected_service = gather_expected_service();
+    let self_binary_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string());
+
+    ProcessOwnerModel {
+        expected_service,
+        actual_processes,
+        port,
+        self_binary_path,
+        db_path,
+        storage_root: config.storage_root.display().to_string(),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn stop_launchd_service() -> CliResult<()> {
     let uid = current_uid()?;

@@ -14308,6 +14308,21 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 ),
             });
 
+            // I4 (br-bvq1x.9.4): unified process-owner model — the single
+            // runtime-ownership surface (expected-service vs actual-process
+            // vs port-owner vs binary-path vs DB-path). Divergences and a
+            // supervisor respawn loop are degraded conditions.
+            let process_owner = crate::gather_process_owner_model(&config);
+            let process_owner_divergences =
+                crate::doctor::process_owner::classify_service_manager_divergences(&process_owner);
+            let process_owner_respawn = crate::doctor::process_owner::classify_supervisor_respawn(
+                &process_owner,
+                crate::doctor::process_owner::DEFAULT_RESPAWN_THRESHOLD,
+            );
+            let process_owner_has_python_shadow = process_owner.has_python_shadow();
+            let process_owner_degraded =
+                !process_owner_divergences.is_empty() || process_owner_respawn.is_some();
+
             // Overall health
             let overall = if !db_ok
                 || db_file_sanity_unhealthy
@@ -14326,6 +14341,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || disk_probe_failed
                 || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok
                 || tui_liveness_stalled
+                || process_owner_degraded
             {
                 "degraded"
             } else {
@@ -14349,6 +14365,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 #[serde(skip_serializing_if = "Option::is_none")]
                 host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
                 tui_liveness: TuiLivenessReport,
+                // I4: unified process-owner model (five runtime-ownership
+                // dimensions) plus the classified divergences/respawn loop.
+                process_owner: crate::doctor::process_owner::ProcessOwnerModel,
+                process_owner_divergences: Vec<crate::doctor::process_owner::ServiceDivergenceKind>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                supervisor_respawn: Option<crate::doctor::process_owner::SupervisorRespawnVerdict>,
             }
 
             let runtime_identity = crate::runtime_identity_json(
@@ -14386,6 +14408,37 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // FIRST when a freeze is suspected (returns state without a kill).
             let tui_liveness_readout = tui_liveness.readout_command.clone();
 
+            // I4: capture the process-owner alert inputs before the model and
+            // its verdicts are moved into the envelope payload. A respawn loop
+            // or a Python-shadow divergence is the most actionable; a plain
+            // bind/MainPID skew is a warning.
+            let process_owner_alert: Option<(&'static str, String)> = if process_owner_respawn
+                .is_some()
+            {
+                Some((
+                        "warn",
+                        "supervisor respawn loop: agent-mail keeps restarting (recurring crash hidden behind auto-restart)"
+                            .to_string(),
+                    ))
+            } else if !process_owner_divergences.is_empty() {
+                let severity = if process_owner_has_python_shadow {
+                    "error"
+                } else {
+                    "warn"
+                };
+                let summary = format!(
+                    "service-manager divergence: {}",
+                    process_owner_divergences
+                        .iter()
+                        .map(|d| d.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                Some((severity, summary))
+            } else {
+                None
+            };
+
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -14398,8 +14451,19 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     search_index: search_index_snapshot,
                     host: host_report,
                     tui_liveness,
+                    process_owner,
+                    process_owner_divergences,
+                    supervisor_respawn: process_owner_respawn,
                 },
             );
+
+            if let Some((severity, summary)) = process_owner_alert {
+                env = env.with_alert(
+                    severity,
+                    summary,
+                    Some("am robot health --format json | jq .process_owner".to_string()),
+                );
+            }
 
             // Alerts
             if !db_ok {

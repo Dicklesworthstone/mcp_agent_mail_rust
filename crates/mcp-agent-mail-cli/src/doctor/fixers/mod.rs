@@ -56,6 +56,7 @@ pub mod reservation_db_archive_parity;
 pub mod retained_autocommit_leak;
 pub mod runtime_pid_hint_symlink_toctou;
 pub mod schema_version_mismatch;
+pub mod service_manager_divergence;
 pub mod share_half_finished_bundle;
 pub mod share_scrub_manifest_mismatch;
 pub mod share_verify_live_failed_deploy;
@@ -67,6 +68,7 @@ pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
 pub mod stale_python_launcher_entry;
 pub mod stale_python_server_shadow;
+pub mod supervisor_respawn_loop;
 pub mod suspicious_ephemeral_archive_root;
 pub mod text_timestamp_contamination;
 pub mod unexpected_symlink_in_archive;
@@ -748,6 +750,24 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_python_server_shadow",
         },
         FixerSpec {
+            id: supervisor_respawn_loop::FM_ID,
+            severity: "P1",
+            subsystem: "runtime_processes",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "systemd keeps respawning agent-mail (NRestarts over threshold while churning) — a recurring crash hidden behind auto-restart (detect-only; doctor never restarts/kills the service)",
+            source_module: "doctor::fixers::supervisor_respawn_loop",
+        },
+        FixerSpec {
+            id: service_manager_divergence::FM_ID,
+            severity: "P1",
+            subsystem: "runtime_processes",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "service-manager view diverges from runtime reality (active-but-no-server, MainPID-not-owner, unmanaged server, bind mismatch, or Python shadow) — surfaces the unified process-owner model (detect-only)",
+            source_module: "doctor::fixers::service_manager_divergence",
+        },
+        FixerSpec {
             id: committed_env_file_in_repo::FM_ID,
             severity: "P0",
             subsystem: "secrets_env_state",
@@ -902,6 +922,13 @@ pub struct DispatchInputs {
     /// pass `Some(DetectInputs { dir_overrides: Some(...) })` to
     /// scope the walk to a tempdir.
     pub quarantined_bak_detect: Option<quarantined_bak_files::DetectInputs>,
+    /// Unified process-owner model snapshot for the runtime-ownership FMs
+    /// (`supervisor_respawn_loop`, `service_manager_divergence`). `None`
+    /// skips both FMs. Production callers build it via
+    /// `crate::gather_process_owner_model(...)`; tests inject a synthetic
+    /// [`crate::doctor::process_owner::ProcessOwnerModel`] so the pure
+    /// classifiers can be round-tripped without a live host.
+    pub process_owner: Option<crate::doctor::process_owner::ProcessOwnerModel>,
 }
 
 fn db_aware_archive_report(
@@ -1212,6 +1239,38 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
+    } else if fm_id == supervisor_respawn_loop::FM_ID {
+        let model = inputs
+            .process_owner
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: supervisor_respawn_loop::FM_ID,
+                field: "process_owner",
+            })?;
+        let findings = supervisor_respawn_loop::detect_default(model);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = supervisor_respawn_loop::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == service_manager_divergence::FM_ID {
+        let model = inputs
+            .process_owner
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: service_manager_divergence::FM_ID,
+                field: "process_owner",
+            })?;
+        let findings = service_manager_divergence::detect(model);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = service_manager_divergence::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == recovered_tree_shadow::FM_ID {
         let findings = recovered_tree_shadow::detect(&recovered_tree_scan_roots(inputs));
@@ -1871,6 +1930,30 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == supervisor_respawn_loop::FM_ID {
+        let model = inputs
+            .process_owner
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: supervisor_respawn_loop::FM_ID,
+                field: "process_owner",
+            })?;
+        supervisor_respawn_loop::detect_default(model)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == service_manager_divergence::FM_ID {
+        let model = inputs
+            .process_owner
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: service_manager_divergence::FM_ID,
+                field: "process_owner",
+            })?;
+        service_manager_divergence::detect(model)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == recovered_tree_shadow::FM_ID {
         recovered_tree_shadow::detect(&recovered_tree_scan_roots(inputs))
             .iter()
@@ -2405,6 +2488,7 @@ mod tests {
             stale_seconds_override: None,
             missing_project_json_detect_override: None,
             quarantined_bak_detect: None,
+            process_owner: None,
         };
         let run_dir =
             crate::doctor::runs::scaffold_run_dir(temp.path(), "test_run").expect("run dir");

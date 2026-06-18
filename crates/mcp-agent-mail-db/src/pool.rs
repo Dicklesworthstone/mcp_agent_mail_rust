@@ -5890,6 +5890,39 @@ fn command_line_is_agent_mail_server(command: &str) -> bool {
             .any(|arg| matches!(arg, "serve-http" | "serve-stdio"))
 }
 
+/// Recognize a legacy **Python** Agent Mail server from its command line.
+///
+/// The legacy Python `mcp_agent_mail` server (which this Rust port
+/// supersedes) shares the same listener-PID and `storage.sqlite3`
+/// conventions as the Rust server. A co-resident Python server holding
+/// the mailbox activity lock MUST therefore gate writes — otherwise both
+/// servers race on the same database file (the P0
+/// "python-server-coresident-write" incident class).
+///
+/// [`command_line_has_agent_mail_signature`] only inspects `argv0`, which
+/// for a Python server is the interpreter (`python3`), so it misses this
+/// case entirely. This matcher instead requires `argv0` to be a
+/// Python/PyPy interpreter **and** a later argument to name the canonical
+/// `mcp_agent_mail` / `mcp-agent-mail` package (kept precise to avoid
+/// flagging unrelated Python processes).
+#[must_use]
+pub fn command_is_python_agent_mail_shadow(command: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    let Some(argv0) = parts.next() else {
+        return false;
+    };
+    let basename = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+    let lower = basename.to_ascii_lowercase();
+    let is_python = lower.starts_with("python") || lower.starts_with("pypy");
+    if !is_python {
+        return false;
+    }
+    parts.any(|arg| {
+        let a = arg.to_ascii_lowercase();
+        a.contains("mcp_agent_mail") || a.contains("mcp-agent-mail")
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn pid_command_line(pid: u32) -> Option<String> {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
@@ -5921,13 +5954,19 @@ fn pid_executable_deleted(pid: u32) -> bool {
 }
 
 fn pid_is_agent_mail(pid: u32) -> bool {
-    pid_command_line(pid).is_some_and(|command| command_line_has_agent_mail_signature(&command))
-        || pid_executable_path(pid)
-            .and_then(|exe| {
-                exe.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
+    pid_command_line(pid).is_some_and(|command| {
+        // Rust binary (argv0 basename) OR a co-resident Python Agent Mail
+        // shadow (interpreter argv0 + agent-mail module). The Python case
+        // is what makes the pre-write mailbox-ownership gate refuse a
+        // concurrent legacy server (br-bvq1x.9.4 / I4).
+        command_line_has_agent_mail_signature(&command)
+            || command_is_python_agent_mail_shadow(&command)
+    }) || pid_executable_path(pid)
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
 }
 
 fn add_mailbox_process_surface(
@@ -7915,6 +7954,49 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn python_agent_mail_shadow_matcher_is_precise() {
+        // Co-resident legacy Python servers MUST be recognized so the
+        // pre-write ownership gate refuses concurrent writers (I4).
+        for cmd in [
+            "python3 -m mcp_agent_mail.server",
+            "/usr/bin/python3.11 /opt/mcp_agent_mail/server.py serve",
+            "python -m mcp-agent-mail",
+            "pypy3 /home/u/mcp_agent_mail/__main__.py",
+        ] {
+            assert!(
+                command_is_python_agent_mail_shadow(cmd),
+                "should match python shadow: {cmd}"
+            );
+        }
+        // Must NOT match: the Rust binary, unrelated Python, or empty.
+        for cmd in [
+            "mcp-agent-mail serve-http",
+            "/home/u/.local/bin/am serve-http",
+            "python3 -m http.server",
+            "python3 manage.py runserver",
+            "node server.js",
+            "",
+        ] {
+            assert!(
+                !command_is_python_agent_mail_shadow(cmd),
+                "should NOT match: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_signature_matcher_ignores_python_shadow() {
+        // The argv0-only Rust matcher must NOT see a python server (this
+        // is precisely the gap I4 closes via the dedicated matcher).
+        assert!(!command_line_has_agent_mail_signature(
+            "python3 -m mcp_agent_mail.server"
+        ));
+        assert!(command_line_has_agent_mail_signature(
+            "mcp-agent-mail serve"
+        ));
+    }
 
     fn sqlite_cleanup_quarantines(dir: &Path, sidecar_file_name: &str) -> Vec<PathBuf> {
         let prefix = format!("{sidecar_file_name}.cleanup-quarantine-");
