@@ -1246,7 +1246,46 @@ AM_INSTALLED_BINARY_PARITY_BIN=/path/to/installed/am \
 
 The gate writes `tests/artifacts/installed_binary_parity/<run>/parity_report.json` with one pass/fail row per required JSON path, redacted source/installed values, value-mismatch status, and redacted command metadata. If the candidate lacks fields that source tests rely on, or returns different required values, the report is red and the release is not closed. A local direct `am doctor check --json` or `am robot ... --format json` probe is useful for quick inspection, but it is not sufficient release evidence unless paired with this parity report and an `rch exec -- ...` cargo proof.
 
-Use `--dry-run` to inspect the lane without running it. Use `--no-block-on-conflicts` only when the slot conflict is understood and you intentionally want advisory behavior.
+For hardening uptake that must not mutate the live hub, stage the candidate and
+run the focused source/parity gates before any operator installs it:
+
+```bash
+scripts/hardening_uptake_no_live_hub.sh --profile release
+```
+
+The script installs only into `target/hardening-uptake/<run>/bin`, refuses to
+target the currently resolved live `am` directory, checks for enough local free
+space in the stage root and Cargo target directory before heavy Cargo work. The
+default minimum is 64 GiB because cold test builds can exceed smaller tmpfs
+mounts before a report can be written. The script runs the WAL hardening tests,
+then runs installed-binary parity against the staged `am`. Logs, exit codes, the
+command inventory, `version_gate`, `install_gate`, disk preflight fields, and
+`uptake_report.txt` are written under the run's `artifacts/` directory. Use the
+printed `PATH=<stage-bin>:"$PATH"` command only for explicit canary shells; it
+does not replace `~/.local/bin/am` or restart any Agent Mail process. If the
+source filesystem is under pressure, set both `CARGO_TARGET_DIR` and
+`--stage-root` to a filesystem with enough free space, for example a large
+tmpfs:
+
+```bash
+CARGO_TARGET_DIR=/dev/shm/am-hardening-cargo-target \
+  scripts/hardening_uptake_no_live_hub.sh \
+  --profile release \
+  --stage-root /dev/shm/am-hardening-uptake
+```
+
+If `install_gate=hold-until-candidate-version-is-distinguishable`, produce a
+version-distinguishable release before replacing any live binary.
+
+When canarying the staged binary with `am doctor fix --list` or
+`am doctor fix --only <fm-id> --list`, remember that list mode is detector
+inventory only. JSON fields such as `actions_planned` describe what an approved
+`--dry-run`/`--yes` repair path would plan; list mode itself must not be treated
+as a live repair or permission to run one.
+
+For `am verify` lanes, use `--dry-run` to inspect the lane without running it.
+Use `--no-block-on-conflicts` only when the slot conflict is understood and you
+intentionally want advisory behavior.
 
 ### E2E Entrypoint Policy (T9.9)
 

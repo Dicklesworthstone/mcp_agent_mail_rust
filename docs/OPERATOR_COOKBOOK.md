@@ -368,3 +368,125 @@ saved baseline file you can compare later.
 **Troubleshooting:** If you only care about a subset, rerun with `--filter`.
 For release-signoff performance work, capture the baseline on a machine that is
 not already saturated by other agent builds.
+
+## 16. Audit canonical project-key split before swarm work [read-only]
+
+**Goal:** Confirm all agents for one Git repository are using the same project
+key before assigning or reserving work. This catches the common split where new
+sessions use a remote-derived key while older panes still read path-shaped
+projects.
+
+```bash
+cd /abs/path/project
+
+CANONICAL_PROJECT="$(agent-mail-project-key)"
+LEGACY_PROJECTS='[
+  "/abs/path/project",
+  "/older/checkout/path/project"
+]'
+
+printf 'canonical_project=%s\n' "$CANONICAL_PROJECT"
+am robot projects --format json > /tmp/am-projects.json
+
+jq --arg canonical "$CANONICAL_PROJECT" --argjson legacy "$LEGACY_PROJECTS" '
+  .projects
+  | map(select(.path == $canonical or (.path as $p | $legacy | index($p))))
+  | map({
+      slug,
+      path,
+      agents,
+      messages,
+      reservations,
+      updated_at
+    })
+' /tmp/am-projects.json
+
+for project in "$CANONICAL_PROJECT" $(jq -r '.[]' <<<"$LEGACY_PROJECTS"); do
+  printf '\n# active reservations for %s\n' "$project"
+  am robot reservations --project "$project" --all --format json \
+    | jq '{project: ._meta.project, active: (.all_active // [])}'
+done
+
+am doctor drain --json | jq '{owner_class, safe_to_mutate, detail, safe_next_command}'
+am doctor health
+
+# Candidate/new-release inventory surface for reservation parity drift.
+# This is read-only after the release that classifies `doctor fix --list` as
+# read intent; do not substitute `--dry-run` or `--yes` while a live owner holds
+# the mailbox.
+am doctor fix --only fm-db-state-files-reservation-db-archive-parity --list --json \
+  | jq '{mode, fm_id, findings_count, actions_planned}'
+```
+
+`--list` is detector inventory only: it does not create a doctor run, execute the
+chokepoint, or mutate mailbox state. Some FM outputs may still show
+`actions_planned` / `total_actions_planned` for auto-fixable findings; treat
+that as "actions that would exist under an approved `--dry-run`/`--yes` path",
+not as permission or evidence that this read-only audit changed anything.
+
+**Expected output:** The canonical project is the only project with active file
+reservations. Legacy/path-shaped projects may still contain historical messages
+or agents, but active reservations there mean some panes are operating on the
+wrong bus and must be coordinated before new edits start.
+
+**Safety:** This recipe is read-only. Do not release, force-release, archive
+normalize, reconstruct, search-index refresh, restart the server, or edit the
+database from this audit. If `am doctor drain` reports `safe_to_mutate=false`,
+that is normal for a live service owner; use it as a no-mutation guard, not as a
+reason to kill the owner. On deployed versions before the read-intent
+classification fix, `am doctor fix --only <fm-id> --list` may still be blocked
+by the live-owner guard; use a staged/candidate binary for that inventory probe
+until the live version is upgraded.
+
+**No-go criteria:**
+
+- The `agent-mail-project-key` helper is missing or returns an empty value.
+- Both the canonical project and any legacy project have active reservations.
+- `am doctor health` reports archive/DB parity drift or DB sanity failures that
+  would make project/reservation reads ambiguous. A stale search index is a
+  search-only hold; do not refresh search from this audit unless the operator
+  explicitly needs message-search evidence.
+- The installed `am` version is not distinguishable from the candidate release
+  intended to fix the coordination issue.
+
+**Next safe action:** install or update the local `agent-mail-project-key`
+helper on the affected host, point new agents at the canonical project key, and
+wait for old legacy reservations to expire or be explicitly coordinated by their
+owners. Only run stateful doctor fixes after the live service owner has been
+gracefully drained and an operator has approved the exact mutation.
+
+## 17. Stage hardening uptake without touching the live hub [local-artifact-only]
+
+**Goal:** Prove a candidate binary and runbook path before any service restart
+or live install.
+
+```bash
+cd /abs/path/mcp_agent_mail_rust
+scripts/hardening_uptake_no_live_hub.sh --profile release
+sed -n '1,120p' target/hardening-uptake/*/artifacts/uptake_report.txt
+```
+
+**Expected output:** The script writes a passed or failed `uptake_report.txt`
+containing the source commit, staged binary path, live binary path, Cargo target
+directory, disk preflight fields, WAL test results, installed-binary parity
+command, `version_gate`, and `install_gate`. It never replaces the live binary,
+never runs any stateful doctor fixer, and never starts or stops the Agent Mail
+service. The default disk preflight minimum is 64 GiB because a cold test build
+can exceed smaller tmpfs mounts before a report can be written. If it reports
+`failed_step=disk_preflight`, move the proof to a host/workspace with enough
+free space or get operator approval for cleanup; do not discover disk pressure
+by forcing the linker to continue. On a disk-full host with enough tmpfs space,
+use an off-repo stage root and Cargo target directory:
+
+```bash
+CARGO_TARGET_DIR=/dev/shm/am-hardening-cargo-target \
+  scripts/hardening_uptake_no_live_hub.sh \
+  --profile release \
+  --stage-root /dev/shm/am-hardening-uptake
+```
+
+**Rollback:** There is no live rollback for this recipe because it only writes
+under the chosen stage root and Cargo target directory. Close the canary shell
+or remove the temporary `PATH=<stage-bin>:"$PATH"` prefix. A later live install
+must have its own operator-approved rollback plan, usually reinstalling the
+previous released binary and restarting through the service supervisor.

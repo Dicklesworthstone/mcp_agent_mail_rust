@@ -1184,6 +1184,22 @@ fn collect_installed_parity_outputs(binary: &Path, env: &TestEnv) -> Value {
     Value::Object(outputs)
 }
 
+fn prewarm_installed_parity_search_index(env: &TestEnv) {
+    let out = run_am_binary(
+        &am_bin(),
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["robot", "search", "parity-probe", "--format", "json"],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "failed to prewarm installed parity search index\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn run_startup_server_once(env: &TestEnv) -> TimedProcessOutput {
     run_startup_server_once_at(env, env.tmp.path())
 }
@@ -3384,6 +3400,11 @@ fn installed_binary_parity_probe_compares_source_and_installed_am() {
         &env.tmp.path().display().to_string(),
     );
     insert_agent(&conn, 1, 1, "Recipient", "codex-cli", "gpt-5");
+
+    // The index state transitions from delayed to fresh after the first search.
+    // Prewarm once so the source and installed binaries are compared against the
+    // same steady-state isolated mailbox instead of against run-order timing.
+    prewarm_installed_parity_search_index(&env);
 
     let source_outputs = collect_installed_parity_outputs(&am_bin(), &env);
     let installed_outputs = collect_installed_parity_outputs(&installed_binary, &env);

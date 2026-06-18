@@ -295,7 +295,7 @@ fn test_default_gates_count() {
     use mcp_agent_mail_cli::ci::default_gates;
 
     let gates = default_gates();
-    assert_eq!(gates.len(), 19, "should have 19 default gates");
+    assert_eq!(gates.len(), 20, "should have 20 default gates");
 }
 
 #[test]

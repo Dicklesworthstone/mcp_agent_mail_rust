@@ -2785,7 +2785,7 @@ mod tests {
     #[test]
     fn test_default_gates_count() {
         let gates = default_gates();
-        assert_eq!(gates.len(), 19, "Expected 19 default gates");
+        assert_eq!(gates.len(), 20, "Expected 20 default gates");
     }
 
     #[test]

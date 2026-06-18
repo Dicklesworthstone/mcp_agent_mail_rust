@@ -3319,12 +3319,17 @@ fn contacts_command_is_read_only(action: &ContactsCommand) -> bool {
 }
 
 fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
-    // `Drain` is read-only and MUST run even while a live owner holds the
-    // mailbox — reporting the supervised drain protocol is its whole purpose.
-    matches!(
-        action,
-        DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. }
-    )
+    match action {
+        // `Drain` is read-only and MUST run even while a live owner holds the
+        // mailbox — reporting the supervised drain protocol is its whole purpose.
+        DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. } => true,
+        // `doctor fix --list` and `doctor fix --only <fm-id> --list` are
+        // detector-only inventory surfaces. The dispatcher never calls the
+        // mutating fixer branches when `list` is set, so these must be allowed
+        // through the live-owner read-intent path.
+        DoctorCommand::Fix { list: true, .. } => true,
+        _ => false,
+    }
 }
 
 fn execute(cli: Cli) -> CliResult<()> {
@@ -43974,6 +43979,53 @@ http_headers = { Authorization = "Bearer secret" }
             },
         };
         assert!(!command_is_read_only(&fix));
+    }
+
+    #[test]
+    fn doctor_fix_list_inventory_is_read_only_but_mutating_fix_is_not() {
+        let list_all = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: false,
+                json: true,
+                only: None,
+                list: true,
+            },
+        };
+        assert!(command_is_read_only(&list_all));
+
+        let list_one = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: false,
+                json: true,
+                only: Some("fm-db-state-files-reservation-db-archive-parity".to_string()),
+                list: true,
+            },
+        };
+        assert!(command_is_read_only(&list_one));
+
+        let dry_run_chokepoint = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: true,
+                yes: false,
+                json: true,
+                only: Some("fm-db-state-files-reservation-db-archive-parity".to_string()),
+                list: false,
+            },
+        };
+        assert!(!command_is_read_only(&dry_run_chokepoint));
+
+        let apply_one = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: true,
+                json: true,
+                only: Some("fm-db-state-files-reservation-db-archive-parity".to_string()),
+                list: false,
+            },
+        };
+        assert!(!command_is_read_only(&apply_one));
     }
 
     fn doctor_locks_test_ownership(
