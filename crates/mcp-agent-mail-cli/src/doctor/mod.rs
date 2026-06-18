@@ -1516,17 +1516,32 @@ pub(crate) fn create_support_bundle(
 
     // N2 (br-bvq1x.14.2): reliability snapshot. Capture the cheap,
     // always-available diagnostic surfaces this reliability epic added —
-    // runtime identity (which `am`/mailbox/version/PID, plus the offline
-    // known-bad/obsolete `am_version` verdict, J2/J3) and the host-pressure
-    // section (J1) — inline, so an incident responder no longer has to
-    // reconstruct "which binary, which mailbox, was the host under pressure"
-    // from scattered notes. Non-mutating (a port probe + filesystem/loadavg
-    // syscalls); redaction-safe (paths/secrets are scrubbed by
-    // `redact_support_json`). Live coordination/lock state is intentionally
-    // left to the `am doctor drain --json` / `am doctor locks --json` replay
-    // commands rather than opened here — an incident DB may be wedged and a
-    // support bundle must never block. Heartbeats (I1) will join this snapshot
-    // once that surface lands.
+    // inline, so an incident responder no longer has to reconstruct
+    // "which binary, which mailbox, was the host under pressure, were the
+    // TUI/runtime loops alive, who owns the port and the lock" from
+    // scattered notes. Every input here is non-mutating and bounded
+    // (filesystem/`/proc`/loadavg syscalls + one bounded HTTP probe + one
+    // bounded TCP probe), and the whole object is redaction-safe
+    // (paths/secrets are scrubbed by `redact_support_json`). Nothing here
+    // OPENS the (possibly wedged) database, so the bundle never blocks:
+    //
+    //   - runtime_identity (J2/J3): which `am`/mailbox/version/PID + the
+    //     offline known-bad/obsolete `am_version` verdict.
+    //   - host (J1): host-pressure section.
+    //   - tui_liveness (I1/I2): TUI/runtime loop heartbeats + liveness
+    //     verdict, best-effort over the live server's System Health
+    //     payload (an `unreachable` report when the server is down — never
+    //     fatal).
+    //   - process_owner (I4): the unified five-dimension process-owner
+    //     model (expected-service vs actual-process vs port-owner vs
+    //     binary-path vs DB-path) plus its classified service-manager
+    //     divergences and supervisor-respawn verdict.
+    //   - mailbox_ownership (D1): activity-lock owners + PID liveness from
+    //     `inspect_mailbox_ownership`, which is filesystem/`/proc`-based and
+    //     does NOT open the database (safe even on a wedged mailbox).
+    //
+    // The one surface still left to a replay command is `am doctor drain
+    // --json` (its `safe_to_mutate` probe opens the DB).
     let reliability_runtime_identity = crate::runtime_identity_json(
         &config.storage_root,
         database_url,
@@ -1535,17 +1550,39 @@ pub(crate) fn create_support_bundle(
         Some(&database_path.display().to_string()),
     );
     let reliability_host = mcp_agent_mail_core::host_health::sample_host_health(config);
+    let reliability_tui_liveness = crate::robot::fetch_live_tui_liveness(config);
+    let reliability_process_owner = crate::gather_process_owner_model(config);
+    let reliability_process_owner_divergences =
+        crate::doctor::process_owner::classify_service_manager_divergences(
+            &reliability_process_owner,
+        );
+    let reliability_supervisor_respawn = crate::doctor::process_owner::classify_supervisor_respawn(
+        &reliability_process_owner,
+        crate::doctor::process_owner::DEFAULT_RESPAWN_THRESHOLD,
+    );
+    let reliability_mailbox_ownership =
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&database_path, &config.storage_root);
     let reliability_snapshot = serde_json::json!({
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "section": "reliability_snapshot",
         "captured_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "field_schema": {
-            "runtime_identity": "binary_path, version, pid, storage_root, database_url, db_file, http_host, http_port, server_pids, am_version{installed,state[,repair_command,verdict]}",
-            "host": "status, host_pressure_likely, reasons[], disk_free_pct, inodes_free, load_per_cpu, mem_available_pct, db_file_bytes, db_dir_writable, ...",
-            "coordination_via_replay": "am doctor drain --json => {safe_to_mutate, read_only, owner_class}; am doctor locks --json => {owner_state, disposition, processes}",
+            "runtime_identity": "binary_path, version, pid, storage_root, database_url, db_file, http_host, http_port, server_pids, am_version{installed,state[,repair_command,verdict]} (J2/J3)",
+            "host": "status, host_pressure_likely, reasons[], disk_free_pct, inodes_free, load_per_cpu, mem_available_pct, db_file_bytes, db_dir_writable, ... (J1)",
+            "tui_liveness": "source(live|unreachable), overall(alive|stalled|unknown), loops[{name,state,...}], stalled_loops[], headless_fallback_command, readout_command (I1/I2)",
+            "process_owner": "expected_service{manager,installed,active_state,n_restarts,main_pid,configured_host,configured_port}, actual_processes[{pid,binary_path,command,is_python_shadow,executable_deleted,holds_lock,holds_db_file}], port{host,port,class,holder_pids,reachable}, self_binary_path, db_path, storage_root (I4)",
+            "process_owner_divergences": "[manager_active_no_server|main_pid_not_owner|unmanaged_server_running|configured_bind_mismatch|python_shadow_owner] (I4)",
+            "supervisor_respawn": "null | {manager,n_restarts,threshold,active_state,sub_state,result} (I4)",
+            "mailbox_ownership": "disposition, storage_lock_path, sqlite_lock_path, processes[], competing_pids[], supervised_restart_required, detail (D1; fs/proc-based, no DB open)",
+            "coordination_via_replay": "am doctor drain --json => {safe_to_mutate, read_only, owner_class} (opens the DB; run separately)",
         },
         "runtime_identity": reliability_runtime_identity,
         "host": reliability_host,
+        "tui_liveness": reliability_tui_liveness,
+        "process_owner": reliability_process_owner,
+        "process_owner_divergences": reliability_process_owner_divergences,
+        "supervisor_respawn": reliability_supervisor_respawn,
+        "mailbox_ownership": reliability_mailbox_ownership,
     });
     let reliability_snapshot = redact_support_json(reliability_snapshot, &redaction, None);
     write_support_json_file(
@@ -1592,6 +1629,31 @@ pub(crate) fn create_support_bundle(
                 .unwrap_or(serde_json::Value::Null),
             "am_version_state": reliability_snapshot
                 .pointer("/runtime_identity/am_version/state")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            // I1/I2: at-a-glance loop liveness so triage sees a stalled TUI
+            // without opening the full snapshot.
+            "tui_liveness_overall": reliability_snapshot
+                .pointer("/tui_liveness/overall")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            // I4: count of service-manager divergences (0 == runtime story
+            // consistent). The detail lives in process_owner_divergences[].
+            "process_owner_divergence_count": reliability_snapshot
+                .pointer("/process_owner_divergences")
+                .and_then(|v| v.as_array())
+                .map_or(serde_json::Value::Null, |a| {
+                    serde_json::Value::from(a.len())
+                }),
+            "supervisor_respawn_loop": serde_json::Value::Bool(
+                !reliability_snapshot
+                    .pointer("/supervisor_respawn")
+                    .unwrap_or(&serde_json::Value::Null)
+                    .is_null(),
+            ),
+            // D1: who owns the mailbox activity lock (no DB open).
+            "mailbox_ownership_disposition": reliability_snapshot
+                .pointer("/mailbox_ownership/disposition")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
         },
@@ -1812,9 +1874,20 @@ Safe-sharing limits:\n\n\
 - Operator stdout/stderr logs are redacted and truncated when supplied.\n\
 - Subjects are preserved by default; rerun with `--redact-subjects` when subjects may be sensitive.\n\
 - Review `manifest.json` before sharing. It lists every included file and every omitted source class.\n\n\
-Replay commands:\n\n\
+Contents:\n\n\
+- `summary.json` — top-level triage view: recovery decision, config shape, and a `reliability_snapshot` quick-projection (host pressure, am-version state, TUI liveness overall, process-owner divergence count, supervisor respawn loop flag, mailbox-ownership disposition).\n\
+- `reports/reliability-snapshot.json` — the full reliability snapshot. Its `field_schema` object documents every section. Sections (with the reliability-epic track each comes from):\n\
+  - `runtime_identity` (J2/J3): which `am` binary/mailbox/version/PID + the offline known-bad/obsolete `am_version` verdict.\n\
+  - `host` (J1): host-pressure section (disk/inode/load/memory + DB file sizes).\n\
+  - `tui_liveness` (I1/I2): TUI/runtime loop heartbeats + liveness verdict, best-effort over the live server (`source: unreachable` when no server is up).\n\
+  - `process_owner` (I4): the unified five-dimension process-owner model (expected-service vs actual-process vs port-owner vs binary-path vs DB-path), plus `process_owner_divergences` and `supervisor_respawn`.\n\
+  - `mailbox_ownership` (D1): activity-lock owners + PID liveness, filesystem/`/proc`-based (does not open the database, so it never blocks).\n\
+- `reports/latest-forensic-*.json`, `reports/latest-doctor-report.json` — sanitized copies of the most recent repair/reconstruct forensic artifacts and doctor run, when present.\n\
+- `logs/` — redacted, truncated operator stdout/stderr logs (only when supplied via `--stdout-log`/`--stderr-log`).\n\n\
+Replay commands (run separately; the drain probe opens the DB):\n\n\
 ```bash\n\
 am doctor check --json\n\
+am doctor drain --json   # safe_to_mutate / owner_class (opens the DB)\n\
 am doctor repair --dry-run\n\
 am doctor reconstruct --dry-run --json\n\
 am doctor support-bundle --json\n\
@@ -3050,6 +3123,10 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
 
         let mut config = Config {
             storage_root: storage_root.clone(),
+            // Pin an unused port so the bundle's live liveness/port probes
+            // (I1/I4) fail fast and deterministically instead of contacting a
+            // real server that may be listening on the default 8765.
+            http_port: 1,
             ..Default::default()
         };
         config.http_bearer_token = Some("not-written".to_string());
@@ -3101,14 +3178,20 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
     #[test]
     fn support_bundle_includes_reliability_snapshot() {
         // N2 (br-bvq1x.14.2): the bundle must inline the reliability snapshot —
-        // runtime identity (binary/version + offline am_version verdict, J2/J3)
-        // and the host-pressure section (J1) — redaction-safe, with the field
+        // runtime identity (binary/version + offline am_version verdict, J2/J3),
+        // the host-pressure section (J1), TUI/runtime loop heartbeats (I1/I2),
+        // the unified process-owner model (I4), and the fs-based
+        // mailbox-ownership/lock state (D1) — redaction-safe, with the field
         // schema documented inline and an at-a-glance summary pointer.
         let root = tempfile::tempdir().unwrap();
         let storage_root = root.path().join("storage");
         fs::create_dir_all(&storage_root).unwrap();
         let config = Config {
             storage_root: storage_root.clone(),
+            // Pin an unused port so the bundle's live liveness/port probes
+            // (I1/I4) fail fast and deterministically instead of contacting a
+            // real server that may be listening on the default 8765.
+            http_port: 1,
             ..Default::default()
         };
         let result = create_support_bundle(
@@ -3143,8 +3226,47 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
             snap.pointer("/host/host_pressure_likely").is_some(),
             "snapshot must carry the host-pressure section: {snap}"
         );
-        // Field schema is documented inline (no out-of-band lookup needed).
-        assert!(snap.pointer("/field_schema/runtime_identity").is_some());
+        // I1/I2: TUI/runtime loop heartbeats. The probe is pinned to an unused
+        // port above, so it records an honest `unreachable` source.
+        assert_eq!(
+            snap.pointer("/tui_liveness/source")
+                .and_then(serde_json::Value::as_str),
+            Some("unreachable"),
+            "tui_liveness must report unreachable with no server up: {snap}"
+        );
+        // I4: the five process-owner dimensions are all present.
+        for dim in ["expected_service", "actual_processes", "port", "db_path"] {
+            assert!(
+                snap.pointer(&format!("/process_owner/{dim}")).is_some(),
+                "snapshot process_owner missing `{dim}`: {snap}"
+            );
+        }
+        assert!(
+            snap.pointer("/process_owner_divergences")
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "process_owner_divergences must be an array: {snap}"
+        );
+        // D1: fs-based mailbox-ownership/lock state.
+        assert!(
+            snap.pointer("/mailbox_ownership/disposition").is_some(),
+            "snapshot must carry mailbox_ownership.disposition: {snap}"
+        );
+        // Field schema is documented inline (no out-of-band lookup needed) for
+        // every section.
+        for section in [
+            "runtime_identity",
+            "host",
+            "tui_liveness",
+            "process_owner",
+            "process_owner_divergences",
+            "mailbox_ownership",
+        ] {
+            assert!(
+                snap.pointer(&format!("/field_schema/{section}")).is_some(),
+                "field_schema does not document `{section}`: {snap}"
+            );
+        }
 
         // The summary surfaces an at-a-glance reliability pointer.
         let summary: serde_json::Value =
@@ -3155,11 +3277,20 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
                 .and_then(serde_json::Value::as_str),
             Some("reports/reliability-snapshot.json")
         );
-        assert!(
-            summary
-                .pointer("/reliability_snapshot/am_version_state")
-                .is_some()
-        );
+        for quick_field in [
+            "am_version_state",
+            "tui_liveness_overall",
+            "process_owner_divergence_count",
+            "supervisor_respawn_loop",
+            "mailbox_ownership_disposition",
+        ] {
+            assert!(
+                summary
+                    .pointer(&format!("/reliability_snapshot/{quick_field}"))
+                    .is_some(),
+                "summary.reliability_snapshot missing quick-triage field `{quick_field}`: {summary}"
+            );
+        }
 
         // Redaction-safe: the absolute storage_root must not leak into the snapshot.
         assert!(
@@ -3181,6 +3312,9 @@ path=/home/ubuntu/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3
 
         let config = Config {
             storage_root,
+            // Pin an unused port (the symlink check errors out before any
+            // probe, but keep it hermetic regardless).
+            http_port: 1,
             ..Default::default()
         };
         let err = create_support_bundle(

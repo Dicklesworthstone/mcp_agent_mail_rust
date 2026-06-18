@@ -475,6 +475,77 @@ assert_support_manifest_safe_sharing_limits() {
     assert_file_contains "${scenario}/${label} support manifest omits attachments" "${manifest}" "attachment contents and attachment filenames"
 }
 
+# N2 (br-bvq1x.14.2): the reliability snapshot must aggregate every
+# reliability-epic diagnostic surface in ONE file — runtime identity
+# (J2/J3), host pressure (J1), TUI/runtime loop heartbeats (I1/I2), the
+# unified process-owner model (I4), and the fs-based mailbox-ownership /
+# lock state (D1) — each documented in the snapshot's field_schema. This
+# is the e2e proof that the capture bundle is complete and self-describing.
+assert_support_bundle_reliability_snapshot() {
+    local scenario="$1"
+    local label="$2"
+    local manifest snapshot
+    manifest="$(latest_support_manifest)"
+    if [ -z "${manifest}" ]; then
+        e2e_fail "${scenario}/${label} reliability snapshot: bundle manifest exists"
+        return 0
+    fi
+    snapshot="$(dirname "${manifest}")/reports/reliability-snapshot.json"
+    if [ ! -f "${snapshot}" ]; then
+        e2e_fail "${scenario}/${label} reliability snapshot file exists"
+        return 0
+    fi
+    e2e_copy_artifact "${snapshot}" "recovery_chaos/${scenario}/${label}_reliability_snapshot.json"
+    if python3 - "${snapshot}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    snap = json.load(handle)
+
+required = [
+    "runtime_identity",
+    "host",
+    "tui_liveness",
+    "process_owner",
+    "process_owner_divergences",
+    "mailbox_ownership",
+]
+schema = snap.get("field_schema", {})
+for section in required:
+    if section not in snap:
+        print(f"missing section: {section}", file=sys.stderr)
+        sys.exit(1)
+    if section not in schema:
+        print(f"field_schema does not document: {section}", file=sys.stderr)
+        sys.exit(1)
+
+# I4: the five process-owner dimensions must all be present.
+po = snap.get("process_owner", {})
+for dim in ("expected_service", "actual_processes", "port", "db_path"):
+    if dim not in po:
+        print(f"process_owner missing dimension: {dim}", file=sys.stderr)
+        sys.exit(1)
+if not isinstance(snap.get("process_owner_divergences"), list):
+    print("process_owner_divergences is not a list", file=sys.stderr)
+    sys.exit(1)
+# D1: fs-based lock surface exposes a disposition.
+if "disposition" not in snap.get("mailbox_ownership", {}):
+    print("mailbox_ownership missing disposition", file=sys.stderr)
+    sys.exit(1)
+# I1/I2: liveness probe reports an explicit source.
+if "source" not in snap.get("tui_liveness", {}):
+    print("tui_liveness missing source", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PY
+    then
+        e2e_pass "${scenario}/${label} reliability snapshot aggregates J1/J2/J3/I1/I4/D1 with documented field_schema"
+    else
+        e2e_fail "${scenario}/${label} reliability snapshot missing a reliability surface or field_schema entry"
+    fi
+}
+
 assert_manifest_sqlite_status() {
     local scenario="$1"
     local label="$2"
@@ -546,6 +617,7 @@ assert_step_exit "${SCENARIO}" "doctor_support_bundle" "0"
 copy_latest_support_manifest "${SCENARIO}" "doctor_support_bundle"
 assert_support_bundle_observed_command "${SCENARIO}" "doctor_support_bundle" "repair"
 assert_support_manifest_safe_sharing_limits "${SCENARIO}" "doctor_support_bundle"
+assert_support_bundle_reliability_snapshot "${SCENARIO}" "doctor_support_bundle"
 
 # Scenario 3: startup path chooses automatic repair, not reconstruct, for repairable FK drift.
 SCENARIO="startup_auto_repair_orphan_recipient"
@@ -575,6 +647,7 @@ assert_step_exit "${SCENARIO}" "doctor_support_bundle" "0"
 copy_latest_support_manifest "${SCENARIO}" "doctor_support_bundle"
 assert_support_bundle_observed_command "${SCENARIO}" "doctor_support_bundle" "reconstruct"
 assert_support_manifest_safe_sharing_limits "${SCENARIO}" "doctor_support_bundle"
+assert_support_bundle_reliability_snapshot "${SCENARIO}" "doctor_support_bundle"
 
 # Scenario 5: repair forensics capture live SQLite sidecars before mutation.
 SCENARIO="forensics_captures_live_sidecars"

@@ -3282,6 +3282,83 @@ fn doctor_support_bundle_adversarial_redaction_writes_report() {
         missing_retained.is_empty(),
         "support bundle dropped retained labels: {missing_retained:?}"
     );
+
+    // N2 (br-bvq1x.14.2): the reliability snapshot must aggregate the
+    // reliability-epic surfaces an incident responder needs in ONE file:
+    // runtime identity (J2/J3), host pressure (J1), TUI/runtime loop
+    // heartbeats (I1/I2), the unified process-owner model (I4), and the
+    // fs-based mailbox-ownership/lock state (D1). Assert each section is
+    // present and shaped, with its field_schema documented. HTTP_PORT=1 in
+    // the test env makes the liveness/port probes deterministically
+    // unreachable, so the snapshot is stable.
+    let snapshot: Value = serde_json::from_str(
+        &std::fs::read_to_string(bundle_path.join("reports/reliability-snapshot.json"))
+            .expect("reliability-snapshot.json present in bundle"),
+    )
+    .expect("reliability-snapshot.json parses");
+    assert_eq!(
+        snapshot["schema_version"], "1.1",
+        "reliability snapshot schema_version bumped for the I1/I4/D1 sections"
+    );
+    for section in [
+        "runtime_identity",
+        "host",
+        "tui_liveness",
+        "process_owner",
+        "process_owner_divergences",
+        "mailbox_ownership",
+    ] {
+        assert!(
+            snapshot.get(section).is_some(),
+            "reliability snapshot missing section `{section}`: {snapshot:#}"
+        );
+        assert!(
+            snapshot["field_schema"].get(section).is_some(),
+            "reliability snapshot field_schema does not document `{section}`"
+        );
+    }
+    // I1/I2: with the server unreachable (HTTP_PORT=1) the loop-liveness
+    // probe records an honest `unreachable` source rather than fabricating
+    // a verdict.
+    assert_eq!(
+        snapshot["tui_liveness"]["source"], "unreachable",
+        "TUI liveness must report unreachable when no server is up"
+    );
+    // I4: the five process-owner dimensions are all present.
+    for dim in ["expected_service", "actual_processes", "port", "db_path"] {
+        assert!(
+            snapshot["process_owner"].get(dim).is_some(),
+            "process_owner missing dimension `{dim}`"
+        );
+    }
+    assert!(
+        snapshot["process_owner_divergences"].is_array(),
+        "process_owner_divergences must be an array"
+    );
+    // D1: the fs-based lock surface exposes the disposition + lock paths.
+    assert!(
+        snapshot["mailbox_ownership"].get("disposition").is_some(),
+        "mailbox_ownership missing disposition"
+    );
+
+    // The summary.json quick-triage projection surfaces the new at-a-glance
+    // fields so triage does not have to open the full snapshot.
+    let summary: Value = serde_json::from_str(
+        &std::fs::read_to_string(bundle_path.join("summary.json"))
+            .expect("summary.json present in bundle"),
+    )
+    .expect("summary.json parses");
+    for quick_field in [
+        "tui_liveness_overall",
+        "process_owner_divergence_count",
+        "supervisor_respawn_loop",
+        "mailbox_ownership_disposition",
+    ] {
+        assert!(
+            summary["reliability_snapshot"].get(quick_field).is_some(),
+            "summary.reliability_snapshot missing quick-triage field `{quick_field}`"
+        );
+    }
 }
 
 #[test]
