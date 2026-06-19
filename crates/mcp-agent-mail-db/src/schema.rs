@@ -4815,6 +4815,108 @@ mod tests {
     }
 
     #[test]
+    fn v3_migration_preserves_distinct_per_row_timestamps() {
+        // Regression for #153 defect 2: every migrated reservation collapsed to
+        // a single constant `expires_ts`. The v3 conversion must preserve each
+        // row's distinct legacy DATETIME value, not fold them to one instant.
+        use sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v3_multi_row_ts.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+            &[],
+        )
+        .expect("create legacy projects table");
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::Text("legacy-proj".to_string()),
+                Value::Text("/data/legacy".to_string()),
+                Value::Text("2026-02-04 22:13:11.079199".to_string()),
+            ],
+        )
+        .expect("insert legacy project");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL DEFAULT 1, reason TEXT NOT NULL DEFAULT '', created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
+            &[],
+        )
+        .expect("create legacy file_reservations table");
+
+        // Distinct per-row ISO-8601 DATETIME values, mirroring the issue's repro.
+        let legacy_rows = [
+            ("2026-06-17 23:00:00.111111", "2026-06-17 23:12:21.295382"),
+            ("2026-06-17 23:01:00.222222", "2026-06-17 23:12:02.904292"),
+            ("2026-06-17 23:02:00.333333", "2026-06-18 00:03:49.589340"),
+        ];
+        for (created, expires) in legacy_rows {
+            conn.execute_sync(
+                "INSERT INTO file_reservations (project_id, agent_id, path_pattern, created_ts, expires_ts) VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(1),
+                    Value::BigInt(1),
+                    Value::Text("src/**".to_string()),
+                    Value::Text(created.to_string()),
+                    Value::Text(expires.to_string()),
+                ],
+            )
+            .expect("insert legacy file_reservation");
+        }
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap()
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(expires_ts) AS t, expires_ts FROM file_reservations ORDER BY id",
+                &[],
+            )
+            .expect("query file_reservations");
+        assert_eq!(rows.len(), 3, "all three reservations should survive");
+
+        let mut values: Vec<i64> = Vec::new();
+        for row in &rows {
+            assert_eq!(
+                row.get_named::<String>("t").unwrap(),
+                "integer",
+                "expires_ts must convert to integer microseconds"
+            );
+            values.push(row.get_named::<i64>("expires_ts").unwrap());
+        }
+
+        // The exact per-row values canonical SQLite produces for these inputs.
+        assert_eq!(
+            values,
+            vec![
+                1_781_737_941_295_382,
+                1_781_737_922_904_292,
+                1_781_741_029_589_340
+            ],
+            "each reservation must keep its own converted expiry, not a shared constant"
+        );
+
+        let distinct: std::collections::HashSet<i64> = values.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "expires_ts collapsed to a constant across rows (got {values:?})"
+        );
+    }
+
+    #[test]
     fn v3_migration_converts_text_timestamps_to_integer() {
         use sqlmodel_core::Value;
 
