@@ -3319,12 +3319,22 @@ fn contacts_command_is_read_only(action: &ContactsCommand) -> bool {
 }
 
 fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
-    // `Drain` is read-only and MUST run even while a live owner holds the
-    // mailbox — reporting the supervised drain protocol is its whole purpose.
-    matches!(
-        action,
-        DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. }
-    )
+    match action {
+        // `Drain` is read-only and MUST run even while a live owner holds the
+        // mailbox — reporting the supervised drain protocol is its whole purpose.
+        DoctorCommand::Locks { .. } | DoctorCommand::Drain { .. } => true,
+        // `am doctor fix --list` (with or without `--only <fm-id>`) is a
+        // detector-only inventory surface: the dispatcher routes it to
+        // `handle_fix_only_list` / `handle_fix_list_all`, which call
+        // `fixers::detect_only` / `detect_all` and never the mutating
+        // `mutate()` chokepoint (no run-dir scaffolding, no actions recorded).
+        // It must run even while a live owner holds the mailbox so agents can
+        // inventory FM findings without being steered into killing the owner.
+        // `--dry-run` and `--yes` (list == false) remain mutating-intent and
+        // are intentionally still blocked.
+        DoctorCommand::Fix { list: true, .. } => true,
+        _ => false,
+    }
 }
 
 fn execute(cli: Cli) -> CliResult<()> {
@@ -44029,6 +44039,58 @@ http_headers = { Authorization = "Bearer secret" }
             },
         };
         assert!(!command_is_read_only(&fix));
+    }
+
+    #[test]
+    fn doctor_fix_list_inventory_is_read_only_but_mutating_fix_is_not() {
+        // `--list` (no `--only`): detector-only enumeration, read-only.
+        let list_all = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: false,
+                json: true,
+                only: None,
+                list: true,
+            },
+        };
+        assert!(command_is_read_only(&list_all));
+
+        // `--only <fm-id> --list`: single-FM detector inventory, read-only.
+        let list_one = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: false,
+                json: true,
+                only: Some("fm-archive-state-files-stale-archive-lock-from-dead-pid".to_string()),
+                list: true,
+            },
+        };
+        assert!(command_is_read_only(&list_one));
+
+        // `--dry-run` (list == false) exercises the mutate() chokepoint and is
+        // mutating intent; it must stay blocked under a live owner.
+        let dry_run = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: true,
+                yes: false,
+                json: true,
+                only: Some("fm-archive-state-files-stale-archive-lock-from-dead-pid".to_string()),
+                list: false,
+            },
+        };
+        assert!(!command_is_read_only(&dry_run));
+
+        // `--only <fm-id> --yes`: applies the fix; mutating intent, blocked.
+        let apply_one = Commands::Doctor {
+            action: DoctorCommand::Fix {
+                dry_run: false,
+                yes: true,
+                json: true,
+                only: Some("fm-archive-state-files-stale-archive-lock-from-dead-pid".to_string()),
+                list: false,
+            },
+        };
+        assert!(!command_is_read_only(&apply_one));
     }
 
     fn doctor_locks_test_ownership(

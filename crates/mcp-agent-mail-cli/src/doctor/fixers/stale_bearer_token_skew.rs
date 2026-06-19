@@ -79,6 +79,14 @@ const TOKEN_FIELDS: &[&str] = &["Authorization", "authorization", "bearer", "tok
 /// `display_pointer()` so server names containing `.` remain addressable.
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenLocation {
+    /// Project-scoped container path, when the MCP server entry lives
+    /// under `projects.<abs-path>.<container_key>` instead of the
+    /// top-level container. This is the shape `claude mcp add` (local
+    /// scope) writes into `~/.claude.json`. `None` means the entry is
+    /// at the top level. The string is the project key as-is (an
+    /// absolute path), including any `.` characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
     /// `"mcpServers"` or `"mcp_servers"`.
     pub container_key: String,
     /// The server name as-is, including any `.` characters.
@@ -111,13 +119,20 @@ impl StaleBearerTokenSkewFinding {
     /// pre-pass-34 dotted-string ambiguity).
     pub fn display_pointer(&self) -> String {
         let loc = &self.location;
+        let prefix = match &loc.project_path {
+            Some(project) => format!("projects.{project}."),
+            None => String::new(),
+        };
         if loc.inside_headers {
             format!(
-                "{}.{}.headers.{}",
-                loc.container_key, loc.server_name, loc.field
+                "{}{}.{}.headers.{}",
+                prefix, loc.container_key, loc.server_name, loc.field
             )
         } else {
-            format!("{}.{}.{}", loc.container_key, loc.server_name, loc.field)
+            format!(
+                "{}{}.{}.{}",
+                prefix, loc.container_key, loc.server_name, loc.field
+            )
         }
     }
 
@@ -212,57 +227,92 @@ pub fn detect(
             Ok(v) => v,
             Err(_) => continue,
         };
-        for container_key in SERVERS_CONTAINER_KEYS {
-            let Some(servers) = v.get(container_key).and_then(|x| x.as_object()) else {
-                continue;
-            };
-            for (server_name, server_val) in servers {
-                if !is_agent_mail_server_name(server_name) {
-                    continue;
-                }
-                let Some(server_obj) = server_val.as_object() else {
-                    continue;
-                };
-                // Walk `headers.*` and direct top-level token fields.
-                for token_field in TOKEN_FIELDS {
-                    // Direct field on the server object.
-                    if let Some(val) = server_obj.get(*token_field).and_then(|x| x.as_str())
-                        && strip_bearer_prefix(val) != canonical_token
-                    {
-                        out.push(StaleBearerTokenSkewFinding {
-                            config_path: path.clone(),
-                            location: TokenLocation {
-                                container_key: (*container_key).to_string(),
-                                server_name: server_name.clone(),
-                                inside_headers: false,
-                                field: (*token_field).to_string(),
-                            },
-                            current_token: val.to_string(),
-                            canonical_token: canonical_token.to_string(),
-                        });
-                    }
-                    // Inside `headers.<field>`.
-                    if let Some(headers) = server_obj.get("headers").and_then(|x| x.as_object())
-                        && let Some(val) = headers.get(*token_field).and_then(|x| x.as_str())
-                        && strip_bearer_prefix(val) != canonical_token
-                    {
-                        out.push(StaleBearerTokenSkewFinding {
-                            config_path: path.clone(),
-                            location: TokenLocation {
-                                container_key: (*container_key).to_string(),
-                                server_name: server_name.clone(),
-                                inside_headers: true,
-                                field: (*token_field).to_string(),
-                            },
-                            current_token: val.to_string(),
-                            canonical_token: canonical_token.to_string(),
-                        });
-                    }
-                }
+        // Top-level `mcpServers` / `mcp_servers` containers (the
+        // common shape and `claude mcp add -s user` writes into
+        // `~/.claude.json`'s top-level container).
+        scan_value_containers(path, None, &v, canonical_token, &mut out);
+        // Project-scoped containers: `projects.<abs-path>.mcpServers`.
+        // This is what the DEFAULT (local-scope) `claude mcp add`
+        // writes into `~/.claude.json` — the exact file/shape that
+        // drifted in the ts1 401 incident (br-5gfrd).
+        if let Some(projects) = v.get("projects").and_then(|x| x.as_object()) {
+            for (project_path, project_val) in projects {
+                scan_value_containers(
+                    path,
+                    Some(project_path.as_str()),
+                    project_val,
+                    canonical_token,
+                    &mut out,
+                );
             }
         }
     }
     out
+}
+
+/// Scan the `mcpServers` / `mcp_servers` containers directly on
+/// `parent` for agent-mail entries whose token differs from
+/// `canonical_token`. `project_path` records the project scope so the
+/// fixer can navigate back to `projects.<project_path>.<container>`;
+/// pass `None` for a top-level container.
+fn scan_value_containers(
+    path: &std::path::Path,
+    project_path: Option<&str>,
+    parent: &serde_json::Value,
+    canonical_token: &str,
+    out: &mut Vec<StaleBearerTokenSkewFinding>,
+) {
+    for container_key in SERVERS_CONTAINER_KEYS {
+        let Some(servers) = parent.get(container_key).and_then(|x| x.as_object()) else {
+            continue;
+        };
+        for (server_name, server_val) in servers {
+            if !is_agent_mail_server_name(server_name) {
+                continue;
+            }
+            let Some(server_obj) = server_val.as_object() else {
+                continue;
+            };
+            // Walk `headers.*` and direct top-level token fields.
+            for token_field in TOKEN_FIELDS {
+                // Direct field on the server object.
+                if let Some(val) = server_obj.get(*token_field).and_then(|x| x.as_str())
+                    && strip_bearer_prefix(val) != canonical_token
+                {
+                    out.push(StaleBearerTokenSkewFinding {
+                        config_path: path.to_path_buf(),
+                        location: TokenLocation {
+                            project_path: project_path.map(str::to_string),
+                            container_key: (*container_key).to_string(),
+                            server_name: server_name.clone(),
+                            inside_headers: false,
+                            field: (*token_field).to_string(),
+                        },
+                        current_token: val.to_string(),
+                        canonical_token: canonical_token.to_string(),
+                    });
+                }
+                // Inside `headers.<field>`.
+                if let Some(headers) = server_obj.get("headers").and_then(|x| x.as_object())
+                    && let Some(val) = headers.get(*token_field).and_then(|x| x.as_str())
+                    && strip_bearer_prefix(val) != canonical_token
+                {
+                    out.push(StaleBearerTokenSkewFinding {
+                        config_path: path.to_path_buf(),
+                        location: TokenLocation {
+                            project_path: project_path.map(str::to_string),
+                            container_key: (*container_key).to_string(),
+                            server_name: server_name.clone(),
+                            inside_headers: true,
+                            field: (*token_field).to_string(),
+                        },
+                        current_token: val.to_string(),
+                        canonical_token: canonical_token.to_string(),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn is_agent_mail_server_name(name: &str) -> bool {
@@ -296,12 +346,32 @@ pub fn fix(
     // Walk the structured location directly; dotted display strings
     // are ambiguous for server names such as "agent-mail.prod".
     let loc = &finding.location;
-    let Some(obj) = v.as_object_mut() else {
+    let Some(root) = v.as_object_mut() else {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
             quarantined_paths: Vec::new(),
         });
+    };
+    // For project-scoped entries, descend into
+    // `projects.<project_path>` before resolving the container.
+    let obj = match &loc.project_path {
+        None => root,
+        Some(project_path) => {
+            let Some(scoped) = root
+                .get_mut("projects")
+                .and_then(|x| x.as_object_mut())
+                .and_then(|projects| projects.get_mut(project_path))
+                .and_then(|x| x.as_object_mut())
+            else {
+                return Ok(FixOutcome {
+                    actions_taken: 0,
+                    actions_skipped: 1,
+                    quarantined_paths: Vec::new(),
+                });
+            };
+            scoped
+        }
     };
     let Some(servers) = obj
         .get_mut(&loc.container_key)
@@ -611,10 +681,120 @@ mod tests {
     }
 
     #[test]
+    fn detector_flags_project_scoped_claude_json_skew() {
+        // `~/.claude.json` shape: default (local) `claude mcp add`
+        // writes the server under `projects.<abs-path>.mcpServers`,
+        // NOT the top-level container. This is the exact ts1 401
+        // incident shape (br-5gfrd).
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("claude.json");
+        fs::write(
+            &p,
+            r#"{
+  "numStartups": 7,
+  "projects": {
+    "/abs/path/to/repo": {
+      "mcpServers": {
+        "agent-mail": {
+          "type": "http",
+          "url": "http://127.0.0.1:8765/mcp/",
+          "headers": { "Authorization": "Bearer stale-956458c9" }
+        }
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let findings = detect("a9d26a73-canonical", std::slice::from_ref(&p));
+        assert_eq!(findings.len(), 1, "must flag the project-scoped entry");
+        assert_eq!(
+            findings[0].location.project_path.as_deref(),
+            Some("/abs/path/to/repo")
+        );
+        assert!(
+            findings[0]
+                .display_pointer()
+                .starts_with("projects./abs/path/to/repo.mcpServers.agent-mail")
+        );
+    }
+
+    #[test]
+    fn fixer_rewrites_project_scoped_claude_json_in_place() {
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("claude.json");
+        fs::write(
+            &p,
+            r#"{
+  "numStartups": 7,
+  "projects": {
+    "/abs/path/to/repo": {
+      "mcpServers": {
+        "agent-mail": {
+          "url": "http://127.0.0.1:8765/mcp/",
+          "headers": { "Authorization": "Bearer stale-956458c9" }
+        }
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let findings = detect("a9d26a73-canonical", std::slice::from_ref(&p));
+        assert_eq!(findings.len(), 1);
+
+        let ctx = ctx_for(&td, "2026-06-19T00-00-00Z__claude_json_scoped");
+        let outcome = fix(&ctx, &findings[0]).expect("fix");
+        assert_eq!(outcome.actions_taken, 1);
+
+        let body = fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains(r#""Bearer a9d26a73-canonical""#),
+            "post-fix must reconcile the project-scoped token; got:\n{body}"
+        );
+        assert!(!body.contains("stale-956458c9"));
+        // Unrelated keys must survive the whole-file rewrite (preserve_order).
+        assert!(body.contains(r#""numStartups": 7"#));
+    }
+
+    #[test]
+    fn detector_flags_both_top_level_and_project_scoped() {
+        // A `~/.claude.json` can carry BOTH a user-scoped (top-level)
+        // and a local-scoped (project) agent-mail entry; flag each.
+        let td = TempDir::new().unwrap();
+        let p = td.path().join("claude.json");
+        fs::write(
+            &p,
+            r#"{
+  "mcpServers": {
+    "agent-mail": { "headers": { "Authorization": "Bearer stale-top" } }
+  },
+  "projects": {
+    "/repo": {
+      "mcpServers": {
+        "agent-mail": { "headers": { "Authorization": "Bearer stale-scoped" } }
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let findings = detect("canon", std::slice::from_ref(&p));
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|f| f.location.project_path.is_none()));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.location.project_path.as_deref() == Some("/repo"))
+        );
+    }
+
+    #[test]
     fn evidence_redacts_token_values() {
         let f = StaleBearerTokenSkewFinding {
             config_path: PathBuf::from("/x/mcp.json"),
             location: TokenLocation {
+                project_path: None,
                 container_key: "mcpServers".into(),
                 server_name: "agent-mail".into(),
                 inside_headers: true,

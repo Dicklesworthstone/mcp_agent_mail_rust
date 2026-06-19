@@ -928,6 +928,13 @@ fn default_token_backup_candidates(storage_root: &Path) -> Vec<PathBuf> {
 fn default_mcp_config_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(home) = dirs::home_dir() {
+        // `~/.claude.json` is Claude Code's primary config and the file
+        // `claude mcp add` actually writes to (top-level `mcpServers`
+        // for user scope, `projects.<path>.mcpServers` for local scope).
+        // This is the exact file that drifted in the ts1 401 incident
+        // (br-5gfrd); the stale-bearer/wrong-url/duplicate FMs need to
+        // see it. Keep `.claude/.mcp.json` too for older layouts.
+        v.push(home.join(".claude.json"));
         v.push(home.join(".claude").join(".mcp.json"));
         v.push(home.join(".cursor").join("mcp.json"));
         v.push(home.join(".windsurf").join("mcp_config.json"));
