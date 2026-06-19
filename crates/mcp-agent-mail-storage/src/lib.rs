@@ -880,11 +880,17 @@ pub struct WbqCircuitBreakerArchive {
 static WBQ_CIRCUIT_BREAKER: LazyLock<WbqCircuitBreaker> = LazyLock::new(WbqCircuitBreaker::default);
 
 fn wbq_circuit_breaker_threshold() -> u64 {
-    std::env::var("AM_WBQ_CIRCUIT_BREAKER_THRESHOLD")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(WBQ_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+    // Static config: read the env override once and cache it. `wbq_note_drain_outcome`
+    // calls this for every drained group on the hot drain path, so re-reading the env
+    // var each time would be both wasteful and a source of mid-run inconsistency.
+    static THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("AM_WBQ_CIRCUIT_BREAKER_THRESHOLD")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(WBQ_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+    });
+    *THRESHOLD
 }
 
 /// Per-archive identity `(storage_root, project_slug)` for every `WriteOp`.
