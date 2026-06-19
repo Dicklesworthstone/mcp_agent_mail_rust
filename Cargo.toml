@@ -158,10 +158,14 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Keep asupersync unified with the sibling frankensearch checkout. Its workspace
-# dependency is currently a path dependency on ../asupersync, so resolving our
-# direct crates.io dependency from the registry would split Cx/Outcome types.
-asupersync = { path = "../asupersync" }
+# Keep asupersync unified with the sibling checkouts. FrankenSQLite and
+# FrankenSearch reference asupersync via the absolute `/dp/asupersync`
+# path (fleet-wide symlink to the canonical checkout); we MUST use the
+# identical path string here or cargo treats `../asupersync` and
+# `/dp/asupersync` as two distinct 0.3.5 packages and refuses the lock
+# ("package collision in the lockfile"). Single path string => single
+# Cx/Outcome universe.
+asupersync = { path = "/dp/asupersync" }
 #
 # fastmcp-rust is temporarily force-patched to the sibling checkout
 # until its own v0.3 release propagates to crates.io. The currently
