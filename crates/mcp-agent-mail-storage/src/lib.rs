@@ -741,6 +741,394 @@ pub fn clear_durability_degraded() {
         .set(0);
 }
 
+// ---------------------------------------------------------------------------
+// WBQ per-archive circuit breaker (br-bvq1x.9.8 Part 3)
+// ---------------------------------------------------------------------------
+//
+// Before this, `wbq_execute_op` retried `max_retries` times and, on exhausting
+// the budget, set the sticky `wbq_last_unrecoverable_error_us` flag
+// (`durability_degraded()`) — with NO recovery trigger. A single persistently
+// broken archive (e.g. a wedged `.git` after the ts2 git-2.51.0 index race)
+// would silently degrade durability forever while the drain loop kept failing
+// every tick.
+//
+// The circuit breaker tracks consecutive non-retryable commit failures
+// PER ARCHIVE (keyed by `storage_root::project_slug`, so healthy archives'
+// successes don't mask one wedged archive). After K consecutive failures it
+// "trips" once (then enters a cooldown) and fires an archive self-heal via
+// `boot_check::preflight_archive_integrity(..., AutoRepair)` plus an actionable
+// operator escalation, instead of degrading silently. A subsequent success
+// resets that archive's counter.
+
+/// Default consecutive non-retryable commit failures (per archive) before the
+/// circuit breaker trips. Override with `AM_WBQ_CIRCUIT_BREAKER_THRESHOLD`.
+pub const WBQ_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u64 = 5;
+
+/// Cooldown after a trip before the SAME archive may trip again. Prevents the
+/// heavy boot-check scan from re-firing on every drain while an archive stays
+/// wedged (the durability-degraded flag remains set in the meantime).
+const WBQ_CIRCUIT_BREAKER_COOLDOWN_MICROS: i64 = 60_000_000; // 60s
+
+/// Per-archive failure accounting for the circuit breaker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ArchiveFailureState {
+    consecutive_failures: u64,
+    last_trip_micros: i64,
+    trips_total: u64,
+}
+
+/// Pure decision core (no I/O, no locks) so the trip logic is unit-testable.
+///
+/// Returns the next state and whether the breaker should trip NOW. A trip
+/// fires only when `consecutive_failures` first reaches `threshold` AND the
+/// per-archive cooldown has elapsed since the last trip — never on success.
+fn circuit_breaker_decide(
+    prev: ArchiveFailureState,
+    failed: bool,
+    threshold: u64,
+    now_micros: i64,
+    cooldown_micros: i64,
+) -> (ArchiveFailureState, bool) {
+    if !failed {
+        // Success resets the consecutive counter but keeps trip history so the
+        // snapshot can still surface a previously-wedged-then-recovered archive.
+        return (
+            ArchiveFailureState {
+                consecutive_failures: 0,
+                ..prev
+            },
+            false,
+        );
+    }
+    let consecutive = prev.consecutive_failures.saturating_add(1);
+    let cooled_down = prev.last_trip_micros == 0
+        || now_micros.saturating_sub(prev.last_trip_micros) >= cooldown_micros;
+    let trip = consecutive >= threshold && cooled_down;
+    let next = ArchiveFailureState {
+        consecutive_failures: consecutive,
+        last_trip_micros: if trip {
+            now_micros
+        } else {
+            prev.last_trip_micros
+        },
+        trips_total: if trip {
+            prev.trips_total.saturating_add(1)
+        } else {
+            prev.trips_total
+        },
+    };
+    (next, trip)
+}
+
+#[derive(Debug, Default)]
+struct WbqCircuitBreaker {
+    inner: Mutex<HashMap<String, ArchiveFailureState>>,
+}
+
+impl WbqCircuitBreaker {
+    /// Record one drain outcome for `archive_key`. Returns `(tripped, state)`.
+    /// Pure w.r.t. side effects beyond its own map — the caller performs the
+    /// escalation when `tripped` is true. `threshold`/`now`/`cooldown` are
+    /// explicit so tests are deterministic; production passes the env-derived
+    /// threshold and `now_micros_i64()`.
+    fn record_with(
+        &self,
+        archive_key: &str,
+        failed: bool,
+        threshold: u64,
+        now_micros: i64,
+        cooldown_micros: i64,
+    ) -> (bool, ArchiveFailureState) {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = map.get(archive_key).copied().unwrap_or_default();
+        let (next, trip) =
+            circuit_breaker_decide(prev, failed, threshold, now_micros, cooldown_micros);
+        if next == ArchiveFailureState::default() {
+            // Healthy archive with no history — keep the map bounded.
+            map.remove(archive_key);
+        } else {
+            map.insert(archive_key.to_string(), next);
+        }
+        (trip, next)
+    }
+
+    fn snapshot(&self) -> Vec<WbqCircuitBreakerArchive> {
+        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: Vec<WbqCircuitBreakerArchive> = map
+            .iter()
+            .map(|(k, v)| WbqCircuitBreakerArchive {
+                archive_key: k.clone(),
+                consecutive_failures: v.consecutive_failures,
+                trips_total: v.trips_total,
+                last_trip_micros: v.last_trip_micros,
+            })
+            .collect();
+        out.sort_by(|a, b| a.archive_key.cmp(&b.archive_key));
+        out
+    }
+}
+
+/// Snapshot row for one archive tracked by the WBQ circuit breaker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WbqCircuitBreakerArchive {
+    pub archive_key: String,
+    pub consecutive_failures: u64,
+    pub trips_total: u64,
+    pub last_trip_micros: i64,
+}
+
+static WBQ_CIRCUIT_BREAKER: LazyLock<WbqCircuitBreaker> = LazyLock::new(WbqCircuitBreaker::default);
+
+fn wbq_circuit_breaker_threshold() -> u64 {
+    std::env::var("AM_WBQ_CIRCUIT_BREAKER_THRESHOLD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(WBQ_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+}
+
+/// Per-archive identity `(storage_root, project_slug)` for every `WriteOp`.
+fn write_op_archive_identity(op: &WriteOp) -> (&Path, &str) {
+    match op {
+        WriteOp::MessageBundle {
+            project_slug,
+            config,
+            ..
+        }
+        | WriteOp::AgentProfile {
+            project_slug,
+            config,
+            ..
+        }
+        | WriteOp::FileReservation {
+            project_slug,
+            config,
+            ..
+        }
+        | WriteOp::NotificationSignal {
+            config,
+            project_slug,
+            ..
+        }
+        | WriteOp::ClearSignal {
+            config,
+            project_slug,
+            ..
+        } => (config.storage_root.as_path(), project_slug.as_str()),
+    }
+}
+
+/// Feed one drain-group outcome to the circuit breaker and escalate on trip.
+fn wbq_note_drain_outcome(op: &WriteOp, failed: bool) {
+    let (storage_root, project_slug) = write_op_archive_identity(op);
+    let archive_key = format!("{}::{}", storage_root.display(), project_slug);
+    let (trip, state) = WBQ_CIRCUIT_BREAKER.record_with(
+        &archive_key,
+        failed,
+        wbq_circuit_breaker_threshold(),
+        now_micros_i64(),
+        WBQ_CIRCUIT_BREAKER_COOLDOWN_MICROS,
+    );
+    if trip {
+        wbq_circuit_breaker_escalate(storage_root, project_slug, state.consecutive_failures);
+    }
+}
+
+/// Escalation action: fire a bounded archive self-heal and surface an
+/// actionable operator error instead of degrading silently. Runs only on a
+/// trip (rare — after K consecutive failures, then once per cooldown window).
+fn wbq_circuit_breaker_escalate(storage_root: &Path, project_slug: &str, consecutive: u64) {
+    tracing::error!(
+        consecutive_failures = consecutive,
+        project_slug = %project_slug,
+        storage_root = %storage_root.display(),
+        "[wbq-circuit-breaker] archive hit {consecutive} consecutive non-retryable commit \
+         failures — firing boot-check self-heal. If this persists, run \
+         `am doctor reconstruct` (archive-first rebuild) or `am doctor repair`",
+    );
+    let report = boot_check::preflight_archive_integrity(
+        storage_root,
+        boot_check::BootCheckMode::AutoRepair,
+    );
+    if report.auto_repaired_count > 0 {
+        tracing::warn!(
+            auto_repaired = report.auto_repaired_count,
+            storage_root = %storage_root.display(),
+            "[wbq-circuit-breaker] boot-check auto-repaired archive issue(s); WBQ will retry on \
+             the next drain tick",
+        );
+    } else if report.has_findings() {
+        tracing::error!(
+            findings = report.findings.len(),
+            storage_root = %storage_root.display(),
+            "[wbq-circuit-breaker] boot-check found unrepaired archive finding(s) — operator \
+             action required: `am doctor reconstruct`",
+        );
+    } else {
+        tracing::error!(
+            storage_root = %storage_root.display(),
+            "[wbq-circuit-breaker] boot-check found no repairable git-shape issue; the failure \
+             cause is elsewhere (disk full / permissions / DB corruption) — run \
+             `am robot health --include-host` then `am doctor --json`",
+        );
+    }
+}
+
+/// Snapshot of the WBQ circuit breaker's per-archive failure accounting.
+/// Empty when no archive currently has failures or trip history. Surfaced for
+/// robot/doctor reliability views and used by tests.
+#[must_use]
+pub fn wbq_circuit_breaker_snapshot() -> Vec<WbqCircuitBreakerArchive> {
+    WBQ_CIRCUIT_BREAKER.snapshot()
+}
+
+#[cfg(test)]
+mod wbq_circuit_breaker_tests {
+    use super::*;
+
+    const T: u64 = 5; // threshold
+    const CD: i64 = 60_000_000; // cooldown micros
+
+    #[test]
+    fn decide_resets_consecutive_on_success() {
+        let prev = ArchiveFailureState {
+            consecutive_failures: 3,
+            last_trip_micros: 0,
+            trips_total: 0,
+        };
+        let (next, trip) = circuit_breaker_decide(prev, false, T, 1_000, CD);
+        assert!(!trip);
+        assert_eq!(next.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn decide_does_not_trip_below_threshold() {
+        let mut state = ArchiveFailureState::default();
+        for i in 1..T {
+            let (next, trip) = circuit_breaker_decide(state, true, T, i as i64, CD);
+            assert!(!trip, "must not trip at {i} failures (< {T})");
+            state = next;
+            assert_eq!(state.consecutive_failures, i);
+        }
+    }
+
+    #[test]
+    fn decide_trips_exactly_at_threshold() {
+        let mut state = ArchiveFailureState::default();
+        let mut trips = 0;
+        for i in 1..=T {
+            let (next, trip) = circuit_breaker_decide(state, true, T, i as i64, CD);
+            if trip {
+                trips += 1;
+            }
+            state = next;
+        }
+        assert_eq!(trips, 1, "exactly one trip on reaching the threshold");
+        assert_eq!(state.trips_total, 1);
+        assert_eq!(state.consecutive_failures, T);
+    }
+
+    #[test]
+    fn decide_cooldown_blocks_immediate_retrip_then_allows_after_window() {
+        // Reach threshold and trip at t=100.
+        let mut state = ArchiveFailureState::default();
+        for i in 1..=T {
+            let (next, _) = circuit_breaker_decide(state, true, T, 100, CD);
+            state = next;
+            let _ = i;
+        }
+        assert_eq!(state.trips_total, 1);
+        let trip_time = state.last_trip_micros;
+        assert_eq!(trip_time, 100);
+
+        // Another failure still within cooldown → no re-trip.
+        let (state2, trip_during_cd) =
+            circuit_breaker_decide(state, true, T, trip_time + CD - 1, CD);
+        assert!(!trip_during_cd, "must not re-trip within cooldown");
+        assert_eq!(state2.trips_total, 1);
+
+        // A failure past the cooldown window → re-trips.
+        let (state3, trip_after_cd) = circuit_breaker_decide(state2, true, T, trip_time + CD, CD);
+        assert!(trip_after_cd, "must re-trip after cooldown elapses");
+        assert_eq!(state3.trips_total, 2);
+    }
+
+    #[test]
+    fn decide_success_between_failures_prevents_trip() {
+        let mut state = ArchiveFailureState::default();
+        // 4 failures, a success, then 4 more failures → never reaches 5 in a row.
+        for t in 0..4 {
+            let (next, trip) = circuit_breaker_decide(state, true, T, t, CD);
+            assert!(!trip);
+            state = next;
+        }
+        let (next, _) = circuit_breaker_decide(state, false, T, 4, CD);
+        state = next;
+        assert_eq!(state.consecutive_failures, 0);
+        for t in 5..9 {
+            let (next, trip) = circuit_breaker_decide(state, true, T, t, CD);
+            assert!(!trip, "interrupted run must not trip");
+            state = next;
+        }
+    }
+
+    #[test]
+    fn breaker_map_tracks_per_archive_and_resets() {
+        let breaker = WbqCircuitBreaker::default();
+        let key_a = "/store::proj-a";
+        let key_b = "/store::proj-b";
+
+        // proj-b stays healthy throughout; its successes must NOT reset proj-a.
+        let mut last_trip = false;
+        for i in 1..=T {
+            let (_, _) = breaker.record_with(key_b, false, T, i as i64, CD);
+            let (trip, _) = breaker.record_with(key_a, true, T, i as i64, CD);
+            last_trip = trip;
+        }
+        assert!(
+            last_trip,
+            "proj-a must trip on its own 5th consecutive fail"
+        );
+
+        let snap = breaker.snapshot();
+        // healthy proj-b removed (no history); proj-a present with a trip.
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].archive_key, key_a);
+        assert_eq!(snap[0].trips_total, 1);
+        assert_eq!(snap[0].consecutive_failures, T);
+
+        // A success on proj-a resets its consecutive counter (history kept).
+        let (_, state) = breaker.record_with(key_a, false, T, 1_000, CD);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.trips_total, 1);
+    }
+
+    #[test]
+    fn archive_identity_extracts_root_and_slug_for_every_variant() {
+        let config = Config {
+            storage_root: PathBuf::from("/abs/store"),
+            ..Config::default()
+        };
+        let bundle = WriteOp::AgentProfile {
+            project_slug: "data-projects-x".to_string(),
+            config: config.clone(),
+            agent_json: serde_json::json!({}),
+        };
+        let (root, slug) = write_op_archive_identity(&bundle);
+        assert_eq!(root, Path::new("/abs/store"));
+        assert_eq!(slug, "data-projects-x");
+
+        let clear = WriteOp::ClearSignal {
+            config,
+            project_slug: "p2".to_string(),
+            agent_name: "BlueLake".to_string(),
+        };
+        let (root, slug) = write_op_archive_identity(&clear);
+        assert_eq!(root, Path::new("/abs/store"));
+        assert_eq!(slug, "p2");
+    }
+}
+
 fn wbq_drain_loop(
     rx: std::sync::mpsc::Receiver<WbqMsg>,
     op_depth: Arc<AtomicU64>,
@@ -809,6 +1197,7 @@ fn wbq_drain_loop(
             } else {
                 wbq_execute_op(&envelopes[0].op)
             };
+            let group_failed = result.is_err();
             for envelope in envelopes {
                 let latency_us = u64::try_from(
                     envelope
@@ -849,6 +1238,11 @@ fn wbq_drain_loop(
                     errors += 1;
                 }
             }
+            // Feed the per-archive circuit breaker. A run of non-retryable
+            // failures on one archive trips a bounded boot-check self-heal +
+            // actionable escalation instead of degrading silently; a success
+            // resets that archive's counter. (br-bvq1x.9.8 Part 3)
+            wbq_note_drain_outcome(envelopes[0].op.as_ref(), group_failed);
             idx = end;
         }
 

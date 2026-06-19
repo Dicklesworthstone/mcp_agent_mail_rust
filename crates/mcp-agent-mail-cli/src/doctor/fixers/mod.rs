@@ -68,6 +68,7 @@ pub mod stale_head_or_ref_lock;
 pub mod stale_listener_pid_hint;
 pub mod stale_python_launcher_entry;
 pub mod stale_python_server_shadow;
+pub mod stale_tmp_pack;
 pub mod supervisor_respawn_loop;
 pub mod suspicious_ephemeral_archive_root;
 pub mod text_timestamp_contamination;
@@ -404,6 +405,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::stale_head_or_ref_lock",
         },
         FixerSpec {
+            id: stale_tmp_pack::FM_ID,
+            severity: "P2",
+            subsystem: "archive_state_files",
+            op_pattern: "Op::Rename",
+            auto_fixable: true,
+            one_line_description: "Orphaned `.git/objects/pack/tmp_pack_*` files left by an interrupted gc/repack (hard reboot / OOM mid-pack) — wasted disk + inode pressure; auto-fix quarantines each stale temp pack via Op::Rename (reversible via `am doctor undo`)",
+            source_module: "doctor::fixers::stale_tmp_pack",
+        },
+        FixerSpec {
             id: suspicious_ephemeral_archive_root::FM_ID,
             severity: "P3",
             subsystem: "archive_state_files",
@@ -732,6 +742,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::port_bound_by_foreign_process",
         },
         FixerSpec {
+            id: service_manager_divergence::FM_ID,
+            severity: "P1",
+            subsystem: "runtime_processes",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "service-manager view diverges from runtime reality (active-but-no-server, MainPID-not-owner, unmanaged server, bind mismatch, or Python shadow) — surfaces the unified process-owner model (detect-only)",
+            source_module: "doctor::fixers::service_manager_divergence",
+        },
+        FixerSpec {
             id: stale_listener_pid_hint::FM_ID,
             severity: "P1",
             subsystem: "runtime_processes",
@@ -757,15 +776,6 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: false,
             one_line_description: "systemd keeps respawning agent-mail (NRestarts over threshold while churning) — a recurring crash hidden behind auto-restart (detect-only; doctor never restarts/kills the service)",
             source_module: "doctor::fixers::supervisor_respawn_loop",
-        },
-        FixerSpec {
-            id: service_manager_divergence::FM_ID,
-            severity: "P1",
-            subsystem: "runtime_processes",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "service-manager view diverges from runtime reality (active-but-no-server, MainPID-not-owner, unmanaged server, bind mismatch, or Python shadow) — surfaces the unified process-owner model (detect-only)",
-            source_module: "doctor::fixers::service_manager_divergence",
         },
         FixerSpec {
             id: committed_env_file_in_repo::FM_ID,
@@ -1028,6 +1038,19 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = stale_head_or_ref_lock::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+            outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
+    } else if fm_id == stale_tmp_pack::FM_ID {
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_tmp_pack::DEFAULT_STALE_SECONDS);
+        let findings = stale_tmp_pack::detect(&inputs.archive_roots, stale_secs);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = stale_tmp_pack::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
@@ -1799,6 +1822,14 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .stale_seconds_override
             .unwrap_or(stale_head_or_ref_lock::DEFAULT_STALE_SECONDS);
         stale_head_or_ref_lock::detect(&inputs.archive_roots, stale_secs)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == stale_tmp_pack::FM_ID {
+        let stale_secs = inputs
+            .stale_seconds_override
+            .unwrap_or(stale_tmp_pack::DEFAULT_STALE_SECONDS);
+        stale_tmp_pack::detect(&inputs.archive_roots, stale_secs)
             .iter()
             .map(|f| f.to_finding())
             .collect()
