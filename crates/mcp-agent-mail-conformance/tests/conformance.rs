@@ -17,7 +17,17 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
-const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to"];
+///
+/// Includes both a row's own `id` and foreign keys that REFERENCE an
+/// autoincrement id (`message_id`, `reply_to` → messages.id; `sender_id`
+/// → agents.id). agents.id and messages.id are global `AUTOINCREMENT`
+/// counters, so when the fixture cases replay sequentially in a shared DB
+/// the concrete value an agent/message lands on depends on how many were
+/// created in earlier cases — it diverges from the value the Python
+/// reference happened to record. Sender ATTRIBUTION is still verified via
+/// the human-readable `from`/`sender_name` field, so nulling `sender_id`
+/// loses no semantic coverage (mirrors how `id` is already nulled).
+const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to", "sender_id"];
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
 const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
@@ -1338,6 +1348,37 @@ fn load_and_validate_fixture_schema() {
             .contains_key("resource://config/environment"),
         "fixtures should include resource://config/environment"
     );
+}
+
+#[test]
+fn null_auto_increment_ids_nulls_sender_id_but_keeps_attribution() {
+    // Regression for br-zbqrq: a fetch_inbox message carries `sender_id`
+    // (FK -> agents.id, a global AUTOINCREMENT) whose concrete value depends
+    // on how many agents earlier shared-DB cases registered. It must be
+    // nulled like `id`/`message_id`/`reply_to`, while the human-readable
+    // sender attribution (`from`) and the user-supplied `thread_id` (a
+    // deterministic string) must survive so parity coverage isn't lost.
+    let mut value = serde_json::json!([
+        {
+            "id": 4,
+            "sender_id": 2,
+            "message_id": 9,
+            "reply_to": 7,
+            "thread_id": "T-2",
+            "from": "BlueLake",
+            "subject": "LLM Thread T-2"
+        }
+    ]);
+    null_auto_increment_ids(&mut value);
+    let msg = &value[0];
+    assert!(msg["id"].is_null(), "id must be nulled");
+    assert!(msg["sender_id"].is_null(), "sender_id must be nulled");
+    assert!(msg["message_id"].is_null(), "message_id must be nulled");
+    assert!(msg["reply_to"].is_null(), "reply_to must be nulled");
+    // Semantic fields preserved.
+    assert_eq!(msg["thread_id"], "T-2", "user thread_id must survive");
+    assert_eq!(msg["from"], "BlueLake", "sender attribution must survive");
+    assert_eq!(msg["subject"], "LLM Thread T-2");
 }
 
 #[test]
