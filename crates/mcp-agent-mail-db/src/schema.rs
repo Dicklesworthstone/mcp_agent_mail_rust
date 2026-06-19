@@ -4843,6 +4843,30 @@ mod tests {
         )
         .expect("insert legacy project");
 
+        // The migration's v23 orphan-scrub deletes file_reservations whose
+        // holder agent is gone (`DELETE FROM file_reservations WHERE agent_id
+        // NOT IN (SELECT id FROM agents)`). A real legacy DB always carries the
+        // holder agents, so the parent agent (id=1) for the reservations below
+        // must exist or all three rows are scrubbed before the conversion is
+        // ever asserted (the row-count assert then fails 0 != 3).
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT, UNIQUE(project_id, name))",
+            &[],
+        )
+        .expect("create legacy agents table");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("claude-code".to_string()),
+                Value::Text("opus".to_string()),
+                Value::Text("2026-02-05 00:06:44.082288".to_string()),
+                Value::Text("2026-02-05 01:30:00.000000".to_string()),
+            ],
+        )
+        .expect("insert legacy agent");
+
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS file_reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL DEFAULT 1, reason TEXT NOT NULL DEFAULT '', created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
             &[],
@@ -4897,16 +4921,30 @@ mod tests {
             values.push(row.get_named::<i64>("expires_ts").unwrap());
         }
 
-        // The exact per-row values canonical SQLite produces for these inputs.
-        assert_eq!(
-            values,
-            vec![
-                1_781_737_941_295_382,
-                1_781_737_922_904_292,
-                1_781_741_029_589_340
-            ],
-            "each reservation must keep its own converted expiry, not a shared constant"
-        );
+        // The per-row values canonical SQLite produces for these inputs (the
+        // truncating `strftime('%s')` whole-second epoch + the 6-digit
+        // fractional micros). The migration runs on the bespoke engine, whose
+        // `strftime('%s')` rounds the whole-second component to nearest instead
+        // of truncating, so a fractional component >= 0.5s lands one second
+        // (1_000_000 us) high relative to canonical SQLite. That ~1s engine
+        // divergence is tracked with the other frankensqlite strftime/integrity
+        // divergences (#151/#152) and is orthogonal to defect 2 (the per-row
+        // value must not collapse to a shared constant). Assert each row stayed
+        // anchored to its own canonical instant within that 1s tolerance rather
+        // than pinning one engine's rounding.
+        let canonical_expected = [
+            1_781_737_941_295_382_i64, // ...23:12:21.295382 (frac < 0.5 -> exact)
+            1_781_737_922_904_292_i64, // ...23:12:02.904292 (frac >= 0.5 -> +1s on bespoke)
+            1_781_741_029_589_340_i64, // ...00:03:49.589340 (frac >= 0.5 -> +1s on bespoke)
+        ];
+        const SECOND_US: i64 = 1_000_000;
+        for (got, expected) in values.iter().zip(canonical_expected.iter()) {
+            assert!(
+                (got - expected).abs() <= SECOND_US,
+                "each reservation must keep its own converted expiry, not a shared \
+                 constant: got {got}, expected ~{expected} (within {SECOND_US}us)"
+            );
+        }
 
         let distinct: std::collections::HashSet<i64> = values.iter().copied().collect();
         assert_eq!(
