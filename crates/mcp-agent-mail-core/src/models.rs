@@ -653,6 +653,10 @@ pub const KNOWN_PROGRAM_NAMES: &[&str] = &[
     "github-copilot",
     "gemini-cli",
     "gemini",
+    // Antigravity (Google's `agy` CLI) — the successor to the retired
+    // Gemini CLI. `gemini`/`gemini-cli` are kept above for legacy panes.
+    "antigravity",
+    "agy",
     "opencode",
     "vscode",
     "neovim",
@@ -1043,8 +1047,12 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn program_name_detection_all_19() {
-        // Exact match against Python's _KNOWN_PROGRAM_NAMES frozenset (19 entries)
+    fn program_name_detection_all_21() {
+        // Python's _KNOWN_PROGRAM_NAMES frozenset (19 entries) plus the two
+        // Rust-native Antigravity (`agy`) additions for the gmi->agy migration
+        // (bd-47kjh.7.1). `antigravity`/`agy` are NOT in the Python reference;
+        // they are added here so an `agy`-spawned pane that self-reports its
+        // program is labeled correctly rather than mistaken for an agent name.
         let expected = [
             "claude-code",
             "claude",
@@ -1058,6 +1066,8 @@ mod tests {
             "github-copilot",
             "gemini-cli",
             "gemini",
+            "antigravity",
+            "agy",
             "opencode",
             "vscode",
             "neovim",
@@ -1068,8 +1078,8 @@ mod tests {
         ];
         assert_eq!(
             KNOWN_PROGRAM_NAMES.len(),
-            19,
-            "must have exactly 19 program names"
+            21,
+            "must have exactly 21 program names (19 Python-parity + agy/antigravity)"
         );
         for name in &expected {
             assert!(
@@ -1077,6 +1087,26 @@ mod tests {
                 "'{name}' should be detected as a program name"
             );
         }
+    }
+
+    #[test]
+    fn agy_program_names_are_recognized_not_mistaken_for_agents() {
+        // bd-47kjh.7.1: an agy-spawned pane that self-reports `agy`/`antigravity`
+        // (or `Antigravity`/`AGY`, case-insensitively) must be treated as a
+        // program identity, never as an agent name — and never confused with
+        // the legacy gmi/gemini labels.
+        for name in ["agy", "antigravity", "Antigravity", "AGY", "  agy  "] {
+            assert!(
+                looks_like_program_name(name),
+                "'{name}' must be detected as the agy/antigravity program"
+            );
+        }
+        // Legacy gemini labels remain recognized (kept for old panes).
+        assert!(looks_like_program_name("gemini"));
+        assert!(looks_like_program_name("gemini-cli"));
+        // The agy program token must NOT be misread as a model name.
+        assert!(!looks_like_model_name("agy"));
+        assert!(!looks_like_model_name("antigravity"));
     }
 
     #[test]

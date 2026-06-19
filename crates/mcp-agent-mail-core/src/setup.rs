@@ -46,6 +46,11 @@ pub enum AgentPlatform {
     Codex,
     Cursor,
     Gemini,
+    /// Antigravity (`agy`) — Google's successor to the retired Gemini CLI.
+    /// Reads MCP servers from `~/.gemini/config/mcp_config.json` (distinct from
+    /// Gemini's `~/.gemini/settings.json`), verified empirically against the
+    /// live agy 1.0.7 binary.
+    Antigravity,
     OpenCode,
     FactoryDroid,
     Cline,
@@ -60,6 +65,7 @@ impl AgentPlatform {
         Self::Codex,
         Self::Cursor,
         Self::Gemini,
+        Self::Antigravity,
         Self::OpenCode,
         Self::FactoryDroid,
         Self::Cline,
@@ -75,6 +81,7 @@ impl AgentPlatform {
             "codex" | "codex-cli" => Some(Self::Codex),
             "cursor" => Some(Self::Cursor),
             "gemini" | "gemini-cli" => Some(Self::Gemini),
+            "antigravity" | "agy" | "antigravity-cli" => Some(Self::Antigravity),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "factory" | "factory-droid" => Some(Self::FactoryDroid),
             "cline" => Some(Self::Cline),
@@ -92,6 +99,7 @@ impl AgentPlatform {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
             Self::OpenCode => "opencode",
             Self::FactoryDroid => "factory",
             Self::Cline => "cline",
@@ -108,6 +116,7 @@ impl AgentPlatform {
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor",
             Self::Gemini => "Gemini CLI",
+            Self::Antigravity => "Antigravity (agy)",
             Self::OpenCode => "OpenCode",
             Self::FactoryDroid => "Factory Droid",
             Self::Cline => "Cline",
@@ -133,6 +142,7 @@ impl AgentPlatform {
             Self::Codex => &[],
             Self::Cursor => &["cursor.mcp.json"],
             Self::Gemini => &["gemini.mcp.json"],
+            Self::Antigravity => &["agy.mcp.json"],
             Self::OpenCode => &["opencode.json"],
             Self::FactoryDroid => &["factory.mcp.json"],
             Self::Cline => &["cline.mcp.json"],
@@ -953,6 +963,7 @@ impl AgentPlatform {
                 }]
             }
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
+            Self::Antigravity => self.antigravity_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
                 self,
                 pdir,
@@ -1091,6 +1102,59 @@ impl AgentPlatform {
                 platform: self,
                 file_path: home.join(".gemini").join("settings.json"),
                 description: "Gemini CLI user-level MCP config".into(),
+                content: ConfigContent::JsonMerge {
+                    servers_key: "mcpServers",
+                    server_name: "mcp-agent-mail",
+                    server_value: json!({ "httpUrl": url }),
+                },
+                permissions: 0o644,
+                backup: true,
+            });
+        }
+        actions
+    }
+
+    /// Antigravity (`agy`) MCP config actions.
+    ///
+    /// agy is the successor to the retired Gemini CLI and consumes the
+    /// gemini-compatible `mcpServers` schema, but from a DIFFERENT file:
+    /// the canonical user-level path is `~/.gemini/config/mcp_config.json`
+    /// (NOT Gemini's `~/.gemini/settings.json`). This was verified empirically
+    /// by stracing the live agy 1.0.7 binary, which opens
+    /// `~/.gemini/config/mcp_config.json` at session start and spawns the
+    /// configured stdio `command`. The HTTP form uses `httpUrl` + `headers`,
+    /// identical to Gemini's MCP entry shape.
+    ///
+    /// Token safety (issue #148): the user-level `mcp_config.json` carries NO
+    /// bearer token; only the project-local `agy.mcp.json` embeds the
+    /// `Authorization` header, and that file is force-added to `.gitignore`
+    /// via `project_local_secret_files()`.
+    fn antigravity_actions(
+        self,
+        params: &SetupParams,
+        url: &str,
+        token: &str,
+        pdir: &Path,
+        home: &Path,
+    ) -> Vec<ConfigAction> {
+        let mut actions = vec![project_local_action(
+            self,
+            pdir,
+            "agy.mcp.json",
+            "mcpServers",
+            json!({
+                "httpUrl": url,
+                "headers": auth_headers_value(token)
+            }),
+            "Antigravity (agy) project-local MCP config",
+        )];
+        if !params.skip_user_config {
+            actions.push(ConfigAction {
+                platform: self,
+                file_path: home.join(".gemini").join("config").join("mcp_config.json"),
+                description: "Antigravity (agy) user-level MCP config \
+                              (~/.gemini/config/mcp_config.json)"
+                    .into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -2827,6 +2891,92 @@ mod tests {
     }
 
     #[test]
+    fn config_actions_antigravity_uses_http_url_and_gemini_config_path() {
+        // bd-47kjh.7.2: agy reads ~/.gemini/config/mcp_config.json (verified by
+        // stracing the live agy 1.0.7 binary), NOT ~/.gemini/settings.json.
+        let home = PathBuf::from("/tmp/agyhome");
+        let params = SetupParams {
+            token: "tok".into(),
+            project_dir: PathBuf::from("/tmp/p"),
+            home_dir_override: Some(home.clone()),
+            skip_user_config: false,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Antigravity.config_actions(&params);
+        assert_eq!(actions.len(), 2, "project-local + user-level");
+
+        // Project-local agy.mcp.json carries httpUrl + the bearer header.
+        let project = &actions[0];
+        assert_eq!(project.file_path, PathBuf::from("/tmp/p/agy.mcp.json"));
+        match &project.content {
+            ConfigContent::JsonMerge {
+                servers_key,
+                server_value,
+                ..
+            } => {
+                assert_eq!(*servers_key, "mcpServers");
+                assert!(
+                    server_value.get("httpUrl").is_some(),
+                    "agy uses httpUrl (gemini-compatible schema)"
+                );
+                assert!(
+                    server_value.get("type").is_none(),
+                    "agy entry has no `type` field"
+                );
+                let auth = server_value
+                    .get("headers")
+                    .and_then(|h| h.get("Authorization"))
+                    .and_then(Value::as_str);
+                assert_eq!(auth, Some("Bearer tok"));
+            }
+            _ => panic!("expected JsonMerge for agy project-local config"),
+        }
+
+        // User-level config is ~/.gemini/config/mcp_config.json with NO token.
+        let user = &actions[1];
+        assert_eq!(
+            user.file_path,
+            home.join(".gemini").join("config").join("mcp_config.json"),
+            "agy user-level config must live at ~/.gemini/config/mcp_config.json"
+        );
+        match &user.content {
+            ConfigContent::JsonMerge { server_value, .. } => {
+                assert!(server_value.get("httpUrl").is_some());
+                assert!(
+                    server_value.get("headers").is_none(),
+                    "user-level agy config must NOT embed a bearer token (#148)"
+                );
+            }
+            _ => panic!("expected JsonMerge for agy user-level config"),
+        }
+    }
+
+    #[test]
+    fn config_actions_antigravity_writes_no_token_under_no_auth() {
+        // #148: empty token (am serve-http --no-auth) => no Authorization header
+        // written into the project-local agy.mcp.json.
+        let params = SetupParams {
+            token: String::new(),
+            project_dir: PathBuf::from("/tmp/p"),
+            home_dir_override: Some(PathBuf::from("/tmp/home")),
+            skip_user_config: true,
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Antigravity.config_actions(&params);
+        assert_eq!(actions.len(), 1);
+        match &actions[0].content {
+            ConfigContent::JsonMerge { server_value, .. } => {
+                let headers = server_value.get("headers").expect("headers object");
+                assert!(
+                    headers.get("Authorization").is_none(),
+                    "no Authorization header may be written with an empty token"
+                );
+            }
+            _ => panic!("expected JsonMerge"),
+        }
+    }
+
+    #[test]
     fn config_actions_codex_uses_http_url() {
         let params = SetupParams {
             token: "tok".into(),
@@ -3254,8 +3404,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_platform_all_has_nine() {
-        assert_eq!(AgentPlatform::ALL.len(), 9);
+    fn agent_platform_all_has_ten() {
+        // 9 original platforms + Antigravity (agy) for the gmi->agy migration
+        // (bd-47kjh.7.2).
+        assert_eq!(AgentPlatform::ALL.len(), 10);
+        assert!(AgentPlatform::ALL.contains(&AgentPlatform::Antigravity));
     }
 
     #[test]
@@ -3389,6 +3542,20 @@ http_headers = { Authorization = "Bearer tok" }
             AgentPlatform::from_slug("gemini-cli"),
             Some(AgentPlatform::Gemini)
         );
+        // Antigravity (agy) — primary slug + the agy / antigravity-cli aliases
+        // (matches the franken-agent-detection connector slug + aliases).
+        assert_eq!(
+            AgentPlatform::from_slug("antigravity"),
+            Some(AgentPlatform::Antigravity)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("agy"),
+            Some(AgentPlatform::Antigravity)
+        );
+        assert_eq!(
+            AgentPlatform::from_slug("antigravity-cli"),
+            Some(AgentPlatform::Antigravity)
+        );
         assert_eq!(
             AgentPlatform::from_slug("open-code"),
             Some(AgentPlatform::OpenCode)
@@ -3428,6 +3595,7 @@ http_headers = { Authorization = "Bearer tok" }
         assert!(names.contains(&"Codex CLI"));
         assert!(names.contains(&"Cursor"));
         assert!(names.contains(&"Gemini CLI"));
+        assert!(names.contains(&"Antigravity (agy)"));
         assert!(names.contains(&"OpenCode"));
         assert!(names.contains(&"Factory Droid"));
         assert!(names.contains(&"Cline"));
