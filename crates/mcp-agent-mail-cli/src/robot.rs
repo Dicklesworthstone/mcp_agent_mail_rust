@@ -1492,6 +1492,14 @@ pub struct ResourcePressure {
     pub fd: mcp_agent_mail_core::FdMetricsSnapshot,
     /// Entries in the storage repo-path cache (paths, not held descriptors).
     pub repo_cache_entries: usize,
+    /// Sticky durability-degraded flag: a WBQ write permanently failed its
+    /// retries and the live operational state may lag the Git archive.
+    pub durability_degraded: bool,
+    /// Per-archive WBQ circuit-breaker state (br-bvq1x.9.8 Part 3). Each row
+    /// reports an archive that has accumulated consecutive drain failures and
+    /// how many times its breaker has tripped a recovery self-heal. Empty in
+    /// the healthy case.
+    pub wbq_circuit_breakers: Vec<mcp_agent_mail_storage::WbqCircuitBreakerArchive>,
 }
 
 /// A derived backpressure alert (kept independent of `RobotEnvelope` so the
@@ -1570,6 +1578,67 @@ pub fn derive_backpressure_alerts(
                 action: Some("am robot health --include-host".to_string()),
             });
         }
+    }
+
+    alerts
+}
+
+/// Derive durability / WBQ circuit-breaker alerts from already-sampled state
+/// (br-bvq1x.9.8 Part 3 → br-5stvf). Pure and side-effect free so the guidance
+/// can be asserted deterministically without tripping a real breaker.
+///
+/// A tripped breaker (`trips_total > 0`) is the high-signal event: it means the
+/// archive accumulated enough consecutive drain failures to fire a bounded
+/// recovery self-heal, so it warrants an `error` alert naming the archive and
+/// the trip count. An archive that is merely accumulating consecutive failures
+/// without a trip yet is a `warn`. The sticky `durability_degraded` flag is
+/// surfaced once even when no per-archive breaker row is present (e.g. a legacy
+/// degrade path that predates the breaker).
+#[must_use]
+pub fn derive_wbq_breaker_alerts(
+    durability_degraded: bool,
+    breakers: &[mcp_agent_mail_storage::WbqCircuitBreakerArchive],
+) -> Vec<BackpressureAlert> {
+    let mut alerts = Vec::new();
+
+    for b in breakers {
+        if b.trips_total > 0 {
+            alerts.push(BackpressureAlert {
+                severity: "error",
+                message: format!(
+                    "WBQ circuit breaker tripped {} time(s) for archive `{}` ({} consecutive \
+                     failure(s) currently) — git-archive writes for that archive repeatedly failed \
+                     their retries and a bounded recovery self-heal was fired. Inspect that \
+                     archive's repo health and disk before assuming a broader outage.",
+                    b.trips_total, b.archive_key, b.consecutive_failures
+                ),
+                action: Some("am doctor health".to_string()),
+            });
+        } else if b.consecutive_failures > 0 {
+            alerts.push(BackpressureAlert {
+                severity: "warn",
+                message: format!(
+                    "Archive `{}` has {} consecutive WBQ drain failure(s) (breaker not yet \
+                     tripped). Watch for a trip; check that archive's repo and disk.",
+                    b.archive_key, b.consecutive_failures
+                ),
+                action: Some("am doctor health".to_string()),
+            });
+        }
+    }
+
+    // Surface the sticky flag once if it is set but no per-archive breaker row
+    // explains it (avoids double-reporting when a breaker alert already fired).
+    if durability_degraded && !breakers.iter().any(|b| b.trips_total > 0) {
+        alerts.push(BackpressureAlert {
+            severity: "warn",
+            message: "Durability is flagged degraded: a write-behind git-archive write \
+                 permanently failed its retries, so the live operational state may lag the \
+                 durable Git archive. Run `am doctor health` and reconcile before relying on \
+                 archive completeness."
+                .to_string(),
+            action: Some("am doctor health".to_string()),
+        });
     }
 
     alerts
@@ -13986,6 +14055,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let pool_snapshot = mcp_agent_mail_core::global_metrics().db.snapshot();
             let fd_snapshot = mcp_agent_mail_core::fd_metrics_snapshot();
             let pool_cfg = mcp_agent_mail_db::pool::DbPoolConfig::from_env();
+            // br-5stvf: surface WBQ per-archive circuit-breaker + durability
+            // state alongside the K5 pool/FD resources so operators can see
+            // which archive tripped the breaker (and how often) instead of only
+            // a sticky boolean buried in logs.
+            let durability_degraded = mcp_agent_mail_storage::durability_degraded();
+            let wbq_circuit_breakers = mcp_agent_mail_storage::wbq_circuit_breaker_snapshot();
             let resources = ResourcePressure {
                 scope: "current_process",
                 pool_max_connections: pool_cfg.max_connections,
@@ -13994,8 +14069,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 pool: pool_snapshot.clone(),
                 fd: fd_snapshot.clone(),
                 repo_cache_entries: mcp_agent_mail_storage::repo_cache_len(),
+                durability_degraded,
+                wbq_circuit_breakers: wbq_circuit_breakers.clone(),
             };
-            let backpressure = derive_backpressure_alerts(&pool_snapshot, &fd_snapshot);
+            let mut backpressure = derive_backpressure_alerts(&pool_snapshot, &fd_snapshot);
+            backpressure.extend(derive_wbq_breaker_alerts(
+                durability_degraded,
+                &wbq_circuit_breakers,
+            ));
 
             #[derive(Serialize)]
             struct MetricsData {
@@ -23370,6 +23451,15 @@ mod tests {
             resources.get("repo_cache_entries").is_some(),
             "repo-cache size must be surfaced: {resources:?}"
         );
+        // br-5stvf: WBQ durability + circuit-breaker state must be surfaced.
+        assert!(
+            resources.get("durability_degraded").is_some(),
+            "durability_degraded must be surfaced: {resources:?}"
+        );
+        assert!(
+            resources["wbq_circuit_breakers"].is_array(),
+            "wbq_circuit_breakers must be an array (empty when healthy): {resources:?}"
+        );
     }
 
     #[test]
@@ -23459,6 +23549,65 @@ mod tests {
             "warning must carry the next-step list: {:?}",
             alerts[0]
         );
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_quiet_when_healthy() {
+        // No breakers + not degraded => silent.
+        assert!(derive_wbq_breaker_alerts(false, &[]).is_empty());
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_errors_on_tripped_breaker_naming_archive() {
+        let breakers = vec![mcp_agent_mail_storage::WbqCircuitBreakerArchive {
+            archive_key: "/root::proj-backend".to_string(),
+            consecutive_failures: 5,
+            trips_total: 2,
+            last_trip_micros: 1_700_000_000_000_000,
+        }];
+        let alerts = derive_wbq_breaker_alerts(true, &breakers);
+        assert_eq!(alerts.len(), 1, "a tripped breaker is one error alert");
+        assert_eq!(alerts[0].severity, "error");
+        assert!(
+            alerts[0].message.contains("/root::proj-backend")
+                && alerts[0].message.contains("tripped 2 time(s)"),
+            "alert must name the archive + trip count: {:?}",
+            alerts[0]
+        );
+        // durability_degraded must NOT double-report when a trip already explains it.
+        assert!(
+            !alerts
+                .iter()
+                .any(|a| a.message.contains("Durability is flagged degraded")),
+            "tripped breaker already explains the degrade; no duplicate flag: {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_warns_on_failures_without_trip() {
+        let breakers = vec![mcp_agent_mail_storage::WbqCircuitBreakerArchive {
+            archive_key: "/root::proj-x".to_string(),
+            consecutive_failures: 3,
+            trips_total: 0,
+            last_trip_micros: 0,
+        }];
+        let alerts = derive_wbq_breaker_alerts(false, &breakers);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "warn");
+        assert!(
+            alerts[0]
+                .message
+                .contains("3 consecutive WBQ drain failure")
+        );
+    }
+
+    #[test]
+    fn derive_wbq_breaker_alerts_surfaces_sticky_degrade_without_breaker_row() {
+        // Legacy degrade path: flag set but no per-archive breaker row.
+        let alerts = derive_wbq_breaker_alerts(true, &[]);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].severity, "warn");
+        assert!(alerts[0].message.contains("Durability is flagged degraded"));
     }
 
     #[test]
