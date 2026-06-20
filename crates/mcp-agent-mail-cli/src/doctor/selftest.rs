@@ -690,8 +690,10 @@ fn run_selftest_sequence_in_process(project_key: &str) -> WriteSelftestReport {
             }
         }
 
-        // 8: list_agents (read-after-write)
-        match identity::list_agents(&ctx, project_key.clone()).await {
+        // 8: list_agents (read-after-write). limit/active_within_days are the
+        // pagination/filter params added to the tool; the selftest smoke check
+        // wants the full roster, so pass None/None.
+        match identity::list_agents(&ctx, project_key.clone(), None, None).await {
             Ok(_) => steps.push(StepResult::passed("list_agents")),
             Err(e) => {
                 steps.push(StepResult::failed("list_agents", e.message));
