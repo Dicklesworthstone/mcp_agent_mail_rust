@@ -281,6 +281,14 @@ pub struct Config {
     pub file_reservation_inactivity_seconds: u64,
     pub file_reservation_activity_grace_seconds: u64,
     pub file_reservations_enforcement_enabled: bool,
+    /// Retention horizon (days) for hard-pruning released/expired file
+    /// reservations from the live DB (GH#154 item 2). When the cleanup worker is
+    /// enabled, released reservations whose settled timestamp is older than this
+    /// many days are `DELETE`d from `file_reservations` (the git archive retains
+    /// the audit history, so the delete is non-destructive). `0` disables the
+    /// retention prune (rows are only ever marked released, never deleted —
+    /// the historical behavior).
+    pub file_reservations_retention_days: u64,
 
     // Ack TTL warnings
     pub ack_ttl_enabled: bool,
@@ -1343,6 +1351,7 @@ impl Default for Config {
             file_reservation_inactivity_seconds: 1800, // 30 minutes
             file_reservation_activity_grace_seconds: 900, // 15 minutes
             file_reservations_enforcement_enabled: true,
+            file_reservations_retention_days: 30,
 
             // Ack TTL warnings
             ack_ttl_enabled: false,
@@ -2013,6 +2022,10 @@ impl Config {
         config.file_reservations_enforcement_enabled = env_bool(
             "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
             config.file_reservations_enforcement_enabled,
+        );
+        config.file_reservations_retention_days = env_u64(
+            "FILE_RESERVATIONS_RETENTION_DAYS",
+            config.file_reservations_retention_days,
         );
 
         // Ack TTL warnings

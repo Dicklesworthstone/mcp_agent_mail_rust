@@ -2157,16 +2157,52 @@ pub fn cleanup_pane_identities(
 ///
 /// # Conformance
 /// Rust-native.
+/// Hard safety cap on the number of agents `list_agents` will ever return, even
+/// when the caller passes no `limit` (GH#154 item 3). Long-lived projects
+/// accumulate agents across many short-lived swarms (one reported project
+/// reached 1,119 agents / a ~199 KB response, enough to blow the calling
+/// agent's context window). The query returns agents ordered most-recently-
+/// active first, so capping keeps the useful (recent) agents.
+const LIST_AGENTS_DEFAULT_MAX: usize = 250;
+
 #[tool(
-    description = "List all registered agents in a project.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy."
+    description = "List registered agents in a project, most-recently-active first.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nThe result is bounded to avoid blowing the calling agent's context window on long-lived projects that accumulate agents across many short-lived swarms: at most `limit` agents (default 250) are returned, optionally restricted to those active within `active_within_days`.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nlimit : Optional[int]\n    Maximum number of agents to return (most-recently-active first). Defaults to 250; values above 250 are clamped to 250.\nactive_within_days : Optional[int]\n    If provided, only return agents whose last_active_ts is within this many days. Omit to include all agents (subject to limit).\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy. Ordered by last_active_ts descending."
 )]
-pub async fn list_agents(ctx: &McpContext, project_key: String) -> McpResult<String> {
+pub async fn list_agents(
+    ctx: &McpContext,
+    project_key: String,
+    limit: Option<u32>,
+    active_within_days: Option<u32>,
+) -> McpResult<String> {
     let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
+    // Bound the response. A caller-supplied limit is honored but clamped to the
+    // safety cap; an omitted limit defaults to the cap.
+    let effective_limit = limit
+        .map_or(LIST_AGENTS_DEFAULT_MAX, |n| {
+            usize::try_from(n).unwrap_or(LIST_AGENTS_DEFAULT_MAX)
+        })
+        .clamp(1, LIST_AGENTS_DEFAULT_MAX);
+
+    let min_last_active_ts = active_within_days.and_then(|days| {
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        let window_us = i64::from(days)
+            .checked_mul(86_400)?
+            .checked_mul(1_000_000)?;
+        Some(now.saturating_sub(window_us))
+    });
+
     let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+        mcp_agent_mail_db::queries::list_agents_bounded(
+            ctx.cx(),
+            &pool,
+            project_id,
+            min_last_active_ts,
+            Some(effective_limit),
+        )
+        .await,
     )?;
 
     let entries: Vec<serde_json::Value> = agents
@@ -3426,7 +3462,7 @@ body
                 rt.block_on(async {
                     let cx = Cx::for_testing();
                     let ctx = McpContext::new(cx.clone(), 1);
-                    let response = list_agents(&ctx, "/archive-project".to_string())
+                    let response = list_agents(&ctx, "/archive-project".to_string(), None, None)
                         .await
                         .expect("list_agents should succeed");
                     let value: serde_json::Value =

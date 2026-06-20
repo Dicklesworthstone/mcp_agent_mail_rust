@@ -4670,6 +4670,34 @@ pub async fn list_agents(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<Vec<AgentRow>, DbError> {
+    list_agents_bounded(cx, pool, project_id, None, None).await
+}
+
+/// List a project's agents with an optional activity floor and result cap
+/// (GH#154 item 3).
+///
+/// `min_last_active_ts`: when `Some(floor)`, only agents whose `last_active_ts`
+/// is `>= floor` are returned (used to exclude agents idle past a retention
+/// horizon). `None` returns agents regardless of idle time.
+///
+/// `limit`: when `Some(n)`, at most `n` rows are returned *after* the
+/// case-insensitive name de-duplication, keeping the most-recently-active
+/// agents (the result is ordered `last_active_ts DESC, id DESC`). This bounds
+/// the tool response on long-lived projects that accumulate agents across many
+/// short-lived swarms (one reported project reached 1,119 agents / ~199 KB,
+/// enough to blow the calling agent's context window). `None` is unbounded
+/// (preserves the historical [`list_agents`] contract).
+///
+/// The activity filter and cap are applied in Rust (not SQL) so this keeps the
+/// "simple ordered scan + Rust-side de-dup" shape that deliberately avoids a
+/// FrankenSQLite window-function dependency during mailbox recovery.
+pub async fn list_agents_bounded(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    min_last_active_ts: Option<i64>,
+    limit: Option<usize>,
+) -> Outcome<Vec<AgentRow>, DbError> {
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -4708,6 +4736,13 @@ pub async fn list_agents(
 
             let mut seen_names = HashSet::new();
             agents.retain(|agent| seen_names.insert(agent.name.to_ascii_lowercase()));
+
+            if let Some(floor) = min_last_active_ts {
+                agents.retain(|agent| agent.last_active_ts >= floor);
+            }
+            if let Some(cap) = limit {
+                agents.truncate(cap);
+            }
             Outcome::Ok(agents)
         }
         Outcome::Err(e) => Outcome::Err(e),
@@ -10989,6 +11024,118 @@ pub async fn release_expired_reservations(
     }
 }
 
+/// Retention sweep: hard-`DELETE` released/expired file reservations whose
+/// release/expiry is older than `older_than_us` (GH#154 item 2).
+///
+/// Reservations are only ever *logically* released (a `file_reservation_releases`
+/// ledger row + `released_ts`), never physically removed by the normal lifecycle,
+/// so `file_reservations` grows without bound on a long-lived mailbox (one report
+/// observed ~30,000 rows over ~55 days with 0 active). That unbounded growth
+/// directly inflates the cost of every active-reservation scan that embeds
+/// [`ACTIVE_RESERVATION_PREDICATE`]. This sweep bounds the table.
+///
+/// A row is eligible when BOTH:
+///   1. it is NOT logically active under [`ACTIVE_RESERVATION_PREDICATE`]
+///      (i.e. it is released — has a ledger row, or a positive `released_ts`),
+///      AND
+///   2. its newest "settled" timestamp — `MAX(ledger.released_ts,
+///      file_reservations.released_ts, expires_ts)` — is `<= older_than_us`.
+///
+/// The git archive (`projects/<slug>/file_reservations/<id>.json`) retains the
+/// full audit history independently, so the DB delete is non-destructive to the
+/// durable record. Matching `file_reservation_releases` rows are removed in the
+/// same pass so the sidecar ledger cannot leak orphans. Returns the number of
+/// `file_reservations` rows deleted.
+///
+/// When `project_id` is `Some`, the sweep is scoped to that project; `None`
+/// sweeps across all projects. Deletes are batched by id to keep statements
+/// bounded.
+pub async fn prune_released_file_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: Option<i64>,
+    older_than_us: i64,
+) -> Outcome<u64, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    // Identify eligible reservation ids. We do NOT trust a correlated DELETE …
+    // WHERE NOT (active predicate); instead select ids first (mirrors
+    // release_expired_reservations) so the delete is a simple `id IN (...)`.
+    // The `file_reservations` table is intentionally NOT aliased here so the
+    // shared `ACTIVE_RESERVATION_PREDICATE` (which fully-qualifies
+    // `file_reservations.released_ts`) resolves unchanged.
+    let mut select_sql = String::from(
+        "SELECT file_reservations.id AS id FROM file_reservations \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = file_reservations.id \
+         WHERE NOT (",
+    );
+    select_sql.push_str(ACTIVE_RESERVATION_PREDICATE);
+    select_sql.push_str(
+        ") AND MAX(COALESCE(rr.released_ts, 0), \
+                   CASE WHEN typeof(file_reservations.released_ts) IN ('integer','real') \
+                        THEN file_reservations.released_ts ELSE 0 END, \
+                   file_reservations.expires_ts) <= ?",
+    );
+    let mut params: Vec<Value> = Vec::with_capacity(2);
+    if let Some(pid) = project_id {
+        select_sql.push_str(" AND file_reservations.project_id = ?");
+        params.push(Value::BigInt(older_than_us));
+        params.push(Value::BigInt(pid));
+    } else {
+        params.push(Value::BigInt(older_than_us));
+    }
+
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &select_sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(id) = row.get_named::<i64>("id") {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Outcome::Ok(0);
+    }
+
+    let mut deleted: u64 = 0;
+    for chunk in ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let placeholders = placeholders(chunk.len());
+        let chunk_params: Vec<Value> = chunk.iter().map(|id| Value::BigInt(*id)).collect();
+
+        // Delete the sidecar ledger rows first (no FK cascade is defined from
+        // file_reservation_releases → file_reservations), then the reservations.
+        let del_ledger = format!(
+            "DELETE FROM file_reservation_releases WHERE reservation_id IN ({placeholders})"
+        );
+        match map_sql_outcome(traw_execute(cx, &tracked, &del_ledger, &chunk_params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+
+        let del_res = format!("DELETE FROM file_reservations WHERE id IN ({placeholders})");
+        match map_sql_outcome(traw_execute(cx, &tracked, &del_res, &chunk_params).await) {
+            Outcome::Ok(affected) => deleted = deleted.saturating_add(affected),
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+
+    Outcome::Ok(deleted)
+}
+
 /// Fetch specific file reservations by their IDs.
 ///
 /// Used by the cleanup worker to retrieve details of released reservations
@@ -16633,6 +16780,171 @@ mod tests {
                 vec!["GreenField", "bluelake"]
             );
             assert_eq!(agents.len(), 2);
+        });
+    }
+
+    #[test]
+    fn list_agents_bounded_applies_limit_and_activity_floor() {
+        // GH#154 item 3: list_agents_bounded must cap the result (keeping the
+        // most-recently-active agents) and optionally exclude agents idle past
+        // an activity floor, without changing the de-dup / ordering contract.
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("list_agents_bounded.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/list-agents-bounded")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // Five distinct agents with strictly increasing last_active_ts.
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES \
+                 ({project_id}, 'Oldest', 'codex-cli', 'gpt-5', '', 1, 100, 'auto', 'auto'), \
+                 ({project_id}, 'Older',  'codex-cli', 'gpt-5', '', 1, 200, 'auto', 'auto'), \
+                 ({project_id}, 'Mid',    'codex-cli', 'gpt-5', '', 1, 300, 'auto', 'auto'), \
+                 ({project_id}, 'Newer',  'codex-cli', 'gpt-5', '', 1, 400, 'auto', 'auto'), \
+                 ({project_id}, 'Newest', 'codex-cli', 'gpt-5', '', 1, 500, 'auto', 'auto')"
+            ))
+            .expect("insert agents");
+            drop(conn);
+
+            // Unbounded: all five, most-recent first.
+            let all = list_agents_bounded(&cx, &pool, project_id, None, None)
+                .await
+                .into_result()
+                .expect("list all");
+            assert_eq!(
+                all.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer", "Mid", "Older", "Oldest"]
+            );
+
+            // Limit keeps the most-recently-active.
+            let capped = list_agents_bounded(&cx, &pool, project_id, None, Some(2))
+                .await
+                .into_result()
+                .expect("list capped");
+            assert_eq!(
+                capped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer"]
+            );
+
+            // Activity floor excludes agents below the floor.
+            let recent = list_agents_bounded(&cx, &pool, project_id, Some(350), None)
+                .await
+                .into_result()
+                .expect("list recent");
+            assert_eq!(
+                recent.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer"]
+            );
+
+            // Floor + limit compose.
+            let recent_capped = list_agents_bounded(&cx, &pool, project_id, Some(150), Some(2))
+                .await
+                .into_result()
+                .expect("list recent capped");
+            assert_eq!(
+                recent_capped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                vec!["Newest", "Newer"]
+            );
+        });
+    }
+
+    #[test]
+    fn prune_released_file_reservations_deletes_old_released_keeps_active_and_recent() {
+        // GH#154 item 2: the retention sweep hard-DELETEs released/expired
+        // reservations past the horizon while preserving (a) still-active
+        // reservations and (b) recently-released ones, and removes the matching
+        // sidecar release-ledger rows.
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("prune_released_reservations.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/prune-reservations")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let agent = register_agent(
+                &cx, &pool, project_id, "RedFox", "codex-cli", "gpt-5", Some("holder"),
+                Some("auto"), None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let day_us: i64 = 86_400 * 1_000_000;
+            let now = now_micros();
+            let old_release = now - 40 * day_us; // older than 30-day horizon
+            let recent_release = now - day_us; // within horizon
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            // id 1: released long ago (eligible). id 2: released recently (keep).
+            // id 3: active (keep).
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations \
+                 (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                 VALUES \
+                 (1, {project_id}, {agent_id}, 'a.rs', 1, 'r', {old_release}, {old_release}, {old_release}), \
+                 (2, {project_id}, {agent_id}, 'b.rs', 1, 'r', {recent_release}, {recent_release}, {recent_release}), \
+                 (3, {project_id}, {agent_id}, 'c.rs', 1, 'r', {now}, {future}, NULL)",
+                future = now + 3600 * 1_000_000,
+            ))
+            .expect("insert reservations");
+            // Sidecar ledger row for the old released reservation.
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (1, {old_release})"
+            ))
+            .expect("insert release ledger");
+            drop(conn);
+
+            let older_than_us = now - 30 * day_us;
+            let deleted = prune_released_file_reservations(&cx, &pool, Some(project_id), older_than_us)
+                .await
+                .into_result()
+                .expect("prune");
+            assert_eq!(deleted, 1, "only the long-released reservation is pruned");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("reacquire connection");
+            let remaining = conn
+                .query_sync("SELECT id FROM file_reservations ORDER BY id", &[])
+                .expect("select remaining");
+            let ids: Vec<i64> = remaining
+                .iter()
+                .filter_map(|r| r.get_named::<i64>("id").ok())
+                .collect();
+            assert_eq!(ids, vec![2, 3], "active + recently-released survive");
+            // The ledger row for the pruned reservation is gone.
+            let ledger = conn
+                .query_sync(
+                    "SELECT reservation_id FROM file_reservation_releases WHERE reservation_id = 1",
+                    &[],
+                )
+                .expect("select ledger");
+            assert!(ledger.is_empty(), "pruned reservation's ledger row is removed");
         });
     }
 

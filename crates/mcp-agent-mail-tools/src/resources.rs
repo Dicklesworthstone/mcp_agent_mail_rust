@@ -7493,7 +7493,7 @@ mod resource_shape_tests {
                 .expect("register_agent BlueDog");
 
                 // Call list_agents tool
-                let result = crate::list_agents(&ctx, project_key.clone())
+                let result = crate::list_agents(&ctx, project_key.clone(), None, None)
                     .await
                     .expect("list_agents tool");
 

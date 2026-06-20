@@ -4849,12 +4849,70 @@ fn reconcile_with_canonical(
                 Err(DbError::IntegrityCorruption { message, details })
             }
             Err(canonical_error) => {
+                // GH#151: distinguish "canonical positively rejected" (handled
+                // above, Ok(false) → stay fail-closed) from "canonical probe
+                // could not RUN". Under sustained concurrent write + archive
+                // git-commit load on a busy mailbox, the canonical second-
+                // opinion connection (a fresh `CanonicalDbConn::open_file`) can
+                // itself fail to acquire the DB with a lock/busy/transient
+                // error. Preserving the bespoke `IntegrityCorruption` verdict in
+                // that case escalates a runtime divergent-engine false positive
+                // (e.g. the `idx_agents_project_name_nocase` COLLATE NOCASE
+                // report that canonical otherwise calls `ok`) straight to an
+                // archive reconstruct → `degraded_read_only` window that times
+                // out every concurrent write — even though we never confirmed
+                // real corruption. Demote a *transient/lock* canonical-probe
+                // failure to a non-corruption recovery-class error so the
+                // integrity guard DEFERS (retries next cycle) instead of
+                // reconstructing. A genuinely corrupt file will be re-probed on
+                // the next cycle once contention clears, and `Ok(false)` (a real
+                // canonical rejection) still preserves the verdict and recovers.
+                let canonical_error_msg = canonical_error.to_string();
+                if crate::error::is_lock_error(&canonical_error_msg)
+                    || is_sqlite_snapshot_conflict_error_message(&canonical_error_msg)
+                    || is_sqlite_recovery_error_message(&canonical_error_msg)
+                {
+                    tracing::warn!(
+                        phase,
+                        path = %path_for_log,
+                        check = %kind,
+                        primary_error = %message,
+                        canonical_error = %canonical_error_msg,
+                        "integrity probe rejected the file but the canonical second-opinion probe \
+                         could not run due to lock/busy contention; deferring (NOT reconstructing) \
+                         so a divergent-engine false positive cannot trigger a spurious recovery \
+                         under concurrent write load (GH#151)"
+                    );
+                    // IMPORTANT: do NOT embed the raw primary `message` or the
+                    // raw `canonical_error_msg` here — either can contain
+                    // corruption/recovery keywords ("database disk image is
+                    // malformed", "wal ... malformed", etc.) that
+                    // `is_corruption_error_message` / `is_sqlite_recovery_error_message`
+                    // would re-match in the integrity guard, re-escalating the
+                    // very reconstruct we are deferring. We surface a neutral,
+                    // classifier-safe deferral string (asserted non-corruption /
+                    // non-recovery by a regression test). The full primary
+                    // verdict and the raw canonical-probe error were already
+                    // logged above with structured fields.
+                    let contention_kind = if crate::error::is_lock_error(&canonical_error_msg) {
+                        "lock/busy"
+                    } else if is_sqlite_snapshot_conflict_error_message(&canonical_error_msg) {
+                        "stale-wal/snapshot-conflict"
+                    } else {
+                        "transient-recovery"
+                    };
+                    return Err(DbError::Sqlite(format!(
+                        "integrity reconcile deferred under {contention_kind} contention: the \
+                         canonical second-opinion probe could not run; the primary verdict is \
+                         unconfirmed and will be re-probed on the next integrity cycle"
+                    )));
+                }
                 tracing::warn!(
                     phase,
                     path = %path_for_log,
                     check = %kind,
                     primary_error = %message,
-                    canonical_error = %canonical_error,
+                    canonical_error = %canonical_error_msg,
                     "integrity probe rejected the file and canonical fallback could not run"
                 );
                 Err(DbError::IntegrityCorruption { message, details })
@@ -10136,8 +10194,11 @@ mod tests {
 
     #[test]
     fn reconcile_canonical_preserves_corruption_when_probe_cannot_run() {
-        // Fail-closed: if we cannot get a canonical second opinion we do NOT
-        // invent health — the corruption verdict is preserved.
+        // Fail-closed: if we cannot get a canonical second opinion *for a
+        // non-transient reason* we do NOT invent health — the corruption
+        // verdict is preserved. ("canonical open failed" is a generic
+        // ConnectionOrConfigError, not a lock/busy/transient contention signal,
+        // so the GH#151 deferral path below does not apply here.)
         let primary: DbResult<integrity::IntegrityCheckResult> =
             Err(DbError::IntegrityCorruption {
                 message: "database disk image is malformed".to_string(),
@@ -10152,6 +10213,63 @@ mod tests {
         )
         .expect_err("unprovable canonical fallback must preserve corruption");
         assert!(matches!(err, DbError::IntegrityCorruption { .. }));
+    }
+
+    #[test]
+    fn reconcile_canonical_defers_when_probe_blocked_by_lock_contention() {
+        // GH#151: when the canonical second-opinion probe cannot RUN because it
+        // hit lock/busy contention (which happens under sustained concurrent
+        // write + archive git-commit load on a busy mailbox), a bespoke
+        // divergent-engine false positive (e.g. the COLLATE NOCASE
+        // `idx_agents_project_name_nocase` "malformed" report that canonical
+        // would otherwise call `ok`) must NOT escalate to a reconstruct. The
+        // verdict is demoted from `IntegrityCorruption` to a neutral,
+        // *non-corruption / non-recovery* deferral error so the integrity guard
+        // re-probes on the next cycle instead of tipping the mailbox into a
+        // spurious `degraded_read_only` window.
+        for canonical_lock_error in [
+            "database is locked",
+            "database table is locked",
+            "snapshot conflict on pages: 7",
+        ] {
+            let primary: DbResult<integrity::IntegrityCheckResult> =
+                Err(DbError::IntegrityCorruption {
+                    message: "database disk image is malformed: index \
+                              idx_agents_project_name_nocase entries are out of order"
+                        .to_string(),
+                    details: Vec::new(),
+                });
+            let err = reconcile_with_canonical(
+                primary,
+                integrity::CheckKind::Quick,
+                "runtime",
+                "/tmp/storage.sqlite3",
+                || Err(SqlError::Custom(canonical_lock_error.to_string())),
+            )
+            .expect_err("lock-blocked canonical probe must defer");
+
+            // Must NOT be a corruption verdict — that is what triggers reconstruct.
+            assert!(
+                !matches!(err, DbError::IntegrityCorruption { .. }),
+                "lock-blocked reconcile must not preserve a corruption verdict ({canonical_lock_error})"
+            );
+            // And the deferral message itself must not re-trip the corruption /
+            // recovery classifiers in the integrity guard (which would
+            // re-escalate the reconstruct we are deferring).
+            let msg = err.to_string();
+            assert!(
+                !is_corruption_error_message(&msg),
+                "deferral error must not classify as corruption ({canonical_lock_error}): {msg}"
+            );
+            assert!(
+                !is_sqlite_recovery_error_message(&msg),
+                "deferral error must not classify as a recovery error ({canonical_lock_error}): {msg}"
+            );
+            assert!(
+                msg.contains("deferred"),
+                "deferral error should be self-describing: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -17,8 +17,8 @@ use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, FileReservationRow, create_pool, now_micros,
     queries::{
         self, get_agent_last_mail_activity, list_unreleased_file_reservations,
-        project_ids_with_active_reservations, release_expired_reservations,
-        release_reservations_by_ids_returning_ids,
+        project_ids_with_active_reservations, prune_released_file_reservations,
+        release_expired_reservations, release_reservations_by_ids_returning_ids,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -300,6 +300,45 @@ fn run_cleanup_cycle_with_cache(
                 error = %err,
                 "cleanup: failed to enqueue archive updates for released reservations"
             );
+        }
+    }
+
+    // Phase 3 (GH#154 item 2): retention prune. Released/expired reservations
+    // are only ever marked released, never deleted, so `file_reservations` grows
+    // unbounded on a long-lived mailbox (one report: ~30k rows / 0 active over
+    // ~55 days), inflating every active-reservation scan. Hard-DELETE released
+    // rows whose settled timestamp is older than the configured retention
+    // horizon. The git archive retains the audit history, so this is
+    // non-destructive. `0` days disables the prune (historical behavior).
+    if config.file_reservations_retention_days > 0 {
+        let retention_us = i64::try_from(config.file_reservations_retention_days)
+            .unwrap_or(30)
+            .saturating_mul(86_400)
+            .saturating_mul(1_000_000);
+        let older_than_us = now_micros().saturating_sub(retention_us);
+        match block_on(async {
+            prune_released_file_reservations(&cx, pool, None, older_than_us).await
+        }) {
+            Outcome::Ok(deleted) => {
+                if deleted > 0 {
+                    info!(
+                        deleted,
+                        retention_days = config.file_reservations_retention_days,
+                        "cleanup: pruned released file reservations past retention horizon"
+                    );
+                }
+            }
+            Outcome::Err(err) => warn!(
+                error = %err,
+                "cleanup: file-reservation retention prune failed; will retry next cycle"
+            ),
+            Outcome::Cancelled(_) => {
+                warn!("cleanup: file-reservation retention prune was cancelled");
+            }
+            Outcome::Panicked(panic) => warn!(
+                panic = %panic.message(),
+                "cleanup: file-reservation retention prune panicked"
+            ),
         }
     }
 
