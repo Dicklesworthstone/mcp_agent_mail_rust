@@ -10,6 +10,44 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+---
+
+## [v0.3.14](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.14) — 2026-06-20 **[Release]**
+
+### Fixed: real on-disk `storage.sqlite3` corruption under multi-agent swarm load (#152, #156)
+
+The published v0.3.13 binary vendored a FrankenSQLite that predated two real
+engine fixes, so a busy `serve-http` host coordinating a multi-pane swarm could
+corrupt `storage.sqlite3` on disk (`2nd reference to page N` / `database disk
+image is malformed`), tripping archive reconstruction and the durability latch
+(agents experienced this as "agent mail crashed"). This release rebuilds against
+the fixed FrankenSQLite:
+
+- **frankensqlite #115** (`d1caefb5`) — concurrent-mode double-allocate of the
+  same page → `2nd reference to page`.
+- **frankensqlite #118** (`f28088b6`) — in-transaction `integrity_check` false
+  positive that drove the downstream reconstruct loop.
+- **FK/trigger INSERT placeholder canonicalization** (`ce846249`) — the
+  `expected canonicalized numbered placeholder` error on reused pooled
+  connections (surfaced as `request_contact` failures).
+
+The git-backed archive runs ahead of the SQLite index throughout, so existing
+data was always recoverable via `am doctor repair`; this release stops the
+corruption at its source.
+
+### `list_agents` bounded + reservation retention; reconcile defers under lock contention (#154, #151)
+
+- **`list_agents` is now bounded** (default/clamped limit + optional
+  `active_within_days` floor) and the slow active-reservation query was rewritten
+  to a non-correlated anti-join — reservation queries no longer hit the 30s
+  dispatch timeout (#154).
+- **`file_reservations` retention sweep** hard-prunes released/expired rows past a
+  configurable horizon (`FILE_RESERVATIONS_RETENTION_DAYS`, default 30); the git
+  archive retains the full audit trail (#154).
+- **Integrity reconcile defers under lock/busy contention** instead of escalating
+  to a spurious archive reconstruction — stopping the reconstruct storm on a busy
+  multi-writer mailbox (#151).
+
 ### Fixed: 32-byte WAL false positive (doctor FAIL + startup re-quarantine + reconstruct cascade)
 
 Two real multi-agent-host incidents (ts1 + css, 2026-06-17) traced to the same
