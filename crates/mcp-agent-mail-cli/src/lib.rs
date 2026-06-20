@@ -24850,6 +24850,87 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
     }
 }
 
+/// Re-probe a database with the AUTHORITATIVE canonical engine's FULL
+/// `integrity_check` and report whether it PROVES the file healthy.
+///
+/// Opens read-only/immutable (no write contention with a live mailbox owner)
+/// and returns `true` only when the canonical full `integrity_check` returns
+/// `ok`. Any open error, check error, or non-`ok` result returns `false` — the
+/// caller must treat that as "health unconfirmed", never as "confirmed
+/// corrupt".
+fn doctor_canonical_integrity_check_refutes_corruption(resolved: &Path) -> bool {
+    if !resolved.exists() {
+        return false;
+    }
+    let Ok(conn) = doctor_open_canonical_readonly_db_for_diagnostic(resolved, "corruption_confirm")
+    else {
+        return false;
+    };
+    matches!(
+        sqlite_conn_check_ok_canonical(&conn, mcp_agent_mail_db::CheckKind::Full),
+        Ok(true)
+    )
+}
+
+/// br-bvq1x.1.6: gate a CHEAP-probe corruption verdict on an authoritative
+/// canonical full `integrity_check` before it can drive a destructive
+/// `Reconstruct`/`Repair` (the `am doctor health` verdict) or the daemon's
+/// startup auto-reconstruct.
+///
+/// The cheap file-sanity gate uses `quick_check` / an engine open, which can
+/// FALSE-flag a healthy DB as corrupt when it races a transient state — a
+/// mid-checkpoint WAL, or a write/open cancelled by an external deadline/clock
+/// bug (the 2026-06-17 asupersync `wall_now` incident). The startup health gate
+/// then rewrites a perfectly healthy `storage.sqlite3` on every boot, which is
+/// itself a corruption RISK and erodes trust in every verdict.
+///
+/// When the verdict is a transient-prone corruption class (the generic
+/// "possible corruption" probe result, or a non-lock sanity-probe ERROR), this
+/// re-probes with the canonical engine's FULL `integrity_check`. A PASSING
+/// canonical check PROVES the DB healthy — refuting the cheap verdict, and
+/// forbidding a lone unsupported-engine "malformed" from standing (A4) — so we
+/// downgrade to `None` and decline to rewrite the database.
+///
+/// Fail-safe: we only downgrade on PROVEN health. A check that fails, errors,
+/// or cannot run leaves the conservative recovery verdict untouched, so a real
+/// 0-byte / non-database file or a torn b-tree still recovers. Unambiguous
+/// structural verdicts (missing core tables, archive drift) are not in the
+/// transient class and pass through unchanged.
+fn doctor_confirm_or_downgrade_corruption_verdict(
+    resolved: &Path,
+    verdict: DoctorDatabaseFixStrategy,
+) -> DoctorDatabaseFixStrategy {
+    let original_detail = match &verdict {
+        DoctorDatabaseFixStrategy::Reconstruct(detail)
+        | DoctorDatabaseFixStrategy::Repair(detail) => detail.clone(),
+        // A `None` verdict is already non-destructive; nothing to gate.
+        DoctorDatabaseFixStrategy::None(_) => return verdict,
+    };
+
+    let is_transient_class = original_detail.contains("possible corruption")
+        || original_detail.contains("Database sanity probe failed");
+    if !is_transient_class {
+        return verdict;
+    }
+
+    if !doctor_canonical_integrity_check_refutes_corruption(resolved) {
+        return verdict;
+    }
+
+    tracing::warn!(
+        path = %resolved.display(),
+        suppressed_verdict = %original_detail,
+        "doctor: cheap probe reported possible corruption but a canonical full integrity_check \
+         passed on re-probe; declining to rewrite a healthy database (transient false positive, \
+         br-bvq1x.1.6)"
+    );
+    DoctorDatabaseFixStrategy::None(format!(
+        "canonical integrity_check passed on re-probe; declined to rewrite a healthy database \
+         (suppressed transient corruption verdict: {})",
+        truncate_doctor_command(&original_detail)
+    ))
+}
+
 fn doctor_database_inventory_failure_strategy(
     error: &CliError,
     archive_reconstruct_available: bool,
@@ -25154,7 +25235,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     match file_sanity {
         Ok((false, detail, _, _)) => {
-            return Ok(if archive_reconstruct_available {
+            let verdict = if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "{detail}; archive recovery is available under {}",
                     archive_root.display()
@@ -25163,10 +25244,15 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                 DoctorDatabaseFixStrategy::Repair(format!(
                     "{detail}; no authoritative archive data is available, attempting in-place repair"
                 ))
-            });
+            };
+            // br-bvq1x.1.6: confirm the cheap "possible corruption" verdict
+            // against a canonical full integrity_check before rewriting the DB.
+            return Ok(doctor_confirm_or_downgrade_corruption_verdict(
+                resolved, verdict,
+            ));
         }
         Err(error) => {
-            return Ok(if archive_reconstruct_available {
+            let verdict = if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database sanity probe failed for {}: {}; archive recovery is available under {}",
                     resolved.display(),
@@ -25179,7 +25265,13 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                     resolved.display(),
                     truncate_doctor_command(&error.to_string())
                 ))
-            });
+            };
+            // br-bvq1x.1.6: a non-lock sanity-probe error (e.g. a cancelled
+            // pool acquire) must not funnel into a destructive reconstruct when
+            // a canonical full integrity_check proves the DB healthy.
+            return Ok(doctor_confirm_or_downgrade_corruption_verdict(
+                resolved, verdict,
+            ));
         }
         Ok((true, _, _, _)) => {}
     }
@@ -45511,6 +45603,112 @@ startup_timeout_sec = 42
         assert!(
             shm_path.exists(),
             "read-only strategy must not quarantine SHM"
+        );
+    }
+
+    // --- br-bvq1x.1.6: canonical integrity_check confirmation gate ---
+
+    #[test]
+    fn doctor_canonical_integrity_check_refutes_corruption_distinguishes_healthy_from_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Healthy, checkpointed DB → canonical full integrity_check passes.
+        let healthy = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&healthy, "healthy", "/healthy");
+        assert!(
+            doctor_canonical_integrity_check_refutes_corruption(&healthy),
+            "a healthy DB must be refuted as a corruption false positive"
+        );
+
+        // A non-database file cannot be opened/verified → not refuted.
+        let garbage = dir.path().join("garbage.sqlite3");
+        std::fs::write(&garbage, b"not-a-sqlite-database").unwrap();
+        assert!(
+            !doctor_canonical_integrity_check_refutes_corruption(&garbage),
+            "a non-database file must not be refuted (fail-safe keeps the verdict)"
+        );
+
+        // A missing file cannot be verified → not refuted.
+        let missing = dir.path().join("missing.sqlite3");
+        assert!(
+            !doctor_canonical_integrity_check_refutes_corruption(&missing),
+            "a missing file must not be refuted"
+        );
+    }
+
+    #[test]
+    fn doctor_confirm_downgrades_possible_corruption_when_canonical_integrity_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        // A raced cheap quick_check produced this verdict on a healthy DB.
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "Health probes failed for {} (possible corruption); archive recovery is available",
+            db_path.display()
+        ));
+        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
+        match result {
+            DoctorDatabaseFixStrategy::None(detail) => assert!(
+                detail.contains("canonical integrity_check passed")
+                    && detail.contains("declined to rewrite"),
+                "downgrade detail should explain the refutation, got: {detail}"
+            ),
+            other => panic!("healthy DB must downgrade a transient corruption verdict: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_confirm_downgrades_sanity_probe_error_when_canonical_integrity_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        // A cancelled/transient sanity-probe error on a healthy DB.
+        let verdict = DoctorDatabaseFixStrategy::Repair(format!(
+            "Database sanity probe failed for {}: operation cancelled",
+            db_path.display()
+        ));
+        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
+        assert!(
+            matches!(result, DoctorDatabaseFixStrategy::None(_)),
+            "a transient sanity-probe error on a healthy DB must not reconstruct: {result:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_confirm_keeps_verdict_when_db_is_truly_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt.sqlite3");
+        std::fs::write(&db_path, b"not-a-sqlite-database").unwrap();
+
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "Health probes failed for {} (possible corruption)",
+            db_path.display()
+        ));
+        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
+        assert!(
+            matches!(result, DoctorDatabaseFixStrategy::Reconstruct(_)),
+            "a genuinely corrupt (non-database) file must keep its recovery verdict: {result:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_confirm_ignores_non_transient_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        // A structural verdict (missing core tables) is unambiguous and must
+        // pass through untouched even though the file itself is now healthy —
+        // the gate only intercepts the transient "possible corruption" class.
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(
+            "Core tables missing from /db: messages, agents; reconstruct from archive".to_string(),
+        );
+        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict.clone());
+        assert_eq!(
+            result, verdict,
+            "non-transient structural verdicts must not be downgraded"
         );
     }
 
