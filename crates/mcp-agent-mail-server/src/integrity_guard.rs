@@ -184,6 +184,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     let mut last_analyze: Option<Instant> = Some(maintenance_start);
     let mut last_vacuum: Option<Instant> = Some(maintenance_start);
     let mut last_atc_retention: Option<Instant> = Some(maintenance_start);
+    let mut last_doctor_retention: Option<Instant> = Some(maintenance_start);
     let mut skip_first_quick_cycle = SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel);
 
     loop {
@@ -222,11 +223,13 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
         run_db_maintenance_cycle(
             &pool,
             config,
+            sqlite_path,
             Instant::now(),
             &mut last_checkpoint,
             &mut last_analyze,
             &mut last_vacuum,
             &mut last_atc_retention,
+            &mut last_doctor_retention,
         );
 
         // Sleep in short increments so shutdown reacts quickly.
@@ -371,11 +374,13 @@ fn run_maintenance_op<F, E>(
 fn run_db_maintenance_cycle(
     pool: &DbPool,
     config: &Config,
+    sqlite_path: &Path,
     now: Instant,
     last_checkpoint: &mut Option<Instant>,
     last_analyze: &mut Option<Instant>,
     last_vacuum: &mut Option<Instant>,
     last_atc_retention: &mut Option<Instant>,
+    last_doctor_retention: &mut Option<Instant>,
 ) {
     if !config.db_maintenance_enabled {
         return;
@@ -458,6 +463,57 @@ fn run_db_maintenance_cycle(
             }
         }
         *last_atc_retention = Some(now);
+    }
+
+    // br-mudrv: bound doctor recovery-debris growth across recovery events.
+    // OBSERVE + ALERT only — the forensic-bundle manifest declares
+    // `automatic_deletion: false` and RULE 1 forbids automatic deletion, so the
+    // actual reclaim is the explicit `am doctor reclaim` operator verb. Here we
+    // surface (warn) when the reclaimable debris exceeds the configured
+    // threshold so the growth that silently reached ~19 GB in prod is visible.
+    if config.doctor_retention_enabled
+        && maintenance_task_due(
+            config.doctor_retention_sweep_interval_secs,
+            *last_doctor_retention,
+            now,
+        )
+    {
+        let artifacts = mcp_agent_mail_db::recovery_retention::enumerate_recovery_debris(
+            &config.storage_root,
+            sqlite_path,
+        );
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_micros()).ok())
+            .unwrap_or(0);
+        let plan = mcp_agent_mail_db::recovery_retention::select_recovery_debris_to_reclaim(
+            artifacts,
+            mcp_agent_mail_db::recovery_retention::RetentionPolicy {
+                keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
+                max_age_secs: config.doctor_retention_max_age_secs,
+            },
+            now_us,
+        );
+        if config.doctor_retention_alert_bytes > 0
+            && plan.reclaimable_bytes >= config.doctor_retention_alert_bytes
+        {
+            tracing::warn!(
+                reclaimable_bytes = plan.reclaimable_bytes,
+                reclaimable_artifacts = plan.prune.len(),
+                total_bytes = plan.total_bytes,
+                total_artifacts = plan.total_count,
+                alert_bytes = config.doctor_retention_alert_bytes,
+                "doctor recovery debris exceeds retention threshold; run `am doctor reclaim` to consolidate (br-mudrv)"
+            );
+        } else if plan.has_reclaimable() {
+            tracing::debug!(
+                reclaimable_bytes = plan.reclaimable_bytes,
+                reclaimable_artifacts = plan.prune.len(),
+                "doctor recovery debris reclaimable but under alert threshold"
+            );
+        }
+        *last_doctor_retention = Some(now);
     }
 }
 
@@ -880,13 +936,25 @@ mod tests {
         };
         let pool = memory_maintenance_pool();
         let now = Instant::now();
+        let sqlite_path = std::path::Path::new("/nonexistent/storage.sqlite3");
         let mut cp = None;
         let mut an = None;
         let mut va = None;
         let mut atc = None;
-        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va, &mut atc);
+        let mut dr = None;
+        run_db_maintenance_cycle(
+            &pool,
+            &config,
+            sqlite_path,
+            now,
+            &mut cp,
+            &mut an,
+            &mut va,
+            &mut atc,
+            &mut dr,
+        );
         assert!(
-            cp.is_none() && an.is_none() && va.is_none() && atc.is_none(),
+            cp.is_none() && an.is_none() && va.is_none() && atc.is_none() && dr.is_none(),
             "disabled maintenance must not attempt or advance any task"
         );
     }
@@ -899,10 +967,15 @@ mod tests {
             db_analyze_interval_secs: 300,
             db_vacuum_interval_secs: 300,
             db_journal_size_limit_bytes: 268_435_456,
+            // The doctor recovery-debris sweep is exercised by the
+            // recovery_retention unit tests; disable it here so this maintenance
+            // test stays hermetic (no filesystem enumeration of the default root).
+            doctor_retention_enabled: false,
             ..Config::default()
         };
         let pool = memory_maintenance_pool();
         let now = Instant::now();
+        let sqlite_path = std::path::Path::new("/nonexistent/storage.sqlite3");
 
         // All tasks never-run => all due => cursors advance to `now`. (Ops no-op
         // on a :memory: pool but still record success and advance the cursor.)
@@ -910,16 +983,41 @@ mod tests {
         let mut an = None;
         let mut va = None;
         let mut atc = None;
-        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va, &mut atc);
+        let mut dr = None;
+        run_db_maintenance_cycle(
+            &pool,
+            &config,
+            sqlite_path,
+            now,
+            &mut cp,
+            &mut an,
+            &mut va,
+            &mut atc,
+            &mut dr,
+        );
         assert_eq!(cp, Some(now), "checkpoint cursor advanced");
         assert_eq!(an, Some(now), "analyze cursor advanced");
         assert_eq!(va, Some(now), "vacuum cursor advanced");
         assert_eq!(atc, Some(now), "atc retention cursor advanced");
+        assert_eq!(
+            dr, None,
+            "doctor retention sweep disabled => cursor untouched"
+        );
 
         // Re-running at the same instant: cursors are fresh, so nothing is due
         // and they must stay put (off-hot-path back-off).
         let before = (cp, an, va, atc);
-        run_db_maintenance_cycle(&pool, &config, now, &mut cp, &mut an, &mut va, &mut atc);
+        run_db_maintenance_cycle(
+            &pool,
+            &config,
+            sqlite_path,
+            now,
+            &mut cp,
+            &mut an,
+            &mut va,
+            &mut atc,
+            &mut dr,
+        );
         assert_eq!(
             (cp, an, va, atc),
             before,

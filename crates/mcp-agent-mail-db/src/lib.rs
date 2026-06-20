@@ -52,6 +52,7 @@ pub mod queries;
 pub mod query_assistance;
 pub mod query_plan_diagnostics;
 pub mod reconstruct;
+pub mod recovery_retention;
 pub mod retry;
 pub mod s3fifo;
 pub mod schema;

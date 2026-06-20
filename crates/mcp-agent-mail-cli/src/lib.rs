@@ -2505,6 +2505,35 @@ pub enum DoctorCommand {
         #[arg(long, default_value_t = 5)]
         largest: usize,
     },
+    /// Reclaim stale recovery debris (forensic bundles + corrupt-DB quarantines).
+    ///
+    /// `am doctor repair`/`reconstruct` and the startup self-heal capture a
+    /// forensic bundle + quarantine the bad DB on every recovery event, with no
+    /// retention — across repeated events this grew to ~19 GB on a prod box and
+    /// wedged startup (br-mudrv). This verb CONSOLIDATES the stale debris (older
+    /// than `--max-age-days` and beyond the `--keep` newest per category) into
+    /// one reversible `<storage_root>/doctor/reclaimable/<ts>/` directory which
+    /// you can then remove. It NEVER deletes and never touches the live DB, so
+    /// it is safe to run while the server is up. Default (no `--yes`) previews.
+    Reclaim {
+        /// Preview the reclaim plan without moving anything (default behavior).
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply: move stale debris into doctor/reclaimable/<ts>/.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Always keep at least this many newest artifacts per category
+        /// (default: DOCTOR_RETENTION_KEEP_MIN).
+        #[arg(long)]
+        keep: Option<u64>,
+        /// Always keep artifacts younger than this many days
+        /// (default: DOCTOR_RETENTION_MAX_AGE_SECS).
+        #[arg(long)]
+        max_age_days: Option<u64>,
+        /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Build a sanitized incident bundle for maintainer support.
     #[command(name = "support-bundle")]
@@ -3333,6 +3362,11 @@ fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
         // `--dry-run` and `--yes` (list == false) remain mutating-intent and
         // are intentionally still blocked.
         DoctorCommand::Fix { list: true, .. } => true,
+        // `am doctor reclaim` only moves STALE recovery debris (forensic bundles
+        // + old corrupt-DB quarantines) — never the live mailbox DB or its
+        // sidecars — so it is safe to run even while a live owner holds the
+        // mailbox (the realistic case: clean up debris while the server is up).
+        DoctorCommand::Reclaim { .. } => true,
         _ => false,
     }
 }
@@ -7509,6 +7543,13 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             json,
             largest,
         } => handle_doctor_artifacts(format, json, largest),
+        DoctorCommand::Reclaim {
+            dry_run,
+            yes,
+            keep,
+            max_age_days,
+            json,
+        } => handle_doctor_reclaim(dry_run, yes, keep, max_age_days, json),
         DoctorCommand::SupportBundle {
             output_dir,
             stdout_log,
@@ -7832,6 +7873,214 @@ fn handle_doctor_artifacts(
             ftui_runtime::ftui_println!("  - {remediation}");
         }
     });
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct DoctorReclaimArtifact {
+    path: String,
+    category: String,
+    bytes: u64,
+    modified_us: i64,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorReclaimReport {
+    storage_root: String,
+    database: String,
+    keep_min: u64,
+    max_age_days: u64,
+    applied: bool,
+    total_artifacts: usize,
+    total_bytes: u64,
+    reclaimable_artifacts: usize,
+    reclaimable_bytes: u64,
+    kept_artifacts: usize,
+    reclaimable: Vec<DoctorReclaimArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_bytes: Option<u64>,
+    failures: Vec<String>,
+    note: String,
+}
+
+/// `am doctor reclaim` — consolidate stale recovery debris (br-mudrv).
+///
+/// Read-only preview by default; `--yes` MOVES (never deletes) the stale
+/// forensic bundles + corrupt-DB quarantines into one reversible
+/// `<storage_root>/doctor/reclaimable/<ts>/` directory the operator can remove.
+fn handle_doctor_reclaim(
+    dry_run: bool,
+    yes: bool,
+    keep: Option<u64>,
+    max_age_days: Option<u64>,
+    json_mode: bool,
+) -> CliResult<()> {
+    use mcp_agent_mail_db::recovery_retention as rr;
+    let fmt = output::CliOutputFormat::resolve(None, json_mode);
+    let config = Config::from_env();
+    let pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let configured_path = pool_cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    if configured_path == ":memory:" {
+        return Err(CliError::Other(
+            "in-memory databases have no on-disk recovery debris to reclaim".to_string(),
+        ));
+    }
+    let resolved = resolve_sqlite_path_with_absolute_candidate(&configured_path);
+    let db_path = PathBuf::from(&resolved);
+    let storage_root = config.storage_root.clone();
+
+    let keep_min = keep.unwrap_or(config.doctor_retention_keep_min);
+    let max_age_secs = match max_age_days {
+        Some(days) => days.saturating_mul(86_400),
+        None => config.doctor_retention_max_age_secs,
+    };
+
+    let artifacts = rr::enumerate_recovery_debris(&storage_root, &db_path);
+    let now_us = chrono::Utc::now().timestamp_micros();
+    let plan = rr::select_recovery_debris_to_reclaim(
+        artifacts,
+        rr::RetentionPolicy {
+            keep_min: usize::try_from(keep_min).unwrap_or(usize::MAX),
+            max_age_secs,
+        },
+        now_us,
+    );
+
+    let apply = yes && !dry_run;
+    let mut moved_to = None;
+    let mut moved = None;
+    let mut moved_bytes = None;
+    let mut failures: Vec<String> = Vec::new();
+
+    if apply && plan.has_reclaimable() {
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let dest = storage_root.join("doctor").join("reclaimable").join(&ts);
+        let outcome = rr::consolidate_debris(&plan, &dest)
+            .map_err(|e| CliError::Other(format!("reclaim consolidation failed: {e}")))?;
+        moved_to = Some(dest.display().to_string());
+        moved = Some(outcome.moved);
+        moved_bytes = Some(outcome.moved_bytes);
+        failures = outcome
+            .failures
+            .iter()
+            .map(|(p, e)| format!("{}: {e}", p.display()))
+            .collect();
+    }
+
+    let note = if apply {
+        format!(
+            "Moved {} stale artifact(s) into a reclaimable directory (nothing was deleted). Remove that directory with `rm -rf` to free the disk.",
+            moved.unwrap_or(0)
+        )
+    } else if plan.has_reclaimable() {
+        "Preview only — re-run with --yes to consolidate the stale debris into doctor/reclaimable/ (nothing is ever deleted automatically).".to_string()
+    } else {
+        "No stale recovery debris beyond the retention policy.".to_string()
+    };
+
+    let report = DoctorReclaimReport {
+        storage_root: storage_root.display().to_string(),
+        database: resolved.clone(),
+        keep_min,
+        max_age_days: max_age_secs / 86_400,
+        applied: apply,
+        total_artifacts: plan.total_count,
+        total_bytes: plan.total_bytes,
+        reclaimable_artifacts: plan.prune.len(),
+        reclaimable_bytes: plan.reclaimable_bytes,
+        kept_artifacts: plan.kept_count,
+        reclaimable: plan
+            .prune
+            .iter()
+            .map(|a| DoctorReclaimArtifact {
+                path: a.path.display().to_string(),
+                category: a.category.as_str().to_string(),
+                bytes: a.bytes,
+                modified_us: a.modified_us,
+            })
+            .collect(),
+        moved_to,
+        moved,
+        moved_bytes,
+        failures: failures.clone(),
+        note,
+    };
+
+    output::emit_output(&report, fmt, || {
+        output::section("Doctor Recovery-Debris Reclaim:");
+        output::kv("Storage root", &report.storage_root);
+        output::kv("Database", &report.database);
+        output::kv(
+            "Policy",
+            &format!(
+                "keep >= {} newest per category, keep < {} days old",
+                report.keep_min, report.max_age_days
+            ),
+        );
+        output::kv(
+            "Total debris",
+            &format!(
+                "{} artifact(s), {}",
+                report.total_artifacts,
+                format_bytes(report.total_bytes)
+            ),
+        );
+        output::kv(
+            "Reclaimable",
+            &format!(
+                "{} artifact(s), {}",
+                report.reclaimable_artifacts,
+                format_bytes(report.reclaimable_bytes)
+            ),
+        );
+        output::kv("Kept", &report.kept_artifacts.to_string());
+        if report.reclaimable.is_empty() {
+            output::emit_empty(fmt, "No stale recovery debris beyond the retention policy.");
+        } else {
+            ftui_runtime::ftui_println!("");
+            output::section("  Reclaimable (oldest first):");
+            let mut table = output::CliTable::new(vec!["CATEGORY", "SIZE", "PATH"]);
+            for a in &report.reclaimable {
+                table.add_row(vec![
+                    a.category.clone(),
+                    format_bytes(a.bytes),
+                    a.path.clone(),
+                ]);
+            }
+            table.render();
+        }
+        if let Some(dest) = &report.moved_to {
+            ftui_runtime::ftui_println!("");
+            output::kv("Moved to", dest);
+            output::kv(
+                "Moved",
+                &format!(
+                    "{} artifact(s), {}",
+                    report.moved.unwrap_or(0),
+                    format_bytes(report.moved_bytes.unwrap_or(0))
+                ),
+            );
+        }
+        if !report.failures.is_empty() {
+            ftui_runtime::ftui_println!("");
+            output::section("  Failures:");
+            for failure in &report.failures {
+                output::warn(failure);
+            }
+        }
+        ftui_runtime::ftui_println!("");
+        ftui_runtime::ftui_println!("{}", report.note);
+    });
+
+    if !failures.is_empty() {
+        return Err(CliError::ExitCode(1));
+    }
     Ok(())
 }
 
@@ -45710,6 +45959,88 @@ startup_timeout_sec = 42
             result, verdict,
             "non-transient structural verdicts must not be downgraded"
         );
+    }
+
+    // --- br-mudrv: `am doctor reclaim` verb ---
+
+    #[test]
+    fn doctor_reclaim_previews_then_consolidates_stale_debris() {
+        let storage = tempfile::tempdir().unwrap();
+        let storage_root = storage.path();
+        let db_path = storage_root.join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").unwrap();
+
+        // Seed one forensic bundle + one corrupt quarantine + a .bak that must
+        // be left alone.
+        let bundle = storage_root
+            .join("doctor")
+            .join("forensics")
+            .join("storage.sqlite3")
+            .join("repair-20260101_000000_000")
+            .join("sqlite");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("storage.sqlite3"), vec![0_u8; 128]).unwrap();
+        let quarantine = storage_root.join("storage.sqlite3.corrupt-20260101_000000_000");
+        std::fs::write(&quarantine, vec![0_u8; 64]).unwrap();
+        std::fs::write(storage_root.join("storage.sqlite3.bak"), b"bak").unwrap();
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_s = storage_root.display().to_string();
+
+        // Preview (no --yes, keep=0/max_age=0 => everything reclaimable): moves nothing.
+        let preview = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            || handle_doctor_reclaim(false, false, Some(0), Some(0), true),
+        );
+        assert!(preview.is_ok(), "preview should succeed: {preview:?}");
+        assert!(
+            quarantine.exists(),
+            "preview (no --yes) must not move any debris"
+        );
+
+        // Apply: consolidates the stale debris into doctor/reclaimable/, never
+        // touching the live DB or the .bak.
+        let applied = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", &db_url), ("STORAGE_ROOT", &storage_root_s)],
+            || handle_doctor_reclaim(false, true, Some(0), Some(0), true),
+        );
+        assert!(applied.is_ok(), "apply should succeed: {applied:?}");
+        assert!(!quarantine.exists(), "apply must move the quarantine out");
+        assert!(db_path.exists(), "apply must never touch the live DB");
+        assert!(
+            storage_root.join("storage.sqlite3.bak").exists(),
+            "apply must never touch the .bak"
+        );
+        let reclaimable = storage_root.join("doctor").join("reclaimable");
+        assert!(
+            reclaimable.is_dir(),
+            "apply must create the reclaimable staging dir"
+        );
+        // The consolidated quarantine landed under reclaimable/<ts>/.
+        let found = walkdir_contains(&reclaimable, "storage.sqlite3.corrupt-20260101_000000_000");
+        assert!(
+            found,
+            "consolidated quarantine should exist under reclaimable/"
+        );
+    }
+
+    fn walkdir_contains(root: &Path, needle: &str) -> bool {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.file_name().and_then(|n| n.to_str()) == Some(needle) {
+                    return true;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        false
     }
 
     #[cfg(unix)]

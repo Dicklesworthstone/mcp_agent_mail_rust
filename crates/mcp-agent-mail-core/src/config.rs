@@ -175,6 +175,17 @@ pub struct Config {
     pub db_vacuum_interval_secs: u64,
     pub db_journal_size_limit_bytes: u64,
 
+    // Doctor recovery-debris retention (br-mudrv): bound forensic bundles +
+    // `.corrupt-*` quarantine siblings that accumulate one-per-recovery-event
+    // (a prod box reached ~19 GB). The background sweep only OBSERVES + ALERTS
+    // (the forensic manifest forbids automatic deletion); `am doctor reclaim`
+    // does the operator-explicit consolidation/reclaim.
+    pub doctor_retention_enabled: bool,
+    pub doctor_retention_keep_min: u64,
+    pub doctor_retention_max_age_secs: u64,
+    pub doctor_retention_alert_bytes: u64,
+    pub doctor_retention_sweep_interval_secs: u64,
+
     // Periodic git health sweep (read-only orphan-ref detection)
     pub health_sweep_enabled: bool,
     pub health_sweep_interval_seconds: u64,
@@ -1243,6 +1254,13 @@ impl Default for Config {
             db_vacuum_interval_secs: 86_400,  // reclaim/defragment daily (0 disables)
             db_journal_size_limit_bytes: 268_435_456, // 256 MiB WAL truncation cap
 
+            // Doctor recovery-debris retention (br-mudrv)
+            doctor_retention_enabled: true,
+            doctor_retention_keep_min: 5, // always keep the 5 newest per category
+            doctor_retention_max_age_secs: 1_209_600, // always keep < 14 days old
+            doctor_retention_alert_bytes: 5_368_709_120, // warn at 5 GiB reclaimable
+            doctor_retention_sweep_interval_secs: 3_600, // hourly observe+alert sweep
+
             // Periodic git health sweep
             health_sweep_enabled: true,
             health_sweep_interval_seconds: 900, // 15 minutes
@@ -1690,6 +1708,28 @@ impl Config {
         config.db_journal_size_limit_bytes = env_u64(
             "DB_JOURNAL_SIZE_LIMIT_BYTES",
             config.db_journal_size_limit_bytes,
+        );
+
+        // Doctor recovery-debris retention (br-mudrv). `*_KEEP_MIN` newest and
+        // anything younger than `*_MAX_AGE_SECS` are always retained;
+        // `DOCTOR_RETENTION_ENABLED=false` disables the background alert sweep.
+        config.doctor_retention_enabled =
+            env_bool("DOCTOR_RETENTION_ENABLED", config.doctor_retention_enabled);
+        config.doctor_retention_keep_min = env_u64(
+            "DOCTOR_RETENTION_KEEP_MIN",
+            config.doctor_retention_keep_min,
+        );
+        config.doctor_retention_max_age_secs = env_u64(
+            "DOCTOR_RETENTION_MAX_AGE_SECS",
+            config.doctor_retention_max_age_secs,
+        );
+        config.doctor_retention_alert_bytes = env_u64(
+            "DOCTOR_RETENTION_ALERT_BYTES",
+            config.doctor_retention_alert_bytes,
+        );
+        config.doctor_retention_sweep_interval_secs = env_u64(
+            "DOCTOR_RETENTION_SWEEP_INTERVAL_SECS",
+            config.doctor_retention_sweep_interval_secs,
         );
 
         // FrankenSQLite MVCC / RaptorQ
