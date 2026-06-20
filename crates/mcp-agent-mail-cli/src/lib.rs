@@ -41152,8 +41152,36 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    /// Best-effort detection of an effective root user (uid 0), used to SKIP
+    /// tests that assert filesystem permission/ownership refusals — root
+    /// bypasses those checks, so the assertions false-fail on the rch remote
+    /// workers that run as root (br-jabez). Returns `false` when the uid cannot
+    /// be determined (treated as non-root → the test still runs), so non-root
+    /// environments are unaffected. Safe (no `unsafe`): on Linux `/proc/self`
+    /// resolves to `/proc/<pid>`, owned by the process's uid.
+    fn test_running_as_root() -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata("/proc/self")
+                .map(|meta| meta.uid() == 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     #[test]
     fn migrate_invalid_path_returns_error() {
+        if test_running_as_root() {
+            eprintln!(
+                "skipping migrate_invalid_path_returns_error: running as root can create \
+                 the otherwise-unwritable parent path, bypassing the failure this asserts (br-jabez)"
+            );
+            return;
+        }
         let url = "sqlite:////nonexistent/deeply/nested/dir/db.sqlite3";
         let res = handle_migrate_with_database_url(url);
         assert!(res.is_err(), "should fail for non-existent path");
@@ -41292,6 +41320,14 @@ http_headers = { Authorization = "Bearer secret" }
     #[test]
     fn migrate_readonly_dir_returns_error() {
         use std::os::unix::fs::PermissionsExt;
+
+        if test_running_as_root() {
+            eprintln!(
+                "skipping migrate_readonly_dir_returns_error: root bypasses the 0o444 \
+                 directory permission, so the write does not fail as this asserts (br-jabez)"
+            );
+            return;
+        }
 
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
