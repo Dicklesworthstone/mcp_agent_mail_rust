@@ -456,6 +456,100 @@ first body
         });
     }
 
+    /// Regression for #157: the static-export / live file_reservations page must
+    /// distinguish Released, Expired and Active leases — it previously labeled
+    /// every unreleased row "Active" (ignoring `expires_ts`) and counted every
+    /// row, including released ones, in the "N active reservations" headline.
+    #[test]
+    fn file_reservations_page_labels_released_expired_and_active_distinctly() {
+        let project = ProjectView {
+            id: 1,
+            slug: "demo".to_string(),
+            human_key: "Demo".to_string(),
+            created_at: String::new(),
+        };
+        let now = now_micros();
+        let hour = 3_600_000_000_i64;
+
+        let mk = |id: i64, expires_ts: i64, released_ts: Option<i64>| {
+            let status = if released_ts.is_some_and(|ts| ts > 0) {
+                "Released"
+            } else if expires_ts <= now {
+                "Expired"
+            } else {
+                "Active"
+            };
+            ReservationView {
+                id,
+                agent: format!("agent{id}"),
+                path_pattern: format!("src/file{id}.rs"),
+                exclusive: true,
+                reason: String::new(),
+                created: ts_display(now - hour),
+                expires: ts_display(expires_ts),
+                released: ts_display_opt(released_ts),
+                status,
+            }
+        };
+
+        // 1 active (future expiry, unreleased), 1 expired (past expiry,
+        // unreleased), 1 released — only the first is genuinely "active".
+        let reservations = vec![
+            mk(1, now + hour, None),
+            mk(2, now - hour, None),
+            mk(3, now + hour, Some(now - hour)),
+        ];
+        let active_count = reservations.iter().filter(|r| r.status == "Active").count();
+        assert_eq!(active_count, 1, "exactly one lease should be active");
+
+        let html = render(
+            "mail_file_reservations.html",
+            FileReservationsCtx {
+                project,
+                file_reservations: reservations,
+                active_count,
+            },
+        )
+        .expect("render should succeed")
+        .expect("render should return html");
+
+        // Headline reflects the live count (1), not the total row count (3).
+        assert!(
+            html.contains(">1</span> active"),
+            "headline should show 1 active, got: {html}"
+        );
+        assert!(
+            html.contains("of 3 total"),
+            "headline should show total of 3, got: {html}"
+        );
+        // Scope badge assertions to the reservations <tbody> so unrelated
+        // chrome icons in the base layout can't skew the counts.
+        let tbody = html
+            .split("<tbody")
+            .nth(1)
+            .and_then(|s| s.split("</tbody>").next())
+            .expect("rendered page should contain a reservations tbody");
+        // Each lifecycle badge renders exactly once. The badge icons are
+        // unambiguous (the literal words also appear in the column tooltip):
+        // clock = Active, timer-off = Expired, check-circle = Released. Exactly
+        // one of each proves the expired-unreleased row is no longer "Active".
+        assert_eq!(
+            tbody.matches("data-lucide=\"clock\"").count(),
+            1,
+            "exactly one Active badge expected in tbody: {tbody}"
+        );
+        assert_eq!(
+            tbody.matches("data-lucide=\"timer-off\"").count(),
+            1,
+            "exactly one Expired badge expected in tbody: {tbody}"
+        );
+        assert_eq!(
+            tbody.matches("data-lucide=\"check-circle\"").count(),
+            1,
+            "exactly one Released badge expected in tbody: {tbody}"
+        );
+    }
+
     #[test]
     fn archive_time_travel_snapshot_uses_archive_without_registered_project() {
         let dir = tempdir().expect("tempdir");
@@ -3981,6 +4075,9 @@ fn truncate_body(body: &str, max: usize) -> String {
 struct FileReservationsCtx {
     project: ProjectView,
     file_reservations: Vec<ReservationView>,
+    /// Count of reservations that are still live (not released and not expired)
+    /// at render time. The total row count is `file_reservations|length`.
+    active_count: usize,
 }
 
 #[derive(Serialize)]
@@ -3993,6 +4090,11 @@ struct ReservationView {
     created: String,
     expires: String,
     released: String,
+    /// Three-state lifecycle label: "Released" (released_ts set), "Expired"
+    /// (unreleased but past expires_ts at render time), or "Active". Computed in
+    /// Rust because the template has no clock — for the static export this is
+    /// evaluated against the generation-time `now`, matching the live route.
+    status: &'static str,
 }
 
 fn render_file_reservations(
@@ -4010,10 +4112,25 @@ fn render_file_reservations(
         Vec::new()
     };
 
+    // Evaluate expiry once against a single generation-time clock so the
+    // headline count and every per-row badge agree. For the live HTTP route
+    // this is "now"; for `am share static-export` the route is rendered at
+    // export time, so this is effectively `manifest.generated_at`.
+    let now = now_micros();
     let mut reservations = Vec::with_capacity(rows.len());
+    let mut active_count = 0usize;
     for r in &rows {
         let agent = block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, r.agent_id))
             .map_or_else(|_| format!("agent#{}", r.agent_id), |a| a.name);
+        // Three-state lifecycle: Released > Expired > Active.
+        let status = if r.released_ts.is_some_and(|ts| ts > 0) {
+            "Released"
+        } else if r.expires_ts <= now {
+            "Expired"
+        } else {
+            active_count += 1;
+            "Active"
+        };
         reservations.push(ReservationView {
             id: r.id.unwrap_or(0),
             agent,
@@ -4023,6 +4140,7 @@ fn render_file_reservations(
             created: ts_display(r.created_ts),
             expires: ts_display(r.expires_ts),
             released: ts_display_opt(r.released_ts),
+            status,
         });
     }
 
@@ -4031,6 +4149,7 @@ fn render_file_reservations(
         FileReservationsCtx {
             project,
             file_reservations: reservations,
+            active_count,
         },
     )
 }
