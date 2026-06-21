@@ -579,6 +579,12 @@ pub struct UndoSummary {
     pub actions_replayed: usize,
     pub actions_skipped: usize,
     pub failures: Vec<String>,
+    /// B3 (br-bvq1x.2.3): chain-of-custody manifest verdict for the run
+    /// (`verified`, `unverified_legacy`, `tampered`, `malformed`,
+    /// `key_unavailable`). When a present manifest fails to verify, undo
+    /// refuses before replaying — so this only ever reports a *passing*
+    /// (or escape-hatch-allowed) verdict on a returned summary.
+    pub manifest_status: String,
 }
 
 /// Replay `actions.jsonl` in reverse. Restore from `backups/`.
@@ -667,6 +673,56 @@ pub fn run_undo_with_scopes(
         run_id: run_id.to_string(),
         ..Default::default()
     };
+
+    // B3 (br-bvq1x.2.3): verify the run's chain-of-custody manifest BEFORE
+    // replaying anything. The replay-time defenses (`enforce_scope`,
+    // per-action hashes) bound *where* undo writes and whether the live
+    // target still looks post-mutation, but they trust the run artifacts
+    // themselves. The manifest binds actions.jsonl + backups/ under the
+    // per-install HMAC key, so a tampered log/payload (which an attacker
+    // who can plant `.doctor/runs/<id>/` could otherwise craft
+    // internally-consistent) is refused here, fail-closed. An *absent*
+    // manifest is the legacy/unsealed path (older binary, or a flow that
+    // doesn't produce undo-able runs): warn and proceed so undo of
+    // in-flight/legacy runs is not broken.
+    {
+        let verdict = super::manifest::verify_run_manifest_default(&run_dir, run_id);
+        let allow_unverified = super::manifest::allow_unverified_from_env();
+        match &verdict {
+            super::manifest::ManifestVerdict::Verified => {}
+            super::manifest::ManifestVerdict::Absent => {
+                eprintln!(
+                    "warning: doctor run {run_id} has no chain-of-custody manifest; \
+                     replaying unverified (legacy/unsealed run)"
+                );
+            }
+            other => {
+                if allow_unverified {
+                    eprintln!(
+                        "warning: doctor run {run_id} manifest is {} ({}); replaying anyway \
+                         because {} is set",
+                        other.status_label(),
+                        other.detail(),
+                        super::manifest::ALLOW_UNVERIFIED_ENV,
+                    );
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to undo run {run_id}: chain-of-custody manifest is {} ({}). \
+                             The run artifacts do not match the sealed manifest, or it was sealed \
+                             with a different key. Set {}=1 to override (e.g. key loss / \
+                             cross-machine recovery).",
+                            other.status_label(),
+                            other.detail(),
+                            super::manifest::ALLOW_UNVERIFIED_ENV,
+                        ),
+                    ));
+                }
+            }
+        }
+        summary.manifest_status = verdict.status_label().to_string();
+    }
 
     let f = fs::File::open(&actions_path)?;
     let raw_lines: Vec<String> = BufReader::new(f).lines().map_while(Result::ok).collect();
@@ -3126,5 +3182,149 @@ mod tests {
         // Now run_undo should succeed.
         let summary = test_undo(td.path(), run_id, false, true).unwrap();
         assert_eq!(summary.actions_replayed, 1);
+    }
+
+    // 32-byte test key (B3 / br-bvq1x.2.3 manifest wiring tests).
+    const UNDO_TEST_KEY: &[u8] = b"undo-it-key-0123456789-0123456a";
+
+    /// B3 item (1): an absolute target in `actions.jsonl` that falls
+    /// OUTSIDE the undo `write_scopes` must be refused by `enforce_scope`
+    /// before any restore — the privilege-escalation defense, complementing
+    /// the `..`/prefix path-traversal tests.
+    #[test]
+    fn undo_refuses_absolute_target_outside_undo_scopes() {
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, b"outside original\n").unwrap();
+
+        let run_id = "2026-06-21T07-00-00Z__outofscope";
+        let run_dir = scaffold_run_dir(repo.path(), run_id).unwrap();
+        let actions = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(run_dir.join("actions.jsonl"))
+            .unwrap();
+        let ctx = MutateContext {
+            run_id: run_id.to_string(),
+            run_dir,
+            capabilities: Capabilities {
+                // The chokepoint grants `outside` so the mutation succeeds...
+                write_scopes: vec![outside.path().to_path_buf()],
+            },
+            actions_file: Mutex::new(actions),
+            fixer_id: "test-fixer".into(),
+            repo_root: repo.path().to_path_buf(),
+            dry_run: false,
+            start: Instant::now(),
+            extra_locks: Vec::new(),
+        };
+        mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"outside new\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        // ...but undo is invoked with scopes that do NOT include `outside`.
+        // enforce_scope must refuse (strict => hard error), and the live
+        // target must be left untouched.
+        let result = run_undo_with_scopes(
+            repo.path(),
+            run_id,
+            false,
+            true,
+            &[repo.path().to_path_buf()],
+        );
+        assert!(
+            result.is_err(),
+            "out-of-scope absolute target must be refused"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("write_scopes"),
+            "error should name the scope boundary: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "outside new\n",
+            "out-of-scope target must not be restored"
+        );
+    }
+
+    /// B3 item (3): a present-but-unverifiable chain-of-custody manifest
+    /// (here: actions.jsonl tampered after sealing) makes `run_undo` refuse
+    /// before replaying anything. The refusal is deterministic regardless
+    /// of whether this host has a per-install key (no key => KeyUnavailable;
+    /// a different key => Tampered; both fail closed).
+    #[test]
+    fn undo_refuses_run_with_tampered_manifest() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("hello.txt");
+        fs::write(&target, b"original\n").unwrap();
+        let run_id = "2026-06-21T07-30-00Z__tampered";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"new\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+
+        let run_dir = doctor_root(td.path()).join("runs").join(run_id);
+        crate::doctor::manifest::seal_run_manifest_with_key(&run_dir, run_id, UNDO_TEST_KEY)
+            .unwrap();
+        // Attacker rewrites the action log after sealing.
+        fs::write(
+            run_dir.join("actions.jsonl"),
+            b"{\"path\":\"hello.txt\",\"op\":\"WriteFile\",\"before_hash\":\"\",\"ok\":true}\n",
+        )
+        .unwrap();
+
+        let result = test_undo(td.path(), run_id, false, true);
+        assert!(result.is_err(), "tampered manifest must be refused");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("manifest"),
+            "error should name the manifest: {err}"
+        );
+        // The live target must be untouched (no replay happened).
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    /// B3 item (3): a normal run produced without a manifest (legacy /
+    /// unsealed) still undoes, and reports the `unverified_legacy` status —
+    /// preserving backward compatibility for in-flight runs.
+    #[test]
+    fn undo_legacy_run_without_manifest_reports_unverified_status() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("hello.txt");
+        fs::write(&target, b"original\n").unwrap();
+        let run_id = "2026-06-21T08-00-00Z__legacy";
+        let ctx = make_ctx(&td, run_id);
+        let _ = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"new\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        drop(ctx);
+        let summary = test_undo(td.path(), run_id, false, true).unwrap();
+        assert_eq!(summary.actions_replayed, 1);
+        assert_eq!(summary.manifest_status, "unverified_legacy");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
     }
 }

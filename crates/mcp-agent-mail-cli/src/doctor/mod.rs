@@ -18,6 +18,7 @@
 
 pub mod capabilities;
 pub mod fixers;
+pub mod manifest;
 pub mod mutate;
 pub(crate) mod platform;
 pub mod process_owner;
@@ -578,6 +579,15 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
     if !dry_run && actions_taken > 0 {
         runs::write_run_artifacts(&run_dir, &run_id, &envelope)
             .map_err(|e| CliError::Other(format!("writing doctor run artifacts: {e}")))?;
+        // B3 (br-bvq1x.2.3): seal a tamper-evident chain-of-custody
+        // manifest binding actions.jsonl + backups/ under the per-install
+        // HMAC key, so `am doctor undo` can prove the run artifacts are
+        // the bytes the doctor wrote. Best-effort: a seal failure must not
+        // fail an otherwise-successful fix — undo simply falls back to the
+        // legacy (unverified) path for an unsealed run.
+        if let Err(e) = manifest::seal_run_manifest_default(&run_dir, &run_id) {
+            eprintln!("warning: could not seal doctor undo manifest for {run_id}: {e}");
+        }
     }
 
     if !dry_run && outcome.actions_taken > 0 {
@@ -2500,6 +2510,7 @@ pub fn handle_undo(
         "actions_replayed": summary.actions_replayed,
         "actions_skipped": summary.actions_skipped,
         "failures": summary.failures,
+        "manifest_status": summary.manifest_status,
         "dry_run": dry_run,
         "strict": strict,
     });
@@ -2511,11 +2522,12 @@ pub fn handle_undo(
             println!("{s}");
         }
         _ => println!(
-            "undo {}: replayed={} skipped={} failures={}",
+            "undo {}: replayed={} skipped={} failures={} manifest={}",
             summary.run_id,
             summary.actions_replayed,
             summary.actions_skipped,
-            summary.failures.len()
+            summary.failures.len(),
+            summary.manifest_status,
         ),
     }
 

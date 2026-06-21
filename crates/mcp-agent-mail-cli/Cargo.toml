@@ -53,6 +53,7 @@ signal-hook.workspace = true
 fs2.workspace = true
 git2.workspace = true
 dirs = "6"
+getrandom = "0.4.2"
 
 # nix is Unix-only (it doesn't compile on Windows). The CLI's nix usages
 # (PID liveness, mkfifo, mode bits) live in #[cfg(unix)] code paths.

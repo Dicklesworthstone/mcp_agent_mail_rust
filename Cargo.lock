@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.3.5"
+version = "0.3.4"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.3.5"
+version = "0.3.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1824,7 +1824,7 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.3.5"
+version = "0.3.4"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.3.5"
+version = "0.3.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.3.5"
+version = "0.3.4"
 dependencies = [
  "serde",
 ]
@@ -3346,7 +3346,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5081,6 +5081,7 @@ dependencies = [
  "fs2",
  "ftui",
  "ftui-runtime",
+ "getrandom 0.4.3",
  "git2",
  "glob",
  "hex",
