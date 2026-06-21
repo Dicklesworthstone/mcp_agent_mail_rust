@@ -48,6 +48,7 @@ output.
 - [SPEC-verify-live-contract.md](SPEC-verify-live-contract.md) - native verify-live contract.
 - [SPEC-artifacts-bundle-schema.md](SPEC-artifacts-bundle-schema.md) - E2E, PTY, and fault-suite artifact bundle schema.
 - [SPEC-threat-model.md](SPEC-threat-model.md) - consolidated threat model.
+- [SPEC-token-handle-safety-contract.md](SPEC-token-handle-safety-contract.md) - which tokens/handles are safe to surface vs must be redacted by downstream tools (E5/br-bvq1x.5.5).
 - [SPEC-web-ui-parity-contract.md](SPEC-web-ui-parity-contract.md) - web UI parity contract.
 - [SPEC-browser-parity-contract-deferred.md](SPEC-browser-parity-contract-deferred.md) - deferred browser parity reference.
 - [SPEC-tui-v2-product-contract.md](SPEC-tui-v2-product-contract.md) - deprecated pointer to [TUI_V2_CONTRACT.md](TUI_V2_CONTRACT.md).

@@ -107,6 +107,7 @@ Security incidents should append a dated lessons entry with:
 - `docs/SPEC-browser-parity-contract-deferred.md`
 - `docs/SPEC-doctor-forensic-bundle-schema.md`
 - `docs/SPEC-ephemeral-root-policy.md`
+- `docs/SPEC-token-handle-safety-contract.md` — which Agent Mail tokens/handles are safe to surface vs must be redacted by downstream tools
 - `docs/SPEC-verify-live-contract.md`
 - `br-il53l.8` — browser dashboard security review work
 - `br-bn0vb.22` — ATC privacy / data-minimization follow-up
