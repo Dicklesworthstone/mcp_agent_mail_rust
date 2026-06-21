@@ -46671,6 +46671,102 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_repair_resumption_report_is_machine_quotable() {
+        // B5: the resumable report must name the failed phase, confirm the
+        // committed cleanup, and offer resume/revert/escalate commands.
+        let backup = std::path::PathBuf::from("/tmp/backups/pre_repair_x.sqlite3");
+        let report =
+            doctor_repair_resumption_report("reindex", "disk I/O error", Some(&backup), 3, 2);
+        assert!(report.contains("repair_status: resumable"), "{report}");
+        assert!(report.contains("repair_failed_phase: reindex"), "{report}");
+        assert!(
+            report.contains("deleted_recipient_rows=3 affected_agents=2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("revert_command: am doctor restore /tmp/backups/pre_repair_x.sqlite3"),
+            "{report}"
+        );
+        assert!(
+            report.contains("resume_command: am doctor repair"),
+            "{report}"
+        );
+        assert!(
+            report.contains("escalate_command: am doctor reconstruct"),
+            "{report}"
+        );
+        // No backup => no revert command, but still resumable + resume cmd.
+        let no_backup = doctor_repair_resumption_report("analyze", "database is busy", None, 0, 0);
+        assert!(
+            no_backup.contains("repair_status: resumable"),
+            "{no_backup}"
+        );
+        assert!(!no_backup.contains("revert_command:"), "{no_backup}");
+        assert!(
+            no_backup.contains("resume_command: am doctor repair"),
+            "{no_backup}"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_maintenance_failure_leaves_resumable_state_not_silent() {
+        // B5 acceptance: injecting a REINDEX failure mid-repair must leave
+        // the DB in a clearly-reported RESUMABLE state — the data-affecting
+        // cleanup committed (orphan recipient gone), the command fails
+        // loudly (never silent success), and a fault-free re-run completes.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("repair_resumable.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+        seed_startup_self_heal_fk_orphan(&db_path);
+
+        set_repair_maintenance_fault(Some("reindex"));
+        let result = handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true);
+        set_repair_maintenance_fault(None);
+
+        // (a) Non-silent: a maintenance failure must surface as a non-zero
+        // exit, never as a success.
+        match result {
+            Err(CliError::ExitCode(1)) => {}
+            other => panic!("expected resumable ExitCode(1), got {other:?}"),
+        }
+
+        // (b) Committed, not reverted: the orphan-recipient cleanup ran
+        // before the maintenance phase, so the dangling row is gone.
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen repaired db");
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM message_recipients WHERE message_id = 999",
+                &[],
+            )
+            .expect("query orphan recipients");
+        let remaining: i64 = rows
+            .first()
+            .and_then(|r| r.get_named("c").ok())
+            .unwrap_or(-1);
+        assert_eq!(
+            remaining, 0,
+            "orphan-recipient cleanup must have committed (resumable, not reverted)"
+        );
+        conn.close_sync().ok();
+
+        // (c) Resumable: re-running repair without the injected fault
+        // completes the maintenance phase cleanly.
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("fault-free re-run should complete the maintenance phase (resumable)");
+
+        // A pre-repair backup was captured as the revert point.
+        assert!(
+            backup_dir.exists(),
+            "repair must capture a pre-repair backup as the revert point"
+        );
+    }
+
+    #[test]
     fn startup_database_self_heal_fails_when_repair_leaves_fk_orphans() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("startup_fk_still_dirty.sqlite3");
@@ -65365,6 +65461,144 @@ fn handle_doctor_repair_with(
     )
 }
 
+/// Which maintenance op failed, plus its raw error detail. The
+/// maintenance phase (VACUUM/ANALYZE/REINDEX/inbox_stats) runs AFTER the
+/// data-affecting cleanup has already committed, so a failure here is a
+/// resumable condition — not a reason to leave the DB in an unknown
+/// half-repaired state (B5 / br-bvq1x.2.5).
+struct DoctorMaintenancePhaseError {
+    phase: &'static str,
+    detail: String,
+}
+
+/// Test-only fault injection for the repair maintenance phase. Lets a
+/// test deterministically force VACUUM/ANALYZE/REINDEX/inbox_stats to
+/// fail mid-repair (B5 acceptance: prove the failure leaves a resumable
+/// state, never a silent half-repair). No-op in production builds.
+#[cfg(test)]
+thread_local! {
+    static REPAIR_MAINTENANCE_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_repair_maintenance_fault(phase: Option<&str>) {
+    REPAIR_MAINTENANCE_FAULT.with(|cell| {
+        *cell.borrow_mut() = phase.map(str::to_string);
+    });
+}
+
+#[cfg(test)]
+fn repair_maintenance_fault(phase: &str) -> Result<(), String> {
+    REPAIR_MAINTENANCE_FAULT.with(|cell| {
+        if cell.borrow().as_deref() == Some(phase) {
+            Err(format!("injected {phase} fault (test fault injection)"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn repair_maintenance_fault(_phase: &str) -> Result<(), String> {
+    Ok(())
+}
+
+/// Run the non-data-affecting maintenance phase of `am doctor repair`
+/// (VACUUM, ANALYZE, REINDEX, then inbox_stats rebuild) over a fresh
+/// canonical connection. Returns the number of agents whose inbox_stats
+/// were rebuilt, or a phase-tagged error so the caller can report a
+/// resumable failure instead of a bare opaque one.
+fn run_doctor_repair_maintenance_phase(
+    reconstruct_db_path: &Path,
+) -> Result<usize, DoctorMaintenancePhaseError> {
+    let path = reconstruct_db_path.display().to_string();
+    let vacuum_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path.clone()).map_err(|e| {
+        DoctorMaintenancePhaseError {
+            phase: "open",
+            detail: e.to_string(),
+        }
+    })?;
+    // REINDEX rebuilds all indexes from scratch, fixing corruption that
+    // VACUUM alone cannot repair (e.g. malformed b-tree ordering in
+    // indexes like idx_agents_project_name_nocase). PRAGMA integrity_check
+    // may not catch index-level corruption, so we run REINDEX
+    // unconditionally as a defensive measure.
+    for (phase, sql) in [
+        ("vacuum", "VACUUM"),
+        ("analyze", "ANALYZE"),
+        ("reindex", "REINDEX"),
+    ] {
+        repair_maintenance_fault(phase)
+            .map_err(|detail| DoctorMaintenancePhaseError { phase, detail })?;
+        vacuum_conn
+            .execute_raw(sql)
+            .map_err(|e| DoctorMaintenancePhaseError {
+                phase,
+                detail: e.to_string(),
+            })?;
+    }
+    drop(vacuum_conn);
+
+    let stats_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path).map_err(|e| {
+        DoctorMaintenancePhaseError {
+            phase: "inbox_stats",
+            detail: e.to_string(),
+        }
+    })?;
+    repair_maintenance_fault("inbox_stats").map_err(|detail| DoctorMaintenancePhaseError {
+        phase: "inbox_stats",
+        detail,
+    })?;
+    let rebuilt_stats_rows =
+        doctor_rebuild_all_inbox_stats_canonical(&stats_conn).map_err(|e| {
+            DoctorMaintenancePhaseError {
+                phase: "inbox_stats",
+                detail: e.to_string(),
+            }
+        })?;
+    Ok(rebuilt_stats_rows)
+}
+
+/// Build the machine-quotable resumable-state report emitted when the
+/// repair maintenance phase fails after the data-affecting cleanup has
+/// already committed. Pure (string-only) so it is unit-testable.
+fn doctor_repair_resumption_report(
+    failed_phase: &str,
+    detail: &str,
+    backup_path: Option<&Path>,
+    deleted_recipient_rows: usize,
+    affected_agents: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str("  repair_status: resumable\n");
+    out.push_str(&format!("  repair_failed_phase: {failed_phase}\n"));
+    out.push_str(&format!(
+        "  repair_failed_detail: {}\n",
+        truncate_doctor_command(detail)
+    ));
+    out.push_str(&format!(
+        "  repair_committed_cleanup: deleted_recipient_rows={deleted_recipient_rows} affected_agents={affected_agents}\n"
+    ));
+    if let Some(backup) = backup_path {
+        out.push_str(&format!("  repair_backup: {}\n", backup.display()));
+        out.push_str(&format!(
+            "  revert_command: am doctor restore {}\n",
+            backup.display()
+        ));
+    }
+    out.push_str("  resume_command: am doctor repair\n");
+    out.push_str("  escalate_command: am doctor reconstruct\n");
+    out.push_str(&format!(
+        "Repair incomplete: the data-affecting cleanup committed durably, but the maintenance \
+         phase '{failed_phase}' failed ({}). The database is in a KNOWN, RESUMABLE state — re-run \
+         `am doctor repair` to retry the maintenance phase, restore the backup to fully revert, or \
+         run `am doctor reconstruct` if corruption persists.",
+        truncate_doctor_command(detail)
+    ));
+    out
+}
+
 fn handle_doctor_repair_with_options(
     database_url: &str,
     storage_root: &Path,
@@ -65663,7 +65897,12 @@ fn handle_doctor_repair_with_options(
         }
     }
 
-    // 2. Optional backup before repair
+    // 2. Optional backup before repair. The pre-repair backup is the
+    // revert point that makes the whole repair revertible — captured here
+    // BEFORE any data-affecting cleanup so a later maintenance-phase
+    // failure can be reported as a resumable (not unknown) state, with a
+    // concrete `am doctor restore` revert command (B5 / br-bvq1x.2.5).
+    let mut verified_backup_path: Option<PathBuf> = None;
     if !dry_run {
         std::fs::create_dir_all(backup_dir)?;
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -65677,6 +65916,7 @@ fn handle_doctor_repair_with_options(
             let bak_path =
                 next_timestamped_sqlite_backup_path_in_dir(backup_dir, "pre_repair", &timestamp);
             copy_sqlite_backup_consistently(Path::new(&db_path), &bak_path)?;
+            verified_backup_path = Some(bak_path.clone());
             ftui_runtime::ftui_println!("  Backup: {}", bak_path.display());
             doctor_quarantine_header_only_wal_sidecars(Path::new(&db_path))?;
 
@@ -65859,37 +66099,39 @@ fn handle_doctor_repair_with_options(
         }
     }
 
-    // 5. VACUUM + ANALYZE + REINDEX
+    // 5. VACUUM + ANALYZE + REINDEX + inbox_stats rebuild — the
+    // non-data-affecting maintenance phase. It runs AFTER the
+    // orphan-recipient cleanup has already committed, so a failure here
+    // (e.g. `ANALYZE` => "database is busy", or `REINDEX` on a corrupt
+    // WAL — the mac-mini-max hazards) must NOT leave a silently
+    // half-repaired DB. Instead we report a clearly-resumable state: the
+    // committed cleanup is durable and correct, and the operator can
+    // re-run repair to retry the maintenance, restore the pre-repair
+    // backup to fully revert, or reconstruct (B5 / br-bvq1x.2.5).
     if !dry_run {
         drop(cleanup_conn);
-        let vacuum_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
-            reconstruct_db_path.display().to_string(),
-        )
-        .map_err(|e| CliError::Other(format!("Failed to open DB for VACUUM: {e}")))?;
-        vacuum_conn
-            .execute_raw("VACUUM")
-            .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
-        vacuum_conn
-            .execute_raw("ANALYZE")
-            .map_err(|e| CliError::Other(format!("ANALYZE failed: {e}")))?;
-        // REINDEX rebuilds all indexes from scratch, fixing corruption that
-        // VACUUM alone cannot repair (e.g. malformed b-tree ordering in
-        // indexes like idx_agents_project_name_nocase).  PRAGMA
-        // integrity_check may not catch index-level corruption, so we run
-        // REINDEX unconditionally as a defensive measure.
-        vacuum_conn
-            .execute_raw("REINDEX")
-            .map_err(|e| CliError::Other(format!("REINDEX failed: {e}")))?;
-        ftui_runtime::ftui_println!("  VACUUM + ANALYZE + REINDEX complete.");
-
-        let stats_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
-            reconstruct_db_path.display().to_string(),
-        )
-        .map_err(|e| CliError::Other(format!("Failed to open DB for inbox_stats rebuild: {e}")))?;
-        let rebuilt_stats_rows = doctor_rebuild_all_inbox_stats_canonical(&stats_conn)?;
-        ftui_runtime::ftui_println!(
-            "  Rebuilt inbox_stats from repaired rows: {rebuilt_stats_rows} agent(s)."
-        );
+        match run_doctor_repair_maintenance_phase(&reconstruct_db_path) {
+            Ok(rebuilt_stats_rows) => {
+                ftui_runtime::ftui_println!("  VACUUM + ANALYZE + REINDEX complete.");
+                ftui_runtime::ftui_println!(
+                    "  Rebuilt inbox_stats from repaired rows: {rebuilt_stats_rows} agent(s)."
+                );
+            }
+            Err(DoctorMaintenancePhaseError { phase, detail }) => {
+                let report = doctor_repair_resumption_report(
+                    phase,
+                    &detail,
+                    verified_backup_path.as_deref(),
+                    recipient_cleanup.deleted_rows,
+                    recipient_cleanup.affected_agents,
+                );
+                ftui_runtime::ftui_eprintln!("{report}");
+                // Non-zero exit so the failure is never read as success,
+                // but the printed report makes the state KNOWN and
+                // resumable rather than an opaque error.
+                return Err(CliError::ExitCode(1));
+            }
+        }
     }
 
     if let Some(ref slug) = project {
