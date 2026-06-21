@@ -44,6 +44,7 @@ output.
 - [SPEC-mailbox-durability-states.md](SPEC-mailbox-durability-states.md) - mailbox durability state machine.
 - [SPEC-doctor-report.md](SPEC-doctor-report.md) - `am doctor` report and capabilities schema.
 - [SPEC-doctor-forensic-bundle-schema.md](SPEC-doctor-forensic-bundle-schema.md) - doctor forensic bundle schema.
+- [DOCTOR_FM_DISPOSITION.md](DOCTOR_FM_DISPOSITION.md) - doctor failure-mode disposition audit (live registry vs historical inventory; B6/br-bvq1x.2.6).
 - [SPEC-verify-live-contract.md](SPEC-verify-live-contract.md) - native verify-live contract.
 - [SPEC-artifacts-bundle-schema.md](SPEC-artifacts-bundle-schema.md) - E2E, PTY, and fault-suite artifact bundle schema.
 - [SPEC-threat-model.md](SPEC-threat-model.md) - consolidated threat model.
