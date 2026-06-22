@@ -45,6 +45,9 @@ pub struct CapabilitiesReport {
     pub write_scopes: Vec<PathBuf>,
     pub run_artifact_layout: RunArtifactLayout,
     pub report_schema: &'static str,
+    /// Machine-readable mirror of the token/handle safety contract so
+    /// downstream redactors consume it without parsing markdown.
+    pub token_handle_safety: TokenHandleSafety,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +95,39 @@ pub struct RunArtifactLayout {
     pub backups_dir: &'static str,
     pub latest_symlink: &'static str,
     pub history_jsonl: &'static str,
+}
+
+/// One entry in the token/handle safety contract — a stable machine token
+/// plus its one-line description, mirrored from
+/// `docs/SPEC-token-handle-safety-contract.md`.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenHandleEntry {
+    /// Stable snake_case machine token for the credential/identifier.
+    pub id: &'static str,
+    /// One-line human description (mirrors the SPEC table "Notes").
+    pub summary: &'static str,
+}
+
+/// Machine-readable mirror of the token/handle safety contract
+/// (`docs/SPEC-token-handle-safety-contract.md`), so downstream redactors
+/// (e.g. NTM screencast/log redaction) consume the classification without
+/// parsing markdown. The doc remains the single source of truth; a unit
+/// test asserts the three lists are non-empty and pairwise disjoint.
+/// See `br-1aq3f` (follow-up of E5 / `br-bvq1x.5.5`).
+#[derive(Debug, Serialize)]
+pub struct TokenHandleSafety {
+    /// Mirrors the doc's `Contract version`. Bump both together.
+    pub contract_version: &'static str,
+    /// Path-stable anchor doc — the authoritative source of truth.
+    pub spec: &'static str,
+    /// Credentials/keys. MUST be redacted in every context — never display,
+    /// even partially.
+    pub secret_never_surface: Vec<TokenHandleEntry>,
+    /// Not credentials, but leak host/workspace structure or user content.
+    /// Redact by default; an operator may opt in within a trusted context.
+    pub sensitive_context_redact_by_default: Vec<TokenHandleEntry>,
+    /// Non-secret coordination identifiers — safe to display.
+    pub safe_to_surface: Vec<TokenHandleEntry>,
 }
 
 /// The 11 subsystems Phase 1 archaeology identified.
@@ -206,6 +242,116 @@ pub fn build_report(tool_version: String, write_scopes: Vec<PathBuf>) -> Capabil
             history_jsonl: ".doctor/scorecard_history.jsonl",
         },
         report_schema: "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/main/docs/SPEC-doctor-report.md",
+        token_handle_safety: build_token_handle_safety(),
+    }
+}
+
+/// Build the machine-readable mirror of the token/handle safety contract.
+///
+/// Source of truth: `docs/SPEC-token-handle-safety-contract.md` (Contract
+/// version 1.0). Any change to a token/handle's class — or any new
+/// secret/identifier — MUST be mirrored here AND in that doc, and bump the
+/// contract version in both. The classes correspond 1:1 to the doc's three
+/// tables (SECRET-NEVER-SURFACE / SENSITIVE-CONTEXT-REDACT-BY-DEFAULT /
+/// SAFE-TO-SURFACE).
+fn build_token_handle_safety() -> TokenHandleSafety {
+    TokenHandleSafety {
+        contract_version: "1.0",
+        spec: "docs/SPEC-token-handle-safety-contract.md",
+        secret_never_surface: vec![
+            TokenHandleEntry {
+                id: "http_bearer_token",
+                summary: "HTTP_BEARER_TOKEN — HTTP/MCP auth credential; leaking it grants full API access",
+            },
+            TokenHandleEntry {
+                id: "jwt_signing_secret",
+                summary: "http_jwt_secret — forges/validates JWTs (auth bypass)",
+            },
+            TokenHandleEntry {
+                id: "jwt_jwks_material",
+                summary: "JWT JWKS / cached verification key material; do not log fetched keys",
+            },
+            TokenHandleEntry {
+                id: "database_url",
+                summary: "DATABASE_URL — direct DB access; also a filesystem path",
+            },
+            TokenHandleEntry {
+                id: "agent_registration_token",
+                summary: "per-agent registration_token (presented as sender_token); leaking it enables impersonation",
+            },
+            TokenHandleEntry {
+                id: "doctor_undo_hmac_key",
+                summary: "per-install key sealing `am doctor undo` chain-of-custody manifests",
+            },
+            TokenHandleEntry {
+                id: "age_encryption_key",
+                summary: "share-bundle age encryption key material",
+            },
+            TokenHandleEntry {
+                id: "ed25519_manifest_signing_seed",
+                summary: "private key (seed) for share-bundle signatures",
+            },
+        ],
+        sensitive_context_redact_by_default: vec![
+            TokenHandleEntry {
+                id: "project_human_key",
+                summary: "absolute project path; leaks workspace layout and (often) the user home",
+            },
+            TokenHandleEntry {
+                id: "storage_root",
+                summary: "STORAGE_ROOT / absolute mailbox-archive path",
+            },
+            TokenHandleEntry {
+                id: "config_data_cache_paths",
+                summary: "absolute XDG/legacy config/data/cache paths revealing OS/user layout",
+            },
+            TokenHandleEntry {
+                id: "message_content",
+                summary: "message subjects/bodies and attachment names/contents (arbitrary user content)",
+            },
+        ],
+        safe_to_surface: vec![
+            TokenHandleEntry {
+                id: "project_slug",
+                summary: "non-secret path-derived lowercased slug used in URLs/logs",
+            },
+            TokenHandleEntry {
+                id: "agent_name",
+                summary: "public coordination identifier (e.g. GreenCastle)",
+            },
+            TokenHandleEntry {
+                id: "agent_program_model",
+                summary: "public capability identifiers (program/model), not credentials",
+            },
+            TokenHandleEntry {
+                id: "message_id",
+                summary: "internal sequential PK",
+            },
+            TokenHandleEntry {
+                id: "thread_id",
+                summary: "conversation grouping (often a br-### id)",
+            },
+            TokenHandleEntry {
+                id: "content_sha256",
+                summary: "message digest / integrity hash; no plaintext leakage",
+            },
+            TokenHandleEntry {
+                id: "intent_id",
+                summary: "16-hex prefix of a SHA-256 dedup id; not a credential",
+            },
+            TokenHandleEntry {
+                id: "pane_key",
+                summary: "session:window:pane TUI pane→agent mapping",
+            },
+            TokenHandleEntry {
+                id: "lease_id",
+                summary: "build-slot / file-reservation advisory-lease PK",
+            },
+            TokenHandleEntry {
+                id: "contact_handle",
+                summary: "non-secret link identifier (agent name or project+agent)",
+            },
+        ],
     }
 }
 
@@ -640,4 +786,66 @@ fn build_manual_remediation_list() -> Vec<ManualRemediation> {
             reason: "Token rotation does not fix already-committed secrets; git history scrub is required.".to_string(),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_handle_safety_lists_are_non_empty_and_disjoint() {
+        let t = build_token_handle_safety();
+        assert_eq!(t.contract_version, "1.0");
+        assert_eq!(t.spec, "docs/SPEC-token-handle-safety-contract.md");
+        assert!(!t.secret_never_surface.is_empty());
+        assert!(!t.sensitive_context_redact_by_default.is_empty());
+        assert!(!t.safe_to_surface.is_empty());
+
+        // Every id is unique across all three classes: a token/handle must
+        // have exactly one disposition, or a downstream redactor could see
+        // the same id classified two ways (e.g. both secret and safe).
+        let mut seen = std::collections::HashSet::new();
+        for entry in t
+            .secret_never_surface
+            .iter()
+            .chain(&t.sensitive_context_redact_by_default)
+            .chain(&t.safe_to_surface)
+        {
+            assert!(
+                seen.insert(entry.id),
+                "token/handle id `{}` appears in more than one safety class",
+                entry.id
+            );
+            assert!(
+                !entry.summary.is_empty(),
+                "empty summary for id `{}`",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_report_surfaces_token_handle_safety() {
+        let report = build_report("test-0.0.0".to_string(), Vec::new());
+        let v = serde_json::to_value(&report).unwrap();
+        let ths = &v["token_handle_safety"];
+        assert_eq!(ths["contract_version"], "1.0");
+
+        let ids_in = |class: &str| -> Vec<String> {
+            ths[class]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let secret = ids_in("secret_never_surface");
+        let safe = ids_in("safe_to_surface");
+        // Spot-check canonical members of each class.
+        assert!(secret.contains(&"http_bearer_token".to_string()));
+        assert!(safe.contains(&"agent_name".to_string()));
+        // A credential must never be classified safe-to-surface.
+        assert!(!safe.contains(&"http_bearer_token".to_string()));
+        assert!(!safe.contains(&"database_url".to_string()));
+    }
 }

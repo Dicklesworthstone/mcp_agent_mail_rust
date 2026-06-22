@@ -101,9 +101,16 @@ the minimum bar and additionally redact the `SENSITIVE-CONTEXT` paths.
   the `Contract version` and update this table. The threat-model change-control
   checklist (`docs/SPEC-threat-model.md`) gates changes that "leak secrets,
   tokens, or message content".
-- A machine-readable mirror of this table in `am doctor capabilities --json`
-  (so integrations can consume it without parsing markdown) is tracked as a
-  follow-up (`br-1aq3f`).
+- A machine-readable mirror of this table is exposed as the
+  `token_handle_safety` object in `am doctor capabilities --json` (so
+  integrations consume it without parsing markdown): `contract_version`,
+  `spec` (this doc's path), and the three lists `secret_never_surface`,
+  `sensitive_context_redact_by_default`, `safe_to_surface` (each entry an
+  `{id, summary}`). Built by `build_token_handle_safety()` in
+  `crates/mcp-agent-mail-cli/src/doctor/capabilities.rs`; a unit test
+  asserts the lists are non-empty and pairwise disjoint. This doc remains
+  the single source of truth — any change here MUST mirror the field (and
+  bump `Contract version`) and vice versa (`br-1aq3f`, done).
 
 ## Cross-references
 
