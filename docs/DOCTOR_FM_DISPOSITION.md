@@ -20,8 +20,8 @@ am doctor fixers --format json | jq '.fixers[] | {id, severity, op_pattern, auto
 The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 (`registry()`); each FM lives in its own file at
 `crates/mcp-agent-mail-cli/src/doctor/fixers/<slug>.rs`. At audit time it held
-**~58 FMs across 11 subsystems (23 auto-fixable, 35 detect-only)** spread over
-60 fixer modules.
+**~59 FMs across 11 subsystems (23 auto-fixable, 36 detect-only)** spread over
+61 fixer modules (incl. `coresident_db_writer`, added by `br-j3e9m`).
 
 ## Disposition legend
 
@@ -39,10 +39,14 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 - 18 of 30 historical FMs map directly to a live FM (plus several name-mismatch
   / partial-coverage cases noted inline).
 - **6 P0 gaps from the original inventory:** 4 are now covered (detect-only by
-  design), 1 is PREVENTED at source, **1 remains a genuine gap** (concurrent
-  Python-server co-resident writes — symptom detected, root cause not).
+  design), 1 is PREVENTED at source, and the last (concurrent Python-server
+  co-resident writes) is now **RESOLVED** by a dedicated detect-only FM
+  (`fm-runtime-processes-coresident-db-writer`, P0; `br-j3e9m`).
 - **Genuine remaining gaps routed to beads:**
-  - `python-server-coresident-write` → **`br-j3e9m`** (P2, detect-only candidate).
+  - `python-server-coresident-write` → **RESOLVED** (`br-j3e9m`):
+    `fm-runtime-processes-coresident-db-writer` flags a live Python
+    `mcp_agent_mail` server holding `storage.sqlite3` open (or its advisory
+    lock) — the root cause, caught before it corrupts.
   - `search-v3-index-corrupt` → **`br-2vdg9`** (P3, detect + rebuild-hint).
   - `busy-timeout-missing` → **PREVENT** (no bead — set in `schema.rs` init SQL,
     test-guarded).
@@ -69,7 +73,7 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 | sqlite-sidecar-symlink | DETECT-ONLY | `fm-db-state-files-sqlite-sidecar-symlink`. |
 | **busy-timeout-missing** | **PREVENT** | Set in canonical init SQL `crates/mcp-agent-mail-db/src/schema.rs:224` (`PRAGMA busy_timeout = 60000;`) and guarded by `pragma_busy_timeout_matches_legacy`. The pass-35V doctor detector was correctly reverted: `busy_timeout` is connection-local, so a separate doctor-process connection always reads SQLite defaults — detection from doctor is unsound. |
 | **search-v3-index-corrupt** | **GAP → `br-2vdg9` (P3)** | No live FM. The frankensearch index is rebuildable; `legacy-fts-residue` only cleans old FTS5 artifacts. Add a detect + rebuild-hint FM. |
-| **python-server-coresident-write** | **GAP → `br-j3e9m` (P2)** | No live FM. An *active* Python server writing the same DB concurrently is a corruption root cause (referenced in `integrity_page_malformed.rs:16`, `wal_shm_sidecar_drift.rs:32`). The corruption *symptom* is detected (integrity FMs) and a *stale* Python shadow is detected (`fm-runtime-processes-stale-python-server-shadow`), but the live concurrent writer is not. |
+| **python-server-coresident-write** | **DETECT-ONLY (`br-j3e9m` resolved)** | `fm-runtime-processes-coresident-db-writer` (P0, runtime_processes). Pure over the I4 `ProcessOwnerModel`: flags a live Python `mcp_agent_mail` holder of `storage.sqlite3` (open fd → confidence 1.0; advisory lock → 0.9) before it corrupts. Detect-only by design — doctor never kills a foreign process. Sibling FMs cover the *symptom* (`fm-db-state-files-integrity-page-malformed`) and the PID-hint *stale* case (`fm-runtime-processes-stale-python-server-shadow`). Known scope limit (routed to follow-up): a truly foreign writer that is neither the Rust binary nor a recognizable Python shadow is filtered out by `inspect_mailbox_ownership` upstream and is invisible to this pure detector. |
 
 ### Runtime-process FMs
 
@@ -107,13 +111,13 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 | schema-version-mismatch | Covered | DETECT-ONLY; forward = restart/migrate, newer = binary upgrade. |
 | retained-autocommit-leak | Covered | DETECT-ONLY; source-policy (pool init SQL + test). |
 | busy-timeout-missing | Resolved | PREVENT (schema init SQL + `pragma_busy_timeout_matches_legacy`). |
-| python-server-coresident-write | **Open** | GAP → bead (P2): detect the live concurrent writer (symptom corruption is already detected). |
+| python-server-coresident-write | **Closed** | DETECT-ONLY: `fm-runtime-processes-coresident-db-writer` (P0) detects the live Python concurrent writer before it corrupts (`br-j3e9m`). |
 
 ## Routing
 
 | Gap | Action |
 |-----|--------|
-| python-server-coresident-write | `br-j3e9m` (P2) — detect-only FM for an active co-resident DB writer. |
+| python-server-coresident-write | **Done** — `br-j3e9m`: `fm-runtime-processes-coresident-db-writer` (P0, detect-only) detects an active Python co-resident DB writer. |
 | search-v3-index-corrupt | `br-2vdg9` (P3) — detect + rebuild-hint FM for a corrupt frankensearch index. |
 
 All other historical FMs are AUTO-FIX, DETECT-ONLY, PREVENT, or

@@ -27,6 +27,7 @@ pub mod archive_message_artifact_anomalies;
 pub mod archive_message_dir_structure_anomalies;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
+pub mod coresident_db_writer;
 pub mod dangling_doctor_latest;
 pub mod duplicate_canonical_message_ids;
 pub mod empty_or_truncated_db;
@@ -724,6 +725,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::wrong_mcp_url_json",
         },
         FixerSpec {
+            id: coresident_db_writer::FM_ID,
+            severity: "P0",
+            subsystem: "runtime_processes",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "a live foreign process (legacy Python mcp_agent_mail server) is holding storage.sqlite3 open or its advisory lock — an uncoordinated co-resident writer that corrupts the DB (detect-only; doctor never kills foreign processes)",
+            source_module: "doctor::fixers::coresident_db_writer",
+        },
+        FixerSpec {
             id: runtime_pid_hint_symlink_toctou::FM_ID,
             severity: "P1",
             subsystem: "runtime_processes",
@@ -1276,6 +1286,22 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = supervisor_respawn_loop::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == coresident_db_writer::FM_ID {
+        let model = inputs
+            .process_owner
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: coresident_db_writer::FM_ID,
+                field: "process_owner",
+            })?;
+        let findings = coresident_db_writer::detect(model);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = coresident_db_writer::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -1970,6 +1996,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
                 field: "process_owner",
             })?;
         supervisor_respawn_loop::detect_default(model)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == coresident_db_writer::FM_ID {
+        let model = inputs
+            .process_owner
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: coresident_db_writer::FM_ID,
+                field: "process_owner",
+            })?;
+        coresident_db_writer::detect(model)
             .iter()
             .map(|f| f.to_finding())
             .collect()

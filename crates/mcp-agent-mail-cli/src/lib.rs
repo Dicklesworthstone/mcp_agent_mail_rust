@@ -65471,10 +65471,12 @@ struct DoctorMaintenancePhaseError {
     detail: String,
 }
 
-/// Test-only fault injection for the repair maintenance phase. Lets a
-/// test deterministically force VACUUM/ANALYZE/REINDEX/inbox_stats to
-/// fail mid-repair (B5 acceptance: prove the failure leaves a resumable
-/// state, never a silent half-repair). No-op in production builds.
+// Test-only fault injection for the repair maintenance phase. Lets a
+// test deterministically force VACUUM/ANALYZE/REINDEX/inbox_stats to
+// fail mid-repair (B5 acceptance: prove the failure leaves a resumable
+// state, never a silent half-repair). No-op in production builds.
+// (Plain `//` — a `///` doc comment on a macro invocation is rejected by
+// `unused_doc_comments` under `-D warnings`.)
 #[cfg(test)]
 thread_local! {
     static REPAIR_MAINTENANCE_FAULT: std::cell::RefCell<Option<String>> =
