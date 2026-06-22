@@ -138,6 +138,7 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     }
 }
 

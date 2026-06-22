@@ -420,6 +420,8 @@ pub fn handle_fix_only(fm_id: &str, dry_run: bool, yes: bool, _json: bool) -> Cl
         // I4 (br-bvq1x.9.4): the unified process-owner snapshot drives the
         // supervisor-respawn-loop and service-manager-divergence FMs.
         process_owner: Some(crate::gather_process_owner_model(&config)),
+        // SEARCH_V3_INDEX_DIR (unset/empty → None → corrupt_search_index FM skipped).
+        search_index_root: fixers::corrupt_search_index::index_root_from_env(),
     };
 
     let run_id = format!(
@@ -656,6 +658,8 @@ pub fn handle_fix_only_list(fm_id: &str, _json: bool) -> CliResult<()> {
         // I4 (br-bvq1x.9.4): the unified process-owner snapshot drives the
         // supervisor-respawn-loop and service-manager-divergence FMs.
         process_owner: Some(crate::gather_process_owner_model(&config)),
+        // SEARCH_V3_INDEX_DIR (unset/empty → None → corrupt_search_index FM skipped).
+        search_index_root: fixers::corrupt_search_index::index_root_from_env(),
     };
 
     let outcome = match fixers::detect_only(fm_id, &inputs) {
@@ -750,6 +754,8 @@ pub fn handle_fix_list_all(_json: bool) -> CliResult<()> {
         // I4 (br-bvq1x.9.4): the unified process-owner snapshot drives the
         // supervisor-respawn-loop and service-manager-divergence FMs.
         process_owner: Some(crate::gather_process_owner_model(&config)),
+        // SEARCH_V3_INDEX_DIR (unset/empty → None → corrupt_search_index FM skipped).
+        search_index_root: fixers::corrupt_search_index::index_root_from_env(),
     };
 
     let outcome = match fixers::detect_all(&inputs) {

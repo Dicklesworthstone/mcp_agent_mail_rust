@@ -79,6 +79,7 @@ fn dispatch_only_stale_archive_lock_quarantines_via_mutate() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
@@ -141,6 +142,7 @@ fn dispatch_only_unknown_fm_id_returns_error() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
     let result = fixers::dispatch_only("fm-not-a-real-fixer-id-xxx", &ctx, &inputs);
     assert!(matches!(result, Err(fixers::DispatchError::UnknownFm(_))));
@@ -173,6 +175,7 @@ fn detect_only_finds_stale_lock_without_touching_chokepoint() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome =
@@ -263,6 +266,7 @@ fn detect_only_routes_ref_lock_through_canonical_120s_default() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome =
@@ -320,6 +324,7 @@ fn dispatch_only_world_readable_storage_db_chmods_via_chokepoint() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
@@ -385,6 +390,7 @@ fn dispatch_only_dangling_doctor_latest_re_aims_via_chokepoint() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
@@ -449,6 +455,7 @@ fn dispatch_only_dangling_doctor_latest_requires_target_path() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
     let err = fixers::dispatch_only(fm_id, &ctx, &inputs)
         .expect_err("missing input must surface as DispatchError");
@@ -507,6 +514,7 @@ fn dispatch_only_unrelated_fm_does_not_touch_gitignore() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
@@ -556,6 +564,7 @@ fn dispatch_only_missing_gitignore_appends_via_chokepoint() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome = fixers::dispatch_only(fm_id, &ctx, &inputs).expect("dispatch_only");
@@ -609,6 +618,7 @@ fn dispatch_only_missing_gitignore_requires_target_path() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
     let err = fixers::dispatch_only(fm_id, &ctx, &inputs)
         .expect_err("missing input must surface as DispatchError");
@@ -661,6 +671,7 @@ fn list_all_iterates_registry_and_aggregates_findings() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
 
     let outcome = fixers::detect_all(&inputs).expect("detect_all");
@@ -730,6 +741,7 @@ fn empty_inputs(td: &tempfile::TempDir) -> DispatchInputs {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     }
 }
 
@@ -932,6 +944,7 @@ fn detect_only_unknown_fm_id_returns_error() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
     let err =
         fixers::detect_only("fm-also-not-real-xxx", &inputs).expect_err("unknown id should error");
@@ -1018,6 +1031,7 @@ fn dispatch_only_wrong_mcp_url_requires_canonical_url() {
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
         process_owner: None,
+        search_index_root: None,
     };
     let err = fixers::dispatch_only(fixers::wrong_mcp_url_json::FM_ID, &ctx, &inputs)
         .expect_err("missing input should error");

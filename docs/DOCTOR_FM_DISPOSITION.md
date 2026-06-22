@@ -20,8 +20,9 @@ am doctor fixers --format json | jq '.fixers[] | {id, severity, op_pattern, auto
 The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 (`registry()`); each FM lives in its own file at
 `crates/mcp-agent-mail-cli/src/doctor/fixers/<slug>.rs`. At audit time it held
-**~59 FMs across 11 subsystems (23 auto-fixable, 36 detect-only)** spread over
-61 fixer modules (incl. `coresident_db_writer`, added by `br-j3e9m`).
+**~60 FMs across 11 subsystems (23 auto-fixable, 37 detect-only)** spread over
+62 fixer modules (incl. `coresident_db_writer` from `br-j3e9m` and
+`corrupt_search_index` from `br-2vdg9`).
 
 ## Disposition legend
 
@@ -42,12 +43,17 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
   design), 1 is PREVENTED at source, and the last (concurrent Python-server
   co-resident writes) is now **RESOLVED** by a dedicated detect-only FM
   (`fm-runtime-processes-coresident-db-writer`, P0; `br-j3e9m`).
-- **Genuine remaining gaps routed to beads:**
+- **Both gaps originally routed to beads are now RESOLVED** (no open doctor-FM
+  gaps remain from this audit):
   - `python-server-coresident-write` → **RESOLVED** (`br-j3e9m`):
     `fm-runtime-processes-coresident-db-writer` flags a live Python
     `mcp_agent_mail` server holding `storage.sqlite3` open (or its advisory
     lock) — the root cause, caught before it corrupts.
-  - `search-v3-index-corrupt` → **`br-2vdg9`** (P3, detect + rebuild-hint).
+  - `search-v3-index-corrupt` → **RESOLVED** (`br-2vdg9`):
+    `fm-search-index-state-corrupt-index` (P2, detect-only) probes the
+    on-disk frankensearch/Tantivy index for a dangling active link, a
+    missing Tantivy `meta.json`, or a failed/incomplete/unparseable
+    `checkpoint.json`, and points at the restart-driven rebuild.
   - `busy-timeout-missing` → **PREVENT** (no bead — set in `schema.rs` init SQL,
     test-guarded).
   - `tui-foreground-cpu-spin`, `commit-coalescer-thread-died`,
@@ -72,7 +78,7 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 | inbox-stats-divergence | AUTO-FIX | `fm-db-state-files-inbox-stats-divergence` (Op::DbExec). |
 | sqlite-sidecar-symlink | DETECT-ONLY | `fm-db-state-files-sqlite-sidecar-symlink`. |
 | **busy-timeout-missing** | **PREVENT** | Set in canonical init SQL `crates/mcp-agent-mail-db/src/schema.rs:224` (`PRAGMA busy_timeout = 60000;`) and guarded by `pragma_busy_timeout_matches_legacy`. The pass-35V doctor detector was correctly reverted: `busy_timeout` is connection-local, so a separate doctor-process connection always reads SQLite defaults — detection from doctor is unsound. |
-| **search-v3-index-corrupt** | **GAP → `br-2vdg9` (P3)** | No live FM. The frankensearch index is rebuildable; `legacy-fts-residue` only cleans old FTS5 artifacts. Add a detect + rebuild-hint FM. |
+| **search-v3-index-corrupt** | **DETECT-ONLY (`br-2vdg9` resolved)** | `fm-search-index-state-corrupt-index` (P2, search_index_state). Pure over `$SEARCH_V3_INDEX_DIR`: flags a dangling `active-{engine}` link, a missing Tantivy `meta.json` (lexical), or a failed/incomplete/unparseable `checkpoint.json`. Low-risk (the index is a derived artifact — SQLite is the source of truth; rebuilt from it on restart). `legacy-fts-residue` only cleans old SQLite FTS5 artifacts; this is the live frankensearch-index surface. |
 | **python-server-coresident-write** | **DETECT-ONLY (`br-j3e9m` resolved)** | `fm-runtime-processes-coresident-db-writer` (P0, runtime_processes). Pure over the I4 `ProcessOwnerModel`: flags a live Python `mcp_agent_mail` holder of `storage.sqlite3` (open fd → confidence 1.0; advisory lock → 0.9) before it corrupts. Detect-only by design — doctor never kills a foreign process. Sibling FMs cover the *symptom* (`fm-db-state-files-integrity-page-malformed`) and the PID-hint *stale* case (`fm-runtime-processes-stale-python-server-shadow`). Known scope limit (routed to follow-up): a truly foreign writer that is neither the Rust binary nor a recognizable Python shadow is filtered out by `inspect_mailbox_ownership` upstream and is invisible to this pure detector. |
 
 ### Runtime-process FMs
@@ -118,7 +124,7 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 | Gap | Action |
 |-----|--------|
 | python-server-coresident-write | **Done** — `br-j3e9m`: `fm-runtime-processes-coresident-db-writer` (P0, detect-only) detects an active Python co-resident DB writer. |
-| search-v3-index-corrupt | `br-2vdg9` (P3) — detect + rebuild-hint FM for a corrupt frankensearch index. |
+| search-v3-index-corrupt | **Done** — `br-2vdg9`: `fm-search-index-state-corrupt-index` (P2, detect-only) probes the on-disk index and points at the restart-driven rebuild. |
 
 All other historical FMs are AUTO-FIX, DETECT-ONLY, PREVENT, or
 COVERED-ELSEWHERE as tabulated above — none are silently dropped.

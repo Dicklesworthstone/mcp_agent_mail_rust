@@ -28,6 +28,7 @@ pub mod archive_message_dir_structure_anomalies;
 pub mod codex_startup_timeout;
 pub mod committed_env_file_in_repo;
 pub mod coresident_db_writer;
+pub mod corrupt_search_index;
 pub mod dangling_doctor_latest;
 pub mod duplicate_canonical_message_ids;
 pub mod empty_or_truncated_db;
@@ -788,6 +789,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::supervisor_respawn_loop",
         },
         FixerSpec {
+            id: corrupt_search_index::FM_ID,
+            severity: "P2",
+            subsystem: "search_index_state",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "Search V3 (frankensearch/Tantivy) index under $SEARCH_V3_INDEX_DIR is corrupt/incomplete (dangling active link, missing meta.json, or failed checkpoint) — derived artifact, rebuilt from SQLite on restart (detect-only)",
+            source_module: "doctor::fixers::corrupt_search_index",
+        },
+        FixerSpec {
             id: committed_env_file_in_repo::FM_ID,
             severity: "P0",
             subsystem: "secrets_env_state",
@@ -949,6 +959,11 @@ pub struct DispatchInputs {
     /// [`crate::doctor::process_owner::ProcessOwnerModel`] so the pure
     /// classifiers can be round-tripped without a live host.
     pub process_owner: Option<crate::doctor::process_owner::ProcessOwnerModel>,
+    /// Resolved Search V3 index root (`SEARCH_V3_INDEX_DIR`) for the
+    /// `corrupt_search_index` FM. `None` (env unset/empty → no Tantivy
+    /// index configured) skips the FM. Production callers resolve it via
+    /// `corrupt_search_index::index_root_from_env()`; tests inject a tempdir.
+    pub search_index_root: Option<std::path::PathBuf>,
 }
 
 fn db_aware_archive_report(
@@ -1302,6 +1317,22 @@ pub fn dispatch_only(
         for f in &findings {
             outcome.findings.push(f.to_finding());
             let result = coresident_db_writer::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
+    } else if fm_id == corrupt_search_index::FM_ID {
+        let index_root = inputs
+            .search_index_root
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: corrupt_search_index::FM_ID,
+                field: "search_index_root",
+            })?;
+        let findings = corrupt_search_index::detect(index_root);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = corrupt_search_index::fix(ctx, f)?;
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
@@ -2011,6 +2042,18 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == corrupt_search_index::FM_ID {
+        let index_root = inputs
+            .search_index_root
+            .as_ref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: corrupt_search_index::FM_ID,
+                field: "search_index_root",
+            })?;
+        corrupt_search_index::detect(index_root)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == service_manager_divergence::FM_ID {
         let model = inputs
             .process_owner
@@ -2558,6 +2601,7 @@ mod tests {
             missing_project_json_detect_override: None,
             quarantined_bak_detect: None,
             process_owner: None,
+            search_index_root: None,
         };
         let run_dir =
             crate::doctor::runs::scaffold_run_dir(temp.path(), "test_run").expect("run dir");
