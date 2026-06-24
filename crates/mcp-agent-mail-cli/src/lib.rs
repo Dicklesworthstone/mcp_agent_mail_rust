@@ -25193,15 +25193,20 @@ fn doctor_classify_canonical_pragma_check(
     match result {
         Ok(rows) => {
             let details = mcp_agent_mail_db::integrity::extract_check_details(&rows, kind);
-            if mcp_agent_mail_db::integrity::details_indicate_ok(&details) {
+            if mcp_agent_mail_db::integrity::details_indicate_ok(&details)
+                || mcp_agent_mail_db::integrity::integrity_details_are_suspect(&details)
+            {
+                // `details_indicate_ok` is a clean "ok"; `integrity_details_are_suspect`
+                // is the engine giving a DEFINITIVE benign answer — only freelist /
+                // sidecar slack ("... never used", "unused", "wal without shm"), with
+                // no real corruption row. The codebase treats both as healthy
+                // (`sqlite_pragma_check_rows_ok`), and the pre-A3
+                // `*_refutes_corruption` gate did too, so they must count as a Pass —
+                // otherwise a benign DB resolves to `Inconclusive` and the A3 gate
+                // needlessly rewrites it, re-introducing the br-bvq1x.1.6 false
+                // positive. (A genuine can't-answer is an engine ERROR, handled in the
+                // `Err` arm below.)
                 CanonicalProbeAuthority::Pass
-            } else if mcp_agent_mail_db::integrity::integrity_details_are_suspect(&details) {
-                // Benign/suspect rows ("... never used", "wal without shm"): the
-                // engine produced unreliable output — never proof of corruption.
-                CanonicalProbeAuthority::CannotAnswer(format!(
-                    "{kind} returned benign/suspect findings: {}",
-                    details.join("; ")
-                ))
             } else {
                 CanonicalProbeAuthority::Corruption(format!(
                     "{kind} reported: {}",
