@@ -7168,6 +7168,17 @@ fn handle_serve_stdio() -> CliResult<()> {
     Ok(())
 }
 
+/// Decide whether `check-inbox` should route through the daemon (HTTP) or read
+/// SQLite directly.
+///
+/// The default (non-`--direct`) path always prefers the daemon. `--direct` prefers
+/// the daemon only when it is reachable, falling back to a direct SQLite read when
+/// no daemon is listening — this avoids contending on the WAL with a running
+/// `serve-http` daemon's long-lived writer (GH#158).
+const fn check_inbox_should_use_daemon(direct: bool, daemon_reachable: bool) -> bool {
+    !direct || daemon_reachable
+}
+
 /// Handle the check-inbox command.
 ///
 /// Checks the agent inbox for unread messages. Designed for git hooks and editor integrations.
@@ -7222,16 +7233,17 @@ fn handle_check_inbox(
         }
     }
 
-    // Fetch inbox (direct or HTTP)
-    let result = if direct {
-        let config = CheckInboxDirectConfig {
-            project_key,
-            agent_name: agent_name.clone(),
-            limit: CHECK_INBOX_FETCH_LIMIT,
-        };
-        check_inbox_direct(&config)
-    } else {
-        // Build HTTP config and fetch via JSON-RPC
+    // Fetch inbox.
+    //
+    // `--direct` historically opened SQLite unconditionally, which contends on the
+    // WAL with a running `serve-http` daemon's long-lived writer (GH#158). Prefer
+    // the daemon over HTTP whenever it is reachable — even under `--direct` — and
+    // fall back to a direct SQLite read only when no daemon is listening.
+    let daemon_reachable = direct && process_owner_port_reachable(&host, port);
+    let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
+
+    let result = if use_daemon {
+        // Build HTTP config and fetch via JSON-RPC.
         let config = Config::from_env();
         let config = resolve_check_inbox_rpc_config_reader(
             |key| std::env::var(key).ok(),
@@ -7248,7 +7260,29 @@ fn handle_check_inbox(
             .build()
             .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
 
-        rt.block_on(async { fetch_inbox_via_jsonrpc_with_fallback(&config, &server_urls).await })
+        let via_daemon = rt
+            .block_on(async { fetch_inbox_via_jsonrpc_with_fallback(&config, &server_urls).await });
+
+        if direct && via_daemon.is_err() {
+            // The daemon went away between the reachability probe and the call.
+            // Honor the co-located `--direct` intent with a direct SQLite read.
+            let config = CheckInboxDirectConfig {
+                project_key,
+                agent_name: agent_name.clone(),
+                limit: CHECK_INBOX_FETCH_LIMIT,
+            };
+            check_inbox_direct(&config)
+        } else {
+            via_daemon
+        }
+    } else {
+        // No daemon is listening — read SQLite directly (the fast co-located path).
+        let config = CheckInboxDirectConfig {
+            project_key,
+            agent_name: agent_name.clone(),
+            limit: CHECK_INBOX_FETCH_LIMIT,
+        };
+        check_inbox_direct(&config)
     };
 
     // Handle result - exit silently on any error (fail-safe for hooks)
@@ -25099,32 +25133,240 @@ fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
     }
 }
 
-/// Re-probe a database with the AUTHORITATIVE canonical engine's FULL
-/// `integrity_check` and report whether it PROVES the file healthy.
+/// br-bvq1x.1.3 (A3): tri-state outcome of the canonical-SQLite double-probe
+/// cross-check.
 ///
-/// Opens read-only/immutable (no write contention with a live mailbox owner)
-/// and returns `true` only when the canonical full `integrity_check` returns
-/// `ok`. Any open error, check error, or non-`ok` result returns `false` — the
-/// caller must treat that as "health unconfirmed", never as "confirmed
-/// corrupt".
-fn doctor_canonical_integrity_check_refutes_corruption(resolved: &Path) -> bool {
-    if !resolved.exists() {
-        return false;
-    }
-    let Ok(conn) = doctor_open_canonical_readonly_db_for_diagnostic(resolved, "corruption_confirm")
-    else {
-        return false;
-    };
-    matches!(
-        sqlite_conn_check_ok_canonical(&conn, mcp_agent_mail_db::CheckKind::Full),
-        Ok(true)
-    )
+/// On any corruption-class error, [`doctor_canonical_double_probe`] runs the
+/// AUTHORITATIVE engine's full read-only battery (quick_check, integrity_check,
+/// foreign_key_check, a schema-table probe, and an FTS probe when applicable) so
+/// a cheap-probe corruption verdict is only upheld when an authoritative check
+/// confirms damage — and is reclassified as an engine/connection limitation
+/// (A1 taxonomy) when the canonical engine PROVES the file healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorCanonicalCrossCheck {
+    /// Every applicable canonical probe passed: the file is PROVEN healthy and a
+    /// transient corruption verdict must be reclassified (engine/connection
+    /// limitation), never upheld as "database corrupt".
+    Healthy,
+    /// A canonical probe AUTHORITATIVELY reported damage (integrity/quick check
+    /// corruption rows, a foreign-key violation, or a main-DB corruption engine
+    /// error). The corruption verdict stands.
+    ConfirmsCorruption(String),
+    /// The canonical engine could not authoritatively answer (open failure,
+    /// engine-probe limitation, benign/suspect rows, schema drift, missing core
+    /// tables, or a non-corruption probe error). Per the A4/M2 contract we keep
+    /// the conservative verdict but NEVER assert corruption from this state.
+    Inconclusive(String),
 }
 
-/// br-bvq1x.1.6: gate a CHEAP-probe corruption verdict on an authoritative
-/// canonical full `integrity_check` before it can drive a destructive
-/// `Reconstruct`/`Repair` (the `am doctor health` verdict) or the daemon's
-/// startup auto-reconstruct.
+/// Strict 3-way authority for a single canonical PRAGMA integrity/quick check.
+///
+/// Unlike [`sqlite_pragma_check_rows_ok`] — which deliberately folds
+/// benign/suspect findings into "ok" for the lenient liveness gate — this keeps
+/// `CannotAnswer` distinct from both `Pass` and `Corruption` so the double-probe
+/// never escalates an engine limitation into an authoritative "malformed".
+enum CanonicalProbeAuthority {
+    Pass,
+    Corruption(String),
+    CannotAnswer(String),
+}
+
+/// Classify a canonical probe ERROR message against the A1 taxonomy: only a
+/// main-DB B-tree corruption or foreign-key inconsistency is authoritative;
+/// every other class (engine-probe limitation, connection/config, busy, schema
+/// drift, WAL/FTS) means the engine could not answer the corruption question.
+fn doctor_classify_canonical_probe_error(message: &str, label: &str) -> CanonicalProbeAuthority {
+    match mcp_agent_mail_db::classify_db_error_message(message).class {
+        mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
+        | mcp_agent_mail_db::DbErrorClass::ForeignKeyInconsistency => {
+            CanonicalProbeAuthority::Corruption(format!("{label} error: {message}"))
+        }
+        _ => CanonicalProbeAuthority::CannotAnswer(format!("{label} error: {message}")),
+    }
+}
+
+/// Classify the rows (or error) from one canonical quick_check / integrity_check.
+fn doctor_classify_canonical_pragma_check(
+    kind: mcp_agent_mail_db::CheckKind,
+    result: CliResult<Vec<mcp_agent_mail_db::sqlmodel_core::Row>>,
+) -> CanonicalProbeAuthority {
+    match result {
+        Ok(rows) => {
+            let details = mcp_agent_mail_db::integrity::extract_check_details(&rows, kind);
+            if mcp_agent_mail_db::integrity::details_indicate_ok(&details) {
+                CanonicalProbeAuthority::Pass
+            } else if mcp_agent_mail_db::integrity::integrity_details_are_suspect(&details) {
+                // Benign/suspect rows ("... never used", "wal without shm"): the
+                // engine produced unreliable output — never proof of corruption.
+                CanonicalProbeAuthority::CannotAnswer(format!(
+                    "{kind} returned benign/suspect findings: {}",
+                    details.join("; ")
+                ))
+            } else {
+                CanonicalProbeAuthority::Corruption(format!(
+                    "{kind} reported: {}",
+                    details.join("; ")
+                ))
+            }
+        }
+        Err(error) => doctor_classify_canonical_probe_error(&error.to_string(), &kind.to_string()),
+    }
+}
+
+/// Fold one probe's authority into the running cross-check state: an
+/// authoritative corruption short-circuits the battery (returns `Some`), a
+/// can't-answer records the first inconclusive reason, and a pass is a no-op.
+fn doctor_fold_probe_authority(
+    authority: CanonicalProbeAuthority,
+    inconclusive_reason: &mut Option<String>,
+) -> Option<DoctorCanonicalCrossCheck> {
+    match authority {
+        CanonicalProbeAuthority::Pass => None,
+        CanonicalProbeAuthority::Corruption(detail) => {
+            Some(DoctorCanonicalCrossCheck::ConfirmsCorruption(detail))
+        }
+        CanonicalProbeAuthority::CannotAnswer(detail) => {
+            inconclusive_reason.get_or_insert(detail);
+            None
+        }
+    }
+}
+
+/// br-bvq1x.1.3 (A3): run the AUTHORITATIVE canonical engine's full read-only
+/// battery against a database and report whether it PROVES the file healthy,
+/// CONFIRMS corruption, or is inconclusive.
+///
+/// The DB is opened read-only/immutable (shares the B2 purity machinery — no
+/// `-wal`/`-shm` creation, no write contention with a live mailbox owner, and no
+/// lock waits, which is what bounds the probe on a sick host). The battery, in
+/// increasing cost, is: `quick_check`, full `integrity_check`,
+/// `foreign_key_check`, a schema-table probe (core tables present and readable),
+/// and an FTS read probe when a legacy FTS table exists.
+///
+/// Authority rules (A4/M2): a check that returns clean `ok` rows or an empty
+/// `foreign_key_check` is a `Pass`; a check that returns real corruption rows,
+/// a foreign-key violation, or a main-DB-corruption engine error is an
+/// authoritative `ConfirmsCorruption`; an engine-probe limitation, a
+/// benign/suspect result, a missing-core-table, or any other non-corruption
+/// error is `Inconclusive`. We return `Healthy` only when EVERY applicable probe
+/// passes — so a lone unsupported-engine "malformed" can never stand.
+fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
+    if !resolved.exists() {
+        return DoctorCanonicalCrossCheck::Inconclusive(
+            "database file does not exist; cannot run canonical cross-check".to_string(),
+        );
+    }
+
+    let conn = match doctor_open_canonical_readonly_db_for_diagnostic(
+        resolved,
+        "double_probe_cross_check",
+    ) {
+        Ok(conn) => conn,
+        Err(error) => {
+            // An open failure is a connection/config limitation, not proof of
+            // on-disk damage — UNLESS the engine reports an authoritative
+            // corruption signature in the open error itself.
+            let message = error.to_string();
+            return if matches!(
+                mcp_agent_mail_db::classify_db_error_message(&message).class,
+                mcp_agent_mail_db::DbErrorClass::MainDbBtreeCorruption
+            ) {
+                DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
+                    "canonical read-only open reported corruption: {message}"
+                ))
+            } else {
+                DoctorCanonicalCrossCheck::Inconclusive(format!(
+                    "canonical read-only open failed: {message}"
+                ))
+            };
+        }
+    };
+
+    // First inconclusive reason wins; an authoritative corruption short-circuits.
+    let mut inconclusive_reason: Option<String> = None;
+
+    // 1 + 2: quick_check then full integrity_check.
+    for kind in [
+        mcp_agent_mail_db::CheckKind::Quick,
+        mcp_agent_mail_db::CheckKind::Full,
+    ] {
+        let rows = sqlite_query_check_rows(
+            |sql| conn.query_sync(sql, &[]).map_err(|e| e.to_string()),
+            kind,
+        );
+        let authority = doctor_classify_canonical_pragma_check(kind, rows);
+        if let Some(verdict) = doctor_fold_probe_authority(authority, &mut inconclusive_reason) {
+            return verdict;
+        }
+    }
+
+    // 3: foreign_key_check (an empty result is healthy).
+    let fk_authority = match doctor_foreign_key_violations_canonical(&conn) {
+        Ok(violations) if violations.is_empty() => CanonicalProbeAuthority::Pass,
+        Ok(violations) => {
+            let first = &violations[0];
+            CanonicalProbeAuthority::Corruption(format!(
+                "foreign_key_check reported {} violation(s); first: table={} rowid={} parent={} fkid={}",
+                violations.len(),
+                first.table,
+                first.rowid,
+                first.parent,
+                first.fkid
+            ))
+        }
+        Err(error) => {
+            doctor_classify_canonical_probe_error(&error.to_string(), "foreign_key_check")
+        }
+    };
+    if let Some(verdict) = doctor_fold_probe_authority(fk_authority, &mut inconclusive_reason) {
+        return verdict;
+    }
+
+    // 4: schema-table probe — the core tables must be present and readable.
+    let schema_authority = match doctor_required_tables_canonical(&conn) {
+        Ok(missing) if missing.is_empty() => CanonicalProbeAuthority::Pass,
+        // Missing core tables is a structural verdict, not B-tree corruption: do
+        // not claim health, but do not assert "malformed" either.
+        Ok(missing) => CanonicalProbeAuthority::CannotAnswer(format!(
+            "core tables missing: {}",
+            missing.join(", ")
+        )),
+        Err(error) => {
+            doctor_classify_canonical_probe_error(&error.to_string(), "schema-table probe")
+        }
+    };
+    if let Some(verdict) = doctor_fold_probe_authority(schema_authority, &mut inconclusive_reason) {
+        return verdict;
+    }
+
+    // 5: FTS read probe — only when a legacy FTS table exists. A corrupt FTS
+    // index raises an FTS error but is rebuildable and does not prove main-DB
+    // damage, so it can only downgrade `Healthy` to `Inconclusive`.
+    if let Some(fts_table) = doctor_legacy_fts_tables_canonical(&conn).first() {
+        let quoted = fts_table.replace('"', "\"\"");
+        if let Err(error) = conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[]) {
+            let fts_authority = doctor_classify_canonical_probe_error(
+                &error.to_string(),
+                &format!("fts probe ({fts_table})"),
+            );
+            if let Some(verdict) =
+                doctor_fold_probe_authority(fts_authority, &mut inconclusive_reason)
+            {
+                return verdict;
+            }
+        }
+    }
+
+    match inconclusive_reason {
+        Some(reason) => DoctorCanonicalCrossCheck::Inconclusive(reason),
+        None => DoctorCanonicalCrossCheck::Healthy,
+    }
+}
+
+/// br-bvq1x.1.6 / .1.3 (A3): gate a CHEAP-probe corruption verdict on the
+/// AUTHORITATIVE canonical double-probe cross-check before it can drive a
+/// destructive `Reconstruct`/`Repair` (the `am doctor health` verdict) or the
+/// daemon's startup auto-reconstruct.
 ///
 /// The cheap file-sanity gate uses `quick_check` / an engine open, which can
 /// FALSE-flag a healthy DB as corrupt when it races a transient state — a
@@ -25135,16 +25377,20 @@ fn doctor_canonical_integrity_check_refutes_corruption(resolved: &Path) -> bool 
 ///
 /// When the verdict is a transient-prone corruption class (the generic
 /// "possible corruption" probe result, or a non-lock sanity-probe ERROR), this
-/// re-probes with the canonical engine's FULL `integrity_check`. A PASSING
-/// canonical check PROVES the DB healthy — refuting the cheap verdict, and
-/// forbidding a lone unsupported-engine "malformed" from standing (A4) — so we
-/// downgrade to `None` and decline to rewrite the database.
+/// re-probes with [`doctor_canonical_double_probe`] — the canonical engine's
+/// full read-only battery (quick_check, integrity_check, foreign_key_check,
+/// schema-table probe, FTS probe). A `Healthy` cross-check PROVES the DB healthy,
+/// so we reclassify the failure to the A1 `engine_probe_limitation` class,
+/// downgrade to `None`, and decline to rewrite the database (forbidding a lone
+/// unsupported-engine "malformed" from standing — A4).
 ///
-/// Fail-safe: we only downgrade on PROVEN health. A check that fails, errors,
-/// or cannot run leaves the conservative recovery verdict untouched, so a real
-/// 0-byte / non-database file or a torn b-tree still recovers. Unambiguous
-/// structural verdicts (missing core tables, archive drift) are not in the
-/// transient class and pass through unchanged.
+/// Fail-safe: we only downgrade on PROVEN health. `ConfirmsCorruption` (an
+/// authoritative check failed) and `Inconclusive` (the engine could not answer)
+/// both leave the conservative recovery verdict untouched, so a real 0-byte /
+/// non-database file or a torn b-tree still recovers — and we never assert
+/// corruption from an engine that cannot answer (A4/M2). Unambiguous structural
+/// verdicts (missing core tables, archive drift) are not in the transient class
+/// and pass through unchanged.
 fn doctor_confirm_or_downgrade_corruption_verdict(
     resolved: &Path,
     verdict: DoctorDatabaseFixStrategy,
@@ -25162,22 +25408,55 @@ fn doctor_confirm_or_downgrade_corruption_verdict(
         return verdict;
     }
 
-    if !doctor_canonical_integrity_check_refutes_corruption(resolved) {
-        return verdict;
+    // br-bvq1x.1.3 (A3): cross-check the cheap verdict against the AUTHORITATIVE
+    // canonical engine's full read-only battery before it can drive a
+    // destructive Reconstruct/Repair.
+    match doctor_canonical_double_probe(resolved) {
+        DoctorCanonicalCrossCheck::Healthy => {
+            // The canonical engine PROVES the file healthy, so the cheap probe's
+            // failure was an engine/probe limitation (A1), not corruption.
+            let reclass = mcp_agent_mail_db::DbErrorClass::EngineProbeLimitation;
+            tracing::warn!(
+                path = %resolved.display(),
+                suppressed_verdict = %original_detail,
+                reclassified_as = reclass.as_str(),
+                "doctor: cheap probe reported possible corruption but the canonical double-probe \
+                 cross-check (quick_check, integrity_check, foreign_key_check, schema, fts) all \
+                 passed; reclassifying as an engine/probe limitation and declining to rewrite a \
+                 healthy database (br-bvq1x.1.3)"
+            );
+            DoctorDatabaseFixStrategy::None(format!(
+                "canonical double-probe cross-check passed (quick_check, integrity_check, \
+                 foreign_key_check, schema, fts); reclassified as {} — declined to rewrite a \
+                 healthy database (suppressed transient corruption verdict: {})",
+                reclass.as_str(),
+                truncate_doctor_command(&original_detail)
+            ))
+        }
+        DoctorCanonicalCrossCheck::ConfirmsCorruption(reason) => {
+            tracing::warn!(
+                path = %resolved.display(),
+                confirmation = %reason,
+                "doctor: canonical double-probe cross-check CONFIRMED corruption on re-probe; \
+                 upholding the recovery verdict (br-bvq1x.1.3)"
+            );
+            verdict
+        }
+        DoctorCanonicalCrossCheck::Inconclusive(reason) => {
+            // The canonical engine could not authoritatively answer. Keep the
+            // conservative recovery verdict, but never assert corruption from an
+            // engine that cannot answer (A4/M2).
+            tracing::warn!(
+                path = %resolved.display(),
+                reason = %reason,
+                suppressed_verdict = %original_detail,
+                "doctor: canonical double-probe cross-check was inconclusive (engine could not \
+                 authoritatively answer); keeping the conservative recovery verdict without \
+                 asserting corruption (br-bvq1x.1.3 / A4)"
+            );
+            verdict
+        }
     }
-
-    tracing::warn!(
-        path = %resolved.display(),
-        suppressed_verdict = %original_detail,
-        "doctor: cheap probe reported possible corruption but a canonical full integrity_check \
-         passed on re-probe; declining to rewrite a healthy database (transient false positive, \
-         br-bvq1x.1.6)"
-    );
-    DoctorDatabaseFixStrategy::None(format!(
-        "canonical integrity_check passed on re-probe; declined to rewrite a healthy database \
-         (suppressed transient corruption verdict: {})",
-        truncate_doctor_command(&original_detail)
-    ))
 }
 
 fn doctor_database_inventory_failure_strategy(
@@ -35837,6 +36116,18 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
     }
 
     #[test]
+    fn check_inbox_routing_prefers_daemon_then_falls_back_to_direct() {
+        // The default (non-`--direct`) path always uses the daemon, regardless of
+        // the (unprobed) reachability flag.
+        assert!(check_inbox_should_use_daemon(false, false));
+        assert!(check_inbox_should_use_daemon(false, true));
+        // `--direct` uses the daemon only when it is reachable (GH#158: avoid WAL
+        // contention), otherwise falls back to a direct SQLite read.
+        assert!(check_inbox_should_use_daemon(true, true));
+        assert!(!check_inbox_should_use_daemon(true, false));
+    }
+
+    #[test]
     fn check_inbox_server_urls_support_api_mcp_aliases() {
         assert_eq!(
             check_inbox_server_urls("127.0.0.1", 8765, "api"),
@@ -45894,34 +46185,6 @@ startup_timeout_sec = 42
     // --- br-bvq1x.1.6: canonical integrity_check confirmation gate ---
 
     #[test]
-    fn doctor_canonical_integrity_check_refutes_corruption_distinguishes_healthy_from_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Healthy, checkpointed DB → canonical full integrity_check passes.
-        let healthy = dir.path().join("healthy.sqlite3");
-        seed_project_only_db(&healthy, "healthy", "/healthy");
-        assert!(
-            doctor_canonical_integrity_check_refutes_corruption(&healthy),
-            "a healthy DB must be refuted as a corruption false positive"
-        );
-
-        // A non-database file cannot be opened/verified → not refuted.
-        let garbage = dir.path().join("garbage.sqlite3");
-        std::fs::write(&garbage, b"not-a-sqlite-database").unwrap();
-        assert!(
-            !doctor_canonical_integrity_check_refutes_corruption(&garbage),
-            "a non-database file must not be refuted (fail-safe keeps the verdict)"
-        );
-
-        // A missing file cannot be verified → not refuted.
-        let missing = dir.path().join("missing.sqlite3");
-        assert!(
-            !doctor_canonical_integrity_check_refutes_corruption(&missing),
-            "a missing file must not be refuted"
-        );
-    }
-
-    #[test]
     fn doctor_confirm_downgrades_possible_corruption_when_canonical_integrity_passes() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("healthy.sqlite3");
@@ -45935,9 +46198,11 @@ startup_timeout_sec = 42
         let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
         match result {
             DoctorDatabaseFixStrategy::None(detail) => assert!(
-                detail.contains("canonical integrity_check passed")
-                    && detail.contains("declined to rewrite"),
-                "downgrade detail should explain the refutation, got: {detail}"
+                detail.contains("double-probe cross-check passed")
+                    && detail.contains("declined to rewrite")
+                    && detail.contains("engine_probe_limitation"),
+                "downgrade detail should explain the refutation and the A1 reclassification, \
+                 got: {detail}"
             ),
             other => panic!("healthy DB must downgrade a transient corruption verdict: {other:?}"),
         }
@@ -45994,6 +46259,139 @@ startup_timeout_sec = 42
         assert_eq!(
             result, verdict,
             "non-transient structural verdicts must not be downgraded"
+        );
+    }
+
+    // --- br-bvq1x.1.3 (A3): canonical double-probe cross-check ---
+
+    #[test]
+    fn doctor_canonical_double_probe_proves_healthy_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        // Capture sidecar presence BEFORE the probe so the purity assertion
+        // measures only what the cross-check itself does, not what seeding left.
+        let wal = dir.path().join("healthy.sqlite3-wal");
+        let shm = dir.path().join("healthy.sqlite3-shm");
+        let wal_before = wal.exists();
+        let shm_before = shm.exists();
+
+        assert_eq!(
+            doctor_canonical_double_probe(&db_path),
+            DoctorCanonicalCrossCheck::Healthy,
+            "the full canonical battery must prove a healthy DB healthy"
+        );
+
+        // Purity (shared with B2): a read-only/immutable cross-check must not
+        // materialize WAL/SHM sidecars that weren't already present.
+        assert_eq!(
+            wal.exists(),
+            wal_before,
+            "double-probe must not change -wal sidecar presence"
+        );
+        assert_eq!(
+            shm.exists(),
+            shm_before,
+            "double-probe must not change -shm sidecar presence"
+        );
+    }
+
+    #[test]
+    fn doctor_canonical_double_probe_confirms_malformed_btree() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed.sqlite3");
+        seed_malformed_btree_db(&db_path);
+
+        match doctor_canonical_double_probe(&db_path) {
+            DoctorCanonicalCrossCheck::ConfirmsCorruption(detail) => {
+                assert!(
+                    !detail.is_empty(),
+                    "a confirmed-corruption verdict must carry a reason"
+                );
+            }
+            other => panic!("a genuinely malformed B-tree must confirm corruption, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_canonical_double_probe_confirms_non_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("garbage.sqlite3");
+        std::fs::write(&db_path, b"not-a-sqlite-database").unwrap();
+
+        assert!(
+            matches!(
+                doctor_canonical_double_probe(&db_path),
+                DoctorCanonicalCrossCheck::ConfirmsCorruption(_)
+            ),
+            "a non-database file is an authoritative 'file is not a database' corruption signal"
+        );
+    }
+
+    #[test]
+    fn doctor_canonical_double_probe_is_inconclusive_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.sqlite3");
+
+        assert!(
+            matches!(
+                doctor_canonical_double_probe(&db_path),
+                DoctorCanonicalCrossCheck::Inconclusive(_)
+            ),
+            "a missing file cannot be proven healthy or corrupt — never assert corruption"
+        );
+    }
+
+    #[test]
+    fn doctor_confirm_flips_fk_false_positive_to_engine_limitation() {
+        // L1 FK false-positive: the cheap path flagged FK/possible corruption,
+        // but the canonical foreign_key_check + full battery pass → the verdict
+        // must flip to an engine-probe limitation (A1), never a reconstruct.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        // Confirm the canonical FK check itself is clean on this fixture.
+        assert_eq!(
+            doctor_canonical_double_probe(&db_path),
+            DoctorCanonicalCrossCheck::Healthy
+        );
+
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "Health probes failed for {} (possible corruption): foreign_key_check raised an \
+             unsupported-op error; archive recovery is available",
+            db_path.display()
+        ));
+        match doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict) {
+            DoctorDatabaseFixStrategy::None(detail) => assert!(
+                detail.contains("engine_probe_limitation")
+                    && detail.contains("double-probe cross-check passed"),
+                "an FK false positive on a healthy DB must reclassify as an engine limitation, \
+                 got: {detail}"
+            ),
+            other => panic!("FK false positive must not drive a reconstruct: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_confirm_keeps_verdict_for_malformed_btree() {
+        // The malformed-B-tree direction: a genuine on-disk B-tree corruption
+        // must survive the cross-check and keep its recovery verdict.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed.sqlite3");
+        seed_malformed_btree_db(&db_path);
+
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "Health probes failed for {} (possible corruption); archive recovery is available",
+            db_path.display()
+        ));
+        assert!(
+            matches!(
+                doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict),
+                DoctorDatabaseFixStrategy::Reconstruct(_)
+            ),
+            "a genuinely malformed B-tree must keep its recovery verdict after the cross-check"
         );
     }
 
@@ -74936,6 +75334,62 @@ fn seed_project_only_db(db_path: &Path, slug: &str, human_key: &str) {
         conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint project-only canonical db");
     }
+}
+
+/// br-bvq1x.1.3 (A3): seed a real, multi-page SQLite database and then corrupt
+/// its table B-tree pages so the file still opens as a database (page 1 — the
+/// header + `sqlite_master` root — is preserved) but a full `integrity_check`
+/// authoritatively reports damage. Distinct from a non-database garbage file:
+/// this exercises the "genuinely malformed B-tree" acceptance direction.
+#[cfg(test)]
+fn seed_malformed_btree_db(db_path: &Path) {
+    let db_path_text = db_path.display().to_string();
+    init_schema_sqlite_canonical(&db_path_text).expect("init schema for malformed fixture");
+    {
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
+            .expect("open canonical db for malformed fixture");
+        // Bulk-load enough sizable rows to force a multi-page table B-tree, so
+        // corrupting pages 2+ reliably reaches populated data pages.
+        let filler = "x".repeat(600);
+        for i in 1..=1500i64 {
+            conn.query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(i),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(format!("slug-{i}")),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(format!("/repo/{i}/{filler}")),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(i),
+                ],
+            )
+            .expect("insert filler row for malformed fixture");
+        }
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint malformed fixture db");
+    }
+
+    let mut bytes = std::fs::read(db_path).expect("read malformed fixture db file");
+    // The SQLite page size is a 2-byte big-endian value at header offset 16; a
+    // stored value of 1 means 65536.
+    let page_size = {
+        let raw = u16::from_be_bytes([bytes[16], bytes[17]]);
+        if raw == 1 {
+            65_536usize
+        } else {
+            usize::from(raw)
+        }
+    };
+    assert!(
+        bytes.len() > page_size * 3,
+        "malformed fixture must span multiple pages (len={}, page_size={page_size})",
+        bytes.len()
+    );
+    // Overwrite every byte after page 1 with a fixed garbage pattern, mangling
+    // the table B-tree leaf/interior pages while leaving the header + schema
+    // root intact so the file still opens as a database.
+    for byte in bytes.iter_mut().skip(page_size) {
+        *byte = 0xA5;
+    }
+    std::fs::write(db_path, &bytes).expect("write corrupted malformed fixture db file");
 }
 
 #[cfg(test)]
