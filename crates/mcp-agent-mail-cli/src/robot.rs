@@ -7128,8 +7128,12 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     } else if metrics.failures_total == 0 {
         format!("{} checks, all passed", metrics.checks_total)
     } else {
+        // #164: the last check passed, so the DB is healthy *now*. Make the
+        // cumulative `failures_total` explicitly historical and surface
+        // `failures_since_last_ok` (0 here) so this never reads as current
+        // corruption.
         format!(
-            "last check passed; {} historical failures across {} checks",
+            "last check passed (0 failures since last ok); {} historical failures across {} checks (lifetime tally, not current state)",
             metrics.failures_total, metrics.checks_total
         )
     };
@@ -17592,6 +17596,7 @@ mod tests {
             last_check_ts: 2_000,
             checks_total: 5,
             failures_total: 2,
+            failures_since_last_ok: 1,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -17602,16 +17607,21 @@ mod tests {
             last_check_ts: 2_000,
             checks_total: 5,
             failures_total: 2,
+            failures_since_last_ok: 0,
         });
         assert!(ok);
         assert_eq!(probe.status, "ok");
         assert!(probe.detail.contains("historical failures"));
+        // #164: a currently-healthy daemon with historical failures must read
+        // as clean, not current corruption.
+        assert!(probe.detail.contains("not current state"));
 
         let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
             last_ok_ts: 0,
             last_check_ts: 0,
             checks_total: 0,
             failures_total: 1,
+            failures_since_last_ok: 1,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");

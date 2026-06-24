@@ -73,6 +73,12 @@ struct IntegrityCheckState {
     checks_total: AtomicU64,
     /// Total number of failures detected.
     failures_total: AtomicU64,
+    /// Number of failures observed *since the last clean check* — reset to 0
+    /// on every passing check. Unlike `failures_total` (a monotonic lifetime
+    /// tally), this reflects *current* integrity state: a daemon that saw a
+    /// transient failure earlier but is healthy now reports 0 here even while
+    /// `failures_total` stays elevated (#164).
+    failures_since_last_ok: AtomicU64,
 }
 
 impl IntegrityCheckState {
@@ -83,6 +89,7 @@ impl IntegrityCheckState {
             last_full_check_ts: AtomicI64::new(0),
             checks_total: AtomicU64::new(0),
             failures_total: AtomicU64::new(0),
+            failures_since_last_ok: AtomicU64::new(0),
         }
     }
 }
@@ -97,7 +104,15 @@ pub struct IntegrityMetrics {
     pub last_ok_ts: i64,
     pub last_check_ts: i64,
     pub checks_total: u64,
+    /// Monotonic lifetime tally of failed checks since this process started.
+    /// This NEVER decreases, so it does not reflect the *current* integrity
+    /// verdict — read `failures_since_last_ok` for that (#164).
     pub failures_total: u64,
+    /// Failures observed since the last clean check (reset to 0 on each pass).
+    /// `0` here with `last_ok_ts == last_check_ts` means the DB is currently
+    /// healthy regardless of how large `failures_total` is.
+    #[serde(default)]
+    pub failures_since_last_ok: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +148,7 @@ pub fn integrity_metrics() -> IntegrityMetrics {
             .failures_total
             .load(Ordering::Relaxed)
             .saturating_add(runtime_failures),
+        failures_since_last_ok: s.failures_since_last_ok.load(Ordering::Relaxed),
     }
 }
 
@@ -369,12 +385,17 @@ pub fn evaluate_check_rows(
     s.checks_total.fetch_add(1, Ordering::Relaxed);
     if ok {
         s.last_ok_ts.store(now, Ordering::Relaxed);
+        // #164: a clean check means the DB is healthy *now*. Reset the
+        // since-last-ok counter so `failures_since_last_ok` reflects current
+        // state (0), while `failures_total` stays as the lifetime trend tally.
+        s.failures_since_last_ok.store(0, Ordering::Relaxed);
         // K3 (br-bvq1x.11.3): a clean integrity check means the database is
         // healthy again, so clear the corruption circuit breaker (self-heal
         // after `am doctor repair`/`reconstruct`) and let writes resume.
         crate::corruption_circuit_breaker().reset();
     } else {
         s.failures_total.fetch_add(1, Ordering::Relaxed);
+        s.failures_since_last_ok.fetch_add(1, Ordering::Relaxed);
         // A5 (br-bvq1x.1.5): record the corruption-class detection keyed by
         // probe source so operators get trend visibility, not a one-shot scare.
         let source = match kind {
@@ -513,6 +534,50 @@ mod tests {
             .store(last_full_check_ts, Ordering::Relaxed);
         s.checks_total.store(checks_total, Ordering::Relaxed);
         s.failures_total.store(failures_total, Ordering::Relaxed);
+        s.failures_since_last_ok
+            .store(failures_total, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn clean_check_resets_failures_since_last_ok_but_keeps_lifetime_total() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        // Simulate a process that saw transient failures earlier.
+        set_state_for_tests(0, 0, 0, 10, 7);
+        assert_eq!(integrity_metrics().failures_since_last_ok, 7);
+
+        // A subsequent clean check on a healthy DB.
+        let conn = open_test_db();
+        let result = quick_check(&conn).expect("quick check should run");
+        assert!(result.ok, "healthy DB should pass quick_check");
+
+        let m = integrity_metrics();
+        assert_eq!(
+            m.failures_since_last_ok, 0,
+            "a clean check must reset the since-last-ok counter (#164)"
+        );
+        assert!(
+            m.failures_total >= 7,
+            "lifetime tally must NOT decrease on a clean check (got {})",
+            m.failures_total
+        );
+        assert_eq!(
+            m.last_ok_ts, m.last_check_ts,
+            "last_ok_ts should advance to last_check_ts on a clean check"
+        );
+    }
+
+    #[test]
+    fn failed_check_increments_both_total_and_since_last_ok() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        set_state_for_tests(0, 0, 0, 0, 0);
+        // Drive a failing evaluation directly (empty rows == corruption verdict).
+        let _ = evaluate_check_rows(&[], CheckKind::Quick, 0);
+        let m = integrity_metrics();
+        assert!(
+            m.failures_since_last_ok >= 1,
+            "a failed check must increment failures_since_last_ok"
+        );
+        assert!(m.failures_total >= 1);
     }
 
     #[test]
@@ -788,14 +853,15 @@ mod tests {
         let obj = json.as_object().expect("should be object");
         assert_eq!(
             obj.len(),
-            4,
-            "IntegrityMetrics should have exactly 4 fields"
+            5,
+            "IntegrityMetrics should have exactly 5 fields"
         );
         for key in &[
             "last_ok_ts",
             "last_check_ts",
             "checks_total",
             "failures_total",
+            "failures_since_last_ok",
         ] {
             assert!(obj.contains_key(*key), "missing field: {key}");
         }
