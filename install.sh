@@ -3627,6 +3627,171 @@ PY
   esac
 }
 
+# Insert or create an mcp-agent-mail entry in an OpenCode `opencode.json`.
+# OpenCode reads MCP servers from the top-level `mcp` object (NOT the
+# Claude-style `mcpServers`), and mcp-agent-mail's `serve` runs an HTTP
+# runtime, so the entry is a remote server (`type: "remote"` + `url`),
+# never a stdio/local command. Mirrors the Rust `am setup` path
+# (crates/mcp-agent-mail-core/src/setup.rs OpenCode arm). See GH#165.
+setup_single_opencode_json_config() {
+  local tool="$1"
+  local config_path="$2"
+  local desired_url
+  desired_url="$(desired_mcp_http_url)"
+  local bearer_token
+  bearer_token="$(resolve_setup_http_bearer_token)"
+  local desired_auth_header=""
+
+  if [ -n "$bearer_token" ]; then
+    desired_auth_header="Bearer ${bearer_token}"
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    verbose "setup_opencode_json:skip_no_python3 tool=${tool} path=${config_path}"
+    return 2
+  fi
+
+  local result
+  result=$(python3 - "$config_path" "$desired_url" "$desired_auth_header" <<'PY'
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime, timezone
+
+config_path, desired_url, desired_auth_header = sys.argv[1:4]
+
+ENTRY_NAMES = ("mcp-agent-mail", "mcp_agent_mail")
+
+
+def load_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def parse_json(text: str):
+    if text.startswith("﻿"):
+        text = text[1:]
+    if not text.strip():
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r"//.*?\n", "\n", text)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        return json.loads(cleaned)
+
+
+def dump_json(doc) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
+text = load_text(config_path)
+doc = parse_json(text)
+if not isinstance(doc, dict):
+    print("ERROR:not_object")
+    raise SystemExit(0)
+
+# OpenCode reads MCP servers ONLY from the top-level `mcp` object.
+container = doc.get("mcp")
+if not isinstance(container, dict):
+    container = {}
+    doc["mcp"] = container
+
+entry_key = "mcp-agent-mail"
+for candidate in ENTRY_NAMES:
+    if isinstance(container.get(candidate), dict):
+        entry_key = candidate
+        break
+
+existing_entry = container.get(entry_key)
+if not isinstance(existing_entry, dict):
+    existing_entry = {}
+
+# Preserve any unrelated fields the user added, but drop stdio/local and
+# stale transport keys so the remote entry is clean and authoritative.
+# Keep `type`/`url`/`enabled` if present so they are overwritten in place
+# (stable key order) and a re-run is a true no-op (SKIP:unchanged).
+new_entry = {
+    key: value
+    for key, value in existing_entry.items()
+    if key not in {"command", "args", "environment", "env", "transport", "httpUrl"}
+}
+new_entry["type"] = "remote"
+new_entry["url"] = desired_url
+new_entry["enabled"] = True
+
+headers = new_entry.get("headers")
+if not isinstance(headers, dict):
+    headers = {}
+if desired_auth_header:
+    headers["Authorization"] = desired_auth_header
+if headers:
+    new_entry["headers"] = headers
+else:
+    new_entry.pop("headers", None)
+
+container[entry_key] = new_entry
+
+# Self-heal: older installer versions wrote a dead entry under the
+# Claude-style `mcpServers` key, which OpenCode ignores. Remove our entry
+# there and drop the container if it is now empty.
+legacy = doc.get("mcpServers")
+if isinstance(legacy, dict):
+    for candidate in ENTRY_NAMES:
+        legacy.pop(candidate, None)
+    if not legacy:
+        doc.pop("mcpServers", None)
+
+new_text = dump_json(doc)
+if new_text == dump_json(parse_json(text)):
+    print("SKIP:unchanged")
+    raise SystemExit(0)
+
+parent_dir = os.path.dirname(config_path)
+if parent_dir:
+    os.makedirs(parent_dir, exist_ok=True)
+if os.path.exists(config_path):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup = f"{config_path}.{stamp}.bak"
+    shutil.copy2(config_path, backup)
+else:
+    backup = ""
+with open(config_path, "w", encoding="utf-8") as handle:
+    handle.write(new_text)
+
+if backup:
+    print(f"OK:updated backup={backup}")
+else:
+    print("OK:created")
+PY
+) || true
+
+  case "$result" in
+    SKIP:unchanged)
+      verbose "setup_opencode_json:unchanged tool=${tool} path=${config_path}"
+      return 1
+      ;;
+    OK:*)
+      verbose "setup_opencode_json:configured tool=${tool} path=${config_path} ${result}"
+      return 0
+      ;;
+    ERROR:*)
+      verbose "setup_opencode_json:error tool=${tool} path=${config_path} ${result}"
+      return 2
+      ;;
+    *)
+      verbose "setup_opencode_json:unknown_result tool=${tool} path=${config_path} ${result}"
+      return 2
+      ;;
+  esac
+}
+
 # Insert or create an mcp-agent-mail entry in a JSON config file.
 # Uses python3/jq for JSON manipulation if available, otherwise sed-based.
 setup_single_mcp_config() {
@@ -3648,6 +3813,11 @@ setup_single_mcp_config() {
 
   if [ "$tool" = "codex" ]; then
     setup_single_codex_json_config "$tool" "$config_path"
+    return $?
+  fi
+
+  if [ "$tool" = "opencode" ]; then
+    setup_single_opencode_json_config "$tool" "$config_path"
     return $?
   fi
 
