@@ -532,6 +532,12 @@ fn add_home_claude_candidates(
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
     home: &Path,
 ) {
+    // GH#168: `~/.claude.json` (top-level `mcpServers` user scope) is the file
+    // the Claude Code v2.x runtime actually loads — list it first/primary. The
+    // legacy `settings.json`/`settings.local.json` entries are retained below so
+    // `am setup status`/`am doctor` can still surface a stale (now-ignored)
+    // `mcpServers` block for migration.
+    push_candidate(out, seen, McpConfigTool::Claude, home.join(".claude.json"));
     push_candidate(
         out,
         seen,
@@ -719,6 +725,15 @@ fn add_project_candidates(
     seen: &mut HashSet<(McpConfigTool, PathBuf)>,
     project_dir: &Path,
 ) {
+    // GH#168: `<project>/.mcp.json` (top-level `mcpServers`) is the project-scope
+    // file Claude Code reads; list it first. `.claude/settings*.json` are kept
+    // for stale-config/migration detection only.
+    push_candidate(
+        out,
+        seen,
+        McpConfigTool::Claude,
+        project_dir.join(".mcp.json"),
+    );
     push_candidate(
         out,
         seen,
@@ -965,7 +980,9 @@ pub fn setup_mcp_config_file(
 #[must_use]
 pub fn preferred_config_path(tool: McpConfigTool, home: &Path) -> PathBuf {
     match tool {
-        McpConfigTool::Claude => home.join(".claude").join("settings.json"),
+        // GH#168: Claude Code loads MCP servers from `~/.claude.json`
+        // (top-level `mcpServers` = user scope), NOT `~/.claude/settings.json`.
+        McpConfigTool::Claude => home.join(".claude.json"),
         McpConfigTool::Codex => home.join(".codex").join("config.toml"),
         McpConfigTool::Cursor => home.join(".cursor").join("mcp.json"),
         McpConfigTool::Gemini => home.join(".gemini").join("settings.json"),
@@ -1013,6 +1030,22 @@ mod tests {
             app_data_dir: Some(appdata.clone()),
         });
 
+        assert!(
+            contains_location(
+                &locations,
+                McpConfigTool::Claude,
+                &home.join(".claude.json")
+            ),
+            "GH#168: expected `~/.claude.json` (the file Claude Code actually reads)"
+        );
+        assert!(
+            contains_location(
+                &locations,
+                McpConfigTool::Claude,
+                &project.join(".mcp.json")
+            ),
+            "GH#168: expected project `.mcp.json` (Claude Code project scope)"
+        );
         assert!(
             contains_location(
                 &locations,
@@ -1680,7 +1713,7 @@ mod tests {
         let home = Path::new("/home/user");
         assert_eq!(
             preferred_config_path(McpConfigTool::Claude, home),
-            PathBuf::from("/home/user/.claude/settings.json")
+            PathBuf::from("/home/user/.claude.json")
         );
         assert_eq!(
             preferred_config_path(McpConfigTool::Codex, home),

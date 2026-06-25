@@ -129,17 +129,16 @@ impl AgentPlatform {
     /// that may embed the bearer token (security issue #148: these MUST be
     /// covered by the auto-generated `.gitignore` so `git add -A` never commits
     /// a live credential). User-level files (e.g. `~/.codex/config.toml`,
-    /// `~/.claude/settings.json`) are not project-tracked and excluded here.
+    /// `~/.claude.json`) are not project-tracked and excluded here.
     #[must_use]
     pub const fn project_local_secret_files(self) -> &'static [&'static str] {
         match self {
-            // `.claude/settings.local.json` is the token-bearing project file;
-            // `.claude/settings.json` (hooks) carries no token but is also
-            // gitignored separately for parity with the historical behavior.
-            Self::Claude => &[".claude/settings.local.json"],
-            // Codex only writes the user-level `~/.codex/config.toml`; nothing
-            // token-bearing lands in the project dir.
-            Self::Codex => &[],
+            // Neither Claude nor Codex writes a token-bearing file into the
+            // project dir. GH#168: Claude's MCP config now lives in
+            // `~/.claude.json` (home, not project-tracked) — the only file it
+            // writes into the project dir is `.claude/settings.json` (hooks),
+            // which carries no token. Codex only writes `~/.codex/config.toml`.
+            Self::Claude | Self::Codex => &[],
             Self::Cursor => &["cursor.mcp.json"],
             Self::Gemini => &["gemini.mcp.json"],
             Self::Antigravity => &["agy.mcp.json"],
@@ -194,6 +193,16 @@ pub enum ConfigContent {
     /// Merge an MCP server entry into existing JSON (or create fresh).
     JsonMerge {
         servers_key: &'static str,
+        server_name: &'static str,
+        server_value: Value,
+    },
+    /// Merge an MCP server entry into Claude Code's *local* (per-project) scope:
+    /// `projects.<project_path>.mcpServers.<server_name>` inside `~/.claude.json`
+    /// (GH#168). This mirrors what `claude mcp add` (default/local scope) writes,
+    /// and is one of the only locations the Claude Code v2.x runtime actually
+    /// reads MCP servers from. `settings.json`/`settings.local.json` are NOT.
+    ClaudeLocalScopeMcp {
+        project_path: String,
         server_name: &'static str,
         server_value: Value,
     },
@@ -540,6 +549,45 @@ pub fn merge_mcp_server(
 
     let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
     let servers = obj.entry(servers_key).or_insert_with(|| json!({}));
+    let servers_obj = servers.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+
+    if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
+        for alias in ["mcp-agent-mail", "mcp_agent_mail"] {
+            if alias != server_name {
+                servers_obj.remove(alias);
+            }
+        }
+    }
+    servers_obj.insert(server_name.to_string(), server_value);
+
+    Ok(serde_json::to_string_pretty(&doc)? + "\n")
+}
+
+/// Merge an MCP server entry into Claude Code's local (per-project) scope inside
+/// `~/.claude.json`: `projects.<project_path>.mcpServers.<server_name>` (GH#168).
+///
+/// All unrelated top-level keys (`numStartups`, other `projects`, the top-level
+/// user-scope `mcpServers`, …) are preserved. Idempotent: re-running replaces the
+/// entry in place and de-dupes the hyphen/underscore alias.
+pub fn merge_claude_local_scope_mcp(
+    existing: Option<&str>,
+    project_path: &str,
+    server_name: &str,
+    server_value: Value,
+) -> Result<String, SetupError> {
+    let mut doc: Value = match existing {
+        Some(s) if !s.trim().is_empty() => serde_json::from_str(s)?,
+        _ => json!({}),
+    };
+
+    let obj = doc.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+    let projects = obj.entry("projects").or_insert_with(|| json!({}));
+    let projects_obj = projects.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+    let repo = projects_obj
+        .entry(project_path.to_string())
+        .or_insert_with(|| json!({}));
+    let repo_obj = repo.as_object_mut().ok_or(SetupError::NotJsonObject)?;
+    let servers = repo_obj.entry("mcpServers").or_insert_with(|| json!({}));
     let servers_obj = servers.as_object_mut().ok_or(SetupError::NotJsonObject)?;
 
     if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
@@ -1001,12 +1049,23 @@ impl AgentPlatform {
         pdir: &Path,
         home: &Path,
     ) -> Vec<ConfigAction> {
+        // GH#168: Claude Code v2.x reads MCP servers ONLY from `~/.claude.json`
+        // (top-level `mcpServers` = user scope; `projects.<abs>.mcpServers` =
+        // local/per-project scope) and project `.mcp.json` — NEVER from
+        // `settings.json`/`settings.local.json` (those are hooks/permissions).
+        // Writing the old location left every fresh `claude` instance with zero
+        // Agent Mail tools. Mirror `claude mcp add`: local scope per-project +
+        // user scope top-level, both in `~/.claude.json` (home, not git-tracked,
+        // so the bearer token never lands in the project working tree).
+        let claude_json = home.join(".claude.json");
+        let project_key = pdir.to_string_lossy().into_owned();
         let mut actions = vec![ConfigAction {
             platform: self,
-            file_path: pdir.join(".claude").join("settings.local.json"),
-            description: "Claude Code project-local MCP config (secrets)".into(),
-            content: ConfigContent::JsonMerge {
-                servers_key: "mcpServers",
+            file_path: claude_json.clone(),
+            description:
+                "Claude Code project-local MCP config (~/.claude.json local scope; secrets)".into(),
+            content: ConfigContent::ClaudeLocalScopeMcp {
+                project_path: project_key,
                 server_name: "mcp-agent-mail",
                 server_value: standard_http_server_value(url, token),
             },
@@ -1016,8 +1075,9 @@ impl AgentPlatform {
         if !params.skip_user_config {
             actions.push(ConfigAction {
                 platform: self,
-                file_path: home.join(".claude").join("settings.json"),
-                description: "Claude Code user-level MCP config".into(),
+                file_path: claude_json,
+                description: "Claude Code user-level MCP config (~/.claude.json top-level mcpServers)"
+                    .into(),
                 content: ConfigContent::JsonMerge {
                     servers_key: "mcpServers",
                     server_name: "mcp-agent-mail",
@@ -1404,6 +1464,16 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
         } => merge_mcp_server(
             existing.as_deref(),
             servers_key,
+            server_name,
+            server_value.clone(),
+        )?,
+        ConfigContent::ClaudeLocalScopeMcp {
+            project_path,
+            server_name,
+            server_value,
+        } => merge_claude_local_scope_mcp(
+            existing.as_deref(),
+            project_path,
             server_name,
             server_value.clone(),
         )?,
@@ -2143,6 +2213,15 @@ fn expected_entry_for_action(action: &ConfigAction) -> Value {
             "server_name": server_name,
             "entry": server_value,
         }),
+        ConfigContent::ClaudeLocalScopeMcp {
+            project_path,
+            server_name,
+            server_value,
+        } => json!({
+            "container": format!("projects.{project_path}.mcpServers"),
+            "server_name": server_name,
+            "entry": server_value,
+        }),
         ConfigContent::JsonFull(value) => value.clone(),
         ConfigContent::HooksMerge { .. } => json!({}),
         ConfigContent::TomlSection {
@@ -2166,7 +2245,8 @@ fn expected_authorization_for_action(action: &ConfigAction, token: &str) -> Opti
         return None;
     }
     match &action.content {
-        ConfigContent::JsonMerge { server_value, .. } => {
+        ConfigContent::JsonMerge { server_value, .. }
+        | ConfigContent::ClaudeLocalScopeMcp { server_value, .. } => {
             json_entry_authorization(server_value).map(str::to_string)
         }
         ConfigContent::TomlSection { key_values, .. } => {
@@ -2193,6 +2273,7 @@ fn expected_startup_timeout_for_action(action: &ConfigAction) -> Option<u64> {
             })
         }
         ConfigContent::JsonMerge { .. }
+        | ConfigContent::ClaudeLocalScopeMcp { .. }
         | ConfigContent::JsonFull(_)
         | ConfigContent::HooksMerge { .. } => None,
     }
@@ -2678,6 +2759,81 @@ mod tests {
     }
 
     #[test]
+    fn merge_claude_local_scope_mcp_creates_nested_path() {
+        // GH#168: from empty, builds projects.<path>.mcpServers.<name>.
+        let result = merge_claude_local_scope_mcp(
+            None,
+            "/abs/repo",
+            "mcp-agent-mail",
+            json!({"type": "http", "url": "http://127.0.0.1:8765/mcp/"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            doc["projects"]["/abs/repo"]["mcpServers"]["mcp-agent-mail"]["url"],
+            json!("http://127.0.0.1:8765/mcp/")
+        );
+    }
+
+    #[test]
+    fn merge_claude_local_scope_mcp_preserves_unrelated_keys() {
+        // Unrelated top-level keys, other projects, and the user-scope top-level
+        // mcpServers must all survive the merge.
+        let existing = r#"{
+  "numStartups": 7,
+  "mcpServers": { "other-user-server": { "url": "x" } },
+  "projects": {
+    "/other/repo": { "mcpServers": { "keep": { "url": "y" } } },
+    "/abs/repo": { "allowedTools": ["Bash"] }
+  }
+}"#;
+        let result = merge_claude_local_scope_mcp(
+            Some(existing),
+            "/abs/repo",
+            "mcp-agent-mail",
+            json!({"url": "z"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(doc["numStartups"], json!(7));
+        assert_eq!(doc["mcpServers"]["other-user-server"]["url"], json!("x"));
+        assert_eq!(
+            doc["projects"]["/other/repo"]["mcpServers"]["keep"]["url"],
+            json!("y")
+        );
+        // existing per-project keys preserved alongside the inserted server
+        assert_eq!(
+            doc["projects"]["/abs/repo"]["allowedTools"],
+            json!(["Bash"])
+        );
+        assert_eq!(
+            doc["projects"]["/abs/repo"]["mcpServers"]["mcp-agent-mail"]["url"],
+            json!("z")
+        );
+    }
+
+    #[test]
+    fn merge_claude_local_scope_mcp_idempotent_and_dedupes_alias() {
+        // Re-running replaces in place; the underscore alias is removed.
+        let seeded = r#"{"projects":{"/r":{"mcpServers":{"mcp_agent_mail":{"url":"old"}}}}}"#;
+        let result = merge_claude_local_scope_mcp(
+            Some(seeded),
+            "/r",
+            "mcp-agent-mail",
+            json!({"url": "new"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        let servers = doc["projects"]["/r"]["mcpServers"].as_object().unwrap();
+        assert!(
+            !servers.contains_key("mcp_agent_mail"),
+            "alias must be dropped"
+        );
+        assert_eq!(servers["mcp-agent-mail"]["url"], json!("new"));
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
     fn config_actions_cursor() {
         let params = SetupParams {
             host: "127.0.0.1".into(),
@@ -2744,6 +2900,9 @@ mod tests {
             }
         }
         // Spot-check the high-risk filenames the old hardcoded list missed.
+        // (GH#168: Claude no longer writes a token-bearing file into the project
+        // dir — its MCP config lives in `~/.claude.json` — so it is no longer
+        // expected here.)
         for expected in [
             "cursor.mcp.json",
             "gemini.mcp.json",
@@ -2752,7 +2911,6 @@ mod tests {
             "cline.mcp.json",
             "opencode.json",
             ".vscode/mcp.json",
-            ".claude/settings.local.json",
         ] {
             assert!(
                 lines.contains(&expected),
@@ -2827,7 +2985,8 @@ mod tests {
             };
             for action in platform.config_actions(&params) {
                 let serialized = match &action.content {
-                    ConfigContent::JsonMerge { server_value, .. } => {
+                    ConfigContent::JsonMerge { server_value, .. }
+                    | ConfigContent::ClaudeLocalScopeMcp { server_value, .. } => {
                         serde_json::to_string(server_value).unwrap()
                     }
                     ConfigContent::JsonFull(v) => serde_json::to_string(v).unwrap(),
@@ -3813,13 +3972,23 @@ http_headers = { Authorization = "Bearer tok" }
         let actions = AgentPlatform::Claude.config_actions(&params);
         // project-local, user-level, hooks = 3 actions
         assert_eq!(actions.len(), 3);
-        assert!(
-            actions[0]
-                .file_path
-                .ends_with(".claude/settings.local.json")
-        );
-        assert!(actions[1].file_path.ends_with(".claude/settings.json"));
-        // Third action is hooks
+        // GH#168: project-local MCP config is the local scope inside ~/.claude.json.
+        assert!(actions[0].file_path.ends_with(".claude.json"));
+        assert!(matches!(
+            actions[0].content,
+            ConfigContent::ClaudeLocalScopeMcp { .. }
+        ));
+        // User-level MCP config is the top-level mcpServers inside ~/.claude.json.
+        assert!(actions[1].file_path.ends_with(".claude.json"));
+        assert!(matches!(
+            actions[1].content,
+            ConfigContent::JsonMerge {
+                servers_key: "mcpServers",
+                ..
+            }
+        ));
+        // Hooks still live in the project-local settings.json.
+        assert!(actions[2].file_path.ends_with(".claude/settings.json"));
         assert!(matches!(
             actions[2].content,
             ConfigContent::HooksMerge { .. }
@@ -3860,10 +4029,16 @@ http_headers = { Authorization = "Bearer tok" }
     #[test]
     fn run_setup_creates_gitignore_entries() {
         let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        // Cline writes a token-bearing project-local file (cline.mcp.json) that
+        // must be gitignored; pair it with Claude to exercise both.
         let params = SetupParams {
             token: "tok".into(),
             project_dir: tmp.path().to_path_buf(),
-            agents: Some(vec![AgentPlatform::Claude]),
+            // home_dir_override keeps the Claude write (GH#168: ~/.claude.json)
+            // off the real home during tests.
+            home_dir_override: Some(home.clone()),
+            agents: Some(vec![AgentPlatform::Claude, AgentPlatform::Cline]),
             skip_user_config: true,
             skip_hooks: true,
             project_slug: "test".into(),
@@ -3873,7 +4048,20 @@ http_headers = { Authorization = "Bearer tok" }
         let _ = run_setup(&params);
         let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap_or_default();
         assert!(gi.contains(".env"));
-        assert!(gi.contains(".claude/settings.local.json"));
+        // Cline's project-local token file is still gitignored.
+        assert!(gi.contains("cline.mcp.json"));
+        // GH#168: Claude's secret-bearing MCP config lands in ~/.claude.json
+        // (under the tmp home), NOT the project dir, and carries the token.
+        let claude_json = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+        assert!(claude_json.contains("\"tok\"") || claude_json.contains("Bearer tok"));
+        assert!(claude_json.contains("mcp-agent-mail"));
+        // And nothing token-bearing was written into the project's .claude dir.
+        assert!(
+            !tmp.path()
+                .join(".claude")
+                .join("settings.local.json")
+                .exists()
+        );
     }
 
     #[test]
