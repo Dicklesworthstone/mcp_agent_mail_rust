@@ -72,6 +72,10 @@ hybrid = [
     "frankensearch/model2vec",
     "frankensearch/lexical",
     "frankensearch/rerank",
+    # `rerank` compiles the pure-Rust NativeReranker (frankentorch) backend, but
+    # the umbrella crate's `NativeReranker` re-export is cfg-gated on the separate
+    # `native` feature; enable it so `fs::NativeReranker` resolves (br-nnar1).
+    "frankensearch/native",
     "dep:frankensearch-core",
     "dep:frankensearch-embed",
     "frankensearch-embed/hash",

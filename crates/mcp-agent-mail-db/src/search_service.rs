@@ -2141,7 +2141,8 @@ pub const fn two_tier_metrics_snapshot() -> Option<()> {
 #[cfg(feature = "hybrid")]
 static TWO_TIER_BRIDGE: OnceLock<Option<Arc<TwoTierBridge>>> = OnceLock::new();
 #[cfg(feature = "hybrid")]
-static HYBRID_RERANKER: OnceLock<Option<Arc<fs::FlashRankReranker>>> = OnceLock::new();
+static HYBRID_RERANKER: OnceLock<Option<Arc<fs::SyncRerankerAdapter<fs::NativeReranker>>>> =
+    OnceLock::new();
 #[cfg(feature = "hybrid")]
 static FAST_ONLY_SEARCH_HINT_EMITTED: OnceLock<()> = OnceLock::new();
 
@@ -3194,7 +3195,7 @@ fn resolve_rerank_model_dir() -> Option<PathBuf> {
 }
 
 #[cfg(feature = "hybrid")]
-fn get_or_init_hybrid_reranker() -> Option<Arc<fs::FlashRankReranker>> {
+fn get_or_init_hybrid_reranker() -> Option<Arc<fs::SyncRerankerAdapter<fs::NativeReranker>>> {
     HYBRID_RERANKER
         .get_or_init(|| {
             let Some(model_dir) = resolve_rerank_model_dir() else {
@@ -3205,8 +3206,11 @@ fn get_or_init_hybrid_reranker() -> Option<Arc<fs::FlashRankReranker>> {
                 return None;
             };
 
-            match fs::FlashRankReranker::load(&model_dir) {
-                Ok(reranker) => Some(Arc::new(reranker)),
+            // NativeReranker (pure-Rust BERT cross-encoder) implements `SyncRerank`,
+            // not `Reranker` directly, so wrap it in `SyncRerankerAdapter` to satisfy
+            // the `&dyn Reranker` bound that `fs::rerank_step` requires downstream.
+            match fs::NativeReranker::load(&model_dir) {
+                Ok(reranker) => Some(Arc::new(fs::SyncRerankerAdapter(reranker))),
                 Err(error) => {
                     tracing::warn!(
                         target: "search.metrics",
