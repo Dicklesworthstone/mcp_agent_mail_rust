@@ -31,7 +31,8 @@ use crate::resources::{
     reservation_project_workspace_path,
 };
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
+    resolve_project,
 };
 
 const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -909,6 +910,88 @@ fn collect_previous_expiries(
         .collect()
 }
 
+/// F5 (br-bvq1x.6.5): build a fail-closed envelope for a reservation ACQUIRE
+/// failure. Acquire must fail CLOSED for safety, but the agent has to be able to
+/// tell WHY it failed — a corrupt DB, a corrupt index, or a busy/unavailable
+/// subsystem — as distinct from a genuine conflict (which separately returns the
+/// conflicting holder via `FILE_RESERVATION_CONFLICT`). This reuses the A1 typed
+/// classification + A2 failure envelope from [`db_error_to_mcp_error`] (so the
+/// class, severity, recommended command, and corruption metrics stay consistent)
+/// and grafts on the reservation-specific context the generic chokepoint cannot
+/// know: the exact requested paths and an explicit `do_not_edit` set, so an agent
+/// that could not verify current holders treats every requested path as off-limits
+/// until recovery rather than editing blind (the css/ts2 incident: `reserve`
+/// failing with a malformed B-tree left the agent unable to tell "contended" from
+/// "DB corrupt").
+fn reservation_acquire_failure(
+    requested_paths: &[String],
+    operation: &'static str,
+    err: DbError,
+) -> McpError {
+    let classification = err.classification();
+    let cause = classification.class.as_str();
+    let blocks_edits = classification.blocks_edits;
+    let safe_to_continue_read_only = classification.safe_to_continue_read_only;
+    let recommended_command = classification.recommended_command;
+    // Reuse the canonical classified envelope (class / severity / code / metrics)...
+    let mut error = db_error_to_mcp_error(err);
+    // ...then graft the reservation-acquire fail-closed context onto its data.
+    let guidance = if blocks_edits {
+        "Reservation acquire FAILED CLOSED: current holders are unverifiable because the \
+         reservation index could not be read. Do NOT edit the requested paths until the \
+         database is recovered."
+    } else {
+        "Reservation acquire did NOT grant: the reservation subsystem is temporarily \
+         unavailable (busy/locked). The paths were left unreserved; retry after the \
+         condition clears."
+    };
+    // Fail closed: when the index is unreadable, every requested path is a
+    // DO-NOT-EDIT until reservations can be verified again. (Precomputed because
+    // `json!` cannot take a bare `if`/`else` in value position.)
+    let do_not_edit: Vec<String> = if blocks_edits {
+        requested_paths.to_vec()
+    } else {
+        Vec::new()
+    };
+    let context = json!({
+        "operation": operation,
+        "cause": cause,
+        "fail_closed": true,
+        "blocks_edits": blocks_edits,
+        "safe_to_continue_read_only": safe_to_continue_read_only,
+        "recommended_command": recommended_command,
+        "requested_paths": requested_paths,
+        "do_not_edit": do_not_edit,
+        "guidance": guidance,
+    });
+    match error.data {
+        Some(Value::Object(ref mut map)) => {
+            map.insert("reservation_acquire".to_string(), context);
+        }
+        _ => {
+            error.data = Some(json!({ "reservation_acquire": context }));
+        }
+    }
+    error
+}
+
+/// F5: route an acquire-path DB [`asupersync::Outcome`] through
+/// [`reservation_acquire_failure`] on error (so the caller gets the fail-closed
+/// reservation context), delegating success / cancellation / panic to the shared
+/// [`db_outcome_to_mcp_result`] chokepoint.
+fn acquire_outcome<T>(
+    out: asupersync::Outcome<T, DbError>,
+    requested_paths: &[String],
+    operation: &'static str,
+) -> McpResult<T> {
+    match out {
+        asupersync::Outcome::Err(err) => {
+            Err(reservation_acquire_failure(requested_paths, operation, err))
+        }
+        other => db_outcome_to_mcp_result(other),
+    }
+}
+
 /// Request advisory file reservations on project-relative paths/globs.
 ///
 /// # Parameters
@@ -1042,9 +1125,15 @@ pub async fn file_reservation_paths(
     .await?;
     let agent_id = agent.id.unwrap_or(0);
 
-    // Check for conflicts with existing active reservations
-    let active = db_outcome_to_mcp_result(
+    // Check for conflicts with existing active reservations. F5: if this read
+    // fails (DB/index corrupt, busy/unavailable), surface a fail-closed
+    // reservation-acquire envelope that names the cause and the do-not-edit set
+    // instead of an opaque DB error — the agent must be able to tell "could not
+    // verify reservations" from "truly contended".
+    let active = acquire_outcome(
         mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
+        &paths,
+        "file_reservation_paths",
     )?;
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
@@ -1270,8 +1359,10 @@ pub async fn file_reservation_paths(
                 (vec![], db_conflicts)
             }
             other => {
-                // All other errors propagate normally.
-                db_outcome_to_mcp_result(other)?;
+                // F5: a grant failure that is not a recoverable conflict still
+                // fails closed with the classified reservation-acquire context
+                // (cause + do-not-edit set) rather than an opaque DB error.
+                acquire_outcome(other, &paths, "file_reservation_paths")?;
                 unreachable!()
             }
         }
@@ -2263,6 +2354,66 @@ mod tests {
             .as_micros();
         let time_component = u64::try_from(micros).unwrap_or(u64::MAX);
         time_component.wrapping_add(RESERVATION_TEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    // --- F5 (br-bvq1x.6.5): acquire failure classification + fail-closed context ---
+
+    #[test]
+    fn f5_acquire_failure_corruption_fails_closed_with_do_not_edit() {
+        let paths = vec!["src/**".to_string(), "config/app.yaml".to_string()];
+        // A malformed-B-tree read failure on the conflict-check path (the css/ts2
+        // incident): the reservation index could not be read.
+        let err = DbError::Sqlite("database disk image is malformed".to_string());
+        let mcp = reservation_acquire_failure(&paths, "file_reservation_paths", err);
+        let data = mcp.data.expect("F5 envelope carries data");
+        let acq = data
+            .get("reservation_acquire")
+            .expect("reservation_acquire context block");
+        assert_eq!(
+            acq.get("cause").and_then(Value::as_str),
+            Some("main_db_btree_corruption"),
+            "corruption-driven acquire failure must classify as main_db_btree_corruption"
+        );
+        assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
+        assert_eq!(acq.get("blocks_edits").and_then(Value::as_bool), Some(true));
+        // Fail closed: every requested path is do-not-edit when holders are
+        // unverifiable — the agent must not edit blind.
+        let do_not_edit: Vec<String> = acq
+            .get("do_not_edit")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            do_not_edit, paths,
+            "a corruption-driven acquire failure must mark every requested path do-not-edit"
+        );
+        // Reuses the A1/A2 classified envelope rather than inventing a new one.
+        assert!(
+            data.get("db_error_classification").is_some(),
+            "F5 must reuse the A1 classification envelope from db_error_to_mcp_error"
+        );
+    }
+
+    #[test]
+    fn f5_acquire_failure_busy_is_distinct_from_corruption() {
+        let paths = vec!["src/**".to_string()];
+        // Busy/locked subsystem — UNAVAILABLE, not corrupt and not contended.
+        let err = DbError::ResourceBusy("database is locked".to_string());
+        let mcp = reservation_acquire_failure(&paths, "file_reservation_paths", err);
+        let data = mcp.data.expect("data");
+        let acq = data
+            .get("reservation_acquire")
+            .expect("reservation_acquire context block");
+        assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
+        // The whole point of F5: an UNAVAILABLE cause is classified DISTINCTLY
+        // from a corruption cause (and both are distinct from a genuine conflict,
+        // which is the separate FILE_RESERVATION_CONFLICT path).
+        let cause = acq.get("cause").and_then(Value::as_str).unwrap_or_default();
+        assert!(!cause.is_empty(), "busy failure must carry a typed cause");
+        assert_ne!(
+            cause, "main_db_btree_corruption",
+            "a busy/unavailable failure must not be misclassified as corruption"
+        );
+        assert!(data.get("db_error_classification").is_some());
     }
 
     fn with_serialized_reservations<F, T>(f: F) -> T
