@@ -1930,6 +1930,7 @@ name = "frankensearch-index"
 version = "0.2.1"
 dependencies = [
  "ahash",
+ "bytemuck",
  "crc32fast",
  "frankensearch-core",
  "half",
