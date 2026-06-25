@@ -104,6 +104,7 @@ output.
 
 - [AUDIT-mailbox-durability-program.md](AUDIT-mailbox-durability-program.md) - mailbox durability audit.
 - [CONFORMANCE_AUDIT_2026-04-18.md](CONFORMANCE_AUDIT_2026-04-18.md) - conformance audit snapshot.
+- [FRANKENSQLITE_PRAGMA_GAPS.md](FRANKENSQLITE_PRAGMA_GAPS.md) - living FrankenSQLite↔canonical pragma divergence list, reproducers, and M2-fallback retirement checklist (M3/br-bvq1x.13.3).
 - [DOC_SWEEP_AUDIT_2026-04-18.md](DOC_SWEEP_AUDIT_2026-04-18.md) - documentation sweep audit.
 - [GIT_SHELLOUT_AUDIT.md](GIT_SHELLOUT_AUDIT.md) - Git shell-out audit.
 - [GIT_SHELLOUT_AUDIT_COUNT.txt](GIT_SHELLOUT_AUDIT_COUNT.txt) - Git shell-out audit count.
