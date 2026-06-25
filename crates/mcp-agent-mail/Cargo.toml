@@ -17,6 +17,8 @@ name = "mcp-agent-mail"
 path = "src/main.rs"
 
 [dependencies]
+# GH#161: global allocator to bound long-running daemon RSS (glibc arena fragmentation).
+mimalloc = { workspace = true }
 mcp-agent-mail-core = { workspace = true }
 mcp-agent-mail-storage = { workspace = true, default-features = false }
 mcp-agent-mail-tools = { workspace = true, default-features = false }

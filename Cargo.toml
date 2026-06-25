@@ -53,6 +53,9 @@ ftui-harness = "0.4.0"
 ftui-render = "0.4.0"
 beads_rust = { version = "0.2.15", default-features = false }
 toon = { version = "0.2.3", package = "tru" }
+# GH#161: global allocator for the long-running serve-http daemon to avoid
+# glibc per-thread arena fragmentation (multi-GB retained RSS under load).
+mimalloc = "0.1"
 
 # Internal workspace crates
 mcp-agent-mail-core = { path = "crates/mcp-agent-mail-core" }

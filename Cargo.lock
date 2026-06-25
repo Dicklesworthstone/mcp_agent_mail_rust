@@ -1964,10 +1964,12 @@ dependencies = [
  "ft-api",
  "ft-autograd",
  "ft-core",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers",
  "tracing",
+ "wide 1.5.0",
 ]
 
 [[package]]
@@ -5116,6 +5118,7 @@ dependencies = [
  "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
+ "mimalloc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5150,6 +5153,7 @@ dependencies = [
  "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
  "mcp-agent-mail-tools",
+ "mimalloc",
  "nix",
  "plist",
  "regex",

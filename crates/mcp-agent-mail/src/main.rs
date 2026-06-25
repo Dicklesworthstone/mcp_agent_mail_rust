@@ -4,6 +4,15 @@
 
 #![forbid(unsafe_code)]
 
+// GH#161: use mimalloc as the global allocator so the long-running serve-http
+// daemon does not retain multiple GB of glibc per-thread arena memory under
+// sustained multi-agent load (each of ~39 runtime threads otherwise pins a
+// ~64 MiB secondary arena that glibc never returns to the OS, tripping
+// `memory_pressure=Critical` → `health_check` RED on a healthy mailbox).
+// Declaring the static needs no `unsafe`, so it stays `#![forbid(unsafe_code)]`.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::fs;
 use std::io::IsTerminal;

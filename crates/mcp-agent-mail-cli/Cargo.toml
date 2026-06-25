@@ -16,6 +16,8 @@ name = "am"
 path = "src/main.rs"
 
 [dependencies]
+# GH#161: global allocator to bound long-running daemon RSS (glibc arena fragmentation).
+mimalloc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 fastmcp.workspace = true
 serde.workspace = true
