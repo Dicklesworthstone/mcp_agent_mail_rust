@@ -964,13 +964,18 @@ fn reservation_acquire_failure(
         "do_not_edit": do_not_edit,
         "guidance": guidance,
     });
-    match error.data {
-        Some(Value::Object(ref mut map)) => {
-            map.insert("reservation_acquire".to_string(), context);
-        }
-        _ => {
-            error.data = Some(json!({ "reservation_acquire": context }));
-        }
+    // `db_error_to_mcp_error` always produces the legacy envelope
+    // `{ error: { type, message, recoverable, data: {...} } }`. Graft the
+    // reservation-acquire context into that INNER `data` object — alongside the
+    // A1 `db_error_classification` and `failure_envelope` — so the whole error
+    // payload is coherent, rather than at an unrelated top level. (If the
+    // envelope shape ever changed, the context is simply dropped and the
+    // classified error still surfaces — defensive, never hit in practice.)
+    if let Some(Value::Object(top)) = error.data.as_mut()
+        && let Some(Value::Object(err_obj)) = top.get_mut("error")
+        && let Some(Value::Object(data_obj)) = err_obj.get_mut("data")
+    {
+        data_obj.insert("reservation_acquire".to_string(), context);
     }
     error
 }
@@ -2366,7 +2371,12 @@ mod tests {
         let err = DbError::Sqlite("database disk image is malformed".to_string());
         let mcp = reservation_acquire_failure(&paths, "file_reservation_paths", err);
         let data = mcp.data.expect("F5 envelope carries data");
-        let acq = data
+        // Legacy envelope shape: { error: { type, message, recoverable, data } }.
+        let payload = data
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .expect("legacy error.data payload");
+        let acq = payload
             .get("reservation_acquire")
             .expect("reservation_acquire context block");
         assert_eq!(
@@ -2386,9 +2396,10 @@ mod tests {
             do_not_edit, paths,
             "a corruption-driven acquire failure must mark every requested path do-not-edit"
         );
-        // Reuses the A1/A2 classified envelope rather than inventing a new one.
+        // Reuses the A1/A2 classified envelope (grafted alongside it) rather than
+        // inventing a new one.
         assert!(
-            data.get("db_error_classification").is_some(),
+            payload.get("db_error_classification").is_some(),
             "F5 must reuse the A1 classification envelope from db_error_to_mcp_error"
         );
     }
@@ -2400,7 +2411,11 @@ mod tests {
         let err = DbError::ResourceBusy("database is locked".to_string());
         let mcp = reservation_acquire_failure(&paths, "file_reservation_paths", err);
         let data = mcp.data.expect("data");
-        let acq = data
+        let payload = data
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .expect("legacy error.data payload");
+        let acq = payload
             .get("reservation_acquire")
             .expect("reservation_acquire context block");
         assert_eq!(acq.get("fail_closed").and_then(Value::as_bool), Some(true));
@@ -2413,7 +2428,7 @@ mod tests {
             cause, "main_db_btree_corruption",
             "a busy/unavailable failure must not be misclassified as corruption"
         );
-        assert!(data.get("db_error_classification").is_some());
+        assert!(payload.get("db_error_classification").is_some());
     }
 
     fn with_serialized_reservations<F, T>(f: F) -> T
