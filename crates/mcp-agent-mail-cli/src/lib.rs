@@ -69146,6 +69146,54 @@ struct BlockingHttpResponse {
 const JSONRPC_BLOCKING_MAX_HEADER_BYTES: usize = 64 * 1024;
 const JSONRPC_BLOCKING_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Per-`read()` polling interval for the blocking HTTP client. Kept short so a
+/// signal-interrupted (`EINTR`) or slow-trickle read is retried promptly within
+/// the overall request deadline rather than parking for the full timeout.
+const JSONRPC_BLOCKING_READ_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Read one chunk from a blocking HTTP stream, transparently retrying on
+/// signal-interrupted (`EINTR`) and timeout-class (`WouldBlock`/`TimedOut`)
+/// reads until `deadline`.
+///
+/// GH#170: the blocking `read()` runs inside an async runtime worker thread, and
+/// a runtime that delivers wakeup/cancellation signals to its worker threads
+/// will interrupt any blocking `recv()` with `EINTR` (`os error 4`). A bare
+/// `read()?` mapped that transient interrupt straight to a fatal
+/// "transport failure", which `server_tool_error_is_unavailable` then treated as
+/// "server unavailable" and used to refuse the local SQLite fallback because the
+/// (healthy) daemon owns the mailbox lock — converting a retryable interrupt
+/// into a hard failure with no escape path for every proxied call. The
+/// server-side request reader and the test HTTP helper already retry on
+/// `Interrupted`; this is the one client reader that omitted it. A genuine
+/// timeout (no data by `deadline`) still surfaces as a fatal transport error.
+fn read_blocking_http_chunk<R: std::io::Read>(
+    stream: &mut R,
+    chunk: &mut [u8],
+    server_url: &str,
+    deadline: std::time::Instant,
+) -> CliResult<usize> {
+    loop {
+        match stream.read(chunk) {
+            Ok(read) => return Ok(read),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "transport failure calling {server_url}: {error}"
+                )));
+            }
+        }
+    }
+}
+
 fn parse_blocking_http_port(port_text: &str, authority: &str) -> CliResult<u16> {
     port_text.parse::<u16>().map_err(|error| {
         CliError::Other(format!(
@@ -69270,6 +69318,7 @@ fn read_http_body_bytes(
     server_url: &str,
     body: &mut Vec<u8>,
     content_length: usize,
+    deadline: std::time::Instant,
 ) -> CliResult<()> {
     if content_length > JSONRPC_BLOCKING_MAX_BODY_BYTES {
         return Err(CliError::Other(format!(
@@ -69280,9 +69329,7 @@ fn read_http_body_bytes(
 
     let mut chunk = [0_u8; 8192];
     while body.len() < content_length {
-        let read = std::io::Read::read(stream, &mut chunk).map_err(|error| {
-            CliError::Other(format!("transport failure calling {server_url}: {error}"))
-        })?;
+        let read = read_blocking_http_chunk(stream, &mut chunk, server_url, deadline)?;
         if read == 0 {
             return Err(CliError::Other(format!(
                 "truncated HTTP response from {server_url}: expected {content_length} body bytes, got {}",
@@ -69299,13 +69346,12 @@ fn read_http_body_bytes(
 fn read_blocking_http_response(
     stream: &mut std::net::TcpStream,
     server_url: &str,
+    deadline: std::time::Instant,
 ) -> CliResult<BlockingHttpResponse> {
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 8192];
     let header_end = loop {
-        let read = std::io::Read::read(stream, &mut chunk).map_err(|error| {
-            CliError::Other(format!("transport failure calling {server_url}: {error}"))
-        })?;
+        let read = read_blocking_http_chunk(stream, &mut chunk, server_url, deadline)?;
         if read == 0 {
             break find_http_header_end(&raw);
         }
@@ -69364,16 +69410,25 @@ fn read_blocking_http_response(
 
     let mut body = raw[header_end..].to_vec();
     if let Some(length) = content_length {
-        read_http_body_bytes(stream, server_url, &mut body, length)?;
+        read_http_body_bytes(stream, server_url, &mut body, length, deadline)?;
     } else {
-        std::io::Read::read_to_end(stream, &mut body).map_err(|error| {
-            CliError::Other(format!("transport failure calling {server_url}: {error}"))
-        })?;
-        if body.len() > JSONRPC_BLOCKING_MAX_BODY_BYTES {
-            return Err(CliError::Other(format!(
-                "response body from {server_url} exceeds {} byte limit",
-                JSONRPC_BLOCKING_MAX_BODY_BYTES
-            )));
+        // No Content-Length: read until the peer closes (Connection: close).
+        // Drain via the EINTR-aware chunk reader (GH#170) rather than
+        // `read_to_end`, whose internal loop would still surface a transient
+        // signal interrupt as a fatal transport error.
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = read_blocking_http_chunk(stream, &mut chunk, server_url, deadline)?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+            if body.len() > JSONRPC_BLOCKING_MAX_BODY_BYTES {
+                return Err(CliError::Other(format!(
+                    "response body from {server_url} exceeds {} byte limit",
+                    JSONRPC_BLOCKING_MAX_BODY_BYTES
+                )));
+            }
         }
     }
 
@@ -69419,7 +69474,9 @@ fn post_jsonrpc_request_blocking_http(
         .map_err(|error| CliError::Other(format!("failed to encode JSON-RPC request: {error}")))?;
     let timeout = std::time::Duration::from_secs(timeout_seconds.max(1));
     let mut stream = connect_blocking_http(&target, timeout, server_url)?;
-    stream.set_read_timeout(Some(timeout))?;
+    // Short per-read poll interval so an EINTR / slow-trickle read is retried
+    // promptly; the overall response wait is bounded by `deadline` below (GH#170).
+    stream.set_read_timeout(Some(JSONRPC_BLOCKING_READ_POLL))?;
     stream.set_write_timeout(Some(timeout))?;
 
     let authorization = if let Some(token) = bearer.filter(|value| !value.is_empty()) {
@@ -69449,7 +69506,12 @@ fn post_jsonrpc_request_blocking_http(
         CliError::Other(format!("transport failure calling {server_url}: {error}"))
     })?;
 
-    Ok(Some(read_blocking_http_response(&mut stream, server_url)?))
+    let deadline = std::time::Instant::now() + timeout;
+    Ok(Some(read_blocking_http_response(
+        &mut stream,
+        server_url,
+        deadline,
+    )?))
 }
 
 fn get_blocking_http_request(
@@ -69461,7 +69523,8 @@ fn get_blocking_http_request(
     };
     let timeout = std::time::Duration::from_secs(timeout_seconds.max(1));
     let mut stream = connect_blocking_http(&target, timeout, server_url)?;
-    stream.set_read_timeout(Some(timeout))?;
+    // Short per-read poll interval; overall wait bounded by `deadline` (GH#170).
+    stream.set_read_timeout(Some(JSONRPC_BLOCKING_READ_POLL))?;
     stream.set_write_timeout(Some(timeout))?;
 
     let head = format!(
@@ -69475,7 +69538,103 @@ fn get_blocking_http_request(
         CliError::Other(format!("transport failure calling {server_url}: {error}"))
     })?;
 
-    Ok(Some(read_blocking_http_response(&mut stream, server_url)?))
+    let deadline = std::time::Instant::now() + timeout;
+    Ok(Some(read_blocking_http_response(
+        &mut stream,
+        server_url,
+        deadline,
+    )?))
+}
+
+#[cfg(test)]
+mod blocking_http_chunk_tests {
+    use super::{CliError, read_blocking_http_chunk};
+    use std::io::{Error, ErrorKind, Read};
+
+    /// A `Read` that replays a scripted sequence of results, one per `read()`.
+    struct ScriptedReader {
+        steps: std::collections::VecDeque<Result<&'static [u8], ErrorKind>>,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: Vec<Result<&'static [u8], ErrorKind>>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+            }
+        }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(Ok(bytes)) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Some(Err(kind)) => Err(Error::from(kind)),
+                // Exhausted script => EOF.
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    }
+
+    #[test]
+    fn eintr_is_retried_not_fatal() {
+        // GH#170: a signal-interrupted read (EINTR) must be retried, not mapped
+        // to a fatal transport failure that refuses the local SQLite fallback.
+        let mut reader = ScriptedReader::new(vec![
+            Err(ErrorKind::Interrupted),
+            Err(ErrorKind::Interrupted),
+            Ok(b"hello"),
+        ]);
+        let mut chunk = [0_u8; 16];
+        let n = read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", far_deadline())
+            .expect("EINTR must be retried");
+        assert_eq!(n, 5);
+        assert_eq!(&chunk[..5], b"hello");
+    }
+
+    #[test]
+    fn timeout_class_is_retried_until_data() {
+        // WouldBlock/TimedOut polls are retried within the deadline budget.
+        let mut reader = ScriptedReader::new(vec![
+            Err(ErrorKind::WouldBlock),
+            Err(ErrorKind::TimedOut),
+            Ok(b"ok"),
+        ]);
+        let mut chunk = [0_u8; 16];
+        let n = read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", far_deadline())
+            .expect("timeout-class reads must be retried");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn non_retryable_error_is_fatal() {
+        // A genuine transport error (e.g. connection reset) is still fatal.
+        let mut reader = ScriptedReader::new(vec![Err(ErrorKind::ConnectionReset)]);
+        let mut chunk = [0_u8; 16];
+        let err =
+            read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", far_deadline())
+                .expect_err("connection reset must be fatal");
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
+    }
+
+    #[test]
+    fn interrupt_past_deadline_is_fatal() {
+        // If EINTR keeps firing past the deadline, the call eventually fails
+        // (a genuinely wedged endpoint must not loop forever).
+        let mut reader = ScriptedReader::new(vec![Err(ErrorKind::Interrupted); 8]);
+        let mut chunk = [0_u8; 16];
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = read_blocking_http_chunk(&mut reader, &mut chunk, "http://x/mcp/", past)
+            .expect_err("past-deadline interrupt must be fatal");
+        assert!(matches!(err, CliError::Other(msg) if msg.contains("transport failure calling")));
+    }
 }
 
 fn decode_jsonrpc_http_response(
