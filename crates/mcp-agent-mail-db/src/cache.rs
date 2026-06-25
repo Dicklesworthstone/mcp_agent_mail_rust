@@ -655,12 +655,27 @@ impl ReadCache {
     pub fn put_agent_scoped(&self, scope: &str, agent: &AgentRow) {
         let scope_fp = scope_fingerprint(scope);
         let shared = Arc::new(agent.clone());
-        let mut by_key = self.agents_by_key.write();
         let name_lower = agent.name.to_ascii_lowercase();
-        by_key.insert(
-            (scope_fp, agent.project_id, InternedStr::new(&name_lower)),
-            CacheEntry::new(Arc::clone(&shared)),
-        );
+        {
+            let mut by_key = self.agents_by_key.write();
+            let key = (scope_fp, agent.project_id, InternedStr::new(&name_lower));
+            // GH#169: the name key is case-insensitive (matching SQL COLLATE
+            // NOCASE), so two case-variant rows from a registration race share
+            // it. Pin the mapping to the canonical (lowest-id) row — the same
+            // row resolved by `ORDER BY id ASC` in queries.rs — so a name lookup
+            // (e.g. resolving the caller for a reservation release) never
+            // resolves to a shadow duplicate after a `get_agent_by_id` on the
+            // higher-id variant cached it here. The same id (or no existing id)
+            // still refreshes; only a strictly-higher duplicate id is prevented
+            // from displacing the canonical mapping.
+            let displaces_canonical = matches!(
+                (agent.id, by_key.peek(&key).and_then(|e| e.value.id)),
+                (Some(new_id), Some(existing_id)) if existing_id < new_id
+            );
+            if !displaces_canonical {
+                by_key.insert(key, CacheEntry::new(Arc::clone(&shared)));
+            }
+        }
         if let Some(id) = agent.id {
             let mut by_id = self.agents_by_id.write();
             by_id.insert((scope_fp, id), CacheEntry::new(shared));
@@ -1314,6 +1329,35 @@ mod tests {
             "the by-id entry for the actually-cached id (10) must not orphan when \
              the invalidation hint (20) differs"
         );
+    }
+
+    #[test]
+    fn put_agent_keeps_canonical_lowest_id_for_name() {
+        // GH#169: the case-insensitive name key shared by two case-variant rows
+        // must stay pinned to the canonical (lowest-id) row, so a later
+        // get_agent_by_id on the higher-id duplicate cannot poison name
+        // resolution (which would leak a file reservation: release would resolve
+        // a different id than grant did).
+        let cache = ReadCache::new();
+
+        // Canonical (first-registered) row, lowest id.
+        cache.put_agent(&make_agent_with_id("bluelake", 1, 10));
+        assert_eq!(cache.get_agent(1, "BlueLake").and_then(|a| a.id), Some(10));
+
+        // A higher-id case variant gets cached (e.g. resolving a reservation
+        // owner by id). It must NOT displace the canonical name mapping.
+        cache.put_agent(&make_agent_with_id("BlueLake", 1, 20));
+        assert_eq!(
+            cache.get_agent(1, "bluelake").and_then(|a| a.id),
+            Some(10),
+            "higher-id duplicate must not poison the canonical name key"
+        );
+        // The by-id cache still holds the duplicate under its own id.
+        assert_eq!(cache.get_agent_by_id(20).and_then(|a| a.id), Some(20));
+
+        // A re-put of the canonical (same id) still refreshes the name mapping.
+        cache.put_agent(&make_agent_with_id("bluelake", 1, 10));
+        assert_eq!(cache.get_agent(1, "BlueLake").and_then(|a| a.id), Some(10));
     }
 
     #[test]

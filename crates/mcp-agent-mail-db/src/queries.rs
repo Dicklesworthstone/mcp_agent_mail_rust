@@ -1618,11 +1618,13 @@ async fn verify_agent_visible_after_commit(
     project_id: i64,
     name: &str,
 ) -> Outcome<AgentRow, DbError> {
+    // GH#169: resolve the canonical (lowest-id) variant deterministically, the
+    // same row get_agent / register_agent reuse resolves.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               LIMIT 1";
+               ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
     let fresh_result = match durability_probe_query(cx, pool, sql, &params).await {
         Outcome::Ok(rows) => rows.first().map_or_else(
@@ -4140,7 +4142,7 @@ pub async fn register_agent(
                      registration_token \
                      FROM agents \
                      WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                     LIMIT 1";
+                     ORDER BY id ASC LIMIT 1";
     let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
     let existing_before = match durability_probe_query(cx, pool, fetch_sql, &fetch_params).await {
         Outcome::Ok(rows) => rows.first().map(decode_agent_row_indexed),
@@ -4395,11 +4397,14 @@ pub async fn create_agent(
 
             let task_desc = task_description.unwrap_or_default();
             let attach_pol = attachments_policy.unwrap_or("auto");
+            // GH#169: resolve the canonical (first-registered / lowest-id) row
+            // deterministically so the duplicate check matches what get_agent
+            // resolves; see the get_agent note for the full rationale.
             let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
                              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                              registration_token \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                             LIMIT 1";
+                             ORDER BY id ASC LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
             // Fast duplicate check before insert.
@@ -4568,11 +4573,20 @@ pub async fn get_agent(
     let tracked = tracked(&*conn);
 
     // Optimized: filter by name directly in SQL (case-insensitive).
+    //
+    // GH#169: a case-insensitive lookup against a BINARY-unique `agents` table
+    // can match several case-variant rows (e.g. `BlueLake` and `bluelake`,
+    // created by a concurrent multi-pane registration race). `LIMIT 1` with no
+    // `ORDER BY` picks a row non-deterministically, so the same `agent_name`
+    // could resolve to a different `agent_id` over time — leaking file
+    // reservations (release resolves to a different id than grant did). Pin a
+    // stable canonical row: the first-registered (lowest `id`) variant. Grant
+    // and release then always resolve to the same row.
     let sql = "SELECT id, project_id, name, program, model, task_description, \
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               LIMIT 1";
+               ORDER BY id ASC LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
@@ -5043,11 +5057,14 @@ pub async fn set_agent_contact_policy_by_name(
         let now = now_micros();
 
         // Resolve row first so we can preserve attachments_policy explicitly.
+        // GH#169: pin the same canonical (lowest-id) row get_agent resolves so a
+        // policy set here actually applies to the row reads resolve back to when
+        // case-variant duplicates exist.
         let current_sql = "SELECT id, project_id, name, program, model, task_description, \
                            inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                            registration_token \
                            FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                           ORDER BY last_active_ts DESC, id DESC LIMIT 1";
+                           ORDER BY id ASC LIMIT 1";
         let current_params = [
             Value::BigInt(project_id),
             Value::Text(normalized_name.to_string()),
@@ -11559,7 +11576,8 @@ pub async fn insert_system_agent(
         let select_sql = "SELECT id, project_id, name, program, model, task_description, \
                           inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                           registration_token \
-                          FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE LIMIT 1";
+                          FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                          ORDER BY id ASC LIMIT 1";
         let select_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
         let rows = try_in_tx!(
             cx,
@@ -16734,6 +16752,112 @@ mod tests {
                 .into_result()
                 .expect("list agents");
             assert_eq!(agents.len(), 1);
+        });
+    }
+
+    #[test]
+    fn get_agent_resolves_case_variant_duplicates_deterministically() {
+        // GH#169: when a concurrent multi-pane registration race leaves two
+        // case-variant rows (e.g. `bluelake` and `BlueLake`) under the
+        // BINARY-unique agents table, get_agent must resolve EVERY casing to the
+        // same canonical (first-registered / lowest-id) row. Otherwise a file
+        // reservation granted under one resolved id can never be released via
+        // another casing (the lease leaks until TTL).
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("get_agent_case_variant_dedup.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        // Older DBs may lack the NOCASE guard, so case-variant rows can coexist.
+        init_conn
+            .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+            .ok();
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-get-agent-dup-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            // First registration -> canonical lowest-id row.
+            let first = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "bluelake",
+                "codex-cli",
+                "gpt-5",
+                Some("first"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register bluelake");
+            let canonical_id = first.id.expect("first id");
+
+            // Inject a second, exact-case-variant row directly (the race that
+            // register_agent's NOCASE pre-check would otherwise have collapsed).
+            // Use the pool's own connection so the duplicate is guaranteed
+            // visible to the subsequent get_agent reads.
+            let now = now_micros();
+            let dup_sql = "INSERT INTO agents (project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                 VALUES (?, 'BlueLake', 'codex-cli', 'gpt-5', '', ?, ?, 'auto', 'auto', 0)";
+            let dup_params = [
+                Value::BigInt(project_id),
+                Value::BigInt(now),
+                Value::BigInt(now),
+            ];
+            {
+                let conn = acquire_conn(&cx, &pool).await.into_result().expect("conn");
+                let tracked = tracked(&*conn);
+                map_sql_outcome(traw_execute(&cx, &tracked, dup_sql, &dup_params).await)
+                    .into_result()
+                    .expect("insert duplicate case variant");
+            }
+            // Clear any cached name->row mapping so resolution goes through SQL.
+            crate::read_cache().clear();
+
+            // Every casing must resolve to the canonical (lowest-id) row.
+            for casing in ["BlueLake", "bluelake", "BLUELAKE", "BlUeLaKe"] {
+                let resolved = get_agent(&cx, &pool, project_id, casing)
+                    .await
+                    .into_result()
+                    .unwrap_or_else(|e| panic!("get_agent({casing}) failed: {e:?}"));
+                assert_eq!(
+                    resolved.id,
+                    Some(canonical_id),
+                    "casing {casing:?} must resolve to the canonical lowest-id row"
+                );
+                crate::read_cache().clear();
+            }
         });
     }
 
