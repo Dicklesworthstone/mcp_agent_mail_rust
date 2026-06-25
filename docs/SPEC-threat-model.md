@@ -69,6 +69,9 @@ account boundaries and disk controls for confidentiality at rest.
 | ATC data minimization | ATC learning is a validated opt-in hot path (`shadow`/`live` via `AM_ATC_WRITE_MODE`); privacy follow-up tracked in `br-bn0vb.22` | Partial; durable learning exists, but redaction/minimization work should land before any default-on promotion |
 | Installer integrity | `install.sh` supports `--verify` with checksum and Sigstore cosign validation | `✓` Available; provenance checks are still optional and operators can skip them |
 | Supply chain | Explicit `Cargo.lock`, release process, and documented verification paths | Partial; recommend recurring `cargo audit` / dependency review cadence |
+| Doctor support bundle | `am doctor support-bundle` deliberately omits raw SQLite files, canonical message files, bodies, and attachments; `--redact-subjects` masks subjects; `manifest.json` lists every included file, redaction mode, and omitted-evidence class | `✓` Review `manifest.json` before sharing; redaction is opt-in for subjects and must be chosen when subjects are sensitive |
+| Doctor `--fix` / `undo` | Single `mutate()` chokepoint, verbatim hash-witnessed backups, atomic write-then-rename, no deletion (quarantine via `Op::Rename`), scope-bounded writes, symlink-safe; `undo` restores byte-identically and refuses to clobber files modified after the fix | `✓` Reversible and auditable; protection assumes the `.doctor/runs` artifacts are not tampered with out-of-band |
+| Degraded-mode intent artifacts | Durable queued-intent JSONL (release/send/ack) written `0600`, symlink-rejected, content-`sha256` hash-witnessed with replay-dedup, replayed idempotently and re-validated before applying | `✓` Fails closed when the mailbox is unavailable; replay re-checks current state so it never force-applies a stale intent |
 
 ## Out of Scope
 

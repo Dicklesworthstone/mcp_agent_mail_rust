@@ -263,18 +263,20 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 `am doctor` diagnoses and (with `--fix`) repairs Agent Mail's mailbox state. The world-class surface (added in commit `641990d8`, hardened in pass-2) provides reversible, hash-witnessed, agent-ergonomic remediation with strict scope isolation.
 
-### Verbs (16 total — pass-30 baseline + D4 drain)
+### Verbs (counts drift fast — `am doctor fixers` / `capabilities --json` are authoritative)
 
 | Verb | Mutates? | Default exit |
 |------|----------|--------------|
 | `am doctor` (or `check`) | No | 0 healthy / 1 findings |
 | `am doctor drain` | No (read-only) | 0 |
+| `am doctor locks` (`--json`) | No (read-only owner intelligence — D1) | 0 |
 | `am doctor --fix` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
 | `am doctor --dry-run --fix` | No | 0 |
 | `am doctor fix --only <fm-id>` | Yes (via `mutate()`) | 0 / 3 / 4 / 64 |
 | `am doctor fix --only <fm-id> --list` | No | 0 |
 | `am doctor fix --list` | No | 0 |
 | `am doctor undo <run-id>` | Yes (restore-only) | 0 / 3 |
+| `am doctor reclaim` | Yes (consolidates stale debris) | 0 |
 | `am doctor capabilities --json` | No | 0 |
 | `am doctor fixers` | No | 0 |
 | `am doctor explain <id>` | No | 0 / 64 |
@@ -283,6 +285,10 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 | `am doctor ls` | No | 0 |
 | `am doctor triage` | No | 0 |
 | `am doctor selftest` | No | 0 / 1 |
+| `am doctor mcp-selftest` | No (live MCP probe — C2) | 0 / 1 |
+| `am doctor write-selftest` | No (write-path probe — C3) | 0 / 1 |
+| `am doctor support-bundle` (`--json`) | Writes a sanitized support bundle only (N2) | 0 |
+| `am doctor artifacts` | No (read-only run inventory) | 0 |
 
 Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
 

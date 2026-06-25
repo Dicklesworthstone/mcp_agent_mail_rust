@@ -315,10 +315,21 @@ PROJECT=/abs/path/project
 
 am doctor check "$PROJECT" --format toon
 am doctor backups --format toon
+
+# Reliability diagnostics (all read-only; run before any mutating repair):
+am doctor health --format json        # one-line multi-verdict health rollup
+am doctor locks --json                # owner intelligence: who holds the mailbox (live/wedged/stale)
+am doctor drain                       # is it safe_to_mutate right now? (no live owner)
+am doctor mcp-selftest --format json  # live MCP round-trip self-test
+am doctor reclaim --dry-run           # preview consolidation of stale .doctor run debris
+am doctor support-bundle --json       # sanitized incident bundle for maintainer triage (no raw DB/bodies)
 ```
 
 **Expected output:** `doctor check` reports archive or database problems, and
 `doctor backups` lists any available backup snapshots or recovery artifacts.
+`doctor locks` / `doctor drain` tell you whether a live `am` still owns the
+mailbox — `repair` and `reconstruct` refuse while a live owner is present, so
+drain it via your supervisor first (never kill `am` directly).
 
 **Troubleshooting:** If the mailbox lock is busy, wait for the current archive
 operation to finish and retry. Run repair commands only after reading the doctor

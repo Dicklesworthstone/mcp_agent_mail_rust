@@ -916,7 +916,17 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint notifications |
 | `AM_TUI_EFFECTS` | `true` | Enable text/animation effects |
 | `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
+| `AM_TUI_FULL_REDRAW_MAX_SECS` | `1.0` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs incremental-diff render desync; `<= 0` disables the bound |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
+| `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run `PRAGMA integrity_check` during startup self-heal (set `false` to fast-unblock a degraded boot) |
+| `STARTUP_READINESS_BIND_TIMEOUT_SECS` | `20` | Max seconds to wait for DB readiness before binding the listener anyway (`/healthz` stays up while the DB warms) |
+| `DB_MAINTENANCE_ENABLED` | `true` | Enable the off-hot-path periodic SQLite maintenance worker (checkpoint/ANALYZE/VACUUM/journal-size cap) |
+| `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
+| `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
+| `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
+| `DB_JOURNAL_SIZE_LIMIT_BYTES` | `268435456` | `journal_size_limit` WAL truncation cap (256 MiB) |
+| `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
+| `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 
@@ -1435,6 +1445,7 @@ What `check` inspects:
 | Port 8765 already in use | `am serve-http --port 9000` or stop the existing server |
 | TUI not rendering | Check `TUI_ENABLED=true` and that your terminal supports 256 colors |
 | TUI appears **frozen** (render/input stuck, but the process is still serving MCP/API) | Do **not** kill the process. Run the non-interactive freeze escape hatch `am tui-dump --format json`: it returns the same situational snapshot the TUI renders, fetched live from `/mail/ws-state` (including a per-loop liveness verdict that names the stalled loop) and falling back to a local SQLite read if the whole process is wedged. Always exits 0. `am robot health --format json` also classifies the stall and points at the same read-out. If the freeze persists, restart headless: `mcp-agent-mail serve --no-tui`. |
+| TUI shows **garbled / stale cells** (render corruption that clears on resize) | A guaranteed full redraw is bounded by wall clock: `AM_TUI_FULL_REDRAW_MAX_SECS` (default `1.0`s). Lower it (e.g. `0.25`) to repair incremental-diff desync faster, or set `<= 0` to disable the bound. Ensure you are on the latest build — confirm with `am --version` and reinstall via `./install-local.sh` if stale, since render fixes ship in the binary, not the running session. |
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
