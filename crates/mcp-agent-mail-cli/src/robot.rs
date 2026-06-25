@@ -849,6 +849,11 @@ struct RobotEnvelopeView<'a, T: Serialize> {
     _actions: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     _diagnostics: Option<&'a TailLatencyPhaseLedger>,
+    // E4 (br-bvq1x.5.4): the view must carry the safe-remediation contract too,
+    // otherwise `with_remediation` is silently dropped on the real output path
+    // (the bare-struct serialization in the unit test does NOT exercise this view).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _remediation: Option<&'a RobotRemediation>,
     #[serde(flatten)]
     data: &'a T,
 }
@@ -871,6 +876,7 @@ fn serialize_envelope_with_format<T: Serialize>(
         _alerts: &envelope._alerts,
         _actions: &envelope._actions,
         _diagnostics: envelope._diagnostics.as_ref(),
+        _remediation: envelope._remediation.as_ref(),
         data: &envelope.data,
     };
     if pretty {
@@ -23286,12 +23292,14 @@ mod tests {
     fn robot_envelope_serializes_remediation_when_present_and_omits_when_absent() {
         // E4 (br-bvq1x.5.4): the robot envelope carries the safe-remediation
         // contract when attached (failure path) and OMITS it on success — so a
-        // healthy response is never polluted. The robot-health DB-failure path is
-        // wired the same way (`with_remediation` when `!db_ok`), but is not
-        // unit-testable end-to-end: frankensqlite's `open_file` is lenient enough
-        // that the db_connectivity probe cannot be reliably forced to fail, so the
-        // contract logic is covered by the classifier + `from_db_error` tests above
-        // and the envelope serialization is covered here.
+        // healthy response is never polluted.
+        //
+        // This MUST go through the real `format_output` path (which serializes a
+        // `RobotEnvelopeView`, not the bare struct): an earlier revision dropped
+        // `_remediation` from that view, so `with_remediation` was silently lost on
+        // the wire even though a bare `serde_json::to_value(&env)` looked correct.
+        // The end-to-end DB-failure path is also covered by
+        // tests/e2e/test_cli_mcp_surface.sh (E4) against a real `am`.
         let with = RobotEnvelope::new(
             "robot health",
             OutputFormat::Json,
@@ -23300,11 +23308,12 @@ mod tests {
         .with_remediation(RobotRemediation::from_db_error_message(
             "database disk image is malformed",
         ));
-        let v = serde_json::to_value(&with).expect("serialize envelope");
+        let rendered = format_output(&with, OutputFormat::Json).expect("render envelope");
+        let v: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
         let rem = v
             .get("_remediation")
             .and_then(serde_json::Value::as_object)
-            .expect("_remediation must serialize when attached");
+            .expect("_remediation must serialize through the real output view when attached");
         for field in [
             "recommended_command",
             "operator_only",
@@ -23331,7 +23340,8 @@ mod tests {
             OutputFormat::Json,
             serde_json::json!({ "overall": "healthy" }),
         );
-        let v2 = serde_json::to_value(&without).expect("serialize envelope");
+        let rendered2 = format_output(&without, OutputFormat::Json).expect("render envelope");
+        let v2: serde_json::Value = serde_json::from_str(&rendered2).expect("valid JSON");
         assert!(
             v2.get("_remediation").is_none(),
             "_remediation must be omitted on a healthy response: {v2}"
