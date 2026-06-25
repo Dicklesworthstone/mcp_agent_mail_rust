@@ -25097,18 +25097,64 @@ fn doctor_archive_inventory_suffix(archive: &DoctorArchiveInventory) -> String {
     }
 }
 
+/// A4 (br-bvq1x.1.4): resolve the on-disk path for `database_url` so the
+/// corruption-authority chokepoint can run the canonical double-probe. Returns
+/// `None` for `:memory:` / unresolvable URLs, where there is no file to
+/// cross-check.
+fn doctor_resolved_sqlite_path(database_url: &str) -> Option<PathBuf> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let configured_path = cfg.sqlite_path().ok()?;
+    if configured_path == ":memory:" {
+        return None;
+    }
+    Some(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        &configured_path,
+    )))
+}
+
+/// A4 (br-bvq1x.1.4): the single chokepoint. Every `am` database fix strategy is
+/// produced by [`doctor_database_fix_strategy_with_wal_cleanup`] and then routed
+/// here, so no corruption-class verdict reaches the health/JSON reporting surface
+/// without passing through [`doctor_enforce_corruption_verdict_authority`].
+fn doctor_enforce_verdict_authority_for_url(
+    database_url: &str,
+    verdict: DoctorDatabaseFixStrategy,
+) -> DoctorDatabaseFixStrategy {
+    // Non-destructive verdicts need no cross-check (and this avoids an extra probe
+    // on the common healthy path).
+    if matches!(verdict, DoctorDatabaseFixStrategy::None(_)) {
+        return verdict;
+    }
+    match doctor_resolved_sqlite_path(database_url) {
+        Some(resolved) => doctor_enforce_corruption_verdict_authority(&resolved, verdict),
+        // No on-disk file to cross-check (e.g. :memory:); leave the verdict as-is.
+        None => verdict,
+    }
+}
+
 fn doctor_database_fix_strategy(
     database_url: &str,
     storage_root: &Path,
 ) -> CliResult<DoctorDatabaseFixStrategy> {
-    doctor_database_fix_strategy_with_wal_cleanup(database_url, storage_root, true)
+    let verdict = doctor_database_fix_strategy_with_wal_cleanup(database_url, storage_root, true)?;
+    Ok(doctor_enforce_verdict_authority_for_url(
+        database_url,
+        verdict,
+    ))
 }
 
 fn doctor_database_fix_strategy_read_only(
     database_url: &str,
     storage_root: &Path,
 ) -> CliResult<DoctorDatabaseFixStrategy> {
-    doctor_database_fix_strategy_with_wal_cleanup(database_url, storage_root, false)
+    let verdict = doctor_database_fix_strategy_with_wal_cleanup(database_url, storage_root, false)?;
+    Ok(doctor_enforce_verdict_authority_for_url(
+        database_url,
+        verdict,
+    ))
 }
 
 fn doctor_truncated_wal_sidecar_detail(sqlite_path: &Path) -> Option<String> {
@@ -25368,35 +25414,90 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     }
 }
 
-/// br-bvq1x.1.6 / .1.3 (A3): gate a CHEAP-probe corruption verdict on the
-/// AUTHORITATIVE canonical double-probe cross-check before it can drive a
-/// destructive `Reconstruct`/`Repair` (the `am doctor health` verdict) or the
-/// daemon's startup auto-reconstruct.
+/// A4 (br-bvq1x.1.4): pure classifier — does this recovery-verdict detail assert
+/// AUTHORITATIVE on-disk corruption (a "malformed"/integrity-check claim) as
+/// opposed to a STRUCTURAL or relational recovery reason?
 ///
-/// The cheap file-sanity gate uses `quick_check` / an engine open, which can
-/// FALSE-flag a healthy DB as corrupt when it races a transient state — a
-/// mid-checkpoint WAL, or a write/open cancelled by an external deadline/clock
-/// bug (the 2026-06-17 asupersync `wall_now` incident). The startup health gate
-/// then rewrites a perfectly healthy `storage.sqlite3` on every boot, which is
-/// itself a corruption RISK and erodes trust in every verdict.
+/// Only a corruption claim is gated by the canonical cross-check. Structural
+/// recoveries (missing core tables, archive-ahead drift) and relational repairs
+/// (orphaned recipient rows, foreign-key cleanup) are legitimate non-corruption
+/// recovery actions and MUST pass through untouched — their details are keyed off
+/// counts and identities, never an on-disk-corruption signature, so they never
+/// match the TRUE set below. Returning `true` makes
+/// [`doctor_enforce_corruption_verdict_authority`] demand an agreeing canonical
+/// double-probe before the claim can stand.
+fn doctor_verdict_is_authoritative_corruption_claim(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("malformed")
+        || lower.contains("integrity_check failed")
+        || lower.contains("disk image")
+        || lower.contains("possible corruption")
+        || lower.contains("database sanity probe failed")
+        || lower.contains("torn b-tree")
+}
+
+/// A4: an `Inconclusive` cross-check keeps the precautionary RECOVERY ACTION but
+/// relabels the AUTHORITY — `am` never surfaces an authoritative
+/// database-corruption verdict from an engine that could not answer. The recovery
+/// variant (`Reconstruct`/`Repair`) is preserved; only the detail's authority is
+/// qualified to the A1 `engine_probe_limitation` class (a stable class string the
+/// N3 taxonomy e2e depends on).
+fn doctor_relabel_recovery_verdict_authority(
+    verdict: DoctorDatabaseFixStrategy,
+    inconclusive_reason: &str,
+    original_detail: &str,
+) -> DoctorDatabaseFixStrategy {
+    let reclass = mcp_agent_mail_db::DbErrorClass::EngineProbeLimitation;
+    let relabeled = format!(
+        "precautionary recovery retained, but the canonical double-probe cross-check could not \
+         authoritatively confirm on-disk corruption ({}); classifying the trigger as {} rather \
+         than authoritative database corruption (original probe verdict: {})",
+        truncate_doctor_command(inconclusive_reason),
+        reclass.as_str(),
+        truncate_doctor_command(original_detail)
+    );
+    match verdict {
+        DoctorDatabaseFixStrategy::Reconstruct(_) => {
+            DoctorDatabaseFixStrategy::Reconstruct(relabeled)
+        }
+        DoctorDatabaseFixStrategy::Repair(_) => DoctorDatabaseFixStrategy::Repair(relabeled),
+        // Unreachable: the caller already returned early on a `None` verdict.
+        DoctorDatabaseFixStrategy::None(_) => verdict,
+    }
+}
+
+/// br-bvq1x.1.4 (A4) — generalizing br-bvq1x.1.6 / .1.3 (A3): enforce the
+/// reporting-boundary invariant that `am` may not emit an AUTHORITATIVE on-disk
+/// corruption verdict unless an agreeing canonical double-probe confirms it. This
+/// gates a corruption-claim `Reconstruct`/`Repair` (the `am doctor health`
+/// verdict and the daemon's startup auto-reconstruct) on the canonical engine's
+/// full read-only battery before it can drive a destructive rewrite.
 ///
-/// When the verdict is a transient-prone corruption class (the generic
-/// "possible corruption" probe result, or a non-lock sanity-probe ERROR), this
-/// re-probes with [`doctor_canonical_double_probe`] — the canonical engine's
-/// full read-only battery (quick_check, integrity_check, foreign_key_check,
-/// schema-table probe, FTS probe). A `Healthy` cross-check PROVES the DB healthy,
-/// so we reclassify the failure to the A1 `engine_probe_limitation` class,
-/// downgrade to `None`, and decline to rewrite the database (forbidding a lone
-/// unsupported-engine "malformed" from standing — A4).
+/// A3 only gated the transient subset (a cheap "possible corruption" probe result
+/// or a non-lock sanity-probe ERROR). A4 broadens the trigger to the FULL
+/// authoritative-corruption-claim set via
+/// [`doctor_verdict_is_authoritative_corruption_claim`] — `malformed`,
+/// `integrity_check failed`, `disk image`, `torn b-tree`, and the transient
+/// classes — so an unsupported-engine "malformed" can never stand without a
+/// canonical cross-check, no matter which probe raised it. Structural verdicts
+/// (missing core tables, archive drift) and relational repairs (foreign-key /
+/// orphaned-recipient) are not corruption claims and pass through unchanged.
 ///
-/// Fail-safe: we only downgrade on PROVEN health. `ConfirmsCorruption` (an
-/// authoritative check failed) and `Inconclusive` (the engine could not answer)
-/// both leave the conservative recovery verdict untouched, so a real 0-byte /
-/// non-database file or a torn b-tree still recovers — and we never assert
-/// corruption from an engine that cannot answer (A4/M2). Unambiguous structural
-/// verdicts (missing core tables, archive drift) are not in the transient class
-/// and pass through unchanged.
-fn doctor_confirm_or_downgrade_corruption_verdict(
+/// The cheap probes can FALSE-flag a healthy DB when they race a transient state
+/// (a mid-checkpoint WAL, or a write/open cancelled by an external deadline/clock
+/// bug — the 2026-06-17 asupersync `wall_now` incident), so without this gate the
+/// startup health surface would rewrite a perfectly healthy `storage.sqlite3` on
+/// boot, itself a corruption RISK.
+///
+/// Outcomes: a `Healthy` cross-check PROVES the DB healthy, so we reclassify to
+/// the A1 `engine_probe_limitation` class and downgrade to `None` (decline the
+/// rewrite). `ConfirmsCorruption` upholds the recovery verdict. `Inconclusive`
+/// (the engine could not authoritatively answer — including an M2
+/// frankensqlite-probe `DiagnosticEngineLimitation`) keeps the precautionary
+/// recovery ACTION but relabels its authority, so a real 0-byte / non-database
+/// file or torn b-tree still recovers while `am` never asserts corruption from an
+/// engine that cannot answer (A4/M2).
+fn doctor_enforce_corruption_verdict_authority(
     resolved: &Path,
     verdict: DoctorDatabaseFixStrategy,
 ) -> DoctorDatabaseFixStrategy {
@@ -25407,9 +25508,11 @@ fn doctor_confirm_or_downgrade_corruption_verdict(
         DoctorDatabaseFixStrategy::None(_) => return verdict,
     };
 
-    let is_transient_class = original_detail.contains("possible corruption")
-        || original_detail.contains("Database sanity probe failed");
-    if !is_transient_class {
+    // A4: only an authoritative on-disk-corruption claim is gated. Structural and
+    // relational recovery reasons are not corruption claims and pass through
+    // unchanged (a missing-table or archive-drift Reconstruct is a legit rebuild;
+    // an orphaned-recipient / foreign-key Repair is relational hygiene).
+    if !doctor_verdict_is_authoritative_corruption_claim(&original_detail) {
         return verdict;
     }
 
@@ -25425,15 +25528,15 @@ fn doctor_confirm_or_downgrade_corruption_verdict(
                 path = %resolved.display(),
                 suppressed_verdict = %original_detail,
                 reclassified_as = reclass.as_str(),
-                "doctor: cheap probe reported possible corruption but the canonical double-probe \
+                "doctor: a cheap probe asserted on-disk corruption but the canonical double-probe \
                  cross-check (quick_check, integrity_check, foreign_key_check, schema, fts) all \
                  passed; reclassifying as an engine/probe limitation and declining to rewrite a \
-                 healthy database (br-bvq1x.1.3)"
+                 healthy database (br-bvq1x.1.4)"
             );
             DoctorDatabaseFixStrategy::None(format!(
                 "canonical double-probe cross-check passed (quick_check, integrity_check, \
                  foreign_key_check, schema, fts); reclassified as {} — declined to rewrite a \
-                 healthy database (suppressed transient corruption verdict: {})",
+                 healthy database (suppressed unconfirmed corruption verdict: {})",
                 reclass.as_str(),
                 truncate_doctor_command(&original_detail)
             ))
@@ -25448,18 +25551,22 @@ fn doctor_confirm_or_downgrade_corruption_verdict(
             verdict
         }
         DoctorCanonicalCrossCheck::Inconclusive(reason) => {
-            // The canonical engine could not authoritatively answer. Keep the
-            // conservative recovery verdict, but never assert corruption from an
-            // engine that cannot answer (A4/M2).
+            // A4: the canonical engine could not authoritatively answer (open
+            // failure, engine-probe limitation, schema drift, or an M2
+            // frankensqlite `DiagnosticEngineLimitation`). Keep the precautionary
+            // recovery ACTION, but relabel the authority so `am` never surfaces an
+            // authoritative database-corruption verdict from an engine that could
+            // not answer (A4/M2).
             tracing::warn!(
                 path = %resolved.display(),
                 reason = %reason,
                 suppressed_verdict = %original_detail,
                 "doctor: canonical double-probe cross-check was inconclusive (engine could not \
-                 authoritatively answer); keeping the conservative recovery verdict without \
-                 asserting corruption (br-bvq1x.1.3 / A4)"
+                 authoritatively answer); keeping the precautionary recovery action but relabeling \
+                 its authority to an engine/probe limitation rather than authoritative corruption \
+                 (br-bvq1x.1.4 / A4)"
             );
-            verdict
+            doctor_relabel_recovery_verdict_authority(verdict, &reason, &original_detail)
         }
     }
 }
@@ -25778,11 +25885,11 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                     "{detail}; no authoritative archive data is available, attempting in-place repair"
                 ))
             };
-            // br-bvq1x.1.6: confirm the cheap "possible corruption" verdict
-            // against a canonical full integrity_check before rewriting the DB.
-            return Ok(doctor_confirm_or_downgrade_corruption_verdict(
-                resolved, verdict,
-            ));
+            // A4 (br-bvq1x.1.4): the entry-point chokepoint
+            // (`doctor_enforce_verdict_authority_for_url`) cross-checks this
+            // corruption-claim verdict against the canonical double-probe before it
+            // reaches the reporting surface, so return it raw here.
+            return Ok(verdict);
         }
         Err(error) => {
             let verdict = if archive_reconstruct_available {
@@ -25799,12 +25906,10 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                     truncate_doctor_command(&error.to_string())
                 ))
             };
-            // br-bvq1x.1.6: a non-lock sanity-probe error (e.g. a cancelled
-            // pool acquire) must not funnel into a destructive reconstruct when
-            // a canonical full integrity_check proves the DB healthy.
-            return Ok(doctor_confirm_or_downgrade_corruption_verdict(
-                resolved, verdict,
-            ));
+            // A4 (br-bvq1x.1.4): a non-lock sanity-probe error must not funnel
+            // into a destructive reconstruct when the canonical cross-check at the
+            // entry-point chokepoint proves the DB healthy; return it raw here.
+            return Ok(verdict);
         }
         Ok((true, _, _, _)) => {}
     }
@@ -46200,7 +46305,7 @@ startup_timeout_sec = 42
             "Health probes failed for {} (possible corruption); archive recovery is available",
             db_path.display()
         ));
-        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
+        let result = doctor_enforce_corruption_verdict_authority(&db_path, verdict);
         match result {
             DoctorDatabaseFixStrategy::None(detail) => assert!(
                 detail.contains("double-probe cross-check passed")
@@ -46224,7 +46329,7 @@ startup_timeout_sec = 42
             "Database sanity probe failed for {}: operation cancelled",
             db_path.display()
         ));
-        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
+        let result = doctor_enforce_corruption_verdict_authority(&db_path, verdict);
         assert!(
             matches!(result, DoctorDatabaseFixStrategy::None(_)),
             "a transient sanity-probe error on a healthy DB must not reconstruct: {result:?}"
@@ -46241,7 +46346,7 @@ startup_timeout_sec = 42
             "Health probes failed for {} (possible corruption)",
             db_path.display()
         ));
-        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict);
+        let result = doctor_enforce_corruption_verdict_authority(&db_path, verdict);
         assert!(
             matches!(result, DoctorDatabaseFixStrategy::Reconstruct(_)),
             "a genuinely corrupt (non-database) file must keep its recovery verdict: {result:?}"
@@ -46256,14 +46361,15 @@ startup_timeout_sec = 42
 
         // A structural verdict (missing core tables) is unambiguous and must
         // pass through untouched even though the file itself is now healthy —
-        // the gate only intercepts the transient "possible corruption" class.
+        // A4's classifier only intercepts authoritative-corruption claims, never
+        // structural recovery reasons.
         let verdict = DoctorDatabaseFixStrategy::Reconstruct(
             "Core tables missing from /db: messages, agents; reconstruct from archive".to_string(),
         );
-        let result = doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict.clone());
+        let result = doctor_enforce_corruption_verdict_authority(&db_path, verdict.clone());
         assert_eq!(
             result, verdict,
-            "non-transient structural verdicts must not be downgraded"
+            "structural (non-corruption-claim) verdicts must not be downgraded"
         );
     }
 
@@ -46368,7 +46474,7 @@ startup_timeout_sec = 42
              unsupported-op error; archive recovery is available",
             db_path.display()
         ));
-        match doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict) {
+        match doctor_enforce_corruption_verdict_authority(&db_path, verdict) {
             DoctorDatabaseFixStrategy::None(detail) => assert!(
                 detail.contains("engine_probe_limitation")
                     && detail.contains("double-probe cross-check passed"),
@@ -46393,11 +46499,144 @@ startup_timeout_sec = 42
         ));
         assert!(
             matches!(
-                doctor_confirm_or_downgrade_corruption_verdict(&db_path, verdict),
+                doctor_enforce_corruption_verdict_authority(&db_path, verdict),
                 DoctorDatabaseFixStrategy::Reconstruct(_)
             ),
             "a genuinely malformed B-tree must keep its recovery verdict after the cross-check"
         );
+    }
+
+    // --- br-bvq1x.1.4 (A4): authoritative-corruption-claim authority guard ---
+
+    #[test]
+    fn doctor_verdict_is_authoritative_corruption_claim_classifies() {
+        // On-disk-corruption signatures are corruption claims (gated by A4).
+        for detail in [
+            "database disk image is malformed",
+            "PRAGMA integrity_check failed for /db",
+            "Health probes failed for /db (possible corruption)",
+            "Database sanity probe failed for /db: operation cancelled",
+            "torn b-tree page in /db",
+        ] {
+            assert!(
+                doctor_verdict_is_authoritative_corruption_claim(detail),
+                "expected an authoritative-corruption claim for: {detail}"
+            );
+        }
+        // Structural recoveries and relational repairs are NOT corruption claims:
+        // they must pass through the guard untouched.
+        for detail in [
+            "Core tables missing from /db: messages, agents; reconstruct from archive",
+            "Archive canonical data is not fully represented in the SQLite DB (messages archive=9 db=3); reconstruct from archive",
+            "Database consistency issues detected in /db (...): 2 repairable foreign-key violation(s), 1 orphaned message recipient row(s)",
+            "Database file is missing at /db; reconstruct from archive",
+        ] {
+            assert!(
+                !doctor_verdict_is_authoritative_corruption_claim(detail),
+                "structural/relational recovery must not classify as a corruption claim: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_authority_guard_downgrades_unconfirmed_malformed_on_healthy_db() {
+        // A4 generalizes A3 beyond the transient "possible corruption" wording: a
+        // frankensqlite probe that asserts "malformed" (M2 diagnostic engine
+        // limitation) without an agreeing canonical cross-check must NOT surface
+        // an authoritative corruption verdict on a healthy DB.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "foreign_key_check engine=frankensqlite authority=diagnostic_engine_limitation; \
+             database disk image is malformed for {}; archive recovery is available",
+            db_path.display()
+        ));
+        match doctor_enforce_corruption_verdict_authority(&db_path, verdict) {
+            DoctorDatabaseFixStrategy::None(detail) => assert!(
+                detail.contains("engine_probe_limitation")
+                    && detail.contains("double-probe cross-check passed"),
+                "an unconfirmed 'malformed' on a healthy DB must downgrade to an engine-probe \
+                 limitation, got: {detail}"
+            ),
+            other => panic!(
+                "an unconfirmed 'malformed' claim on a healthy DB must not drive a reconstruct: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn doctor_authority_guard_keeps_confirmed_malformed_btree() {
+        // The other direction: a genuine on-disk corruption with a 'malformed'
+        // detail is confirmed by the canonical battery and keeps its recovery
+        // verdict — A4 must never downgrade a confirmed corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("malformed.sqlite3");
+        seed_malformed_btree_db(&db_path);
+
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "database disk image is malformed for {}; archive recovery is available",
+            db_path.display()
+        ));
+        assert!(
+            matches!(
+                doctor_enforce_corruption_verdict_authority(&db_path, verdict),
+                DoctorDatabaseFixStrategy::Reconstruct(_)
+            ),
+            "a canonically-confirmed malformed B-tree must keep its recovery verdict"
+        );
+    }
+
+    #[test]
+    fn doctor_authority_guard_passes_relational_repair_through() {
+        // The critical false-negative guard: a relational Repair (foreign-key /
+        // orphaned recipient) is NOT a corruption claim and must pass through
+        // untouched even on a healthy DB — A4 must not catch it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("healthy.sqlite3");
+        seed_project_only_db(&db_path, "healthy", "/healthy");
+
+        let verdict = DoctorDatabaseFixStrategy::Repair(
+            "Database consistency issues detected in /db (foreign_key_check engine=canonical_sqlite \
+             authority=authoritative): 2 repairable foreign-key violation(s), 1 orphaned message \
+             recipient row(s)"
+                .to_string(),
+        );
+        let result = doctor_enforce_corruption_verdict_authority(&db_path, verdict.clone());
+        assert_eq!(
+            result, verdict,
+            "a relational repair must not be cross-checked or downgraded as a corruption claim"
+        );
+    }
+
+    #[test]
+    fn doctor_authority_guard_relabels_inconclusive_without_asserting_corruption() {
+        // When the canonical engine cannot authoritatively answer (here, a missing
+        // file), A4 keeps the precautionary recovery ACTION but relabels the
+        // authority — it must never surface an unqualified authoritative
+        // corruption verdict from an engine that could not answer.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.sqlite3");
+
+        let verdict = DoctorDatabaseFixStrategy::Reconstruct(format!(
+            "database disk image is malformed for {}; archive recovery is available",
+            db_path.display()
+        ));
+        match doctor_enforce_corruption_verdict_authority(&db_path, verdict) {
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => assert!(
+                detail.contains("engine_probe_limitation")
+                    && detail.contains("could not")
+                    && detail.contains("authoritatively confirm"),
+                "an inconclusive cross-check must keep the recovery action but relabel the \
+                 authority to an engine-probe limitation, got: {detail}"
+            ),
+            other => panic!(
+                "an inconclusive cross-check must preserve the precautionary recovery action: \
+                 {other:?}"
+            ),
+        }
     }
 
     // --- br-mudrv: `am doctor reclaim` verb ---
