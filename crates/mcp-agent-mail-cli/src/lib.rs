@@ -21686,6 +21686,25 @@ fn doctor_relational_integrity_diagnostics(
     conn: &mcp_agent_mail_db::DbConn,
     db_path: &Path,
 ) -> CliResult<DoctorRelationalIntegrityDiagnostics> {
+    // css/ts2 startup-wedge fix: PREFER the canonical (real-SQLite) engine for
+    // the relational battery. It is the AUTHORITATIVE engine for these verdicts
+    // (A4 / br-bvq1x.1.4) and runs `PRAGMA foreign_key_check` in ~10ms via
+    // indexed parent lookups, whereas the bespoke FrankenSQLite engine's
+    // `foreign_key_check` is `O(child_rows × parent_lookup)` and spun the
+    // STARTUP self-heal for minutes on large mailboxes (tens of thousands of
+    // `file_reservations`) — blocking the listener bind so the interactive
+    // server/TUI looked hung (`am` never opened :8765). The bespoke probes
+    // (each with their own canonical-on-error fallback) remain the fallback for
+    // when the canonical file cannot be opened. The read-only `am doctor health`
+    // path already used the canonical engine, which is why it stayed fast while
+    // startup wedged.
+    if db_path.as_os_str() != ":memory:"
+        && let Ok(canonical) =
+            doctor_open_canonical_readonly_db_for_diagnostic(db_path, "relational_integrity")
+        && let Ok(diagnostics) = doctor_relational_integrity_diagnostics_canonical(&canonical)
+    {
+        return Ok(diagnostics);
+    }
     let foreign_key = doctor_foreign_key_violations_with_diagnostic_fallback(conn, db_path)?;
     let orphaned = doctor_orphaned_message_recipients_with_diagnostic_fallback(conn, db_path)?;
     Ok(DoctorRelationalIntegrityDiagnostics {
@@ -26026,30 +26045,35 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     let opened_path = Path::new(&opened.opened_path);
-    let integrity_ok = match sqlite_conn_check_ok_with_canonical_file_fallback(
-        &opened.conn,
-        opened_path,
-        mcp_agent_mail_db::CheckKind::Full,
-    ) {
-        Ok(ok) => ok,
-        Err(error) => {
-            let detail = format!(
-                "PRAGMA integrity_check failed for {}: {error}",
-                opened.opened_path
-            );
-            if is_sqlite_recovery_error_message(&error.to_string()) {
-                return Ok(if archive_reconstruct_available {
-                    DoctorDatabaseFixStrategy::Reconstruct(format!(
-                        "{detail}; reconstruct from archive {}",
-                        archive_root.display()
-                    ))
-                } else {
-                    DoctorDatabaseFixStrategy::Repair(detail)
-                });
+    // css/ts2 startup-wedge fix: run the FULL integrity_check on the canonical
+    // (real-SQLite) engine rather than the bespoke FrankenSQLite engine. The
+    // bespoke `integrity_check` is linear in DB size but slow on a large file,
+    // and `sqlite_conn_check_ok_with_canonical_file_fallback` runs the bespoke
+    // engine FIRST (only falling back to canonical on error) — so on a healthy
+    // large mailbox the slow engine always executed and added seconds to the
+    // startup self-heal. Canonical is fast and authoritative (A4), matching the
+    // read-only `am doctor health` path.
+    let integrity_ok =
+        match sqlite_file_check_ok_canonical(opened_path, mcp_agent_mail_db::CheckKind::Full) {
+            Ok(ok) => ok,
+            Err(error) => {
+                let detail = format!(
+                    "PRAGMA integrity_check failed for {}: {error}",
+                    opened.opened_path
+                );
+                if is_sqlite_recovery_error_message(&error.to_string()) {
+                    return Ok(if archive_reconstruct_available {
+                        DoctorDatabaseFixStrategy::Reconstruct(format!(
+                            "{detail}; reconstruct from archive {}",
+                            archive_root.display()
+                        ))
+                    } else {
+                        DoctorDatabaseFixStrategy::Repair(detail)
+                    });
+                }
+                return Err(CliError::Other(detail));
             }
-            return Err(CliError::Other(detail));
-        }
-    };
+        };
     if !integrity_ok {
         return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -47231,6 +47255,34 @@ startup_timeout_sec = 42
         conn.close_sync().expect("close missing-agent fixture db");
         mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
             .expect("truncate missing-agent fixture WAL");
+    }
+
+    #[test]
+    fn doctor_relational_integrity_diagnostics_prefers_canonical_engine() {
+        // css/ts2 startup-wedge regression guard: the relational battery on the
+        // startup self-heal path MUST run on the canonical (real-SQLite) engine,
+        // not the bespoke FrankenSQLite engine whose PRAGMA foreign_key_check is
+        // O(child_rows × parent_lookup) and pegged a CPU core for minutes on a
+        // large mailbox (the interactive server/TUI looked hung). Verdicts are
+        // preserved (the orphaned recipient is still detected) and the evidence
+        // proves the canonical engine ran.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("relational_engine.sqlite3");
+        seed_startup_self_heal_fk_orphan(&db_path);
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open bespoke conn");
+        let diagnostics = doctor_relational_integrity_diagnostics(&conn, &db_path)
+            .expect("relational diagnostics");
+        assert!(
+            !diagnostics.orphaned_recipients.is_empty(),
+            "the orphaned recipient must still be detected (verdict preserved)"
+        );
+        let detail = doctor_relational_integrity_detail_prefix(&diagnostics);
+        assert!(
+            detail.contains("canonical_sqlite"),
+            "startup relational diagnostics must run on the canonical engine, not the bespoke \
+             O(n²) engine; evidence: {detail}"
+        );
     }
 
     #[test]
