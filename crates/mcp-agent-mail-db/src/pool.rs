@@ -6456,6 +6456,23 @@ pub fn inspect_mailbox_ownership(
     }
 }
 
+/// Cheap probe for a deleted/replaced executable that owns the mailbox locks.
+///
+/// Avoids the expensive `/proc/*/fd` database-file walk performed by full
+/// [`inspect_mailbox_ownership`]: reads only the advisory lock holders (via
+/// `/proc/locks`) and checks whether any Agent Mail holder runs a deleted
+/// executable. Suitable for the request-path health probe (GH#166), where the
+/// full ownership walk is intentionally skipped on the healthy fast path.
+#[must_use]
+pub fn mailbox_owner_executable_deleted(primary_path: &Path, storage_root: &Path) -> bool {
+    let storage_lock_path = mailbox_activity_lock_path_for_storage_root(storage_root);
+    let sqlite_lock_path = mailbox_activity_lock_path_for_sqlite(primary_path);
+    lock_holder_pids_via_proc(&storage_lock_path)
+        .into_iter()
+        .chain(lock_holder_pids_via_proc(&sqlite_lock_path))
+        .any(|pid| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
+}
+
 #[allow(clippy::result_large_err)]
 fn refuse_mutating_mailbox_when_owned(
     primary_path: &Path,

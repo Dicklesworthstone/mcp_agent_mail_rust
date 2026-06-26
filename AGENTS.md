@@ -300,8 +300,8 @@ Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `rec
 `am doctor fixers --format json` enumerates the live registry; for an
 exact current count run a quick scan of `op_pattern` / `auto_fixable`
 over `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`. As of
-2026-05-21 the registry holds **55 FMs, of which 22 are auto-fixable**
-(33 remain detect-only by design — they need operator-supplied truth,
+2026-06-26 the registry holds **62 FMs, of which 25 are auto-fixable**
+(37 remain detect-only by design — they need operator-supplied truth,
 an authoritative-side policy decision, or a source fix).
 
 Illustrative auto-fix entries (one per Op variant):
@@ -315,10 +315,12 @@ Illustrative auto-fix entries (one per Op variant):
 | `fm-db-state-files-legacy-fts-residue` | P2 | `Op::DbExec` | db_state_files |
 | `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
 | `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
+| `fm-db-state-files-reservation-db-archive-parity` | P1 | `Op::Rename` (cross-project global-id collision quarantine; other drift detect-only) | db_state_files |
 
-Op coverage across the 22 auto-fix FMs (2026-05-21): `Op::WriteFile`×7,
-`Op::Chmod`×5, `Op::Rename`×5 (incl. directory-tree and symlink
-quarantine), `Op::DbExec`×3, `Op::AppendFile`×1, `Op::SymlinkAtomic`×1.
+Op coverage across the 25 auto-fix FMs (2026-06-26): `Op::WriteFile`×7,
+`Op::Chmod`×5, `Op::Rename`×7 (incl. directory-tree, symlink, and
+stale duplicate reservation-artifact quarantine), `Op::DbExec`×4,
+`Op::AppendFile`×1, `Op::SymlinkAtomic`×1.
 `Op::DbExec` is live (e.g. dependency-ordered DROP of legacy FTS
 residue); `Op::DbMigrate` remains a bookkeeping marker (migration SQL
 runs via paired `Op::DbExec`). `Op::Rename` now quarantines whole

@@ -11,6 +11,14 @@ pub const RESERVATION_PARITY_SCHEMA_VERSION: &str = "reservation_db_archive_pari
 pub struct ReservationParityDriftSummary {
     pub missing_archive_artifacts: usize,
     pub archive_without_db_rows: usize,
+    /// Archive `id-<id>.json` artifacts whose reservation id exists in `SQLite` only
+    /// under a *different* project.
+    ///
+    /// `SQLite` reservation ids are global while the archive parity key is
+    /// `(project_slug, id)`, so these are stale duplicate artifacts left behind by an
+    /// id that was later reused — NOT missing DB rows to insert (GH#167). They are
+    /// safe to quarantine, never to reconstruct into `SQLite`.
+    pub archive_id_collisions: usize,
     pub agent_id_mismatches: usize,
     pub released_ts_mismatches: usize,
     pub active_status_mismatches: usize,
@@ -23,6 +31,7 @@ impl ReservationParityDriftSummary {
     pub const fn total(&self) -> usize {
         self.missing_archive_artifacts
             + self.archive_without_db_rows
+            + self.archive_id_collisions
             + self.agent_id_mismatches
             + self.released_ts_mismatches
             + self.active_status_mismatches
@@ -72,6 +81,12 @@ impl ReservationParityReport {
             fields.push(format!(
                 "archive_without_db={}",
                 self.drift.archive_without_db_rows
+            ));
+        }
+        if self.drift.archive_id_collisions > 0 {
+            fields.push(format!(
+                "archive_id_collision={}",
+                self.drift.archive_id_collisions
             ));
         }
         if self.drift.agent_id_mismatches > 0 {
@@ -277,6 +292,17 @@ where
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // SQLite reservation ids are global; map each id to every project that owns it
+    // in the DB so an archive-only artifact can be classified as a genuine missing
+    // row vs. a cross-project global-id collision (GH#167). Built from the rows
+    // already loaded — no extra query.
+    let mut db_projects_by_id: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for reservation in &db_reservations {
+        db_projects_by_id
+            .entry(reservation.reservation_id)
+            .or_default()
+            .insert(reservation.project_slug.clone());
+    }
     let archive_by_key = archive_reservations
         .iter()
         .map(|reservation| {
@@ -312,17 +338,40 @@ where
                 });
             }
             (None, Some(_)) => {
-                drift.archive_without_db_rows += 1;
-                examples.push(ReservationParityExample {
-                    reservation_id,
-                    project_slug,
-                    field: "db_row".to_string(),
-                    db_value: "missing".to_string(),
-                    archive_value: "present".to_string(),
-                    detail: format!(
-                        "reservation_id={reservation_id} archive artifact has no DB row"
-                    ),
-                });
+                // The archive artifact at (this project, id) has no DB row. If the
+                // id exists in SQLite under a *different* project it is a stale
+                // duplicate (global id reuse), not a missing row — quarantine, do
+                // not reconstruct (GH#167). Any matching id here is necessarily a
+                // different project, since a same-project row would land in the
+                // (Some, Some) arm above.
+                if let Some(db_projects) = db_projects_by_id.get(&reservation_id) {
+                    drift.archive_id_collisions += 1;
+                    let db_projects_label =
+                        db_projects.iter().cloned().collect::<Vec<_>>().join(",");
+                    let archive_project = project_slug.clone();
+                    examples.push(ReservationParityExample {
+                        reservation_id,
+                        project_slug,
+                        field: "archive_id_collision".to_string(),
+                        db_value: db_projects_label.clone(),
+                        archive_value: "present".to_string(),
+                        detail: format!(
+                            "reservation_id={reservation_id} archive artifact under project={archive_project} collides with a DB row owned by project(s)=[{db_projects_label}] (global reservation id reused); stale duplicate archive artifact — quarantine, do not reconstruct"
+                        ),
+                    });
+                } else {
+                    drift.archive_without_db_rows += 1;
+                    examples.push(ReservationParityExample {
+                        reservation_id,
+                        project_slug,
+                        field: "db_row".to_string(),
+                        db_value: "missing".to_string(),
+                        archive_value: "present".to_string(),
+                        detail: format!(
+                            "reservation_id={reservation_id} archive artifact has no DB row"
+                        ),
+                    });
+                }
             }
             (None, None) => {}
         }

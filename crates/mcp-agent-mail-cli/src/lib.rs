@@ -544,7 +544,10 @@ pub enum Commands {
         /// Minimum interval between checks in seconds (default: 120, 0 to disable).
         #[arg(long, default_value_t = 120)]
         rate_limit: u64,
-        /// Query DB directly instead of HTTP (faster for co-located setups).
+        /// Allow a direct SQLite read for co-located setups. Still prefers the
+        /// running daemon over HTTP when it is reachable (avoids WAL contention
+        /// with the daemon's writer) and only reads SQLite directly when no
+        /// daemon is listening.
         #[arg(long)]
         direct: bool,
         /// Output format: table, json, or toon (default: auto-detect).
@@ -34884,9 +34887,75 @@ fn service_uninstall_launchd() -> CliResult<()> {
 
 fn handle_service_status() -> CliResult<()> {
     let backend = detect_service_backend()?;
-    match backend {
+    let result = match backend {
         ServiceBackend::Systemd => service_status_systemd(),
         ServiceBackend::Launchd => service_status_launchd(),
+    };
+    // GH#166: a deleted/replaced executable can keep the mailbox locks while the
+    // service still reports `active`, so surface it as a first-class status
+    // condition pointing at a supervised restart.
+    service_report_deleted_executable_owner();
+    result
+}
+
+/// Build the operator-facing warning lines for a deleted/replaced executable that
+/// owns the mailbox locks, or `None` when the owner is not a deleted executable.
+/// Pure so it can be unit-tested without a live process (GH#166).
+fn deleted_executable_owner_warning(
+    disposition: mcp_agent_mail_db::pool::MailboxOwnershipDisposition,
+    owner_class: &str,
+    detail: &str,
+    deleted_pids: &[u32],
+) -> Option<Vec<String>> {
+    if disposition != mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable {
+        return None;
+    }
+    let pid_list = if deleted_pids.is_empty() {
+        "unknown".to_string()
+    } else {
+        deleted_pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(vec![
+        format!(
+            "WARNING: the running Agent Mail owner is a deleted/replaced executable \
+             (pid {pid_list}, owner_state={owner_class}) and still holds the mailbox \
+             storage/SQLite locks. Mail keeps flowing through the old process, but \
+             direct file-reservation and DB-recovery paths refuse until it restarts."
+        ),
+        format!("  detail: {detail}"),
+        "  next: run `am service restart` to swap in the fresh binary (do NOT run \
+         `am doctor repair`; it refuses a live owner)."
+            .to_string(),
+    ])
+}
+
+/// Inspect mailbox ownership and, when a deleted/replaced executable owns the
+/// locks, print the supervised-restart guidance to stderr. Read-only and
+/// best-effort: any inspection failure is silently skipped.
+fn service_report_deleted_executable_owner() {
+    let config = Config::from_env();
+    let Ok(report) = build_doctor_locks_report_with_config(&config) else {
+        return;
+    };
+    let deleted_pids: Vec<u32> = report
+        .processes
+        .iter()
+        .filter(|proc| proc.executable_deleted)
+        .map(|proc| proc.pid)
+        .collect();
+    if let Some(lines) = deleted_executable_owner_warning(
+        report.disposition,
+        report.owner_state.class.as_str(),
+        &report.detail,
+        &deleted_pids,
+    ) {
+        for line in lines {
+            ftui_runtime::ftui_eprintln!("{line}");
+        }
     }
 }
 
@@ -45125,6 +45194,55 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(owner_state.class, DoctorLockOwnerClass::UnsafeToTouch);
         assert!(action.contains("Lock waiters are present"));
         assert!(action.contains("Owner class unsafe-to-touch"));
+    }
+
+    #[test]
+    fn deleted_executable_owner_warning_surfaces_supervised_restart() {
+        let lines = deleted_executable_owner_warning(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable,
+            "wedged",
+            "another live Agent Mail mailbox owner is running a deleted executable: pid 1741547",
+            &[1_741_547],
+        )
+        .expect("deleted executable should produce a warning");
+        let joined = lines.join("\n");
+        assert!(joined.contains("1741547"), "names the owner pid");
+        assert!(joined.contains("deleted/replaced executable"));
+        assert!(
+            joined.contains("am service restart"),
+            "points at supervised restart"
+        );
+        assert!(
+            joined.contains("do NOT run `am doctor repair`"),
+            "steers away from doctor repair"
+        );
+    }
+
+    #[test]
+    fn deleted_executable_owner_warning_none_for_non_deleted_dispositions() {
+        for disposition in [
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned,
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::ActiveOtherOwner,
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::StaleLiveProcess,
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::SplitBrain,
+        ] {
+            assert!(
+                deleted_executable_owner_warning(disposition, "live", "detail", &[42]).is_none(),
+                "only DeletedExecutable should warn (got {disposition:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_executable_owner_warning_handles_unknown_pid() {
+        let lines = deleted_executable_owner_warning(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::DeletedExecutable,
+            "wedged",
+            "deleted executable owner",
+            &[],
+        )
+        .expect("deleted executable should produce a warning even without a pid");
+        assert!(lines.join("\n").contains("pid unknown"));
     }
 
     #[test]

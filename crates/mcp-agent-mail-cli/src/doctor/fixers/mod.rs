@@ -482,9 +482,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: reservation_db_archive_parity::FM_ID,
             severity: "P1",
             subsystem: "db_state_files",
-            op_pattern: "detect-only",
-            auto_fixable: false,
-            one_line_description: "File reservation SQLite rows and stable archive JSON artifacts disagree on holder, released_ts, active status, or thread provenance (pre-commit guard over/under-block risk; manual reconcile until per-field mutate repair is implemented)",
+            op_pattern: "Op::Rename",
+            auto_fixable: true,
+            one_line_description: "File reservation SQLite rows and stable archive JSON artifacts disagree on holder, released_ts, active status, or thread provenance. Auto-fix quarantines only cross-project global-id collisions (a duplicate id-<id>.json whose id is owned by another project in SQLite); all other drift stays detect-only for manual reconcile.",
             source_module: "doctor::fixers::reservation_db_archive_parity",
         },
         FixerSpec {

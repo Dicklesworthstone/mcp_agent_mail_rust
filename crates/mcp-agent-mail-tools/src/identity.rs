@@ -119,7 +119,7 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
     };
     use mcp_agent_mail_db::pool::{
         MailboxOwnershipDisposition, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
-        resolve_mailbox_sqlite_path,
+        mailbox_owner_executable_deleted, resolve_mailbox_sqlite_path,
     };
 
     let resolved = resolve_mailbox_sqlite_path(&config.database_url).ok()?;
@@ -144,7 +144,16 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
     );
     let durability = DurabilityState::from_mailbox_state(verdict.state);
 
+    // GH#166: a deleted/replaced executable can own the mailbox locks while the
+    // fast verdict still reads Healthy (fast verdicts skip the ownership walk).
+    // That state blocks direct reservation/recovery paths, so health_check must
+    // not report fully green. Probe the lock holders cheaply (no /proc/*/fd walk)
+    // and keep building recovery context when an owner runs a deleted executable.
+    let deleted_executable_owner =
+        mailbox_owner_executable_deleted(&db_path, storage_root.as_path());
+
     if !recovery_lock.active
+        && !deleted_executable_owner
         && (durability == DurabilityState::Healthy
             || recovery_verdict_is_archive_lag_only(&verdict))
     {
@@ -152,6 +161,8 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
     }
 
     let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
+    let executable_deleted =
+        ownership.disposition == MailboxOwnershipDisposition::DeletedExecutable;
     let mode = durability.to_string();
 
     let owner = match ownership.disposition {
@@ -174,22 +185,30 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         ),
     };
 
-    let next_action = match durability {
-        DurabilityState::Healthy => "No action required".to_string(),
-        DurabilityState::DegradedReadOnly => {
-            if recovery_lock.active {
-                "Recovery in progress; wait for completion or check recovery lock holder"
-                    .to_string()
-            } else {
-                "Run `am doctor repair` to attempt automatic recovery".to_string()
+    let next_action = if executable_deleted {
+        "Run `am service restart` to replace the deleted/stale owner executable \
+         (do not run `am doctor repair`; it refuses a live owner)"
+            .to_string()
+    } else {
+        match durability {
+            DurabilityState::Healthy => "No action required".to_string(),
+            DurabilityState::DegradedReadOnly => {
+                if recovery_lock.active {
+                    "Recovery in progress; wait for completion or check recovery lock holder"
+                        .to_string()
+                } else {
+                    "Run `am doctor repair` to attempt automatic recovery".to_string()
+                }
             }
-        }
-        DurabilityState::Recovering => recovery_lock.pid.map_or_else(
-            || "Recovery lock held but PID unknown; check for stale lock files".to_string(),
-            |pid| format!("Recovery active (pid {pid}); wait for completion or investigate stall"),
-        ),
-        DurabilityState::Corrupt => {
-            "Run `am doctor repair --yes` or restore from archive backup".to_string()
+            DurabilityState::Recovering => recovery_lock.pid.map_or_else(
+                || "Recovery lock held but PID unknown; check for stale lock files".to_string(),
+                |pid| {
+                    format!("Recovery active (pid {pid}); wait for completion or investigate stall")
+                },
+            ),
+            DurabilityState::Corrupt => {
+                "Run `am doctor repair --yes` or restore from archive backup".to_string()
+            }
         }
     };
 
@@ -203,6 +222,7 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
         bundle_path,
         recovery_lock_active: recovery_lock.active,
         recovery_lock_pid: recovery_lock.pid,
+        executable_deleted,
     })
 }
 
@@ -931,6 +951,12 @@ pub struct RecoveryStatusResponse {
     /// PID of the process holding the recovery lock, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_lock_pid: Option<u32>,
+    /// Whether the lock-owning process is running a deleted/replaced executable.
+    ///
+    /// GH#166: mail still flows through the stale process, but direct
+    /// reservation/recovery paths refuse until a supervised restart.
+    #[serde(default)]
+    pub executable_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1142,7 +1168,14 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
     // verdict (or the live pressure level).
-    let effective_level = pressure_level.max(verdicts.rollup_level());
+    let mut effective_level = pressure_level.max(verdicts.rollup_level());
+    // GH#166: a deleted/replaced executable owning the mailbox locks blocks direct
+    // reservation/recovery paths even while mail still flows through the stale
+    // process. Never report fully green readiness in that state (status stays
+    // "ok" — it is degraded, not down — but health_level drops to at least yellow).
+    if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
+        effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
+    }
     let failing_verdicts = verdicts.failing_names();
 
     let response = HealthCheckResponse {

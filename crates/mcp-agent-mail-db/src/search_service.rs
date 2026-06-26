@@ -4003,98 +4003,11 @@ pub async fn execute_search(
     #[allow(deprecated)]
     if matches!(engine, SearchEngine::Legacy | SearchEngine::Shadow) {
         let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-        let raw_results = if let Some(project_id) = query.project_id {
-            match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
-                Outcome::Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| SearchResult {
-                        doc_kind: DocKind::Message,
-                        id: row.id,
-                        project_id: Some(project_id),
-                        title: row.subject,
-                        body: row.body_md,
-                        score: None,
-                        importance: Some(row.importance),
-                        ack_required: Some(row.ack_required != 0),
-                        created_ts: Some(row.created_ts),
-                        thread_id: row.thread_id,
-                        from_agent: Some(row.from),
-                        from_agent_id: Some(row.sender_id),
-                        reason_codes: Vec::new(),
-                        score_factors: Vec::new(),
-                        redacted: false,
-                        redaction_reason: None,
-                        ..SearchResult::default()
-                    })
-                    .collect(),
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-        } else if let Some(product_id) = query.product_id {
-            match crate::queries::search_messages_for_product(
-                cx,
-                pool,
-                product_id,
-                &query.text,
-                limit,
-            )
-            .await
-            {
-                Outcome::Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| SearchResult {
-                        doc_kind: DocKind::Message,
-                        id: row.id,
-                        project_id: Some(row.project_id),
-                        title: row.subject,
-                        body: row.body_md,
-                        score: None,
-                        importance: Some(row.importance),
-                        ack_required: Some(row.ack_required != 0),
-                        created_ts: Some(row.created_ts),
-                        thread_id: row.thread_id,
-                        from_agent: Some(row.from),
-                        from_agent_id: Some(row.sender_id),
-                        reason_codes: Vec::new(),
-                        score_factors: Vec::new(),
-                        redacted: false,
-                        redaction_reason: None,
-                        ..SearchResult::default()
-                    })
-                    .collect(),
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
-        } else {
-            match crate::queries::search_messages_global(cx, pool, &query.text, limit).await {
-                Outcome::Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| SearchResult {
-                        doc_kind: DocKind::Message,
-                        id: row.id,
-                        project_id: Some(row.project_id),
-                        title: row.subject,
-                        body: row.body_md,
-                        score: None,
-                        importance: Some(row.importance),
-                        ack_required: Some(row.ack_required != 0),
-                        created_ts: Some(row.created_ts),
-                        thread_id: row.thread_id,
-                        from_agent: Some(row.from),
-                        from_agent_id: Some(row.sender_id),
-                        reason_codes: Vec::new(),
-                        score_factors: Vec::new(),
-                        redacted: false,
-                        redaction_reason: None,
-                        ..SearchResult::default()
-                    })
-                    .collect(),
-                Outcome::Err(err) => return Outcome::Err(err),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            }
+        let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
         let raw_results =
             match canonicalize_message_results(cx, pool, query, raw_results, false).await {
@@ -4122,6 +4035,56 @@ pub async fn execute_search(
             cache.put(cache_key, val.clone());
         }
         return resp;
+    }
+
+    // GH#162: When reads are served from a reconstructed archive snapshot
+    // (durability_state=degraded_read_only), the process-global Search V3 lexical
+    // bridge stays bound to the *live* database, so this pool's lexical index is
+    // foreign/empty and the Tantivy candidate path would silently return [] for
+    // messages that exist in the snapshot's relational tables. `state == "stale"`
+    // from `lexical_backfill_health` is exactly the "index belongs to a different
+    // database than this pool" signal (path / identity / active-bridge mismatch).
+    // Fall back to the SQL message scan (same path the Legacy engine uses), which
+    // reads straight from THIS pool, so plain-keyword search keeps returning real
+    // results through the degraded window. Count drift ("partial"/"delayed") is NOT
+    // foreign and is handled by the existing backfill-on-empty retry below.
+    if matches!(
+        engine,
+        SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+    ) && lexical_index_is_foreign_to_pool(pool)
+    {
+        let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
+        let raw_results = match legacy_sql_candidate_results(cx, pool, query, limit).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let raw_results =
+            match canonicalize_message_results(cx, pool, query, raw_results, false).await {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+        let raw_results = apply_cursor_window(raw_results, query);
+        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+        let explain = if query.explain {
+            Some(build_v3_query_explain(query, engine, None))
+        } else {
+            None
+        };
+        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if options.track_telemetry {
+            record_query("search_service_lexical_sql_fallback", latency_us);
+        }
+        global_metrics()
+            .search
+            .record_legacy_query(latency_us, false);
+        // Deliberately NOT cached: the snapshot pool is ephemeral and this result
+        // reflects a transient degraded window; caching could leak a snapshot read
+        // into the post-recovery live cache.
+        return finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
     }
 
     if matches!(
@@ -4360,6 +4323,122 @@ pub async fn execute_search(
     Outcome::Err(DbError::Sqlite(format!(
         "search engine unavailable: {engine}"
     )))
+}
+
+/// Whether this pool's Search V3 lexical index belongs to a *different* database.
+///
+/// True is the reconstructed-archive-snapshot case (GH#162): the process-global
+/// Tantivy bridge cannot serve this pool, so lexical / hybrid candidate retrieval
+/// must fall back to a SQL message scan. `state == "stale"` is set by
+/// `lexical_backfill_health` exactly when the backfill marker / active bridge is
+/// bound to another database (path, file identity, or active-key mismatch); count
+/// drift surfaces as `"partial"`/`"delayed"`, which is not foreign.
+fn lexical_index_is_foreign_to_pool(pool: &DbPool) -> bool {
+    pool.sqlite_path() != ":memory:" && lexical_backfill_health(pool).state == "stale"
+}
+
+/// Plain-keyword SQL message scan shared by the `Legacy`/`Shadow` engines.
+///
+/// Also the GH#162 stale-lexical-index fallback: reads message candidates straight
+/// from the supplied pool (no Search V3 lexical bridge), so it keeps working when
+/// reads are served from a reconstructed archive snapshot whose lexical index was
+/// never built.
+async fn legacy_sql_candidate_results(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    limit: usize,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if let Some(project_id) = query.project_id {
+        match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                        ..SearchResult::default()
+                    })
+                    .collect(),
+            ),
+            Outcome::Err(err) => Outcome::Err(err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    } else if let Some(product_id) = query.product_id {
+        match crate::queries::search_messages_for_product(cx, pool, product_id, &query.text, limit)
+            .await
+        {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(row.project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                        ..SearchResult::default()
+                    })
+                    .collect(),
+            ),
+            Outcome::Err(err) => Outcome::Err(err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    } else {
+        match crate::queries::search_messages_global(cx, pool, &query.text, limit).await {
+            Outcome::Ok(rows) => Outcome::Ok(
+                rows.into_iter()
+                    .map(|row| SearchResult {
+                        doc_kind: DocKind::Message,
+                        id: row.id,
+                        project_id: Some(row.project_id),
+                        title: row.subject,
+                        body: row.body_md,
+                        score: None,
+                        importance: Some(row.importance),
+                        ack_required: Some(row.ack_required != 0),
+                        created_ts: Some(row.created_ts),
+                        thread_id: row.thread_id,
+                        from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
+                        reason_codes: Vec::new(),
+                        score_factors: Vec::new(),
+                        redacted: false,
+                        redaction_reason: None,
+                        ..SearchResult::default()
+                    })
+                    .collect(),
+            ),
+            Outcome::Err(err) => Outcome::Err(err),
+            Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        }
+    }
 }
 
 fn plan_param_to_value(param: &PlanParam) -> Value {
@@ -4835,6 +4914,115 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("backfill marker belongs"))
         );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn execute_search_falls_back_to_sql_when_lexical_index_is_foreign_snapshot() {
+        // GH#162: while reads are served from a reconstructed archive snapshot, the
+        // process-global Search V3 lexical bridge stays bound to the *live* DB, so
+        // this pool's lexical index is foreign (lexical_backfill_health == "stale").
+        // A plain-keyword Lexical-engine search must still return the matching
+        // message via the SQL fallback instead of silently returning [].
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let pool = temp_file_pool(root.path(), "mailbox.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = match crate::queries::ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/search-snapshot-fallback",
+            )
+            .await
+            {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let project_id = project.id.unwrap_or(0);
+            let sender = match crate::queries::register_agent(
+                &cx, &pool, project_id, "RedPeak", "coder", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register sender failed: {other:?}"),
+            };
+            let recipient = match crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "coder", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register recipient failed: {other:?}"),
+            };
+            let message = match crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap_or(0),
+                "Reconstruct plan for the auth refactor",
+                "Detailed migration plan body",
+                Some("br-search-snapshot"),
+                "high",
+                false,
+                "[]",
+                &[(recipient.id.unwrap_or(0), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+
+            // Mark the lexical index as foreign to this pool (the snapshot case):
+            // the backfill marker belongs to a *different* (pre-reconstruct) DB path.
+            write_backfill_health_state(
+                root.path(),
+                root.path()
+                    .join("pre-reconstruct-mailbox.sqlite3")
+                    .to_str()
+                    .expect("utf8 path"),
+                1,
+                1,
+                1,
+                1,
+            );
+            assert_eq!(
+                lexical_backfill_health(&pool).state,
+                "stale",
+                "precondition: lexical index must read as foreign/stale for this pool"
+            );
+
+            let query = SearchQuery::messages("plan", project_id);
+            let options = SearchOptions {
+                scope_ctx: None,
+                redaction_policy: None,
+                track_telemetry: false,
+                search_engine: Some(SearchEngine::Lexical),
+            };
+            let response = match execute_search(&cx, &pool, &query, &options).await {
+                Outcome::Ok(response) => response,
+                other => panic!("execute_search failed: {other:?}"),
+            };
+
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .any(|row| row.result.id == message.id.unwrap_or(0)),
+                "plain-keyword search over a foreign-lexical-index (snapshot) pool must \
+                 return the matching message via the SQL fallback, got {} results",
+                response.results.len()
+            );
+        });
         reset_lexical_bootstrap_tracking();
     }
 

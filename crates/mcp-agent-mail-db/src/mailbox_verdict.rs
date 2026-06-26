@@ -1146,13 +1146,17 @@ fn probe_sidecar_state(sidecars: &MailboxSidecarState, db_path: &Path) -> ProbeR
             if crate::wal_classify::wal_sidecar_is_truncation_artifact(wal_path.as_path()) {
                 ProbeResult::warn_state(
                     "sidecar_state",
-                    format!("WAL exists without SHM and is a truncation/garbage-header artifact ({detail})"),
+                    format!(
+                        "WAL exists without SHM and is a truncation/garbage-header artifact ({detail})"
+                    ),
                     MailboxState::Suspect,
                 )
             } else {
                 ProbeResult::ok(
                     "sidecar_state",
-                    format!("WAL exists without SHM but is a benign valid/header-only WAL ({detail})"),
+                    format!(
+                        "WAL exists without SHM but is a benign valid/header-only WAL ({detail})"
+                    ),
                 )
             }
         }
@@ -2253,8 +2257,8 @@ mod tests {
             db_projects: 0,
             db_agents: 0,
             db_messages,
-            archive_latest_message_id: Some(archive_messages as i64),
-            db_max_message_id: db_messages as i64,
+            archive_latest_message_id: Some(i64::try_from(archive_messages).unwrap_or(i64::MAX)),
+            db_max_message_id: i64::try_from(db_messages).unwrap_or(i64::MAX),
             missing_projects: Vec::new(),
             detail: format!(
                 "DB is ahead of archive by {} messages",
