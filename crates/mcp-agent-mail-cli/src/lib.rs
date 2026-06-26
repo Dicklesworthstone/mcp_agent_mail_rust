@@ -26053,27 +26053,42 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     // large mailbox the slow engine always executed and added seconds to the
     // startup self-heal. Canonical is fast and authoritative (A4), matching the
     // read-only `am doctor health` path.
-    let integrity_ok =
+    // Prefer the canonical engine (fast + authoritative). On a NON-corruption
+    // canonical failure (e.g. a transient lock/open hiccup on this SECOND
+    // connection, opened while the bespoke `opened.conn` already holds the file)
+    // fall back to the bespoke-first probe rather than hard-failing startup — a
+    // benign canonical open failure must never wedge the boot. A canonical
+    // corruption verdict (recovery error) is kept so it routes to reconstruct.
+    let integrity_probe =
         match sqlite_file_check_ok_canonical(opened_path, mcp_agent_mail_db::CheckKind::Full) {
-            Ok(ok) => ok,
-            Err(error) => {
-                let detail = format!(
-                    "PRAGMA integrity_check failed for {}: {error}",
-                    opened.opened_path
-                );
-                if is_sqlite_recovery_error_message(&error.to_string()) {
-                    return Ok(if archive_reconstruct_available {
-                        DoctorDatabaseFixStrategy::Reconstruct(format!(
-                            "{detail}; reconstruct from archive {}",
-                            archive_root.display()
-                        ))
-                    } else {
-                        DoctorDatabaseFixStrategy::Repair(detail)
-                    });
-                }
-                return Err(CliError::Other(detail));
-            }
+            ok @ Ok(_) => ok,
+            Err(error) if is_sqlite_recovery_error_message(&error.to_string()) => Err(error),
+            Err(_) => sqlite_conn_check_ok_with_canonical_file_fallback(
+                &opened.conn,
+                opened_path,
+                mcp_agent_mail_db::CheckKind::Full,
+            ),
         };
+    let integrity_ok = match integrity_probe {
+        Ok(ok) => ok,
+        Err(error) => {
+            let detail = format!(
+                "PRAGMA integrity_check failed for {}: {error}",
+                opened.opened_path
+            );
+            if is_sqlite_recovery_error_message(&error.to_string()) {
+                return Ok(if archive_reconstruct_available {
+                    DoctorDatabaseFixStrategy::Reconstruct(format!(
+                        "{detail}; reconstruct from archive {}",
+                        archive_root.display()
+                    ))
+                } else {
+                    DoctorDatabaseFixStrategy::Repair(detail)
+                });
+            }
+            return Err(CliError::Other(detail));
+        }
+    };
     if !integrity_ok {
         return Ok(if archive_reconstruct_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
