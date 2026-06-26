@@ -422,6 +422,16 @@ fn run_db_maintenance_cycle(
             &db.maintenance_vacuum_runs_total,
             &db.maintenance_last_vacuum_us,
         );
+        // br-fv0s1: the main vacuum never touches the isolated ATC telemetry
+        // sidecar (atc.sqlite3), so pages freed by the experience-ceiling sweep
+        // (br-bvq1x.11.6) would accumulate. Vacuum it on the same cadence,
+        // reusing the vacuum metrics. No-op when the sidecar was never created.
+        run_maintenance_op(
+            "vacuum_atc_sidecar",
+            || pool.vacuum_atc_sidecar(),
+            &db.maintenance_vacuum_runs_total,
+            &db.maintenance_last_vacuum_us,
+        );
         *last_vacuum = Some(now);
     }
 

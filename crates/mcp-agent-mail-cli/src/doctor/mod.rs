@@ -2384,6 +2384,35 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
+    // br-fv0s1: surface the isolated ATC telemetry sidecar (atc.sqlite3) —
+    // presence, size, and quick_check integrity. The sidecar is deliberately
+    // isolated from the mailbox DB (br-bvq1x.11.7), so a corrupt/large sidecar
+    // is observability, not mailbox corruption: this line never changes the
+    // health exit code. Quiet on a clean slate (no sidecar => ATC never wrote).
+    if let Ok(resolved) = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url) {
+        let sidecar = mcp_agent_mail_db::pool::inspect_atc_sidecar_health(&resolved.canonical_path);
+        if sidecar.present {
+            let size = crate::format_bytes(sidecar.size_bytes);
+            match sidecar.quick_check_ok {
+                Some(true) => {
+                    ftui_runtime::ftui_println!("atc_sidecar: ok size={size} quick_check=ok");
+                }
+                Some(false) => {
+                    ftui_runtime::ftui_println!(
+                        "atc_sidecar: warn size={size} quick_check=corrupt ({}); next: am atc reprocess-features --dry-run",
+                        sidecar.detail
+                    );
+                }
+                None => {
+                    ftui_runtime::ftui_println!(
+                        "atc_sidecar: warn size={size} quick_check=not_run ({})",
+                        sidecar.detail
+                    );
+                }
+            }
+        }
+    }
+
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
     let runs_dir = root.join("runs");

@@ -4458,6 +4458,18 @@ pub(crate) fn gather_process_owner_model(
     let db_path_buf = PathBuf::from(&db_path);
 
     let actual_processes = gather_actual_processes(&db_path_buf, &config.storage_root);
+    // br-epoqj: surface truly-foreign DB-file holders that the agent-mail
+    // ownership filter drops upstream (ad-hoc sqlite3 shell, migration script,
+    // other runtime). Detect-only forensics for `coresident_db_writer`.
+    let foreign_db_holders = mcp_agent_mail_db::pool::foreign_db_file_holders(&db_path_buf)
+        .into_iter()
+        .map(|h| crate::doctor::process_owner::ForeignDbHolder {
+            pid: h.pid,
+            binary_path: h.executable_path,
+            command: h.command,
+            executable_deleted: h.executable_deleted,
+        })
+        .collect();
     let port = gather_port_ownership(&config.http_host, config.http_port);
     let expected_service = gather_expected_service();
     let self_binary_path = std::env::current_exe()
@@ -4467,6 +4479,7 @@ pub(crate) fn gather_process_owner_model(
     ProcessOwnerModel {
         expected_service,
         actual_processes,
+        foreign_db_holders,
         port,
         self_binary_path,
         db_path,
@@ -14715,7 +14728,7 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
             let atc_conn = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
                 .ok()
                 .and_then(|resolved| {
-                    mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(&resolved.canonical_path)
+                    mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
                 });
             let rows = match atc_conn.as_ref() {
                 Some(conn) => query_atc_decision_rows(conn, decision_id)?,
@@ -14772,7 +14785,7 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
             // The replay below reads ATC through the pool's chokepoint (sidecar),
             // but the experience-id range probe needs the sidecar directly
             // (br-bvq1x.11.7). No sidecar => empty range.
-            let range = match mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(
+            let range = match mcp_agent_mail_db::pool::open_atc_sidecar_conn(
                 read_db.pool().sqlite_path(),
             ) {
                 Some(atc_conn) => query_atc_simulation_sequence_range(
@@ -14839,7 +14852,7 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
             let atc_conn = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
                 .ok()
                 .and_then(|resolved| {
-                    mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(&resolved.canonical_path)
+                    mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
                 });
             let Some(atc_conn) = atc_conn else {
                 // No ATC sidecar (telemetry never written) => nothing to reprocess.
@@ -16458,6 +16471,16 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
                             "runtime canonical follow-up migration panicked: {p}"
                         )));
                     }
+                }
+                // br-fv0s1: the canonical follow-up transiently re-creates the
+                // legacy atc_* tables in the primary mailbox DB. The next pool
+                // open drops them, but drop them inline here so `am migrate`
+                // leaves the main DB free of atc_* immediately (ATC telemetry
+                // lives in the atc.sqlite3 sidecar — br-bvq1x.11.7). Idempotent.
+                if let Err(e) = mcp_agent_mail_db::pool::drop_legacy_atc_tables(&canonical_conn) {
+                    return Err(CliError::Other(format!(
+                        "dropping transient atc_* tables after migrate failed: {e}"
+                    )));
                 }
             }
             schema::enforce_runtime_fts_cleanup(&conn)

@@ -147,6 +147,7 @@ mod tests {
         ProcessOwnerModel {
             expected_service: ExpectedService::none(),
             actual_processes: Vec::new(),
+            foreign_db_holders: Vec::new(),
             port: PortOwnership {
                 host: "127.0.0.1".into(),
                 port: 8765,

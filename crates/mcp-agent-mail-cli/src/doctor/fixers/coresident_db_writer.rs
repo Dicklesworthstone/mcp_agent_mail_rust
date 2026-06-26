@@ -51,19 +51,21 @@
 //! own surface. Flagging them here would double-report and dilute this
 //! FM's specific "an *uncoordinated* writer is corrupting the DB" signal.
 //!
-//! ### Known scope limit (routed to a follow-up)
+//! ### Unclassified foreign holders (br-epoqj)
 //!
 //! `inspect_mailbox_ownership` (db crate) enumerates *every* PID holding
 //! the DB file via a `/proc/*/fd` scan, but filters the result through
 //! `pid_is_agent_mail()` before it reaches the model — so a truly foreign
-//! writer that is **neither** the Rust binary **nor** a recognizable
+//! holder that is **neither** the Rust binary **nor** a recognizable
 //! Python `mcp_agent_mail` shadow (e.g. an ad-hoc `sqlite3` shell, a
-//! migration script, a different language runtime) is dropped upstream and
-//! is invisible to this pure detector. Surfacing those un-classified
-//! foreign holders needs the unfiltered scan to be threaded into the
-//! model; that broadening is tracked by `br-epoqj` rather than silently
-//! implied here. The documented incident class (a co-resident Python
-//! server) is fully covered.
+//! migration script, a different language runtime) is dropped upstream.
+//! `gather_process_owner_model` now also runs the **unfiltered**
+//! `pool::foreign_db_file_holders` scan and threads the result into
+//! `ProcessOwnerModel::foreign_db_holders`. This detector emits one
+//! lower-confidence (0.6) [`HolderClass::UnclassifiedForeign`] finding per
+//! such holder. It stays **detect-only**: doctor never kills a foreign
+//! process, and the holder may well be a harmless read-only consumer, so
+//! the finding asks the operator to confirm whether it writes before acting.
 //!
 //! ## Fix — detect-only
 //!
@@ -77,14 +79,27 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::process_owner::{ActualProcess, ProcessOwnerModel};
+use crate::doctor::process_owner::{ActualProcess, ForeignDbHolder, ProcessOwnerModel};
 use serde::Serialize;
 
 pub const FM_ID: &str = "fm-runtime-processes-coresident-db-writer";
 const FM_SEVERITY: &str = "P0";
 const FM_SUBSYSTEM: &str = "runtime_processes";
 
-/// One live, foreign, co-resident writer racing the mailbox DB.
+/// How a co-resident DB-file holder is classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderClass {
+    /// A legacy Python `mcp_agent_mail` server — the documented root-cause
+    /// class (high confidence; the css/ts2 incident).
+    PythonShadow,
+    /// A holder that is **neither** this Rust binary **nor** a recognizable
+    /// Python shadow (ad-hoc `sqlite3` shell, migration script, another
+    /// runtime). Surfaced at lower confidence; still detect-only (br-epoqj).
+    UnclassifiedForeign,
+}
+
+/// One live, foreign, co-resident holder racing the mailbox DB.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoresidentDbWriterFinding {
     /// The mailbox database the writer is co-resident on
@@ -95,6 +110,8 @@ pub struct CoresidentDbWriterFinding {
     pub binary_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// How the holder is classified (Python shadow vs. unclassified foreign).
+    pub class: HolderClass,
     /// The holder is a legacy Python `mcp_agent_mail` server.
     pub is_python_shadow: bool,
     /// The holder has an open file descriptor on the DB file (the
@@ -112,35 +129,113 @@ impl CoresidentDbWriterFinding {
             pid: p.pid,
             binary_path: p.binary_path.clone(),
             command: p.command.clone(),
+            class: HolderClass::PythonShadow,
             is_python_shadow: p.is_python_shadow,
             holds_db_file: p.holds_db_file,
             holds_lock: p.holds_lock,
         }
     }
 
-    /// Highest confidence when an open DB fd is directly observed; a
-    /// lock-only holder is slightly lower (the lock proves Agent Mail
-    /// protocol participation but not a concurrent page write right now).
+    /// Build an unclassified-foreign finding from a raw foreign DB-file holder
+    /// (br-epoqj).
+    ///
+    /// The holder was dropped upstream by the agent-mail ownership filter. It
+    /// is, by construction, an open-fd holder (the unfiltered scan is
+    /// file-based) that is neither this Rust binary nor a Python shadow.
+    #[must_use]
+    pub fn from_foreign_holder(db_path: &str, h: &ForeignDbHolder) -> Self {
+        Self {
+            db_path: db_path.to_string(),
+            pid: h.pid,
+            binary_path: h.binary_path.clone(),
+            command: h.command.clone(),
+            class: HolderClass::UnclassifiedForeign,
+            is_python_shadow: false,
+            holds_db_file: true,
+            holds_lock: false,
+        }
+    }
+
+    /// Confidence reflects both the classification certainty and the
+    /// concurrency signal.
+    ///
+    /// A confirmed Python shadow holding an open DB fd is the highest (1.0); a
+    /// lock-only Python shadow is slightly lower (0.9 — the lock proves protocol
+    /// participation but not a concurrent page write right now). An
+    /// *unclassified* foreign holder is lower still (0.6): the open fd is real,
+    /// but we cannot prove it writes (it may be a read-only `sqlite3` shell or a
+    /// backup tool).
     #[must_use]
     pub fn confidence(&self) -> f32 {
-        if self.holds_db_file { 1.0 } else { 0.9 }
+        match self.class {
+            HolderClass::PythonShadow => {
+                if self.holds_db_file {
+                    1.0
+                } else {
+                    0.9
+                }
+            }
+            HolderClass::UnclassifiedForeign => 0.6,
+        }
     }
 
     pub fn to_finding(&self) -> super::Finding {
-        let how = if self.holds_db_file {
-            "has storage.sqlite3 open"
-        } else {
-            "holds an Agent Mail advisory lock on the mailbox"
+        let binary_suffix = self
+            .binary_path
+            .as_deref()
+            .map(|b| format!(", {b}"))
+            .unwrap_or_default();
+        let title = match self.class {
+            HolderClass::PythonShadow => {
+                let how = if self.holds_db_file {
+                    "has storage.sqlite3 open"
+                } else {
+                    "holds an Agent Mail advisory lock on the mailbox"
+                };
+                format!(
+                    "live Python co-resident writer (PID {}{binary_suffix}) {how} — concurrent writes corrupt {}",
+                    self.pid, self.db_path,
+                )
+            }
+            HolderClass::UnclassifiedForeign => format!(
+                "unclassified foreign process (PID {}{binary_suffix}) has {} open — verify it is not an uncoordinated writer",
+                self.pid, self.db_path,
+            ),
         };
-        let title = format!(
-            "live Python co-resident writer (PID {}{}) {how} — concurrent writes corrupt {}",
-            self.pid,
-            self.binary_path
-                .as_deref()
-                .map(|b| format!(", {b}"))
-                .unwrap_or_default(),
-            self.db_path,
-        );
+        let manual_steps = match self.class {
+            HolderClass::PythonShadow => serde_json::json!([
+                format!(
+                    "Confirm the holder: lsof -w {} (or: ls -l /proc/{}/exe; cat /proc/{}/cmdline | tr '\\0' ' ')",
+                    self.db_path, self.pid, self.pid
+                ),
+                format!(
+                    "Stop the foreign writer gracefully (it is NOT this Rust server): kill {} — doctor will never do this for you",
+                    self.pid
+                ),
+                "Verify the DB is still intact: am doctor fix --only fm-db-state-files-integrity-page-malformed --list",
+                "Only if integrity_check already failed: am doctor reconstruct --yes (archive-first rebuild; reversible via undo)",
+            ]),
+            HolderClass::UnclassifiedForeign => serde_json::json!([
+                format!(
+                    "Identify the holder: ls -l /proc/{}/exe; cat /proc/{}/cmdline | tr '\\0' ' ' (or: lsof -w {})",
+                    self.pid, self.pid, self.db_path
+                ),
+                "Decide whether it WRITES the DB. A read-only consumer (sqlite3 SELECT, a backup copy) is harmless under WAL; an uncoordinated writer can corrupt the B-tree.",
+                format!(
+                    "If it is an uncoordinated writer, stop it gracefully: kill {} — doctor will never do this for you (the PID may be load-bearing).",
+                    self.pid
+                ),
+                "Verify the DB is still intact: am doctor fix --only fm-db-state-files-integrity-page-malformed --list",
+            ]),
+        };
+        let risk = match self.class {
+            HolderClass::PythonShadow => {
+                "an uncoordinated co-resident writer bypasses the Rust write-behind queue / commit coalescer / WAL discipline → two writers race the same B-tree pages → `database disk image is malformed` corruption"
+            }
+            HolderClass::UnclassifiedForeign => {
+                "a foreign process that is neither the Rust binary nor a recognizable Python shadow has the mailbox DB open; if it writes, it bypasses the Agent Mail write protocol and can race the same B-tree pages into corruption (lower confidence: it may be a read-only consumer)"
+            }
+        };
         super::Finding {
             id: FM_ID,
             severity: FM_SEVERITY,
@@ -152,16 +247,12 @@ impl CoresidentDbWriterFinding {
                 "pid": self.pid,
                 "binary_path": self.binary_path,
                 "command": self.command,
+                "class": self.class,
                 "is_python_shadow": self.is_python_shadow,
                 "holds_db_file": self.holds_db_file,
                 "holds_lock": self.holds_lock,
-                "risk": "an uncoordinated co-resident writer bypasses the Rust write-behind queue / commit coalescer / WAL discipline → two writers race the same B-tree pages → `database disk image is malformed` corruption",
-                "manual_steps": [
-                    format!("Confirm the holder: lsof -w {} (or: ls -l /proc/{}/exe; cat /proc/{}/cmdline | tr '\\0' ' ')", self.db_path, self.pid, self.pid),
-                    format!("Stop the foreign writer gracefully (it is NOT this Rust server): kill {} — doctor will never do this for you", self.pid),
-                    "Verify the DB is still intact: am doctor fix --only fm-db-state-files-integrity-page-malformed --list",
-                    "Only if integrity_check already failed: am doctor reconstruct --yes (archive-first rebuild; reversible via undo)",
-                ],
+                "risk": risk,
+                "manual_steps": manual_steps,
             }),
             remediation: FindingRemediation {
                 // Detect-only: doctor never kills foreign processes.
@@ -179,12 +270,22 @@ impl CoresidentDbWriterFinding {
 /// one). Stable ordering: declaration order of `model.actual_processes`.
 #[must_use]
 pub fn detect(model: &ProcessOwnerModel) -> Vec<CoresidentDbWriterFinding> {
-    model
+    // High-confidence Python-shadow writers (the documented root cause) first,
+    // then the lower-confidence unclassified-foreign holders (br-epoqj). Stable
+    // ordering: declaration order within each bucket.
+    let mut findings: Vec<CoresidentDbWriterFinding> = model
         .actual_processes
         .iter()
         .filter(|p| is_coresident_writer_risk(p))
         .map(|p| CoresidentDbWriterFinding::from_process(&model.db_path, p))
-        .collect()
+        .collect();
+    findings.extend(
+        model
+            .foreign_db_holders
+            .iter()
+            .map(|h| CoresidentDbWriterFinding::from_foreign_holder(&model.db_path, h)),
+    );
+    findings
 }
 
 /// A holder is a co-resident-writer corruption risk when it is a foreign,
@@ -221,6 +322,7 @@ mod tests {
         ProcessOwnerModel {
             expected_service: ExpectedService::none(),
             actual_processes: Vec::new(),
+            foreign_db_holders: Vec::new(),
             port: PortOwnership {
                 host: "127.0.0.1".into(),
                 port: 8765,
@@ -346,6 +448,7 @@ mod tests {
             pid: 700,
             binary_path: None,
             command: None,
+            class: HolderClass::PythonShadow,
             is_python_shadow: true,
             holds_db_file: true,
             holds_lock: false,
@@ -354,5 +457,62 @@ mod tests {
         // shape stay detect-only without constructing a chokepoint ctx.
         assert!(!f.to_finding().remediation.auto_fixable);
         assert_eq!(f.to_finding().remediation.estimated_actions, 0);
+    }
+
+    // --- br-epoqj: unclassified foreign DB-file holders ---------------------
+
+    fn foreign_holder(pid: u32) -> ForeignDbHolder {
+        ForeignDbHolder {
+            pid,
+            binary_path: Some("/usr/bin/sqlite3".into()),
+            command: Some("sqlite3 /srv/storage.sqlite3".into()),
+            executable_deleted: false,
+        }
+    }
+
+    #[test]
+    fn flags_unclassified_foreign_db_holder_at_lower_confidence() {
+        let mut m = base_model();
+        m.foreign_db_holders = vec![foreign_holder(4242)];
+        let findings = detect(&m);
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f.pid, 4242);
+        assert_eq!(f.class, HolderClass::UnclassifiedForeign);
+        assert!(!f.is_python_shadow);
+        assert!(f.holds_db_file);
+        assert!((f.confidence() - 0.6).abs() < 1e-6);
+        let g = f.to_finding();
+        assert_eq!(g.id, FM_ID);
+        // Same FM (P0 severity), but the finding is clearly unclassified and
+        // detect-only.
+        assert_eq!(g.severity, "P0");
+        assert!(!g.remediation.auto_fixable);
+        assert!(g.title.contains("unclassified foreign"));
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(s.contains("unclassified_foreign"));
+        assert!(s.contains("read-only consumer"));
+    }
+
+    #[test]
+    fn python_shadow_and_foreign_holder_both_surface_shadow_first() {
+        let mut m = base_model();
+        m.actual_processes = vec![python_writer(700, true, false)];
+        m.foreign_db_holders = vec![foreign_holder(4242)];
+        let findings = detect(&m);
+        assert_eq!(findings.len(), 2);
+        // Python shadow (root cause, higher confidence) is emitted first.
+        assert_eq!(findings[0].pid, 700);
+        assert_eq!(findings[0].class, HolderClass::PythonShadow);
+        assert!((findings[0].confidence() - 1.0).abs() < 1e-6);
+        assert_eq!(findings[1].pid, 4242);
+        assert_eq!(findings[1].class, HolderClass::UnclassifiedForeign);
+        assert!((findings[1].confidence() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_foreign_finding_when_list_empty() {
+        // base_model() has an empty foreign_db_holders list — the common case.
+        assert!(detect(&base_model()).is_empty());
     }
 }

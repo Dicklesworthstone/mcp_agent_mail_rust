@@ -3092,6 +3092,32 @@ impl DbPool {
         Ok(())
     }
 
+    /// Run `VACUUM` on the ATC telemetry sidecar (`atc.sqlite3`) to reclaim pages
+    /// freed by the experience-ceiling sweep (br-fv0s1).
+    ///
+    /// The primary [`DbPool::vacuum`] only rewrites the mailbox DB and never
+    /// touches the sidecar, so the sidecar's free pages accumulate after
+    /// row-ceiling eviction. The maintenance worker (bead K4) calls this on the
+    /// vacuum cadence right after the main vacuum. Uses the canonical SQLite
+    /// engine (matching `open_canonical_atc_conn`) and a generous `busy_timeout`
+    /// so it defers under contention rather than failing. No-ops for `:memory:`
+    /// pools and when the sidecar file does not exist (ATC never wrote).
+    pub fn vacuum_atc_sidecar(&self) -> DbResult<()> {
+        let Some(atc_path) = self.atc_sqlite_path() else {
+            return Ok(());
+        };
+        if !std::path::Path::new(&atc_path).exists() {
+            return Ok(());
+        }
+        let conn = crate::CanonicalDbConn::open_file(atc_path.as_str())
+            .map_err(|e| DbError::Sqlite(format!("vacuum atc sidecar: open failed: {e}")))?;
+        conn.execute_raw("PRAGMA busy_timeout = 30000;")
+            .map_err(|e| DbError::Sqlite(format!("vacuum atc sidecar: busy_timeout: {e}")))?;
+        conn.execute_raw("VACUUM;")
+            .map_err(|e| DbError::Sqlite(format!("vacuum atc sidecar: {e}")))?;
+        Ok(())
+    }
+
     /// Apply a `journal_size_limit` (bytes) so the WAL is truncated back to the
     /// configured cap after a checkpoint, bounding unbounded WAL growth.
     ///
@@ -5154,16 +5180,25 @@ pub fn atc_sidecar_sqlite_path(primary: &str) -> String {
     sidecar.to_string_lossy().into_owned()
 }
 
-/// Open a canonical (real-SQLite) read connection to the ATC telemetry sidecar
-/// for a given primary mailbox DB path (br-bvq1x.11.7).
+/// Open a canonical (real-SQLite) connection to the ATC telemetry sidecar for a
+/// given primary mailbox DB path (br-bvq1x.11.7).
 ///
 /// ATC experience/rollup tables are isolated in the sidecar, so non-pool
-/// consumers (TUI poller, CLI ATC views, robot fallback) must read them from
-/// there rather than the mailbox connection. Returns `None` for `:memory:`
-/// pools or when the sidecar file does not exist yet (ATC never wrote) — callers
-/// then report empty ATC telemetry.
+/// consumers (TUI poller, CLI ATC views, robot fallback, `am atc
+/// reprocess-features`) reach them through this opener rather than the mailbox
+/// connection. The connection is read/write — most callers only `SELECT`, but
+/// the reprocess path also writes — so the name deliberately drops the misleading
+/// `_read_` it carried before br-fv0s1. The standard per-connection PRAGMAs
+/// (notably `busy_timeout = 60000`) are applied best-effort so reads and the
+/// reprocess writer back off under lock contention instead of erroring
+/// immediately, matching the pool-backed `open_canonical_atc_conn`. The pragma is
+/// best-effort: a failure to apply it leaves the connection usable for plain
+/// `SELECT`s, just without the tuned timeout. `journal_mode` is intentionally
+/// omitted (it is database-wide and owned by the writer that created the
+/// sidecar). Returns `None` for `:memory:` pools or when the sidecar file does
+/// not exist yet (ATC never wrote) — callers then report empty ATC telemetry.
 #[must_use]
-pub fn open_atc_sidecar_read_conn(primary_sqlite_path: &str) -> Option<crate::CanonicalDbConn> {
+pub fn open_atc_sidecar_conn(primary_sqlite_path: &str) -> Option<crate::CanonicalDbConn> {
     if primary_sqlite_path == ":memory:" {
         return None;
     }
@@ -5171,7 +5206,96 @@ pub fn open_atc_sidecar_read_conn(primary_sqlite_path: &str) -> Option<crate::Ca
     if !Path::new(&atc_path).exists() {
         return None;
     }
-    crate::CanonicalDbConn::open_file(atc_path.as_str()).ok()
+    let conn = crate::CanonicalDbConn::open_file(atc_path.as_str()).ok()?;
+    let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
+    Some(conn)
+}
+
+/// Health snapshot of the ATC telemetry sidecar (`atc.sqlite3`) for surfacing in
+/// `am doctor health` (br-fv0s1).
+///
+/// The sidecar is deliberately isolated from the mailbox DB, so its health is
+/// reported on its own line and never gates the mailbox verdict/exit code. A
+/// missing sidecar is the normal "ATC never wrote" state, not a fault.
+#[derive(Debug, Clone)]
+pub struct AtcSidecarHealth {
+    /// Resolved sidecar path (sibling of the primary mailbox DB).
+    pub path: String,
+    /// Whether the sidecar file exists on disk.
+    pub present: bool,
+    /// File size in bytes (`0` when absent or unreadable).
+    pub size_bytes: u64,
+    /// `PRAGMA quick_check` verdict: `Some(true)` clean, `Some(false)` corrupt,
+    /// `None` when not run (absent, in-memory, or could not open/probe).
+    pub quick_check_ok: Option<bool>,
+    /// First non-ok `quick_check` detail (or the open/probe error) when
+    /// `quick_check_ok` is `Some(false)`/`None`; empty when clean.
+    pub detail: String,
+}
+
+/// Inspect the ATC telemetry sidecar's presence, size, and `quick_check`
+/// integrity for the doctor health surface (br-fv0s1).
+///
+/// Read-only and self-contained: opens its own short-lived canonical connection
+/// and does NOT perturb the global mailbox integrity metrics or corruption
+/// circuit breaker (it reuses the engine-agnostic probe helpers but skips
+/// `evaluate_check_rows`). Returns an absent snapshot for `:memory:` pools and
+/// when the sidecar file does not exist.
+#[must_use]
+pub fn inspect_atc_sidecar_health(primary_sqlite_path: &str) -> AtcSidecarHealth {
+    let path = atc_sidecar_sqlite_path(primary_sqlite_path);
+    if primary_sqlite_path == ":memory:" || !Path::new(&path).exists() {
+        return AtcSidecarHealth {
+            path,
+            present: false,
+            size_bytes: 0,
+            quick_check_ok: None,
+            detail: String::new(),
+        };
+    }
+    let size_bytes = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+    let (quick_check_ok, detail) = match crate::CanonicalDbConn::open_file(path.as_str()) {
+        Ok(conn) => {
+            let _ = conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL);
+            match crate::integrity::probe_check_rows(
+                |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+                crate::integrity::CheckKind::Quick,
+            ) {
+                Ok(rows) => {
+                    let details = crate::integrity::extract_check_details(
+                        &rows,
+                        crate::integrity::CheckKind::Quick,
+                    );
+                    if crate::integrity::details_indicate_ok(&details) {
+                        (Some(true), String::new())
+                    } else {
+                        (Some(false), details.first().cloned().unwrap_or_default())
+                    }
+                }
+                Err(error) => (None, error),
+            }
+        }
+        Err(error) => (None, error.to_string()),
+    };
+    AtcSidecarHealth {
+        path,
+        present: true,
+        size_bytes,
+        quick_check_ok,
+        detail,
+    }
+}
+
+/// Drop the legacy ATC telemetry tables (`atc_*`) from a primary mailbox DB.
+///
+/// For callers that re-create them transiently (e.g. `am migrate`'s runtime
+/// canonical follow-up) and want them gone immediately rather than only on the
+/// next pool open (br-fv0s1). Returns `true` if any were present and dropped.
+/// Idempotent. Canonical-engine connection only — never the FrankenSQLite
+/// runtime engine.
+#[allow(clippy::result_large_err)]
+pub fn drop_legacy_atc_tables(conn: &crate::CanonicalDbConn) -> Result<bool, SqlError> {
+    drop_legacy_atc_tables_from_canonical(conn)
 }
 
 #[must_use]
@@ -6471,6 +6595,46 @@ pub fn mailbox_owner_executable_deleted(primary_path: &Path, storage_root: &Path
         .into_iter()
         .chain(lock_holder_pids_via_proc(&sqlite_lock_path))
         .any(|pid| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
+}
+
+/// A truly foreign process holding the mailbox `storage.sqlite3` open — neither
+/// the Rust `am` binary nor a recognizable Python `mcp_agent_mail` shadow
+/// (br-epoqj).
+///
+/// Examples: an ad-hoc `sqlite3` shell, a migration script, a backup tool, or a
+/// different language runtime that opened the DB file directly. These are
+/// uncoordinated holders that bypass the Agent Mail write protocol entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignDbFileHolder {
+    pub pid: u32,
+    pub executable_path: Option<String>,
+    pub command: Option<String>,
+    pub executable_deleted: bool,
+}
+
+/// Enumerate every PID holding the mailbox `storage.sqlite3` file open that is
+/// **not** this process and **not** a recognizable Agent Mail process (br-epoqj).
+///
+/// [`inspect_mailbox_ownership`] filters its `/proc/*/fd` scan through
+/// `pid_is_agent_mail()` before the holder reaches the process-owner model, so a
+/// truly foreign writer is invisible to the pure `coresident_db_writer` detector.
+/// This unfiltered companion surfaces those holders for a low-confidence,
+/// detect-only doctor finding — doctor never kills a foreign process. Returns an
+/// empty list on platforms without `/proc` (the underlying scan is Linux-only).
+#[must_use]
+pub fn foreign_db_file_holders(primary_path: &Path) -> Vec<ForeignDbFileHolder> {
+    let self_pid = std::process::id();
+    pids_holding_file_via_proc(primary_path)
+        .into_iter()
+        .filter(|&pid| pid != self_pid && !pid_is_agent_mail(pid))
+        .map(|pid| ForeignDbFileHolder {
+            pid,
+            executable_path: pid_executable_path(pid)
+                .map(|path| path.to_string_lossy().into_owned()),
+            command: pid_command_line(pid),
+            executable_deleted: pid_executable_deleted(pid),
+        })
+        .collect()
 }
 
 #[allow(clippy::result_large_err)]
@@ -15613,5 +15777,154 @@ mod tests {
         assert_eq!(CanaryAlertTier::Observable.to_string(), "observable");
         assert_eq!(CanaryAlertTier::Warning.to_string(), "warning");
         assert_eq!(CanaryAlertTier::Engineering.to_string(), "engineering");
+    }
+
+    // --- br-fv0s1: ATC sidecar follow-ups -----------------------------------
+
+    /// Create a minimal valid ATC sidecar at `sidecar_path` with one row so the
+    /// file is a real SQLite database with non-zero size.
+    fn write_sidecar_fixture(sidecar_path: &str) {
+        let conn = crate::CanonicalDbConn::open_file(sidecar_path).expect("open sidecar fixture");
+        conn.execute_raw("CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT);")
+            .expect("create atc_experiences");
+        conn.execute_raw("INSERT INTO atc_experiences (state) VALUES ('open');")
+            .expect("seed atc row");
+    }
+
+    #[test]
+    fn inspect_atc_sidecar_health_reports_absent_when_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let health = inspect_atc_sidecar_health(&primary.to_string_lossy());
+        assert!(!health.present);
+        assert_eq!(health.size_bytes, 0);
+        assert_eq!(health.quick_check_ok, None);
+        assert!(health.path.ends_with(ATC_SIDECAR_FILE_NAME));
+    }
+
+    #[test]
+    fn inspect_atc_sidecar_health_reports_memory_as_absent() {
+        let health = inspect_atc_sidecar_health(":memory:");
+        assert!(!health.present);
+        assert_eq!(health.quick_check_ok, None);
+    }
+
+    #[test]
+    fn inspect_atc_sidecar_health_reports_present_and_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let primary_str = primary.to_string_lossy().into_owned();
+        let sidecar = atc_sidecar_sqlite_path(&primary_str);
+        write_sidecar_fixture(&sidecar);
+
+        let health = inspect_atc_sidecar_health(&primary_str);
+        assert!(health.present);
+        assert!(health.size_bytes > 0);
+        assert_eq!(health.quick_check_ok, Some(true));
+        assert!(health.detail.is_empty());
+    }
+
+    #[test]
+    fn inspect_atc_sidecar_health_flags_unhealthy_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let primary_str = primary.to_string_lossy().into_owned();
+        let sidecar = atc_sidecar_sqlite_path(&primary_str);
+        // Not a SQLite database: open/probe must classify it as not-clean and
+        // never report `quick_check=ok`.
+        std::fs::write(&sidecar, b"this is not a sqlite database").expect("write garbage sidecar");
+
+        let health = inspect_atc_sidecar_health(&primary_str);
+        assert!(health.present);
+        assert!(health.size_bytes > 0);
+        assert_ne!(health.quick_check_ok, Some(true));
+        assert!(!health.detail.is_empty());
+    }
+
+    #[test]
+    fn open_atc_sidecar_conn_handles_memory_and_missing_and_present() {
+        assert!(open_atc_sidecar_conn(":memory:").is_none());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let primary_str = primary.to_string_lossy().into_owned();
+        assert!(
+            open_atc_sidecar_conn(&primary_str).is_none(),
+            "no sidecar file yet => None"
+        );
+
+        let sidecar = atc_sidecar_sqlite_path(&primary_str);
+        write_sidecar_fixture(&sidecar);
+        let conn = open_atc_sidecar_conn(&primary_str).expect("sidecar conn after fixture");
+        // The opener applies PRAGMA_CONN_SETTINGS_SQL (busy_timeout, etc.) — a
+        // plain SELECT must succeed through it.
+        let rows = conn
+            .query_sync("SELECT COUNT(*) FROM atc_experiences", &[])
+            .expect("query sidecar");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn drop_legacy_atc_tables_drops_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("main.sqlite3");
+        let conn =
+            crate::CanonicalDbConn::open_file(db.to_string_lossy().as_ref()).expect("open main");
+        for table in LEGACY_ATC_MAIN_TABLES {
+            conn.execute_raw(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY);"))
+                .expect("create legacy atc table");
+        }
+
+        let dropped = drop_legacy_atc_tables(&conn).expect("first drop");
+        assert!(dropped, "first drop removes the legacy tables");
+        for table in LEGACY_ATC_MAIN_TABLES {
+            let rows = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    &[Value::Text(table.to_string())],
+                )
+                .expect("probe table");
+            assert!(rows.is_empty(), "{table} should be gone after drop");
+        }
+
+        let dropped_again = drop_legacy_atc_tables(&conn).expect("second drop");
+        assert!(!dropped_again, "second drop is a no-op (idempotent)");
+    }
+
+    #[test]
+    fn vacuum_atc_sidecar_noops_without_file_and_runs_with_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("vacuum_sidecar.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&cfg).expect("create pool");
+
+        // No sidecar yet => no-op success.
+        pool.vacuum_atc_sidecar()
+            .expect("vacuum no-op without sidecar");
+
+        // Create the sidecar at the pool's derived path, then vacuum it.
+        let sidecar = pool
+            .atc_sqlite_path()
+            .expect("file-backed pool has sidecar path");
+        write_sidecar_fixture(&sidecar);
+        pool.vacuum_atc_sidecar().expect("vacuum existing sidecar");
+    }
+
+    #[test]
+    fn foreign_db_file_holders_empty_for_unheld_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("unheld.sqlite3");
+        std::fs::write(&db, b"").expect("touch db file");
+        // Nobody holds this fresh file open; this process is excluded by pid even
+        // if it briefly touched it. On non-Linux the scan is a stub => also empty.
+        assert!(foreign_db_file_holders(&db).is_empty());
     }
 }

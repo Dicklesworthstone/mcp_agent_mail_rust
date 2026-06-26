@@ -1964,8 +1964,7 @@ fn fetch_agent_decision_counts(agents: &[AgentListRow], window_start: i64) -> Ha
     else {
         return HashMap::new();
     };
-    let Some(atc_conn) =
-        mcp_agent_mail_db::pool::open_atc_sidecar_read_conn(&resolved.canonical_path)
+    let Some(atc_conn) = mcp_agent_mail_db::pool::open_atc_sidecar_conn(&resolved.canonical_path)
     else {
         return HashMap::new();
     };

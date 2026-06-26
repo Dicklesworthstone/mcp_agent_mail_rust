@@ -193,11 +193,35 @@ pub struct ActualProcess {
     pub holds_db_file: bool,
 }
 
+/// A truly foreign process holding the mailbox DB file open — neither this Rust
+/// binary nor a recognizable Python `mcp_agent_mail` shadow (br-epoqj).
+///
+/// `inspect_mailbox_ownership` filters those out before they reach
+/// [`ActualProcess`], so they are carried separately here and surfaced as a
+/// lower-confidence, detect-only finding by
+/// [`super::fixers::coresident_db_writer`]. Mirrors
+/// `mcp_agent_mail_db::pool::ForeignDbFileHolder`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForeignDbHolder {
+    pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The holder's executable was deleted out from under it.
+    pub executable_deleted: bool,
+}
+
 /// The single, unified process-owner model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessOwnerModel {
     pub expected_service: ExpectedService,
     pub actual_processes: Vec<ActualProcess>,
+    /// Unfiltered, un-classified foreign holders of the mailbox DB file
+    /// (neither this Rust binary nor a Python shadow). Detect-only forensics
+    /// (br-epoqj); empty on hosts without `/proc`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_db_holders: Vec<ForeignDbHolder>,
     pub port: PortOwnership,
     /// Resolved executable of *this* `am` invocation.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,6 +440,7 @@ mod tests {
         ProcessOwnerModel {
             expected_service: ExpectedService::none(),
             actual_processes: Vec::new(),
+            foreign_db_holders: Vec::new(),
             port: PortOwnership {
                 host: "127.0.0.1".into(),
                 port: 8765,
