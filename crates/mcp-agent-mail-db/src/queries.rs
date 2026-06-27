@@ -5560,6 +5560,26 @@ pub async fn create_message_with_recipients(
             )));
         }
     };
+    // De-duplicate resolved recipient ids before any insert. The
+    // `message_recipients` primary key is `(message_id, agent_id)` — `kind` is
+    // NOT part of it — so the same agent appearing twice in `recipients` (e.g.
+    // once as `to` and once as `cc`, or a name that resolves to an already-listed
+    // id) would otherwise fail the second insert with a UNIQUE-constraint error
+    // and surface a *false* `isError` even though the message and every distinct
+    // recipient were persisted, prompting clients to retry and create duplicate
+    // messages (see #243 Bug 2). First occurrence wins, preserving order and the
+    // most-prominent kind.
+    let deduped_recipients: Vec<(i64, &str)> = {
+        let mut seen = std::collections::HashSet::with_capacity(recipients.len());
+        let mut out = Vec::with_capacity(recipients.len());
+        for &(agent_id, kind) in recipients {
+            if seen.insert(agent_id) {
+                out.push((agent_id, kind));
+            }
+        }
+        out
+    };
+    let recipients = deduped_recipients.as_slice();
     let now = now_micros();
     let (row, writer_post_commit_counts) = {
         let conn = match acquire_conn(cx, pool).await {
@@ -5813,7 +5833,16 @@ async fn create_message_with_recipients_tx(
     // Insert recipients one row at a time inside the same transaction.
     // This avoids a known multi-row INSERT + trigger path that can surface
     // spurious PRIMARY KEY conflicts in the franken sqlite engine.
-    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL)";
+    //
+    // `ON CONFLICT(message_id, agent_id) DO NOTHING` makes a re-driven insert
+    // idempotent (see #243 Bug 2): under busy/MVCC retry a partial re-drive of
+    // the recipient loop must not fail with a UNIQUE-constraint error that gets
+    // surfaced as a false `isError` after the message + all distinct recipients
+    // were already persisted. The caller de-duplicates recipient ids before this
+    // runs, so a genuinely-distinct recipient is never silently dropped; the
+    // post-commit visibility probe still verifies every distinct recipient is
+    // present, so a swallowed engine quirk cannot hide a missing row.
+    let insert_recipient_sql = "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, NULL, NULL) ON CONFLICT(message_id, agent_id) DO NOTHING";
     for (agent_id, kind) in recipients {
         let params = [
             Value::BigInt(message_id),
@@ -17529,6 +17558,115 @@ mod tests {
             assert_eq!(rows.len(), 2, "should return the requested window size");
             assert_eq!(rows[0].subject, "msg-3");
             assert_eq!(rows[1].subject, "msg-4");
+        });
+    }
+
+    #[test]
+    fn create_message_with_recipients_dedupes_duplicate_recipient_ids() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("dedupe_duplicate_recipients.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-dedupe-recip-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient_one = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient one");
+            let recipient_two = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "PurpleElk",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient two");
+
+            let sender_id = sender.id.expect("sender id");
+            let r1 = recipient_one.id.expect("recipient one id");
+            let r2 = recipient_two.id.expect("recipient two id");
+
+            // The same agent id (r1) appears twice — once as `to`, once as `cc` —
+            // alongside a second distinct recipient. The primary key is
+            // (message_id, agent_id), so without de-duplication the second insert
+            // of r1 fails UNIQUE and the call returns a false isError even though
+            // the message and every distinct recipient were persisted (#243 Bug 2).
+            let recipients = [(r1, "to"), (r2, "to"), (r1, "cc")];
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "dedupe-subject",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create message with a duplicated recipient id must succeed");
+
+            let message_id = message.id.expect("message id");
+            let rows = list_message_recipients_by_message(&cx, &pool, project_id, message_id)
+                .await
+                .into_result()
+                .expect("list recipients");
+
+            assert_eq!(
+                rows.len(),
+                2,
+                "exactly one recipient row per distinct agent id"
+            );
+            let mut names: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["GreenStone".to_string(), "PurpleElk".to_string()],
+                "both distinct recipients persisted exactly once"
+            );
         });
     }
 

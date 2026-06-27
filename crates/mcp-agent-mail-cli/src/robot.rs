@@ -10148,6 +10148,11 @@ fn append_malformed_db_agent_diagnostics(
     project_arg: &str,
 ) {
     for agent in db_agents {
+        // Reserved operator/system identities (e.g. `HumanOverseer`) are
+        // deliberately not adjective+noun names; do not flag them (#243 Bug 3).
+        if mcp_agent_mail_core::models::is_reserved_operator_agent_name(&agent.name) {
+            continue;
+        }
         if mcp_agent_mail_core::models::normalize_agent_name(&agent.name).is_none() {
             diagnostics.push(AgentLifecycleDiagnostic {
                 reason_code: "malformed_agent_name".to_string(),
@@ -10307,26 +10312,36 @@ fn append_pane_identity_diagnostics(
     diagnostics: &mut Vec<AgentLifecycleDiagnostic>,
     project_arg: &str,
 ) {
-    let identities = mcp_agent_mail_core::list_identities(project_human_key);
+    // Enumerate the LIVE pane-identity directory
+    // (`~/.config/agent-mail/identity/<project_hash>/`) and reconcile against the
+    // current `agents` table. Each alert carries the offending pane id, agent
+    // name, and the concrete backing file path so an operator can trace and
+    // remove an orphaned entry rather than chase a warning with no on-disk
+    // referent (#243 Bug 1).
+    let identities = mcp_agent_mail_core::list_identities_with_paths(project_human_key);
     if identities.is_empty() {
         return;
     }
 
-    let mut panes_by_agent = BTreeMap::<String, Vec<String>>::new();
-    for (pane_id, agent_name) in &identities {
+    let mut panes_by_agent = BTreeMap::<String, Vec<(String, std::path::PathBuf)>>::new();
+    for (pane_id, agent_name, path) in &identities {
         panes_by_agent
             .entry(agent_name.to_ascii_lowercase())
             .or_default()
-            .push(pane_id.clone());
+            .push((pane_id.clone(), path.clone()));
 
-        if mcp_agent_mail_core::models::normalize_agent_name(agent_name).is_none() {
+        // Reserved operator/system identities (e.g. `HumanOverseer`) are not
+        // adjective+noun names by design; do not flag them (#243 Bug 3).
+        if !mcp_agent_mail_core::models::is_reserved_operator_agent_name(agent_name)
+            && mcp_agent_mail_core::models::normalize_agent_name(agent_name).is_none()
+        {
             diagnostics.push(AgentLifecycleDiagnostic {
                 reason_code: "malformed_pane_identity".to_string(),
                 severity: "warn".to_string(),
                 agent: agent_name.clone(),
                 summary: "Pane identity file points at a malformed agent name".to_string(),
                 detail: "The pane identity file is readable, but its agent name does not match the current validator.".to_string(),
-                evidence: format!("pane_id={pane_id}"),
+                evidence: format!("pane_id={pane_id}; agent={agent_name}; path={}", path.display()),
                 safe_command: format!("am robot agents --project {project_arg} --format json"),
             });
         }
@@ -10342,8 +10357,8 @@ fn append_pane_identity_diagnostics(
                 severity: "warn".to_string(),
                 agent: agent_name.clone(),
                 summary: "Pane identity file points at an unknown agent".to_string(),
-                detail: "The pane identity exists for this project, but the named agent is not registered in the project DB.".to_string(),
-                evidence: format!("pane_id={pane_id}"),
+                detail: "The pane identity exists for this project, but the named agent is not registered in the project DB. Remove the stale file (path below) or re-register the agent.".to_string(),
+                evidence: format!("pane_id={pane_id}; agent={agent_name}; path={}", path.display()),
                 safe_command: format!("am agents register --project {project_arg} --program codex-cli --model unknown --name {}", robot_shell_arg(agent_name)),
             });
         } else {
@@ -10353,21 +10368,30 @@ fn append_pane_identity_diagnostics(
                 agent: agent_name.clone(),
                 summary: "Pane identity likely belongs to another project".to_string(),
                 detail: "The pane identity name is absent from this project but exists in another project.".to_string(),
-                evidence: format!("pane_id={pane_id}; other_projects={}", other_projects.join(",")),
+                evidence: format!(
+                    "pane_id={pane_id}; agent={agent_name}; path={}; other_projects={}",
+                    path.display(),
+                    other_projects.join(",")
+                ),
                 safe_command: format!("am agents register --project {project_arg} --program codex-cli --model unknown --name {}", robot_shell_arg(agent_name)),
             });
         }
     }
 
-    for (agent_name, pane_ids) in panes_by_agent {
-        if pane_ids.len() > 1 {
+    for (agent_name, panes) in panes_by_agent {
+        if panes.len() > 1 {
+            let evidence = panes
+                .iter()
+                .map(|(pane_id, path)| format!("{pane_id} ({})", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
             diagnostics.push(AgentLifecycleDiagnostic {
                 reason_code: "duplicate_pane_identity".to_string(),
                 severity: "warn".to_string(),
                 agent: agent_name,
                 summary: "Multiple pane identity files point at the same agent".to_string(),
-                detail: "This can indicate duplicate client sessions or stale pane identity files; diagnostics are read-only and did not remove anything.".to_string(),
-                evidence: format!("pane_ids={}", pane_ids.join(",")),
+                detail: "This can indicate duplicate client sessions or stale pane identity files; diagnostics are read-only and did not remove anything. Each pane id and its backing file path is listed in the evidence.".to_string(),
+                evidence: format!("panes=[{evidence}]"),
                 safe_command: format!("am robot agents --project {project_arg} --format json"),
             });
         }

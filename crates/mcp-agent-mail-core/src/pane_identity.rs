@@ -338,6 +338,22 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
 /// Returns `(pane_id, agent_name)` pairs from the canonical directory.
 #[must_use]
 pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
+    list_identities_with_paths(project_key)
+        .into_iter()
+        .map(|(pane_id, name, _path)| (pane_id, name))
+        .collect()
+}
+
+/// List all identity entries for a project, including the concrete file path
+/// that backs each entry.
+///
+/// Returns `(pane_id, agent_name, path)` tuples enumerated from the LIVE
+/// canonical pane-identity directory
+/// (`~/.config/agent-mail/identity/<project_hash>/`). Diagnostics that surface
+/// these to operators should include `path` so a phantom/orphaned warning can be
+/// traced to a real file on disk (see #243 Bug 1).
+#[must_use]
+pub fn list_identities_with_paths(project_key: &str) -> Vec<(String, String, PathBuf)> {
     let base = config_base_dir();
     let hash = project_hash(project_key);
     let project_dir = base.join(IDENTITY_DIR_NAME).join(hash);
@@ -353,8 +369,9 @@ pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
 
     for entry in entries.flatten() {
         let pane_id = entry.file_name().to_string_lossy().to_string();
-        if let Some(name) = read_identity_file(&entry.path()) {
-            result.push((pane_id, name));
+        let path = entry.path();
+        if let Some(name) = read_identity_file(&path) {
+            result.push((pane_id, name, path));
         }
     }
 

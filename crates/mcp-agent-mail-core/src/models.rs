@@ -633,6 +633,26 @@ pub fn is_valid_agent_name(name: &str) -> bool {
     normalize_agent_name(name).is_some()
 }
 
+/// Reserved operator / system agent identities that are intentionally NOT
+/// adjective+noun names.
+///
+/// `HumanOverseer` is the human operator identity the serve-http mail UI uses
+/// to compose messages; it is inserted via `insert_system_agent` without name
+/// validation. Health / diagnostic checks must exempt these from the
+/// `malformed_agent_name` warning so the operator identity does not generate a
+/// permanent, un-actionable warning (see #243 Bug 3).
+pub const RESERVED_OPERATOR_AGENT_NAMES: &[&str] = &["HumanOverseer"];
+
+/// Returns `true` if `name` is a reserved operator / system identity that is
+/// exempt from adjective+noun validation (case-insensitive, trimmed).
+#[must_use]
+pub fn is_reserved_operator_agent_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    RESERVED_OPERATOR_AGENT_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(trimmed))
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Agent name mistake detection (Python parity)
 // ──────────────────────────────────────────────────────────────────────
