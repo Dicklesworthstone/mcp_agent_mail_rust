@@ -1,9 +1,11 @@
+Inspect and maintain the Git-backed message/reservation archive
+
 Usage: am archive <COMMAND>
 
 Commands:
-  save
   list
   restore
+  save
   help     Print this message or the help of the given subcommand(s)
 
 Options:

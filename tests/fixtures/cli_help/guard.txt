@@ -1,10 +1,12 @@
+Install, check, and manage the pre-commit file-reservation guard hook
+
 Usage: am guard <COMMAND>
 
 Commands:
-  install
-  uninstall
-  status
   check
+  install
+  status
+  uninstall
   help       Print this message or the help of the given subcommand(s)
 
 Options:

@@ -1,3 +1,5 @@
+Run a command while holding a build-slot file reservation
+
 Usage: am am-run [OPTIONS] <SLOT> <CMD>...
 
 Arguments:

@@ -1,3 +1,5 @@
+Run the Agent Mail MCP server over streamable HTTP (with optional TUI)
+
 Usage: am serve-http [OPTIONS]
 
 Options:

@@ -1,3 +1,5 @@
+Low-level control-plane utilities (build-slot environment inspection)
+
 Usage: am amctl <COMMAND>
 
 Commands:

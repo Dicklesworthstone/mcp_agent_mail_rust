@@ -2076,6 +2076,56 @@ async fn startup_readiness_self_probe(
     Err(last_failure)
 }
 
+/// Notify systemd (`Type=notify`) that the service is ready, once the HTTP
+/// endpoint is confirmed serving.
+///
+/// Implements the `sd_notify(READY=1)` protocol inline (no extra dependency):
+/// if `NOTIFY_SOCKET` is set — which systemd only does for a `Type=notify` unit
+/// — send `READY=1` over an unnamed unix datagram socket. A leading `@` denotes
+/// a Linux abstract-namespace socket. When `NOTIFY_SOCKET` is unset (a
+/// `Type=simple` unit, or any non-systemd launch) this is a no-op, so it is
+/// always safe to call. Best-effort: failures are logged at debug and never
+/// affect serving. See #174: previously systemd marked the service `active`
+/// before the listener was accepting, so clients got connection-refused for
+/// minutes after a restart on a large mailbox.
+#[cfg(target_os = "linux")]
+fn sd_notify_ready() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let Some(raw) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let datagram = match UnixDatagram::unbound() {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::debug!(%error, "sd_notify: could not open unix datagram socket");
+            return;
+        }
+    };
+    let raw_bytes = raw.as_encoded_bytes();
+    let send_result = if let Some(abstract_name) = raw_bytes.strip_prefix(b"@") {
+        match SocketAddr::from_abstract_name(abstract_name) {
+            Ok(addr) => datagram.send_to_addr(b"READY=1\n", &addr),
+            Err(error) => {
+                tracing::debug!(%error, "sd_notify: invalid abstract NOTIFY_SOCKET address");
+                return;
+            }
+        }
+    } else {
+        datagram.send_to(b"READY=1\n", std::path::Path::new(&raw))
+    };
+    match send_result {
+        Ok(_) => tracing::debug!("sd_notify: READY=1 sent to systemd"),
+        Err(error) => tracing::debug!(%error, "sd_notify: READY=1 send failed"),
+    }
+}
+
+/// Non-Linux fallback for [`sd_notify_ready`]: systemd readiness notification is
+/// Linux-only, so this is a no-op everywhere else.
+#[cfg(not(target_os = "linux"))]
+fn sd_notify_ready() {}
+
 fn build_http_runtime() -> std::io::Result<Runtime> {
     let (reactor, reactor_name) = build_http_reactor()?;
     let workers = resolve_http_runtime_worker_threads();
@@ -4127,6 +4177,10 @@ async fn run_http_server_supervisor(
         port = config.http_port,
         "Startup readiness self-probe passed — server is accepting requests"
     );
+    // The endpoint is confirmed serving; tell systemd (`Type=notify`) we are
+    // ready so `systemctl is-active` only reports `active` once clients can
+    // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
+    sd_notify_ready();
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =

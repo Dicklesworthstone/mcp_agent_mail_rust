@@ -1,3 +1,5 @@
+Run the Agent Mail MCP server over stdio (for direct MCP client launch)
+
 Usage: am serve-stdio
 
 Options:

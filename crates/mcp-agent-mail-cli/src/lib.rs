@@ -352,6 +352,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Run the Agent Mail MCP server over streamable HTTP (with optional TUI).
     #[command(name = "serve-http")]
     ServeHttp {
         #[arg(long)]
@@ -378,6 +379,7 @@ pub enum Commands {
         #[arg(long)]
         takeover: bool,
     },
+    /// Run the Agent Mail MCP server over stdio (for direct MCP client launch).
     #[command(name = "serve-stdio")]
     ServeStdio,
     /// Print the machine-readable CLI capabilities contract.
@@ -644,7 +646,9 @@ pub enum Commands {
         #[arg(long)]
         runs: Option<u32>,
     },
+    /// Run clippy lints across the workspace (`cargo clippy --all-targets -D warnings`).
     Lint,
+    /// Type-check the workspace without building binaries (`cargo check --all-targets`).
     Typecheck,
     /// Run E2E test suites.
     #[command(name = "e2e")]
@@ -652,31 +656,37 @@ pub enum Commands {
         #[command(subcommand)]
         action: E2eCommand,
     },
+    /// Create, inspect, and import encrypted shareable mailbox bundles.
     #[command(name = "share")]
     Share {
         #[command(subcommand)]
         action: ShareCommand,
     },
+    /// Inspect and maintain the Git-backed message/reservation archive.
     #[command(name = "archive")]
     Archive {
         #[command(subcommand)]
         action: ArchiveCommand,
     },
+    /// Install, check, and manage the pre-commit file-reservation guard hook.
     #[command(name = "guard")]
     Guard {
         #[command(subcommand)]
         action: GuardCommand,
     },
+    /// Reserve, renew, release, and inspect file reservations.
     #[command(name = "file_reservations")]
     FileReservations {
         #[command(subcommand)]
         action: FileReservationsCommand,
     },
+    /// List and send reminders for pending or overdue message acknowledgements.
     #[command(name = "acks")]
     Acks {
         #[command(subcommand)]
         action: AcksCommand,
     },
+    /// List acknowledgement status for an agent's recent messages.
     #[command(name = "list-acks")]
     ListAcks {
         #[arg(long = "project")]
@@ -686,6 +696,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
+    /// Migrate or check the on-disk database format (with backup/rollback).
     #[command(name = "migrate")]
     Migrate {
         /// Only check the database format without modifying anything.
@@ -701,6 +712,7 @@ pub enum Commands {
         #[arg(long)]
         backup_dir: Option<PathBuf>,
     },
+    /// List registered projects (optionally including their agents).
     #[command(name = "list-projects")]
     ListProjects {
         #[arg(long, default_value_t = false)]
@@ -712,6 +724,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Destructively wipe all Agent Mail state (optionally archiving first).
     #[command(name = "clear-and-reset-everything")]
     ClearAndResetEverything {
         #[arg(
@@ -733,48 +746,58 @@ pub enum Commands {
         )]
         no_archive: bool,
     },
+    /// Inspect and edit Agent Mail configuration.
     #[command(name = "config")]
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
     },
+    /// Low-level control-plane utilities (build-slot environment inspection).
     #[command(name = "amctl")]
     Amctl {
         #[command(subcommand)]
         action: AmctlCommand,
     },
+    /// Run a command while holding a build-slot file reservation.
     #[command(name = "am-run")]
     AmRun(AmRunArgs),
+    /// Manage projects: register, adopt, mark identity, and discovery.
     #[command(name = "projects")]
     Projects {
         #[command(subcommand)]
         action: ProjectsCommand,
     },
+    /// Send, read, search, reply to, and replay mailbox messages.
     #[command(name = "mail")]
     Mail {
         #[command(subcommand)]
         action: MailCommand,
     },
+    /// Manage product records and link them to projects.
     #[command(name = "products")]
     Products {
         #[command(subcommand)]
         action: ProductsCommand,
     },
+    /// Generate and insert Agent Mail documentation blurbs.
     #[command(name = "docs")]
     Docs {
         #[command(subcommand)]
         action: DocsCommand,
     },
+    /// Diagnose and repair mailbox, archive, and database health.
     #[command(name = "doctor")]
     Doctor {
         #[command(subcommand)]
         action: DoctorCommand,
     },
+    /// Register, list, and inspect agent identities.
     #[command(name = "agents")]
     Agents {
         #[command(subcommand)]
         action: AgentsCommand,
     },
+    /// Inspect the MCP tool directory, schemas, and call metrics.
     #[command(name = "tooling")]
     Tooling {
         #[command(subcommand)]
@@ -2403,6 +2426,17 @@ pub enum DoctorCommand {
         /// How to handle anomalous files: quarantine (move) or annotate (sidecar).
         #[arg(long, value_enum, default_value_t = NormalizeApplyMode::Quarantine)]
         apply_mode: NormalizeApplyMode,
+        /// Also prune released file-reservation archive JSON
+        /// (`file_reservations/<sha>.json` + `id-<id>.json`) whose `released_ts`
+        /// is older than the reservation retention horizon. The audit history is
+        /// preserved in git history; only the working-tree copy is removed so the
+        /// archive stops growing without bound (#173). Off by default.
+        #[arg(long)]
+        prune_released_reservations: bool,
+        /// Retention horizon (days) for `--prune-released-reservations`. Defaults
+        /// to FILE_RESERVATIONS_RETENTION_DAYS (the same horizon the DB rows use).
+        #[arg(long, value_name = "DAYS")]
+        reservation_retention_days: Option<u64>,
     },
     /// Attempt automatic remediation for detected issues.
     ///
@@ -3190,10 +3224,24 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
     }
 }
 
+/// Sort every subcommand listing alphabetically by name in `--help`.
+///
+/// clap renders subcommands ordered by `(display_order, name)`, and the derive
+/// macro assigns an auto-incrementing `display_order` matching declaration
+/// order. Pinning every subcommand to the same `display_order` makes the
+/// tie-breaker (the command name) decide ordering, so help lists commands
+/// alphabetically — matching the other Dicklesworthstone CLIs (#175). Applied
+/// recursively so nested subcommand lists are alphabetical too.
+fn alphabetize_subcommands(cmd: clap::Command) -> clap::Command {
+    cmd.mut_subcommands(|sub| alphabetize_subcommands(sub.display_order(0)))
+}
+
 fn parse_with_invocation_name(invocation_name: &'static str) -> Result<Cli, i32> {
-    let cmd = Cli::command()
-        .name(invocation_name)
-        .bin_name(invocation_name);
+    let cmd = alphabetize_subcommands(
+        Cli::command()
+            .name(invocation_name)
+            .bin_name(invocation_name),
+    );
 
     // Ensure argv0 matches the name we want clap to render, regardless of how this
     // library was invoked.
@@ -7557,7 +7605,16 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             yes,
             json,
             apply_mode,
-        } => handle_doctor_archive_normalize(dry_run, yes, json, apply_mode),
+            prune_released_reservations,
+            reservation_retention_days,
+        } => handle_doctor_archive_normalize(
+            dry_run,
+            yes,
+            json,
+            apply_mode,
+            prune_released_reservations,
+            reservation_retention_days,
+        ),
         DoctorCommand::Fix {
             dry_run,
             yes,
@@ -15699,6 +15756,14 @@ fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
             | ContactsCommand::Respond { .. }
             | ContactsCommand::Policy { .. }
     ) {
+        // Mutating contact verb. Mirror `mail send`: proxy the call through a
+        // running serve-http daemon when one owns the mailbox, and only take
+        // the local SQLite path when no daemon is present. Without this the
+        // verbs fail with a mailbox-activity-lock error whenever a daemon is
+        // running (the residual of #126 reported in #171).
+        if try_proxy_contacts_mutation(&action)? {
+            return Ok(());
+        }
         let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
         let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
         let conn = open_db_sync_while_holding_mailbox_lock()?;
@@ -15992,6 +16057,340 @@ fn handle_contacts_with_conn(
             Ok(())
         }
     }
+}
+
+/// Attempt a mutating `contacts` verb through a running serve-http daemon, the
+/// same way `mail send` proxies via `send_mail_envelope_via_server_or_local`.
+///
+/// Returns `Ok(true)` when the daemon handled the call (output already
+/// emitted), or `Ok(false)` when no daemon owns the mailbox and the caller
+/// should fall back to the local SQLite path. Returns `Err` when the daemon
+/// rejected the call in a way that disallows local fallback, or when a daemon
+/// owns the mailbox but its HTTP endpoint is unreachable (refusing a local
+/// mutation the owner would block anyway). See #171.
+fn try_proxy_contacts_mutation(action: &ContactsCommand) -> CliResult<bool> {
+    let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let server_url = local_server_url_from_parts(
+        &server_config.http_host,
+        server_config.http_port,
+        &server_config.http_path,
+    );
+    let bearer = local_server_bearer_token(&server_config);
+
+    let (tool_name, command_label, arguments) = match action {
+        ContactsCommand::Request {
+            project_key,
+            from_agent,
+            to_agent,
+            reason,
+            ttl_seconds,
+            ..
+        } => (
+            "request_contact",
+            "contacts request",
+            serde_json::json!({
+                "project_key": project_key,
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "reason": reason,
+                "ttl_seconds": ttl_seconds,
+            }),
+        ),
+        ContactsCommand::Respond {
+            project_key,
+            agent_name,
+            from_agent,
+            accept,
+            reject,
+            ttl_seconds,
+            ..
+        } => {
+            let approved = if *reject { false } else { *accept };
+            (
+                "respond_contact",
+                "contacts respond",
+                serde_json::json!({
+                    "project_key": project_key,
+                    "to_agent": agent_name,
+                    "from_agent": from_agent,
+                    "accept": approved,
+                    "ttl_seconds": ttl_seconds,
+                }),
+            )
+        }
+        ContactsCommand::Policy {
+            project_key,
+            agent_name,
+            policy,
+            ..
+        } => {
+            // Preserve the local path's strict policy validation so behavior is
+            // identical whether or not a daemon is running.
+            let valid = ["open", "auto", "contacts_only", "block_all"];
+            if !valid.contains(&policy.as_str()) {
+                return Err(CliError::InvalidArgument(format!(
+                    "invalid policy: {policy}. Valid: {}",
+                    valid.join(", ")
+                )));
+            }
+            (
+                "set_contact_policy",
+                "contacts policy",
+                serde_json::json!({
+                    "project_key": project_key,
+                    "agent_name": agent_name,
+                    "policy": policy,
+                }),
+            )
+        }
+        ContactsCommand::ListContacts { .. } => return Ok(false),
+    };
+
+    let storage_root = server_config.storage_root.clone();
+    let payload = context::run_async(async move {
+        call_contacts_tool_via_server(
+            &server_url,
+            bearer.as_deref(),
+            &database_url,
+            &storage_root,
+            command_label,
+            tool_name,
+            arguments,
+        )
+        .await
+    })?;
+
+    let Some(payload) = payload else {
+        return Ok(false);
+    };
+
+    emit_proxied_contacts_output(action, &payload);
+    Ok(true)
+}
+
+/// Shared server-or-local proxy primitive for the mutating contact verbs and
+/// the contact-handshake macro. Returns `Ok(Some(payload))` when the daemon
+/// handled the tool call, or `Ok(None)` when the caller should fall back to the
+/// local path (no daemon present and the mailbox is not owned).
+async fn call_contacts_tool_via_server(
+    server_url: &str,
+    bearer: Option<&str>,
+    database_url: &str,
+    storage_root: &Path,
+    command_label: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> CliResult<Option<serde_json::Value>> {
+    match try_call_server_tool(server_url, bearer, tool_name, arguments).await {
+        ServerToolCall::Success(result) => {
+            let payload = coerce_tool_result_json_or_error(tool_name, result)?;
+            Ok(Some(payload))
+        }
+        ServerToolCall::Unavailable(message) => {
+            reject_local_fallback_if_mailbox_owned(
+                command_label,
+                server_url,
+                &message,
+                database_url,
+                storage_root,
+            )?;
+            Ok(None)
+        }
+        ServerToolCall::Rejected(message) => {
+            if !mail_server_rejection_allows_local_fallback(&message) {
+                return Err(CliError::Other(format!(
+                    "{command_label} via server failed: {message}"
+                )));
+            }
+            tracing::debug!(
+                command = command_label,
+                message = %message,
+                "contact mutation fell back to local tool after server scope mismatch"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Emit CLI output for a contact verb that was handled by the daemon, matching
+/// the shape the local path emits so scripts see consistent results regardless
+/// of whether a daemon owns the mailbox.
+fn emit_proxied_contacts_output(action: &ContactsCommand, payload: &serde_json::Value) {
+    match action {
+        ContactsCommand::Request {
+            from_agent,
+            to_agent,
+            reason,
+            format,
+            json,
+            ..
+        } => {
+            let fmt = output::CliOutputFormat::resolve(*format, *json);
+            let status = payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending")
+                .to_string();
+            let expires = payload
+                .get("expires_ts")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let result = serde_json::json!({
+                "from": from_agent,
+                "to": to_agent,
+                "status": status,
+                "reason": reason,
+                "expires_ts": expires,
+            });
+            output::emit_output(&result, fmt, || {
+                output::success(&format!("Contact request sent: {from_agent} → {to_agent}"));
+                output::kv("Status", &status);
+                output::kv("Reason", reason);
+                if let Some(ref exp) = expires {
+                    output::kv("Expires", exp);
+                }
+            });
+        }
+        ContactsCommand::Respond {
+            agent_name,
+            from_agent,
+            accept,
+            reject,
+            format,
+            json,
+            ..
+        } => {
+            let fmt = output::CliOutputFormat::resolve(*format, *json);
+            let approved = payload
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(if *reject { false } else { *accept });
+            let new_status = if approved { "approved" } else { "blocked" };
+            let updated = payload
+                .get("updated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let result = serde_json::json!({
+                "from": from_agent,
+                "to": agent_name,
+                "approved": approved,
+                "status": new_status,
+                "updated": updated,
+            });
+            let verb = if approved { "Approved" } else { "Rejected" };
+            output::emit_output(&result, fmt, || {
+                output::success(&format!(
+                    "{verb} contact request: {from_agent} → {agent_name}"
+                ));
+                output::kv("Status", new_status);
+            });
+        }
+        ContactsCommand::Policy {
+            agent_name,
+            policy,
+            format,
+            json,
+            ..
+        } => {
+            let fmt = output::CliOutputFormat::resolve(*format, *json);
+            let agent = payload
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(agent_name)
+                .to_string();
+            let resolved_policy = payload
+                .get("policy")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(policy)
+                .to_string();
+            let result = serde_json::json!({
+                "agent": agent,
+                "policy": resolved_policy,
+            });
+            output::emit_output(&result, fmt, || {
+                output::success(&format!("Contact policy set: {agent} → {resolved_policy}"));
+            });
+        }
+        ContactsCommand::ListContacts { .. } => {}
+    }
+}
+
+/// Attempt the contact-handshake macro through a running serve-http daemon
+/// (`macro_contact_handshake` tool). Returns `Ok(Some(payload))` when the
+/// daemon handled it, or `Ok(None)` when the caller should fall back to the
+/// local async path. See #171.
+#[allow(clippy::too_many_arguments)]
+async fn try_proxy_contact_handshake(
+    project_key: &str,
+    from: &str,
+    to: &str,
+    to_project: Option<&str>,
+    reason: Option<&str>,
+    auto_accept: bool,
+    ttl: i64,
+    welcome_subject: Option<&str>,
+    welcome_body: Option<&str>,
+    thread_id: Option<&str>,
+    register_missing: bool,
+    reg_program: Option<&str>,
+    reg_model: Option<&str>,
+    reg_task: Option<&str>,
+) -> CliResult<Option<serde_json::Value>> {
+    let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let server_url = local_server_url_from_parts(
+        &server_config.http_host,
+        server_config.http_port,
+        &server_config.http_path,
+    );
+    let bearer = local_server_bearer_token(&server_config);
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("project_key".to_string(), serde_json::json!(project_key));
+    arguments.insert("requester".to_string(), serde_json::json!(from));
+    arguments.insert("target".to_string(), serde_json::json!(to));
+    arguments.insert("auto_accept".to_string(), serde_json::json!(auto_accept));
+    arguments.insert("ttl_seconds".to_string(), serde_json::json!(ttl));
+    arguments.insert(
+        "register_if_missing".to_string(),
+        serde_json::json!(register_missing),
+    );
+    if let Some(value) = to_project {
+        arguments.insert("to_project".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = reason {
+        arguments.insert("reason".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = welcome_subject {
+        arguments.insert("welcome_subject".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = welcome_body {
+        arguments.insert("welcome_body".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = thread_id {
+        arguments.insert("thread_id".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = reg_program {
+        arguments.insert("program".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = reg_model {
+        arguments.insert("model".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = reg_task {
+        arguments.insert("task_description".to_string(), serde_json::json!(value));
+    }
+
+    call_contacts_tool_via_server(
+        &server_url,
+        bearer.as_deref(),
+        &database_url,
+        server_config.storage_root.as_path(),
+        "macro contact-handshake",
+        "macro_contact_handshake",
+        serde_json::Value::Object(arguments),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -23439,6 +23838,7 @@ struct DoctorArchiveNormalizeResult {
     metadata_files_written: usize,
     duplicate_files_quarantined: usize,
     duplicate_files_annotated: usize,
+    reservation_archive_files_pruned: usize,
     unresolved_project_metadata_files: usize,
     unresolved_malformed_message_files: usize,
     unresolved_suspicious_projects: usize,
@@ -32590,9 +32990,42 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             format,
             json,
         } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            // Mirror `mail send`: proxy through a running serve-http daemon when
+            // one owns the mailbox, only falling back to the local path when no
+            // daemon is present. Without this the macro's local read missed the
+            // daemon's writes and reported `agent not found` (#171).
+            if let Some(payload) = try_proxy_contact_handshake(
+                &project_key,
+                &from,
+                &to,
+                to_project.as_deref(),
+                reason.as_deref(),
+                auto_accept,
+                ttl,
+                welcome_subject.as_deref(),
+                welcome_body.as_deref(),
+                thread_id.as_deref(),
+                register_missing,
+                reg_program.as_deref(),
+                reg_model.as_deref(),
+                reg_task.as_deref(),
+            )
+            .await?
+            {
+                let welcome_sent = payload.get("welcome_message").is_some_and(|v| !v.is_null());
+                output::emit_output(&payload, fmt, || {
+                    output::success(&format!("Contact handshake: {from} → {to}"));
+                    output::kv("Status", if auto_accept { "approved" } else { "pending" });
+                    if welcome_sent {
+                        output::kv("Welcome", "sent");
+                    }
+                });
+                return Ok(());
+            }
+
             let ctx = context::AsyncCliContext::open()?;
             let cx = asupersync::Cx::for_request();
-            let fmt = output::CliOutputFormat::resolve(format, json);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
@@ -34635,7 +35068,9 @@ StartLimitBurst=5
 StartLimitIntervalSec=300
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=300
 ExecStart={exec_args}
 WorkingDirectory={working_dir}
 Restart=on-failure
@@ -48577,8 +49012,15 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(false, true, false, NormalizeApplyMode::Quarantine)
-                    .expect("archive normalization should succeed");
+                handle_doctor_archive_normalize(
+                    false,
+                    true,
+                    false,
+                    NormalizeApplyMode::Quarantine,
+                    false,
+                    None,
+                )
+                .expect("archive normalization should succeed");
             },
         );
 
@@ -48648,6 +49090,8 @@ startup_timeout_sec = 42
                         true,
                         false,
                         NormalizeApplyMode::Quarantine,
+                        false,
+                        None,
                     )
                     .expect("archive normalization should succeed");
                 },
@@ -48694,6 +49138,8 @@ startup_timeout_sec = 42
                         true,
                         false,
                         NormalizeApplyMode::Quarantine,
+                        false,
+                        None,
                     )
                     .expect("archive normalization should succeed");
                 },
@@ -48768,8 +49214,15 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
             ],
             || {
-                handle_doctor_archive_normalize(false, true, false, NormalizeApplyMode::Annotate)
-                    .expect("archive normalization in annotate mode should succeed");
+                handle_doctor_archive_normalize(
+                    false,
+                    true,
+                    false,
+                    NormalizeApplyMode::Annotate,
+                    false,
+                    None,
+                )
+                .expect("archive normalization in annotate mode should succeed");
             },
         );
 
@@ -48849,6 +49302,8 @@ startup_timeout_sec = 42
                     true,
                     false,
                     NormalizeApplyMode::Annotate,
+                    false,
+                    None,
                 )
                 .expect("dry-run annotate mode should succeed");
             },
@@ -68737,16 +69192,177 @@ fn handle_doctor_archive_verify(
     Ok(())
 }
 
+/// Decide whether a file-reservation archive JSON should be pruned: it must be a
+/// *released* reservation whose settle timestamp is strictly older than
+/// `older_than_us`. Active (unreleased) reservations have no `released_ts` and
+/// are never pruned. Unparseable content, or a missing / empty / non-positive
+/// `released_ts`, also returns `false`, so only clearly-released history is ever
+/// removed. See #173.
+fn reservation_archive_json_is_prunable(content: &str, older_than_us: i64) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(released) = value.get("released_ts") else {
+        return false;
+    };
+    let released_us = match released {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            mcp_agent_mail_core::timestamps::iso_to_micros(text.trim())
+        }
+        _ => None,
+    };
+    matches!(released_us, Some(ts) if ts > 0 && ts < older_than_us)
+}
+
+/// Collect released file-reservation archive JSON files
+/// (`projects/<slug>/file_reservations/*.json`) whose `released_ts` predates the
+/// retention horizon (`retention_days` before now). Active reservations are left
+/// untouched. The git history still retains the audit record after deletion, so
+/// this only bounds the working-tree copy (#173).
+fn collect_prunable_reservation_archives(storage_root: &Path, retention_days: u64) -> Vec<PathBuf> {
+    let now_us = mcp_agent_mail_db::timestamps::now_micros();
+    let retention_us = i64::try_from(retention_days)
+        .unwrap_or(30)
+        .saturating_mul(86_400)
+        .saturating_mul(1_000_000);
+    let older_than_us = now_us.saturating_sub(retention_us);
+
+    let projects_dir = storage_root.join("projects");
+    let mut out = Vec::new();
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return out;
+    };
+    for project in project_entries.flatten() {
+        let res_dir = project.path().join("file_reservations");
+        let Ok(files) = std::fs::read_dir(&res_dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(OsStr::to_str) != Some("json") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if reservation_archive_json_is_prunable(&content, older_than_us) {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod reservation_archive_prune_tests {
+    use super::reservation_archive_json_is_prunable;
+
+    fn micros_to_iso(us: i64) -> String {
+        mcp_agent_mail_db::micros_to_iso(us)
+    }
+
+    #[test]
+    fn prunes_only_released_history_past_horizon() {
+        let now = mcp_agent_mail_db::timestamps::now_micros();
+        let day = 86_400i64 * 1_000_000;
+        let horizon = now - 30 * day;
+        let old_iso = micros_to_iso(now - 100 * day);
+        let recent_iso = micros_to_iso(now - day);
+
+        // Released long ago → prune.
+        assert!(reservation_archive_json_is_prunable(
+            &format!(r#"{{"id":1,"path_pattern":"a","released_ts":"{old_iso}"}}"#),
+            horizon
+        ));
+        // Released recently → keep.
+        assert!(!reservation_archive_json_is_prunable(
+            &format!(r#"{{"id":2,"released_ts":"{recent_iso}"}}"#),
+            horizon
+        ));
+        // Active (no released_ts) → keep.
+        assert!(!reservation_archive_json_is_prunable(
+            r#"{"id":3,"path_pattern":"a"}"#,
+            horizon
+        ));
+        // Explicit null / empty released_ts → keep.
+        assert!(!reservation_archive_json_is_prunable(
+            r#"{"id":4,"released_ts":null}"#,
+            horizon
+        ));
+        assert!(!reservation_archive_json_is_prunable(
+            r#"{"id":5,"released_ts":""}"#,
+            horizon
+        ));
+        // Raw micros integer form, released long ago → prune.
+        assert!(reservation_archive_json_is_prunable(
+            &format!(r#"{{"id":6,"released_ts":{}}}"#, now - 100 * day),
+            horizon
+        ));
+        // Garbage → keep.
+        assert!(!reservation_archive_json_is_prunable("not json", horizon));
+    }
+}
+
 fn handle_doctor_archive_normalize(
     dry_run: bool,
     yes: bool,
     json: bool,
     apply_mode: NormalizeApplyMode,
+    prune_released_reservations: bool,
+    reservation_retention_days: Option<u64>,
 ) -> CliResult<()> {
     let config = Config::from_env();
-    let storage_root = config.storage_root;
+    let storage_root = config.storage_root.clone();
     let _mailbox_storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
+
+    // #173: optional, opt-in prune of released file-reservation archive JSON past
+    // the retention horizon. Self-contained and independent of the project
+    // metadata / duplicate-message normalization below. The git history still
+    // retains the audit record, so this only bounds working-tree growth.
+    let mut reservation_prune_actions: Vec<DoctorArchiveNormalizeAction> = Vec::new();
+    if prune_released_reservations {
+        let retention_days =
+            reservation_retention_days.unwrap_or(config.file_reservations_retention_days);
+        if retention_days == 0 {
+            return Err(CliError::InvalidArgument(
+                "--reservation-retention-days must be > 0 (0 would prune all released history); \
+                 the retention horizon defaults to FILE_RESERVATIONS_RETENTION_DAYS"
+                    .to_string(),
+            ));
+        }
+        let candidates = collect_prunable_reservation_archives(&storage_root, retention_days);
+        if !candidates.is_empty() {
+            let confirm_msg = format!(
+                "Prune {} released file-reservation archive file(s) older than {retention_days} days? \
+                 Git history retains the audit record; only the working-tree copy is removed.",
+                candidates.len()
+            );
+            if dry_run || confirm_mutating_doctor_action(&confirm_msg, dry_run, yes)? {
+                for path in &candidates {
+                    reservation_prune_actions.push(DoctorArchiveNormalizeAction {
+                        kind: "prune_released_reservation_archive".to_string(),
+                        path: path.display().to_string(),
+                        detail: format!("released past {retention_days}-day retention horizon"),
+                    });
+                    if !dry_run {
+                        std::fs::remove_file(path).map_err(|error| {
+                            CliError::Other(format!(
+                                "failed to prune reservation archive {}: {error}",
+                                path.display()
+                            ))
+                        })?;
+                    }
+                }
+            } else {
+                ftui_runtime::ftui_println!("Reservation archive prune cancelled.");
+            }
+        }
+    }
+    let reservation_archive_files_pruned = reservation_prune_actions.len();
+
     let report = audit_doctor_archive(&storage_root);
     let mut result = DoctorArchiveNormalizeResult {
         dry_run,
@@ -68764,8 +69380,10 @@ fn handle_doctor_archive_normalize(
                 .count(),
         unresolved_malformed_message_files: report.malformed_message_files.len(),
         unresolved_suspicious_projects: report.suspicious_projects.len(),
+        reservation_archive_files_pruned,
         ..DoctorArchiveNormalizeResult::default()
     };
+    result.actions.extend(reservation_prune_actions);
 
     let actionable_count = report
         .missing_project_metadata
@@ -68793,6 +69411,13 @@ fn handle_doctor_archive_normalize(
                 })
             );
         } else {
+            if result.reservation_archive_files_pruned > 0 {
+                ftui_runtime::ftui_println!(
+                    "{} released reservation archive file(s) {}.",
+                    result.reservation_archive_files_pruned,
+                    if dry_run { "would be pruned" } else { "pruned" }
+                );
+            }
             ftui_runtime::ftui_println!("No safe archive normalization actions were needed.");
             if result.unresolved_project_metadata_files > 0
                 || result.unresolved_malformed_message_files > 0
@@ -68954,6 +69579,13 @@ fn handle_doctor_archive_normalize(
                     result.duplicate_files_annotated
                 );
             }
+        }
+        if result.reservation_archive_files_pruned > 0 {
+            ftui_runtime::ftui_println!(
+                "Released reservation archive files {}: {}",
+                if dry_run { "to prune" } else { "pruned" },
+                result.reservation_archive_files_pruned
+            );
         }
         if result.unresolved_project_metadata_files > 0
             || result.unresolved_malformed_message_files > 0

@@ -1,3 +1,5 @@
+Destructively wipe all Agent Mail state (optionally archiving first)
+
 Usage: am clear-and-reset-everything [OPTIONS]
 
 Options:
