@@ -547,8 +547,7 @@ INSERT INTO agents (id, project_id, name, program, model, task_description, ince
     fn detector_treats_pruned_released_archive_as_expected_not_drift() {
         let td = TempDir::new().expect("tempdir");
         let db_path = td.path().join("storage.sqlite3");
-        let conn =
-            CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        let conn = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
         conn.execute_raw(PRUNED_SQL).expect("seed retention SQL");
         drop(conn);
 
