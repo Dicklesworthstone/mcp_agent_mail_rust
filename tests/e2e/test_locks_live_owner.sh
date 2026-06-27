@@ -8,17 +8,24 @@
 #        `active_other_owner` disposition and names the holding process(es).
 #   D4 — the rolled-up drain verdict flips to NOT safe_to_mutate / read_only
 #        while a live owner is present (safe_to_mutate:true with no owner).
+#   D4/br-mms51 — `am doctor repair`/`reconstruct` REFUSE a live owner (exit 3,
+#        classification "supervised-owner-required") AND do so signal-safely: no
+#        SIGSTKFLT/process-group broadcast. Each verb is run isolated in its own
+#        session (setsid) + signal-traced; see br-mms51 note below.
 #
 # The supervised guard never asks you to kill `am`; the safe path is to drain
 # via your supervisor. This suite NEVER kills the owner to make a verb succeed —
 # it tears its OWN server down at the end.
 #
-# SCOPED OUT (br-mms51): the `am doctor repair`/`reconstruct` exit-3
-# supervised-owner refusal is verified interactively + unit-tested but not
-# asserted here, because invoking it against an in-process-group live owner in a
-# non-interactive shell emits a process-group signal that kills the test shell.
+# br-mms51: this once-scoped-out assertion is now active. The refusal previously
+# emitted a process-group signal (SIGSTKFLT/16) that could kill a non-interactive
+# test shell; it no longer reproduces (verified by strace on the released binary).
+# The repair/reconstruct invocations run via `amrun_isolated` (setsid + strace),
+# which contains any future regression to a child session and surfaces it as a
+# clean failure (exit != 3 and/or a SIGSTKFLT in the trace) instead of killing
+# the suite.
 #
-# Ref: br-bvq1x.14.6 (N6). Depends on D1/D2/D3/D4 (all closed).
+# Ref: br-bvq1x.14.6 (N6), br-mms51. Depends on D1/D2/D3/D4 (all closed).
 
 set -uo pipefail
 
@@ -59,7 +66,7 @@ e2e_log "am binary: ${AM_BIN}"
 
 WORK="$(e2e_mktemp locks_live_owner_work)"
 ART="${E2E_ARTIFACT_DIR}/scenarios"
-mkdir -p "${WORK}/storage" "${WORK}/home" "${ART}"
+mkdir -p "${WORK}/storage" "${WORK}/home" "${WORK}/proj" "${ART}"
 export AM_INTERFACE_MODE="cli"
 export STORAGE_ROOT="${WORK}/storage"
 export DATABASE_URL="sqlite:///${WORK}/mb.sqlite3"
@@ -98,6 +105,56 @@ exit_is() {
     else
         e2e_fail "${label} (exit ${got}, expected ${want})"
         printf '      out: %s\n' "$(head -c 200 "${out}" "${out}.err" 2>/dev/null | tr '\n' ' ')"
+    fi
+}
+
+out_has() {
+    local label="$1" out="$2" needle="$3"
+    if grep -q -- "${needle}" "${out}" "${out}.err" 2>/dev/null; then
+        e2e_pass "${label}"
+    else
+        e2e_fail "${label} (missing: ${needle})"
+        printf '      out: %s\n' "$(head -c 240 "${out}" "${out}.err" 2>/dev/null | tr '\n' ' ')"
+    fi
+}
+
+# Run a doctor verb against the LIVE owner, fully isolated in its OWN session
+# via setsid (and traced for signals when strace is present). If the
+# supervised-owner refusal ever regressed into a process-group signal broadcast
+# (br-mms51), the new session contains the blast radius to this child — it can
+# never reach the test shell — while the captured exit code (!= 3) and signal
+# trace (a SIGSTKFLT) both surface the regression as a clean test failure.
+amrun_isolated() {
+    local out="$1"
+    shift
+    local pre=(setsid)
+    if command -v timeout >/dev/null 2>&1; then
+        pre+=(timeout "${AM_CMD_TIMEOUT}")
+    fi
+    if command -v strace >/dev/null 2>&1; then
+        pre+=(strace -f -e "trace=%signal" -o "${out}.sigtrace")
+    fi
+    # e2e_lib.sh runs `set -e`; the verbs here intentionally exit non-zero
+    # (3 = supervised-owner refusal), so capture the code with `|| rc=$?`
+    # instead of letting errexit abort the suite before we can assert on it.
+    local rc=0
+    "${pre[@]}" "${AM_BIN}" "$@" >"${out}" 2>"${out}.err" </dev/null || rc=$?
+    printf '%s\n' "${rc}" >"${out}.exit"
+    return 0
+}
+
+no_sigstkflt() {
+    local label="$1" out="$2"
+    local trace="${out}.sigtrace"
+    if ! command -v strace >/dev/null 2>&1 || [ ! -s "${trace}" ]; then
+        e2e_skip "${label} (strace unavailable; covered by the exit-3 assertion)"
+        return 0
+    fi
+    if grep -q "SIGSTKFLT" "${trace}" 2>/dev/null; then
+        e2e_fail "${label} — SIGSTKFLT(16) emitted under a live owner (br-mms51 regression)"
+        printf '      trace: %s\n' "$(grep -m3 SIGSTKFLT "${trace}" | tr '\n' ' ')"
+    else
+        e2e_pass "${label}"
     fi
 }
 
@@ -148,16 +205,28 @@ if [ "${owner_bound}" = "1" ]; then
     check "live owner => read_only is true" "${ART}/drain_live.json" '.read_only == true'
     check "live owner => owner_class is live" "${ART}/drain_live.json" '.owner_class == "live"'
 
-    e2e_case_banner "D4: repair/reconstruct REFUSE under a live owner — scoped out (br-mms51)"
-    # The supervised-owner REFUSAL is correct and verified interactively:
-    # `am doctor repair`/`reconstruct` exit 3 with classification
-    # "supervised-owner-required" rather than ever killing the live `am`.
-    # It is NOT asserted here because invoking it against an in-process-group
-    # live owner inside a NON-INTERACTIVE shell emits a process-group signal
-    # (SIGSTKFLT/16) that kills the test shell itself — a harness/runtime
-    # interaction tracked as br-mms51. The refusal's design guarantee is in
-    # AGENTS.md (supervised-owner guard, D4) and the exit-3 path is unit-tested.
-    e2e_skip "D4 repair/reconstruct exit-3 refusal under a live owner is scoped out of this black-box e2e: it triggers a process-group signal that destabilizes a non-interactive harness (br-mms51); verified interactively + unit-tested + documented in AGENTS.md"
+    e2e_case_banner "D4/br-mms51: repair & reconstruct REFUSE a live owner, signal-safe"
+    # The supervised-owner REFUSAL is correct: `am doctor repair`/`reconstruct`
+    # exit 3 with classification "supervised-owner-required" rather than ever
+    # killing the live `am`. br-mms51 reported that invoking them against an
+    # in-process-group live owner in a non-interactive shell emitted a
+    # process-group signal (SIGSTKFLT/16) that killed the test shell. Each verb
+    # is now run fully isolated in its own session (amrun_isolated/setsid) — so a
+    # regression cannot reach this harness — and asserted to (a) exit 3, (b)
+    # report the supervised-owner-required classification, and (c) emit NO
+    # SIGSTKFLT. If the broadcast ever returns, the isolated child exits 144
+    # (not 3) and/or the signal trace shows SIGSTKFLT, failing the suite cleanly.
+    amrun_isolated "${ART}/repair_live.out" doctor repair "${WORK}/proj" --yes
+    exit_is "repair under live owner refuses (exit 3)" "${ART}/repair_live.out" 3
+    out_has "repair refusal is supervised-owner-required" "${ART}/repair_live.out" \
+        "supervised-owner-required"
+    no_sigstkflt "repair refusal emits no SIGSTKFLT (br-mms51)" "${ART}/repair_live.out"
+
+    amrun_isolated "${ART}/reconstruct_live.out" doctor reconstruct --yes
+    exit_is "reconstruct under live owner refuses (exit 3)" "${ART}/reconstruct_live.out" 3
+    out_has "reconstruct refusal is supervised-owner-required" "${ART}/reconstruct_live.out" \
+        "supervised-owner-required"
+    no_sigstkflt "reconstruct refusal emits no SIGSTKFLT (br-mms51)" "${ART}/reconstruct_live.out"
 else
     e2e_fail "live owner server failed to bind on 127.0.0.1:${SRV_PORT}"
     printf '      server log tail: %s\n' "$(tail -3 "${SRV_LOG}" 2>/dev/null | head -c 320)"
