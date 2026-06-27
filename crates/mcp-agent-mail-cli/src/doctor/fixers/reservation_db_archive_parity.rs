@@ -503,4 +503,81 @@ INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive
                 .exists()
         );
     }
+
+    // ── br-5xbua: retention-pruned released reservations are not drift ─────────
+
+    const PRUNED_SQL: &str = "\
+CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT, inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, capabilities TEXT, metadata TEXT, FOREIGN KEY(project_id) REFERENCES projects(id));
+CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, released_ts INTEGER, FOREIGN KEY(project_id) REFERENCES projects(id), FOREIGN KEY(agent_id) REFERENCES agents(id));
+CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER NOT NULL, FOREIGN KEY(reservation_id) REFERENCES file_reservations(id));
+INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'project-bravo', '/tmp/project-bravo', 1700001000000000);
+INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, capabilities, metadata) VALUES (1, 1, 'BravoHolder', 'codex-cli', 'gpt-5', 'retention fixture', 1700001000000000, 1700001000000000, NULL, NULL);
+";
+
+    // A released reservation the retention prune deleted from SQLite, still in
+    // the archive (released_ts positive) — expected, not drift.
+    const PRUNED_RELEASED_JSON: &str = r#"{
+  "id": 801,
+  "project": "project-bravo",
+  "agent": "BravoHolder",
+  "path_pattern": "src/pruned.rs",
+  "exclusive": true,
+  "reason": "br-retention-fixture",
+  "created_ts": 1700001010000000,
+  "expires_ts": 1700004610000000,
+  "released_ts": 1700004610000000
+}"#;
+
+    // An active reservation present in the archive but missing from SQLite —
+    // genuine drift worth reconstructing.
+    const PRUNED_ACTIVE_JSON: &str = r#"{
+  "id": 802,
+  "project": "project-bravo",
+  "agent": "BravoHolder",
+  "path_pattern": "src/active.rs",
+  "exclusive": true,
+  "reason": "br-retention-fixture",
+  "created_ts": 1700001010000000,
+  "expires_ts": 1700004610000000,
+  "released_ts": null
+}"#;
+
+    #[test]
+    fn detector_treats_pruned_released_archive_as_expected_not_drift() {
+        let td = TempDir::new().expect("tempdir");
+        let db_path = td.path().join("storage.sqlite3");
+        let conn =
+            CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(PRUNED_SQL).expect("seed retention SQL");
+        drop(conn);
+
+        let dir = td
+            .path()
+            .join("projects")
+            .join("project-bravo")
+            .join("file_reservations");
+        std::fs::create_dir_all(&dir).expect("mkdir reservation archive");
+        std::fs::write(dir.join("id-801.json"), PRUNED_RELEASED_JSON).expect("write released");
+        std::fs::write(dir.join("id-802.json"), PRUNED_ACTIVE_JSON).expect("write active");
+
+        let findings = detect(Some(td.path()), std::slice::from_ref(&db_path));
+        // Only the active orphan is drift, so exactly one finding is raised.
+        assert_eq!(findings.len(), 1, "active orphan is genuine drift");
+        let report = &findings[0].report;
+        // The released-but-pruned reservation is tracked as expected, not drift.
+        assert_eq!(
+            report.drift.pruned_released_archived, 1,
+            "released-pruned reservation must be expected, not drift"
+        );
+        assert_eq!(
+            report.drift.archive_without_db_rows, 1,
+            "active orphan must remain genuine drift"
+        );
+        assert_eq!(
+            report.drift.total(),
+            1,
+            "only the active orphan counts toward drift total"
+        );
+    }
 }

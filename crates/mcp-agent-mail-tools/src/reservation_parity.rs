@@ -11,6 +11,13 @@ pub const RESERVATION_PARITY_SCHEMA_VERSION: &str = "reservation_db_archive_pari
 pub struct ReservationParityDriftSummary {
     pub missing_archive_artifacts: usize,
     pub archive_without_db_rows: usize,
+    /// Archive `id-<id>.json` artifacts for *released* reservations that have no
+    /// DB row. These are EXPECTED, not drift: the retention prune
+    /// (`prune_released_file_reservations`) hard-deletes released reservations
+    /// from `SQLite` while the git archive retains the full audit history
+    /// independently. Tracked for visibility but deliberately excluded from
+    /// `total()` so that routine retention never reports parity drift (br-5xbua).
+    pub pruned_released_archived: usize,
     /// Archive `id-<id>.json` artifacts whose reservation id exists in `SQLite` only
     /// under a *different* project.
     ///
@@ -64,6 +71,16 @@ impl ReservationParityReport {
     #[must_use]
     pub fn health_line(&self) -> String {
         if self.ok {
+            // `pruned_released_archived` is expected (retention), not drift, so it
+            // is reported only as an informational suffix when non-zero (br-5xbua).
+            if self.drift.pruned_released_archived > 0 {
+                return format!(
+                    "reservation_parity: ok db={} archive={} drift=0 pruned_released_archived={}",
+                    self.db_reservations,
+                    self.archive_reservations,
+                    self.drift.pruned_released_archived
+                );
+            }
             return format!(
                 "reservation_parity: ok db={} archive={} drift=0",
                 self.db_reservations, self.archive_reservations
@@ -337,7 +354,7 @@ where
                     detail: format!("reservation_id={reservation_id} missing stable id artifact"),
                 });
             }
-            (None, Some(_)) => {
+            (None, Some(archive)) => {
                 // The archive artifact at (this project, id) has no DB row. If the
                 // id exists in SQLite under a *different* project it is a stale
                 // duplicate (global id reuse), not a missing row — quarantine, do
@@ -359,7 +376,17 @@ where
                             "reservation_id={reservation_id} archive artifact under project={archive_project} collides with a DB row owned by project(s)=[{db_projects_label}] (global reservation id reused); stale duplicate archive artifact — quarantine, do not reconstruct"
                         ),
                     });
+                } else if positive_ts(archive.released_ts) {
+                    // A *released* reservation with an archive artifact but no DB
+                    // row is the expected steady state once the retention prune
+                    // has deleted it from SQLite — the git archive keeps the full
+                    // audit record. Count it for visibility, but it is NOT drift
+                    // and must not provoke a reconstruct (which would re-hydrate
+                    // the dead row). br-5xbua.
+                    drift.pruned_released_archived += 1;
                 } else {
+                    // An *active* reservation present in the archive but missing
+                    // from SQLite is genuine drift worth reconstructing.
                     drift.archive_without_db_rows += 1;
                     examples.push(ReservationParityExample {
                         reservation_id,
@@ -368,7 +395,7 @@ where
                         db_value: "missing".to_string(),
                         archive_value: "present".to_string(),
                         detail: format!(
-                            "reservation_id={reservation_id} archive artifact has no DB row"
+                            "reservation_id={reservation_id} active archive artifact has no DB row"
                         ),
                     });
                 }
