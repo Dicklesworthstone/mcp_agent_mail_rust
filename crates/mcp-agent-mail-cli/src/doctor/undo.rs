@@ -674,19 +674,24 @@ pub fn run_undo_with_scopes(
         ..Default::default()
     };
 
-    // B3 (br-bvq1x.2.3): verify the run's chain-of-custody manifest BEFORE
-    // replaying anything. The replay-time defenses (`enforce_scope`,
-    // per-action hashes) bound *where* undo writes and whether the live
-    // target still looks post-mutation, but they trust the run artifacts
-    // themselves. The manifest binds actions.jsonl + backups/ under the
-    // per-install HMAC key, so a tampered log/payload (which an attacker
-    // who can plant `.doctor/runs/<id>/` could otherwise craft
-    // internally-consistent) is refused here, fail-closed. An *absent*
-    // manifest is the legacy/unsealed path (older binary, or a flow that
-    // doesn't produce undo-able runs): warn and proceed so undo of
-    // in-flight/legacy runs is not broken.
+    // B3 (br-bvq1x.2.3) + br-q7f2b: resolve the run's chain-of-custody
+    // verdict BEFORE replaying anything. The replay-time defenses
+    // (`enforce_scope`, per-action hashes) bound *where* undo writes and
+    // whether the live target still looks post-mutation, but they trust the
+    // run artifacts themselves. The manifest binds actions.jsonl + backups/
+    // under the per-install HMAC key, so a tampered log/payload (which an
+    // attacker who can plant `.doctor/runs/<id>/` could otherwise craft
+    // internally-consistent) is refused here, fail-closed. The out-of-repo
+    // run ledger (br-q7f2b) closes the remaining downgrade: if the ledger
+    // recorded a sealed manifest for this run but it is now absent, the
+    // verdict is `LedgerMismatch` and we refuse rather than fall back to the
+    // legacy warn-and-proceed path. An *absent* manifest the ledger has
+    // never seen is the genuine legacy/unsealed path (older binary, a flow
+    // that doesn't produce undo-able runs, or a run sealed on another
+    // machine): warn and proceed so undo of in-flight/legacy runs is not
+    // broken.
     {
-        let verdict = super::manifest::verify_run_manifest_default(&run_dir, run_id);
+        let verdict = super::manifest::resolve_manifest_verdict_default(&run_dir, run_id);
         let allow_unverified = super::manifest::allow_unverified_from_env();
         match &verdict {
             super::manifest::ManifestVerdict::Verified => {}
@@ -709,10 +714,9 @@ pub fn run_undo_with_scopes(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
-                            "refusing to undo run {run_id}: chain-of-custody manifest is {} ({}). \
-                             The run artifacts do not match the sealed manifest, or it was sealed \
-                             with a different key. Set {}=1 to override (e.g. key loss / \
-                             cross-machine recovery).",
+                            "refusing to undo run {run_id}: chain-of-custody manifest check is \
+                             {} ({}). Set {}=1 to override (e.g. key loss / cross-machine \
+                             recovery).",
                             other.status_label(),
                             other.detail(),
                             super::manifest::ALLOW_UNVERIFIED_ENV,
