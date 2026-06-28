@@ -209,6 +209,21 @@ cargo test -p mcp-agent-mail-conformance
 cargo test --workspace --all-features
 ```
 
+#### Orphan-safe runner (`cargo nextest run`)
+
+Prefer `cargo nextest run` for long or interruptible CI/fleet runs. `.config/nextest.toml`
+sets a per-test `slow-timeout` with `terminate-after`, so any test that wedges is SIGTERM→SIGKILL'd
+(by process group) after a few minutes instead of surviving as a multi-day PPID=1 orphan when the
+parent `cargo`/runner is killed (br-fec3r). Plain `cargo test` ignores this file and has no
+equivalent timeout knob, so a hung test under bare `cargo test` can still orphan — use nextest where
+that matters.
+
+```bash
+cargo nextest run --workspace            # default profile (4-min hard kill per test)
+cargo nextest run --profile ci           # CI profile (1 retry, shorter slow-warning cadence)
+cargo nextest run -p mcp-agent-mail-tools
+```
+
 ### End-to-End Tests
 
 ```bash

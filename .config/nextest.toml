@@ -1,0 +1,47 @@
+# cargo-nextest configuration for MCP Agent Mail
+#
+# Primary purpose (br-fec3r): bound the worst case for any individual test so a
+# wedged/hung test binary can NEVER survive as a multi-day PPID=1 orphan.
+#
+# Background: when `cargo test` is interrupted (Ctrl-C, supervisor kill, fleet
+# cleanup), cargo does not propagate the signal to the spawned test binary. If a
+# test happens to be blocked at that instant — e.g. a degraded fleet host puts a
+# pool/fsync/flock syscall into uninterruptible (D) state — the orphaned test
+# binary keeps running and holding RAM for days. The 2026-05-08 fleet sweep found
+# 8-day-old `mcp_agent_mail_tools` orphans across two hosts.
+#
+# This repo's test code is provably free of *unbounded* hangs: every tool-layer
+# retry loop is bounded (<=4 attempts), the DB MVCC retry budget is bounded
+# (~29s), the pool busy_timeout is bounded (60s), and unit tests use per-test
+# isolated databases (`:memory:` or a fresh tempdir) so there is no cross-test
+# shared-DB deadlock. The remaining risk is therefore environmental, not a code
+# defect — exactly the case a runner-level watchdog is meant to cover.
+#
+# cargo-nextest runs each test in its OWN process (and, on Unix, its own process
+# group). `slow-timeout.terminate-after` makes nextest send SIGTERM and then,
+# after `grace-period`, SIGKILL to that whole process group when a test exceeds
+# the budget. That converts "orphan survives for days" into "killed after a few
+# minutes", and the SIGKILL-to-process-group reaches even a wedged child that an
+# in-binary signal handler could never rescue. Run the orphan-prone suites with
+# `cargo nextest run` (the fleet/rch toolchain already supports it) to get this
+# guardrail; plain `cargo test` has no equivalent knob.
+
+[profile.default]
+# Warn that a test is "slow" once per minute, and hard-terminate it after four
+# such periods (~4 minutes). The slowest *legitimate* test path here is a write
+# under maximal lock contention (pool busy_timeout 60s + bounded MVCC/tool
+# retries), comfortably under one minute, so 4 minutes never trips a real test
+# while still bounding a genuine hang to minutes instead of days.
+slow-timeout = { period = "60s", terminate-after = 4, grace-period = "10s" }
+
+# A leaked subprocess that keeps a test's stdout/stderr pipe open also blocks
+# nextest from reaping the test; fail such a test instead of waiting forever.
+leak-timeout = "1s"
+
+# CI profile inherits the same protections with a shorter slow-warning cadence
+# and an automatic single retry for flakes, while keeping the same hard kill.
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 8, grace-period = "10s" }
+leak-timeout = "1s"
+retries = 1
+fail-fast = false
