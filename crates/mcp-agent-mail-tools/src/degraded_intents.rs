@@ -221,7 +221,7 @@ pub fn append_jsonl(
     }
     fs2::FileExt::lock_exclusive(&lock_file)?;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -233,8 +233,29 @@ pub fn append_jsonl(
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    let mut line =
-        serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?;
+    // Defend against a torn final line from a prior crash (a partial append that
+    // never reached fsync). If the log does not currently end in a newline,
+    // write a leading one so the torn fragment stays isolated on its own
+    // (skippable) line instead of being concatenated onto — and lost together
+    // with — this otherwise-valid record on the next read.
+    let needs_leading_newline = if let Ok(meta) = file.metadata()
+        && meta.len() > 0
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        last[0] != b'\n'
+    } else {
+        false
+    };
+    let mut line = Vec::new();
+    if needs_leading_newline {
+        line.push(b'\n');
+    }
+    line.extend_from_slice(
+        &serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?,
+    );
     line.push(b'\n');
     file.write_all(&line)?;
     file.sync_all()?;
@@ -564,6 +585,53 @@ mod tests {
         assert_eq!(queued[0].agent_name, "BlueLake");
         assert_eq!(queued[0].failure.stage, "acknowledge_message");
         assert_eq!(queued[0].intent_id, receipt.intent_id);
+    }
+
+    #[test]
+    fn ack_intent_reader_isolates_torn_final_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+        // Record 1: a valid queued ack intent — the log now ends in a newline.
+        let receipt = append_ack_intent(
+            &config,
+            "/abs/project",
+            "BlueLake",
+            1,
+            "acknowledge_message",
+            "database disk image is malformed",
+        )
+        .expect("append intent 1");
+
+        // Simulate a crash mid-append: a torn fragment with NO trailing newline.
+        {
+            use std::io::Write;
+            let mut torn = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&receipt.intent_path)
+                .expect("open ack intent log");
+            torn.write_all(b"{\"kind\":\"acknowledge_message_intent\",\"partial")
+                .expect("write torn fragment");
+        }
+
+        // Record 2: another valid intent appended after the torn fragment.
+        append_ack_intent(
+            &config,
+            "/abs/project",
+            "BlueLake",
+            2,
+            "acknowledge_message",
+            "database disk image is malformed",
+        )
+        .expect("append intent 2");
+
+        // The leading-newline guard isolates the torn fragment on its own
+        // skippable line, so the second valid record is not swallowed.
+        let queued = read_queued_ack_intents(&config).expect("read");
+        assert_eq!(
+            queued.len(),
+            2,
+            "torn final line must not swallow the following valid record"
+        );
     }
 
     #[test]

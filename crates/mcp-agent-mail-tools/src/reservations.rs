@@ -445,7 +445,7 @@ fn append_release_intent_jsonl(config: &Config, record: &Value) -> std::io::Resu
     }
     fs2::FileExt::lock_exclusive(&lock_file)?;
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -457,8 +457,29 @@ fn append_release_intent_jsonl(config: &Config, record: &Value) -> std::io::Resu
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    let mut line =
-        serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?;
+    // Defend against a torn final line from a prior crash (a partial append that
+    // never reached fsync). If the log does not currently end in a newline,
+    // write a leading one so the torn fragment stays isolated on its own
+    // (skippable) line instead of being concatenated onto — and lost together
+    // with — this otherwise-valid record on the next read.
+    let needs_leading_newline = if let Ok(meta) = file.metadata()
+        && meta.len() > 0
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        last[0] != b'\n'
+    } else {
+        false
+    };
+    let mut line = Vec::new();
+    if needs_leading_newline {
+        line.push(b'\n');
+    }
+    line.extend_from_slice(
+        &serde_json::to_vec(record).map_err(|err| std::io::Error::other(err.to_string()))?,
+    );
     line.push(b'\n');
     file.write_all(&line)?;
     file.sync_all()?;
@@ -3220,6 +3241,58 @@ mod tests {
                     .expect("read after abandon")
                     .is_empty(),
                 "abandoned release intent must be terminal, not retried forever"
+            );
+        });
+    }
+
+    #[test]
+    fn release_intent_reader_isolates_torn_final_line() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            // Record 1: a valid queued intent — the log now ends in a newline.
+            append_release_intent(
+                &config,
+                "/tmp/torn-release",
+                "BlueLake",
+                None,
+                Some(vec![7]),
+                "list_unreleased_file_reservations",
+                "database is locked",
+            )
+            .expect("append intent 1");
+
+            // Simulate a crash mid-append: a torn fragment with NO trailing
+            // newline (looks like a release intent but is truncated/invalid).
+            let log_path = release_intent_log_path(&config);
+            {
+                use std::io::Write;
+                let mut torn = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log_path)
+                    .expect("open release intent log");
+                torn.write_all(b"{\"kind\":\"release_file_reservations_intent\",\"partial")
+                    .expect("write torn fragment");
+            }
+
+            // Record 2: another valid intent appended after the torn fragment.
+            append_release_intent(
+                &config,
+                "/tmp/torn-release",
+                "BlueLake",
+                None,
+                Some(vec![8]),
+                "release_reservations",
+                "database is locked",
+            )
+            .expect("append intent 2");
+
+            // The leading-newline guard isolates the torn fragment on its own
+            // skippable line, so the second valid record is not swallowed.
+            let intents = read_queued_release_intents(&config).expect("read intents");
+            assert_eq!(
+                intents.len(),
+                2,
+                "torn final line must not swallow the following valid record"
             );
         });
     }

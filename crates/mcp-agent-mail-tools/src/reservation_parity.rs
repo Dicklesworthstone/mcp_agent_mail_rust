@@ -471,7 +471,11 @@ fn compare_reservation_pair(
         });
     }
 
-    if db.reason != archive.thread_provenance {
+    // The archive reader trims this field (json_string) while the DB stores the
+    // reason verbatim, so compare both trimmed — otherwise a reason with
+    // surrounding/only whitespace produces spurious parity drift on an
+    // otherwise-identical pair.
+    if db.reason.trim() != archive.thread_provenance.trim() {
         drift.thread_provenance_mismatches += 1;
         examples.push(ReservationParityExample {
             reservation_id: db.reservation_id,
