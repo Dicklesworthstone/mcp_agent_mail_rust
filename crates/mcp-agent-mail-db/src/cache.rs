@@ -656,30 +656,40 @@ impl ReadCache {
         let scope_fp = scope_fingerprint(scope);
         let shared = Arc::new(agent.clone());
         let name_lower = agent.name.to_ascii_lowercase();
-        {
-            let mut by_key = self.agents_by_key.write();
-            let key = (scope_fp, agent.project_id, InternedStr::new(&name_lower));
-            // GH#169: the name key is case-insensitive (matching SQL COLLATE
-            // NOCASE), so two case-variant rows from a registration race share
-            // it. Pin the mapping to the canonical (lowest-id) row — the same
-            // row resolved by `ORDER BY id ASC` in queries.rs — so a name lookup
-            // (e.g. resolving the caller for a reservation release) never
-            // resolves to a shadow duplicate after a `get_agent_by_id` on the
-            // higher-id variant cached it here. The same id (or no existing id)
-            // still refreshes; only a strictly-higher duplicate id is prevented
-            // from displacing the canonical mapping.
-            let displaces_canonical = matches!(
-                (agent.id, by_key.peek(&key).and_then(|e| e.value.id)),
-                (Some(new_id), Some(existing_id)) if existing_id < new_id
-            );
-            if !displaces_canonical {
-                by_key.insert(key, CacheEntry::new(Arc::clone(&shared)));
-            }
+        // br-r3rot: hold the by_key write lock for the ENTIRE operation —
+        // including the by_id insert below — not just the by_key insert. A
+        // concurrent `invalidate_agent_scoped` holds by_key across its by-key
+        // removal AND its by-id cleanup precisely so a put cannot interleave;
+        // that guarantee only holds if put is equally atomic. Releasing by_key
+        // early (the previous behavior) let invalidate's by-id scan run between
+        // this put's by_key work and its by_id insert, leaving a by_id entry
+        // with no by_key entry — a stale `get_agent_by_id` hit (dual-index
+        // desync). GH#169's `displaces_canonical` early-return widened the
+        // window: a displaced put writes ONLY by_id, guaranteeing the desync.
+        // Lock ordering rank 22 (by_key) -> 23 (by_id) is preserved.
+        let mut by_key = self.agents_by_key.write();
+        let key = (scope_fp, agent.project_id, InternedStr::new(&name_lower));
+        // GH#169: the name key is case-insensitive (matching SQL COLLATE
+        // NOCASE), so two case-variant rows from a registration race share
+        // it. Pin the mapping to the canonical (lowest-id) row — the same
+        // row resolved by `ORDER BY id ASC` in queries.rs — so a name lookup
+        // (e.g. resolving the caller for a reservation release) never
+        // resolves to a shadow duplicate after a `get_agent_by_id` on the
+        // higher-id variant cached it here. The same id (or no existing id)
+        // still refreshes; only a strictly-higher duplicate id is prevented
+        // from displacing the canonical mapping.
+        let displaces_canonical = matches!(
+            (agent.id, by_key.peek(&key).and_then(|e| e.value.id)),
+            (Some(new_id), Some(existing_id)) if existing_id < new_id
+        );
+        if !displaces_canonical {
+            by_key.insert(key, CacheEntry::new(Arc::clone(&shared)));
         }
         if let Some(id) = agent.id {
             let mut by_id = self.agents_by_id.write();
             by_id.insert((scope_fp, id), CacheEntry::new(shared));
         }
+        // by_key dropped here — atomic with the by_id insert above.
     }
 
     /// Bulk-insert agents into the cache (cache warming on startup).
@@ -1455,10 +1465,18 @@ mod tests {
         cache.put_agent(&make_agent_with_id("RedCat", 2, 55));
         cache.put_agent(&make_agent_with_id("RedCat", 2, 56));
 
-        assert_eq!(cache.get_agent(2, "RedCat").unwrap().id, Some(56));
+        // GH#169 (br-ovk15): the case-insensitive name key stays pinned to the
+        // canonical (lowest-id) row, so the second put of a strictly-higher
+        // duplicate id (56) must NOT displace the name mapping — `get_agent`
+        // resolves the canonical id 55, not the last-written 56.
+        assert_eq!(cache.get_agent(2, "RedCat").unwrap().id, Some(55));
+        // Both rows remain individually addressable in the by-id index.
         assert!(cache.get_agent_by_id(55).is_some());
         assert!(cache.get_agent_by_id(56).is_some());
 
+        // Invalidating by name with no id hint must clear the name key AND
+        // every by-id entry matching (project, name) — both 55 and 56 — so no
+        // stale `get_agent_by_id` hit survives.
         cache.invalidate_agent(2, "RedCat", None);
         assert!(cache.get_agent(2, "RedCat").is_none());
         assert!(cache.get_agent_by_id(55).is_none());
