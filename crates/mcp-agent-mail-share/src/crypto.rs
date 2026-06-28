@@ -175,6 +175,8 @@ pub fn verify_bundle(
                     signature_checked: false,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some(format!(
                         "SRI entry for {relative_path} has non-string value"
                     )),
@@ -190,6 +192,8 @@ pub fn verify_bundle(
                         signature_checked: false,
                         signature_verified: false,
                         key_source: None,
+                        database_checked: false,
+                        database_verified: false,
                         error: Some(traversal_err),
                     });
                 }
@@ -214,6 +218,8 @@ pub fn verify_bundle(
                         signature_checked: false,
                         signature_verified: false,
                         key_source: None,
+                        database_checked: false,
+                        database_verified: false,
                         error: Some(format!(
                             "SRI mismatch for {relative_path}: file content does not match manifest hash"
                         )),
@@ -228,6 +234,8 @@ pub fn verify_bundle(
                     signature_checked: false,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some(format!("SRI-referenced file missing: {relative_path}")),
                 });
             }
@@ -252,6 +260,8 @@ pub fn verify_bundle(
                     signature_checked: true,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some("signature file must not be a symlink".to_string()),
                 });
             }
@@ -263,6 +273,8 @@ pub fn verify_bundle(
                     signature_checked: true,
                     signature_verified: false,
                     key_source: None,
+                    database_checked: false,
+                    database_verified: false,
                     error: Some("signature file must be a regular file".to_string()),
                 });
             }
@@ -311,6 +323,17 @@ pub fn verify_bundle(
         Err(error) => return Err(ShareError::Io(error)),
     }
 
+    // Verify the database payload against the manifest's signed `database.sha256`.
+    // The signature above only proves `manifest.json` is authentic; without this
+    // check an attacker can swap `mailbox.sqlite3` (or its chunks) for arbitrary
+    // content and the bundle would still verify "green".
+    let (database_checked, database_verified, database_error) =
+        match verify_database_payload(bundle_root, &manifest)? {
+            Some(Ok(())) => (true, true, None),
+            Some(Err(message)) => (true, false, Some(message)),
+            None => (false, false, None),
+        };
+
     Ok(VerifyResult {
         bundle: bundle_root.display().to_string(),
         sri_checked,
@@ -318,8 +341,104 @@ pub fn verify_bundle(
         signature_checked,
         signature_verified,
         key_source,
-        error: None,
+        database_checked,
+        database_verified,
+        error: database_error,
     })
+}
+
+/// Verify the bundle's database payload against the manifest's signed
+/// `database.sha256`.
+///
+/// Returns `Ok(None)` when there is nothing to check (no `database` section,
+/// no recorded hash, or no database artifact present in the bundle),
+/// `Ok(Some(Ok(())))` when the payload hash matches the manifest, and
+/// `Ok(Some(Err(message)))` when it diverges or a referenced artifact is
+/// missing/unreadable. For chunked databases the chunks are streamed in index
+/// order — equivalent to hashing the reassembled file — so the comparison is
+/// against the same `database.sha256` the exporter recorded.
+fn verify_database_payload(
+    bundle_root: &Path,
+    manifest: &serde_json::Value,
+) -> ShareResult<Option<Result<(), String>>> {
+    let Some(database) = manifest.get("database") else {
+        return Ok(None);
+    };
+    let Some(expected) = database.get("sha256").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let chunked = database
+        .get("chunked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let mut hasher = Sha256::new();
+
+    if chunked {
+        let Some(chunk_count) = database
+            .get("chunk_manifest")
+            .and_then(|c| c.get("chunk_count"))
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return Ok(Some(Err(
+                "chunked database manifest is missing chunk_count".to_string(),
+            )));
+        };
+        for index in 0..chunk_count {
+            let chunk_rel = format!("chunks/{index:05}.bin");
+            let chunk_path = match resolve_sri_file_path(bundle_root, &chunk_rel) {
+                Ok(path) => path,
+                Err(err) => return Ok(Some(Err(err))),
+            };
+            if !crate::is_real_file(&chunk_path) {
+                return Ok(Some(Err(format!("database chunk missing: {chunk_rel}"))));
+            }
+            if let Err(err) = hash_file_into(&chunk_path, &mut hasher) {
+                return Ok(Some(Err(format!("failed to read {chunk_rel}: {err}"))));
+            }
+        }
+    } else {
+        let db_rel = database
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mailbox.sqlite3");
+        let db_path = match resolve_sri_file_path(bundle_root, db_rel) {
+            Ok(path) => path,
+            Err(err) => return Ok(Some(Err(err))),
+        };
+        if !crate::is_real_file(&db_path) {
+            // No database artifact present (e.g. a metadata-only bundle) — nothing
+            // to verify, so don't claim a check happened.
+            return Ok(None);
+        }
+        if let Err(err) = hash_file_into(&db_path, &mut hasher) {
+            return Ok(Some(Err(format!("failed to read {db_rel}: {err}"))));
+        }
+    }
+
+    let actual = hex::encode(hasher.finalize());
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(Some(Ok(())))
+    } else {
+        Ok(Some(Err(
+            "database payload does not match the signed manifest hash".to_string(),
+        )))
+    }
+}
+
+/// Stream a file into an existing SHA-256 hasher (bounded memory).
+fn hash_file_into(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(())
 }
 
 fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
@@ -395,6 +514,12 @@ pub struct VerifyResult {
     /// Where the public key came from: `"explicit"` (caller-provided),
     /// `"embedded"` (from sig file itself — self-signed, no trust anchor), or `null`.
     pub key_source: Option<String>,
+    /// Whether the database payload (`mailbox.sqlite3` or its chunks) was checked
+    /// against the manifest's signed `database.sha256`.
+    pub database_checked: bool,
+    /// Whether the database payload matched the manifest's signed `database.sha256`.
+    /// Only meaningful as authenticity when `signature_verified` is also true.
+    pub database_verified: bool,
     pub error: Option<String>,
 }
 
@@ -1024,6 +1149,44 @@ mod tests {
         assert!(
             !result.signature_verified,
             "tampered manifest should fail verification"
+        );
+    }
+
+    #[test]
+    fn tampered_database_fails_verification_despite_valid_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let public_key = write_signed_bundle_fixture(dir.path(), "full");
+
+        // A pristine bundle verifies end-to-end, including the database payload.
+        let ok = verify_bundle(dir.path(), Some(&public_key)).unwrap();
+        assert!(ok.signature_verified, "pristine signature should verify");
+        assert!(ok.database_checked, "database should have been checked");
+        assert!(ok.database_verified, "pristine database should verify");
+        assert!(ok.error.is_none());
+
+        // Swap the database for attacker-controlled content WITHOUT touching the
+        // signed manifest. The Ed25519 signature still validates (it only covers
+        // manifest.json), but the database no longer matches the signed hash — the
+        // exact gap this check closes.
+        std::fs::write(
+            dir.path().join("mailbox.sqlite3"),
+            b"attacker-controlled database",
+        )
+        .unwrap();
+
+        let tampered = verify_bundle(dir.path(), Some(&public_key)).unwrap();
+        assert!(
+            tampered.signature_verified,
+            "manifest signature is untouched, so it still verifies"
+        );
+        assert!(tampered.database_checked);
+        assert!(
+            !tampered.database_verified,
+            "a swapped database must fail verification"
+        );
+        assert!(
+            tampered.error.is_some(),
+            "a database mismatch must surface an error"
         );
     }
 

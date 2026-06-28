@@ -5712,6 +5712,8 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
             output::kv("SRI valid", &result.sri_valid.to_string());
             output::kv("Signature checked", &result.signature_checked.to_string());
             output::kv("Signature valid", &result.signature_verified.to_string());
+            output::kv("Database checked", &result.database_checked.to_string());
+            output::kv("Database valid", &result.database_verified.to_string());
             if let Some(ref err) = result.error {
                 ftui_runtime::ftui_eprintln!("  Error: {err}");
                 return Err(CliError::ExitCode(1));
