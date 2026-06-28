@@ -2335,6 +2335,9 @@ impl DbPool {
             .acquire(cx, || {
                 let sqlite_path = sqlite_path.clone();
                 let storage_root = storage_root.clone();
+                // Owned copy for the per-connection recovery path below; the primary
+                // `storage_root` binding is moved into the one-time init-gate closure.
+                let storage_root_for_recovery = storage_root.clone();
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
                 async move {
@@ -2441,7 +2444,15 @@ impl DbPool {
                         );
 
                         crate::close_db_conn(conn, "sqlite connection init before recovery");
-                        if let Err(recovery_err) = recover_sqlite_file(Path::new(&sqlite_path)) {
+                        // Use the pool's authoritative storage_root, not the
+                        // process-env-derived root, so a multi-mailbox / ephemeral-reroute
+                        // pool reconciles against ITS archive (env-derived root can alias a
+                        // different mailbox or skip archive reconstruction — see the
+                        // DbPoolConfig::storage_root doc-comment).
+                        if let Err(recovery_err) = recover_sqlite_file_with_storage_root(
+                            Path::new(&sqlite_path),
+                            &storage_root_for_recovery,
+                        ) {
                             return Outcome::Err(recovery_err);
                         }
 
@@ -2780,7 +2791,11 @@ impl DbPool {
                         error = %e,
                         "full integrity check failed to open sqlite file; attempting auto-recovery"
                     );
-                    recover_sqlite_file(Path::new(&self.sqlite_path)).map_err(|re| {
+                    recover_sqlite_file_with_storage_root(
+                        Path::new(&self.sqlite_path),
+                        &self.storage_root,
+                    )
+                    .map_err(|re| {
                         DbError::Sqlite(format!("full integrity recovery failed: {re}"))
                     })?;
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
@@ -4688,7 +4703,9 @@ async fn initialize_sqlite_file_once(
                             error = %first_err,
                             "sqlite init failed and health probes detected corruption; attempting automatic recovery"
                         );
-                        if let Err(recover_err) = recover_sqlite_file(path) {
+                        if let Err(recover_err) =
+                            recover_sqlite_file_with_storage_root(path, storage_root)
+                        {
                             if !should_retry_sqlite_init_error(&recover_err) {
                                 return Outcome::Err(recover_err);
                             }

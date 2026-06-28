@@ -8190,15 +8190,14 @@ pub async fn mark_all_messages_read_in_project(
                         WHERE r.agent_id = ? AND r.read_ts IS NULL \
                         AND m.project_id = ?";
         let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-        let rows = match map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await) {
-            Outcome::Ok(r) => r,
-            Outcome::Err(e) => {
-                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
-                return Outcome::Err(e);
-            }
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+        // Route through try_in_tx! so the open BEGIN CONCURRENT is rolled back on
+        // cancel/panic too (the bare match previously only rolled back on Err,
+        // leaking a half-open transaction back into the pool on cancellation).
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
+        );
 
         let count = rows.len();
         if count > 0 {
