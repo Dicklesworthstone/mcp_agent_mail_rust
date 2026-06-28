@@ -3382,8 +3382,12 @@ fn env_bool(key: &str, default: bool) -> bool {
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    // Trim before parsing so a process-env value carrying surrounding
+    // whitespace or a trailing CR (e.g. sourced from a CRLF file) is honored
+    // rather than silently reverting to the default — matching env_bool /
+    // env_u64_opt, which already trim.
     env_value(key)
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
 
@@ -3450,7 +3454,7 @@ fn normalize_tool_filter_mode(value: &str) -> String {
 
 fn env_f64(key: &str, default: f64) -> f64 {
     env_value(key)
-        .and_then(|v| v.parse::<f64>().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|f| f.is_finite())
         .unwrap_or(default)
 }
@@ -3520,6 +3524,21 @@ mod tests {
         assert!(config.contact_enforcement_enabled);
         assert!(!config.allow_absolute_attachment_paths);
         assert!(!config.allow_ephemeral_projects_in_default_storage);
+    }
+
+    #[test]
+    fn env_parse_trims_surrounding_whitespace() {
+        // A process-env value carrying surrounding whitespace or a trailing CR
+        // (e.g. sourced from a CRLF file) must still be honored — matching
+        // env_bool / env_u64_opt — instead of silently reverting to the default.
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_TEST_TRIM_U64", " 256 "),
+            ("AM_TEST_TRIM_U32", "512\r"),
+            ("AM_TEST_TRIM_F64", "  1.5\n"),
+        ]);
+        assert_eq!(env_u64("AM_TEST_TRIM_U64", 7), 256);
+        assert_eq!(env_u32("AM_TEST_TRIM_U32", 7), 512);
+        assert_f64_eq(env_f64("AM_TEST_TRIM_F64", 9.0), 1.5);
     }
 
     #[test]

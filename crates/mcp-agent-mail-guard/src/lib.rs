@@ -1829,6 +1829,17 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                     stderr.trim(),
                 ))));
             }
+        } else {
+            // New-branch push (remote all-zeros) where `git rev-list … --not
+            // --remotes` itself failed: fail CLOSED rather than silently allowing
+            // the push with zero reservation enforcement. Mirrors the enforced
+            // Python pre-push plugin, which exits non-zero on rev-list failure.
+            let stderr = String::from_utf8_lossy(&rev_list.stderr);
+            return Err(GuardError::Io(std::io::Error::other(format!(
+                "git rev-list failed for new-branch push (exit {}): {}",
+                rev_list.status.code().unwrap_or(-1),
+                stderr.trim(),
+            ))));
         };
     }
 

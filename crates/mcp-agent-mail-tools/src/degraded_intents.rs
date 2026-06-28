@@ -523,7 +523,10 @@ pub fn read_queued_release_intents(
         };
         match value.get("kind").and_then(Value::as_str) {
             Some(RELEASE_INTENT_REPLAY_KIND)
-                if value.get("status").and_then(Value::as_str) == Some("replayed") =>
+                if value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_terminal_replay_status) =>
             {
                 if !release_replay_record_has_valid_hash(&value) {
                     continue;
@@ -850,6 +853,63 @@ mod tests {
                 .expect("read after replay")
                 .is_empty(),
             "a replayed release intent must be filtered out"
+        );
+    }
+
+    #[test]
+    fn release_intent_reader_clears_abandoned_intent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tmp.path());
+
+        let (intent_id, content_sha256) =
+            write_release_intent_fixture(&config, 7777, json!(["src/**"]), Value::Null);
+        assert_eq!(
+            read_queued_release_intents(&config)
+                .expect("read release")
+                .len(),
+            1
+        );
+
+        // A terminal "abandoned" marker (written by reservations.rs when the
+        // queued release is permanently un-replayable — e.g. the agent/project no
+        // longer exists) must also clear the intent from the robot-status view,
+        // not just "replayed". Before the fix this read-only view only treated
+        // "replayed" as terminal, so an abandoned intent was surfaced forever with
+        // a replay action that could never succeed.
+        let replay_payload = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_REPLAY_KIND,
+            "intent_id": intent_id,
+            "intent_content_sha256": content_sha256,
+            "replayed_ts": 8888,
+            "status": "abandoned",
+            "released": 0,
+            "error_detail": "agent no longer exists",
+        });
+        let replay_hash = hash_json_value(&replay_payload);
+        let replay_record = json!({
+            "schema_version": RELEASE_INTENT_SCHEMA_VERSION,
+            "kind": RELEASE_INTENT_REPLAY_KIND,
+            "intent_id": intent_id,
+            "content_sha256": replay_hash,
+            "intent_content_sha256": content_sha256,
+            "replayed_ts": 8888,
+            "status": "abandoned",
+            "released": 0,
+            "error_detail": "agent no longer exists",
+        });
+        append_jsonl(
+            &config,
+            RELEASE_INTENT_LOG_FILE,
+            ".release_file_reservations.jsonl.lock",
+            &replay_record,
+        )
+        .expect("append abandoned marker");
+        assert!(
+            read_queued_release_intents(&config)
+                .expect("read after abandon")
+                .is_empty(),
+            "an abandoned release intent must be filtered out of the robot-status view"
         );
     }
 

@@ -7299,7 +7299,16 @@ pub fn process_attachments(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| unreachable!()))
+                .map(|h| {
+                    // A worker panic (e.g. an image decoder panicking on crafted
+                    // input) must fail just this attachment with a clean error,
+                    // not unwind the request thread via unreachable!().
+                    h.join().unwrap_or_else(|_| {
+                        Err(StorageError::Io(std::io::Error::other(
+                            "attachment conversion worker panicked",
+                        )))
+                    })
+                })
                 .collect()
         });
 
@@ -7403,7 +7412,22 @@ pub fn process_markdown_images(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| unreachable!()))
+                .map(|h| {
+                    // A worker panic (e.g. an image decoder panicking on crafted
+                    // markdown-image input) must fail just this image with a clean
+                    // error, not unwind the request thread via unreachable!(). The
+                    // empty full/alt are never read — the Err short-circuits the
+                    // `stored_result?` in the replacement loop below.
+                    h.join().unwrap_or_else(|_| {
+                        (
+                            String::new(),
+                            String::new(),
+                            Err(StorageError::Io(std::io::Error::other(
+                                "attachment image conversion worker panicked",
+                            ))),
+                        )
+                    })
+                })
                 .collect()
         });
         converted.extend(chunk_results);
