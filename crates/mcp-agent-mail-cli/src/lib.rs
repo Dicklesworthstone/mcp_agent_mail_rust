@@ -65904,7 +65904,7 @@ fn load_archive_metadata(zip_path: &Path) -> (serde_json::Value, Option<String>)
         }
     };
 
-    let mut meta_file = match archive.by_name(ARCHIVE_METADATA_FILENAME) {
+    let meta_file = match archive.by_name(ARCHIVE_METADATA_FILENAME) {
         Ok(f) => f,
         Err(zip::result::ZipError::FileNotFound) => {
             return (
@@ -65920,11 +65920,27 @@ fn load_archive_metadata(zip_path: &Path) -> (serde_json::Value, Option<String>)
         }
     };
 
+    // Bound the read: `metadata.json` is a compressed zip entry, so a crafted
+    // archive can inflate a few KB into multiple GB and OOM the process. This is
+    // reachable without confirmation via `am archive list`, which auto-reads the
+    // metadata of every `.zip` in the archive-states directory.
+    const MAX_ARCHIVE_METADATA_BYTES: u64 = 8 * 1024 * 1024;
     let mut contents = String::new();
-    if let Err(e) = meta_file.read_to_string(&mut contents) {
+    if let Err(e) = meta_file
+        .take(MAX_ARCHIVE_METADATA_BYTES + 1)
+        .read_to_string(&mut contents)
+    {
         return (
             serde_json::Value::Object(serde_json::Map::new()),
             Some(format!("Invalid metadata: {e}")),
+        );
+    }
+    if contents.len() as u64 > MAX_ARCHIVE_METADATA_BYTES {
+        return (
+            serde_json::Value::Object(serde_json::Map::new()),
+            Some(format!(
+                "{ARCHIVE_METADATA_FILENAME} too large (>{MAX_ARCHIVE_METADATA_BYTES} bytes)"
+            )),
         );
     }
 

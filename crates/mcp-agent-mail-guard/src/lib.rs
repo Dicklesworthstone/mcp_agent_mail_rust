@@ -178,17 +178,66 @@ pub fn resolve_hooks_dir(repo_path: &Path) -> GuardResult<PathBuf> {
 
 const PLUGIN_FILE_NAME: &str = "50-agent-mail.py";
 
-#[cfg(unix)]
-fn chmod_exec(path: &Path) -> GuardResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
+/// Write a git-hook artifact atomically and symlink-safely.
+///
+/// Hardens `install_guard` against two real hazards:
+/// 1. **Symlink-planted destination.** A blind `std::fs::write` follows a
+///    symlink, so a pre-planted `50-agent-mail.py -> ~/.bashrc` (or any hook
+///    path) would be written *through* the link — an arbitrary-file clobber,
+///    and the subsequent path-based `chmod` would force the exec bit on the
+///    target. We remove any symlink at the destination first (never write
+///    through it) and apply the mode to the freshly-created fd (fchmod), never
+///    via a path that a symlink could redirect.
+/// 2. **Torn / fail-open hook.** `std::fs::write` truncates in place and is not
+///    atomic; a crash or disk-full mid-write leaves a partially written hook
+///    that can parse as an effective no-op and silently bypass the reservation
+///    guard on every later commit. We write to a temp file in the same
+///    directory and atomically rename over the destination.
+fn write_guard_file_atomic(path: &Path, contents: &str, executable: bool) -> GuardResult<()> {
+    use std::io::Write as _;
 
-#[cfg(not(unix))]
-fn chmod_exec(_path: &Path) -> GuardResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        GuardError::Io(std::io::Error::other("hook path has no parent directory"))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| GuardError::Io(std::io::Error::other("hook path has no file name")))?;
+
+    // Never write through a symlink planted at the destination.
+    if let Ok(meta) = path.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        std::fs::remove_file(path)?;
+    }
+
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    // `create_new` refuses to follow a symlink at the temp path.
+    let mut tmp = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+
+    let staged = (|| -> std::io::Result<()> {
+        tmp.write_all(contents.as_bytes())?;
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            // fchmod on the fd we just created — symlink-safe by construction.
+            tmp.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+        tmp.sync_all()?;
+        Ok(())
+    })();
+    #[cfg(not(unix))]
+    let _ = executable;
+
+    drop(tmp);
+
+    if let Err(e) = staged.and_then(|()| std::fs::rename(&tmp_path, path)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(GuardError::Io(e));
+    }
     Ok(())
 }
 
@@ -1009,8 +1058,7 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
 
         // Write chain-runner
         let chain_script = render_chain_runner_script(name);
-        std::fs::write(&chain_path, chain_script)?;
-        chmod_exec(&chain_path)?;
+        write_guard_file_atomic(&chain_path, &chain_script, true)?;
 
         // Windows shims
         let cmd_path = hooks_dir.join(format!("{name}.cmd"));
@@ -1018,20 +1066,23 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
             let body = format!(
                 "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%{name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
             );
-            std::fs::write(&cmd_path, body)?;
+            write_guard_file_atomic(&cmd_path, &body, false)?;
         }
         let ps1_path = hooks_dir.join(format!("{name}.ps1"));
         if !ps1_path.exists() {
             let body = format!(
                 "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot '{name}'\npython $hook @args\nexit $LASTEXITCODE\n"
             );
-            std::fs::write(&ps1_path, body)?;
+            write_guard_file_atomic(&ps1_path, &body, false)?;
         }
 
         // Write guard plugin
         let plugin_path = run_dir.join(PLUGIN_FILE_NAME);
-        std::fs::write(&plugin_path, render_guard_plugin_script(project, name))?;
-        chmod_exec(&plugin_path)?;
+        write_guard_file_atomic(
+            &plugin_path,
+            &render_guard_plugin_script(project, name),
+            true,
+        )?;
 
         Ok(())
     };

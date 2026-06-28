@@ -29,6 +29,38 @@ use std::path::{Path, PathBuf};
 
 type DbConn = crate::CanonicalDbConn;
 
+/// Per-artifact size cap for archive reads during reconstruction (64 MiB).
+///
+/// Archive artifacts are read fully into memory; without a cap a single
+/// oversized file (a multi-GB message body, a crafted `profile.json`, …) OOMs
+/// the reconstruct path — which auto-runs on server-startup self-heal. The cap
+/// is generous relative to any legitimate mailbox artifact.
+const MAX_ARCHIVE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read an archive text artifact with a bounded-memory cap (see
+/// [`MAX_ARCHIVE_ARTIFACT_BYTES`]). Returns an `InvalidData` error if the file
+/// exceeds the cap, which each call site already handles as a skippable read
+/// failure (so an oversized artifact is logged/counted rather than OOMing).
+fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = String::new();
+    let read = file
+        .by_ref()
+        .take(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+        .read_to_string(&mut buf)?;
+    if read as u64 > MAX_ARCHIVE_ARTIFACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive artifact exceeds {MAX_ARCHIVE_ARTIFACT_BYTES} byte cap: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 type SqliteDbConn = crate::CanonicalDbConn;
 
@@ -981,7 +1013,7 @@ fn scan_archive_project_identity(project_path: &Path) -> Option<MailboxProjectId
         .and_then(|name| name.to_str())
         .map(str::to_string);
     let project_json = project_path.join("project.json");
-    if let Ok(content) = std::fs::read_to_string(&project_json)
+    if let Ok(content) = read_archive_text_capped(&project_json)
         && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
     {
         return MailboxProjectIdentity::from_parts(
@@ -1104,7 +1136,7 @@ fn scan_project_archive_message_inventory(
 }
 
 fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
-    let content = std::fs::read_to_string(file_path)
+    let content = read_archive_text_capped(file_path)
         .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
     let Some(frontmatter) = extract_json_frontmatter(&content) else {
         return Ok(None);
@@ -1452,7 +1484,7 @@ fn discover_agents(
             continue;
         }
 
-        let profile_data = match std::fs::read_to_string(&profile_path) {
+        let profile_data = match read_archive_text_capped(&profile_path) {
             Ok(d) => d,
             Err(e) => {
                 stats.parse_errors += 1;
@@ -1647,7 +1679,7 @@ fn parse_and_insert_message(
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
 ) -> DbResult<()> {
-    let content = std::fs::read_to_string(file_path)
+    let content = read_archive_text_capped(file_path)
         .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
 
     // Parse JSON frontmatter between ---json and ---
@@ -2132,7 +2164,7 @@ fn parse_archived_file_reservation(
     file_path: &Path,
     stats: &mut ReconstructStats,
 ) -> Option<ArchivedFileReservation> {
-    let reservation_data = match std::fs::read_to_string(file_path) {
+    let reservation_data = match read_archive_text_capped(file_path) {
         Ok(data) => data,
         Err(e) => {
             stats.parse_errors += 1;
@@ -3823,7 +3855,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         return fallback;
     }
 
-    let metadata_str = match std::fs::read_to_string(&metadata_path) {
+    let metadata_str = match read_archive_text_capped(&metadata_path) {
         Ok(s) => s,
         Err(e) => {
             stats.parse_errors += 1;
