@@ -19,6 +19,7 @@
 //! the archive it's a no-op.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use sqlmodel_core::Value;
 use sqlmodel_sqlite::SqliteConnection;
@@ -206,6 +207,117 @@ pub fn advance_messages_id_floor(
     Ok(Some(archive_max))
 }
 
+/// Process-wide, per-database monotonic message-id allocator
+/// (mcp_agent_mail#176).
+///
+/// # Why this exists
+///
+/// Message ids are normally allocated by SQLite's `AUTOINCREMENT` and read
+/// back from the inserted row. That is correct only while the live SQLite's
+/// durable allocator state (`MAX(id)` / `sqlite_sequence`) reliably advances
+/// across consecutive INSERTs. Issue #176 documented a state where it does
+/// **not**: after a corruption recovery the live database is held *suspect*
+/// by the `idx_agents_project_name_nocase` integrity false-positive (the #151
+/// family) and falls back to the canonical engine, and in that mode the
+/// durable high-water mark advances at startup but not per-write. The result
+/// is that message `N+1` is handed the **same** id as message `N`, the
+/// canonical-archive writer (correctly, per #130) rejects the duplicate
+/// `__<id>.md` file, and the sticky durability latch refuses all further
+/// writes — a *non-terminating* recovery.
+///
+/// This allocator makes id allocation reuse-proof regardless of which surface
+/// is authoritative. It derives the next id as
+/// `max(in_memory_high_water, db_floor, archive_max) + 1` **atomically per
+/// allocation** (the fix direction the issue recommends), so two consecutive
+/// allocations in one process can never collide even when the live SQLite's
+/// durable state fails to advance between them.
+///
+/// The allocator is keyed by the shared connection pool's identity (see
+/// [`DbPool::message_id_allocator`](crate::DbPool::message_id_allocator)), so
+/// every `DbPool` wrapper of the same underlying database shares one
+/// high-water mark — "persist/share the floor increment across pool
+/// connections".
+#[derive(Debug)]
+pub struct MessageIdAllocator {
+    /// The largest id this process has handed out for this database.
+    /// `0` means "no id allocated yet" (the first allocation seeds it).
+    high_water: AtomicI64,
+    /// Set once the archive max has been folded into the high-water mark, so
+    /// the (relatively expensive) archive filesystem walk happens at most once
+    /// per process per database rather than on every message creation.
+    seeded_from_archive: AtomicBool,
+}
+
+impl MessageIdAllocator {
+    /// Create a fresh allocator with no ids handed out yet. Callers should
+    /// resolve a *shared* allocator per database via
+    /// [`DbPool::message_id_allocator`](crate::DbPool::message_id_allocator)
+    /// rather than constructing one directly.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            high_water: AtomicI64::new(0),
+            seeded_from_archive: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the archive max still needs to be folded into the high-water
+    /// mark. The caller scans the archive only when this returns `true`,
+    /// then passes the result to [`MessageIdAllocator::allocate`] and calls
+    /// [`MessageIdAllocator::mark_archive_seeded`].
+    #[must_use]
+    pub fn needs_archive_seed(&self) -> bool {
+        !self.seeded_from_archive.load(Ordering::Acquire)
+    }
+
+    /// Mark that the archive max has been folded in, so subsequent
+    /// allocations skip the archive walk.
+    pub fn mark_archive_seeded(&self) {
+        self.seeded_from_archive.store(true, Ordering::Release);
+    }
+
+    /// Allocate the next message id.
+    ///
+    /// * `db_floor` — `max(MAX(id) FROM messages, sqlite_sequence.seq)` read
+    ///   from the live database for the messages table.
+    /// * `archive_seed` — the maximum message id found in the canonical
+    ///   archive, or `0` when not scanning on this call.
+    ///
+    /// Returns an id strictly greater than `db_floor`, `archive_seed`, and any
+    /// id previously handed out by this allocator in this process. The
+    /// returned id is what the caller MUST use for both the DB row and the
+    /// canonical archive filename so the two never diverge.
+    #[must_use]
+    pub fn allocate(&self, db_floor: i64, archive_seed: i64) -> i64 {
+        let mut current = self.high_water.load(Ordering::Acquire);
+        loop {
+            let base = current.max(db_floor).max(archive_seed).max(0);
+            let next = base.saturating_add(1);
+            match self.high_water.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// The largest id handed out so far (`0` if none). Test/diagnostic use.
+    #[must_use]
+    pub fn current_high_water(&self) -> i64 {
+        self.high_water.load(Ordering::Acquire)
+    }
+}
+
+impl Default for MessageIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +441,52 @@ mod tests {
             .unwrap();
         let max_id = rows[0].get_named::<i64>("max_id").unwrap();
         assert_eq!(max_id, 26);
+    }
+
+    #[test]
+    fn allocator_hands_out_strictly_increasing_ids() {
+        let alloc = MessageIdAllocator::new();
+        // First allocation seeds from the larger of db_floor / archive_seed.
+        assert_eq!(alloc.allocate(1128, 1128), 1129);
+        // db_floor stays at 1128 (the durable allocator failed to advance,
+        // exactly the #176 suspect-mode scenario), but the in-memory
+        // high-water carries forward so the next id is still fresh.
+        assert_eq!(alloc.allocate(1128, 0), 1130);
+        assert_eq!(alloc.allocate(1128, 0), 1131);
+        assert_eq!(alloc.current_high_water(), 1131);
+    }
+
+    #[test]
+    fn allocator_reuse_proof_when_durable_floor_regresses() {
+        // Models the catastrophic case: the live SQLite is suspect, so its
+        // MAX(id)/sqlite_sequence not only fail to advance but can read back
+        // *below* an id we already handed out (e.g. a write that never landed
+        // durably). The allocator must still never re-issue an id.
+        let alloc = MessageIdAllocator::new();
+        let first = alloc.allocate(1128, 1128);
+        assert_eq!(first, 1129);
+        // db_floor regresses to 1000; archive_seed is 0. Without the in-memory
+        // guard this would re-issue 1001 and collide with the archive.
+        let second = alloc.allocate(1000, 0);
+        assert!(
+            second > first,
+            "allocator re-issued or regressed: first={first} second={second}"
+        );
+        assert_eq!(second, 1130);
+    }
+
+    #[test]
+    fn allocator_starts_at_one_for_empty_db_and_archive() {
+        let alloc = MessageIdAllocator::new();
+        assert_eq!(alloc.allocate(0, 0), 1);
+        assert_eq!(alloc.allocate(0, 0), 2);
+    }
+
+    #[test]
+    fn allocator_archive_seed_gate_flips_once() {
+        let alloc = MessageIdAllocator::new();
+        assert!(alloc.needs_archive_seed());
+        alloc.mark_archive_seeded();
+        assert!(!alloc.needs_archive_seed());
     }
 }

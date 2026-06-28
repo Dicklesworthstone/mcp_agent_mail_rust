@@ -5341,14 +5341,35 @@ pub async fn create_message(
     };
 
     let tracked = tracked(&*conn);
+
+    // mcp_agent_mail#176: allocate the canonical id from the process-wide
+    // monotonic allocator (see `create_message_with_recipients` for the full
+    // rationale) and insert it explicitly, so it can never be re-issued even
+    // when the live SQLite's durable AUTOINCREMENT fails to advance.
+    let id_allocator = pool.message_id_allocator();
+    let archive_seed = if id_allocator.needs_archive_seed() {
+        id_allocator.mark_archive_seeded();
+        crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
+    } else {
+        0
+    };
+    let db_floor = match read_messages_id_floor(cx, &tracked).await {
+        Outcome::Ok(floor) => floor,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let message_id = id_allocator.allocate(db_floor, archive_seed);
+
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Insert message using traw_execute and then fetch id.
+        // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
-	               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+	               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+	               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let params = [
+            Value::BigInt(message_id),
             Value::BigInt(project_id),
             Value::BigInt(sender_id),
             thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
@@ -5364,26 +5385,6 @@ pub async fn create_message(
             cx,
             &tracked,
             map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
-        );
-
-        let message_id = try_in_tx!(
-            cx,
-            &tracked,
-            fetch_inserted_message_id_in_tx(
-                cx,
-                &tracked,
-                project_id,
-                sender_id,
-                subject,
-                body_md,
-                thread_id,
-                importance,
-                ack_required,
-                attachments,
-                now,
-                None,
-            )
-            .await
         );
 
         let row = MessageRow {
@@ -5459,70 +5460,42 @@ fn index_created_message_best_effort(
     crate::search_v3::index_message(&message)
 }
 
-/// Resolve the message row inserted earlier in the current transaction.
+/// Read the messages-table allocator floor: the larger of `MAX(id)` and the
+/// `sqlite_sequence` row for `messages`.
 ///
-/// We intentionally avoid `last_insert_rowid()` here. Under file-backed
-/// concurrent-writer load on the FrankenSQLite path, rowid lookup can drift
-/// and attach recipient inserts to the wrong message id. Looking the row back
-/// up by its exact inserted values keeps the lookup transaction-local and
-/// deterministic.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_inserted_message_id_in_tx(
-    cx: &Cx,
-    tracked: &TrackedConnection<'_>,
-    project_id: i64,
-    sender_id: i64,
-    subject: &str,
-    body_md: &str,
-    thread_id: Option<&str>,
-    importance: &str,
-    ack_required: bool,
-    attachments: &str,
-    created_ts: i64,
-    recipients_json: Option<&str>,
-) -> Outcome<i64, DbError> {
-    let sql = "SELECT id FROM messages \
-               WHERE project_id = ? \
-                 AND sender_id = ? \
-                 AND created_ts = ? \
-                 AND subject = ? \
-                 AND body_md = ? \
-                 AND importance = ? \
-                 AND ack_required = ? \
-                 AND attachments = ? \
-                 AND ((? IS NULL AND thread_id IS NULL) OR thread_id = ?) \
-                 AND (? IS NULL OR recipients_json = ?) \
-               ORDER BY id DESC LIMIT 1";
-    let thread_value =
-        thread_id.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
-    let recipients_json_value =
-        recipients_json.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
-    let params = vec![
-        Value::BigInt(project_id),
-        Value::BigInt(sender_id),
-        Value::BigInt(created_ts),
-        Value::Text(subject.to_string()),
-        Value::Text(body_md.to_string()),
-        Value::Text(importance.to_string()),
-        Value::BigInt(i64::from(ack_required)),
-        Value::Text(attachments.to_string()),
-        thread_value.clone(),
-        thread_value,
-        recipients_json_value.clone(),
-        recipients_json_value,
-    ];
-    let rows = match map_sql_outcome(traw_query(cx, tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+/// Used to seed/advance the process-wide [`MessageIdAllocator`](crate::id_floor::MessageIdAllocator)
+/// (mcp_agent_mail#176). A missing `sqlite_sequence` row (or table, on a
+/// brand-new database) is treated as `0` so it can never block message
+/// creation.
+async fn read_messages_id_floor(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<i64, DbError> {
+    let db_max = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT COALESCE(MAX(id), 0) AS v FROM messages",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
-    let Some(message_id) = rows.first().and_then(row_first_i64) else {
-        return Outcome::Err(DbError::Internal(format!(
-            "message insert succeeded but deterministic id lookup failed for project_id={project_id} sender_id={sender_id} created_ts={created_ts}"
-        )));
+    let seq_val = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT COALESCE(seq, 0) AS v FROM sqlite_sequence WHERE name = 'messages'",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows.first().and_then(row_first_i64).unwrap_or(0),
+        // sqlite_sequence may be absent on a fresh DB; not an error here.
+        Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => 0,
     };
-    Outcome::Ok(message_id)
+    Outcome::Ok(db_max.max(seq_val))
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -5590,6 +5563,35 @@ pub async fn create_message_with_recipients(
         };
 
         let tracked = tracked(&*conn);
+
+        // mcp_agent_mail#176: allocate the canonical message id from the
+        // process-wide monotonic allocator rather than relying on the live
+        // SQLite's AUTOINCREMENT. While the database is held suspect
+        // (canonical-fallback mode, the #151 NOCASE family), the durable
+        // allocator can fail to advance per-write and re-issue an id the
+        // archive already considers canonical — the duplicate-canonical-file
+        // reject (#130) then trips a non-clearable durability latch. The
+        // allocator derives the next id as
+        // `max(in_memory_high_water, db_floor, archive_max) + 1` atomically,
+        // so consecutive creations can never collide regardless of which
+        // surface is authoritative. We compute it once here (under the global
+        // MESSAGE_WRITE_SERIALIZER) so MVCC retries of the transaction reuse a
+        // stable id.
+        let id_allocator = pool.message_id_allocator();
+        let archive_seed = if id_allocator.needs_archive_seed() {
+            id_allocator.mark_archive_seeded();
+            crate::id_floor::max_message_id_in_archive(pool.storage_root()).unwrap_or(0)
+        } else {
+            0
+        };
+        let db_floor = match read_messages_id_floor(cx, &tracked).await {
+            Outcome::Ok(floor) => floor,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let message_id = id_allocator.allocate(db_floor, archive_seed);
+
         let row = match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
             create_message_with_recipients_tx(
                 cx,
@@ -5604,6 +5606,7 @@ pub async fn create_message_with_recipients(
                 attachments,
                 recipients,
                 now,
+                message_id,
             )
         })
         .await
@@ -5728,6 +5731,7 @@ async fn create_message_with_recipients_tx(
     attachments: &str,
     recipients: &[(i64, &str)],
     now: i64,
+    message_id: i64,
 ) -> Outcome<MessageRow, DbError> {
     // Use MVCC concurrent transaction for page-level parallelism.
     try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
@@ -5773,11 +5777,19 @@ async fn create_message_with_recipients_tx(
     })
     .to_string();
 
-    // Insert message using traw_execute and then fetch id.
+    // Insert the message with an EXPLICIT id (mcp_agent_mail#176). We do not
+    // rely on AUTOINCREMENT + a deterministic read-back here: the id was
+    // allocated by the process-wide monotonic allocator in the caller, so it
+    // is guaranteed unique-and-increasing even when the live SQLite's durable
+    // allocator state fails to advance. Inserting an explicit rowid keeps the
+    // DB row id and the canonical archive filename in lockstep regardless of
+    // engine state. (Inserting an explicit id > the current sequence also
+    // advances `sqlite_sequence`, keeping any non-explicit path consistent.)
     let sql = "INSERT INTO messages \
-               (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+               (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let params = [
+        Value::BigInt(message_id),
         Value::BigInt(project_id),
         Value::BigInt(sender_id),
         thread_id.map_or_else(|| Value::Null, |t| Value::Text(t.to_string())),
@@ -5794,26 +5806,6 @@ async fn create_message_with_recipients_tx(
         cx,
         tracked,
         map_sql_outcome(traw_execute(cx, tracked, sql, &params).await)
-    );
-
-    let message_id = try_in_tx!(
-        cx,
-        tracked,
-        fetch_inserted_message_id_in_tx(
-            cx,
-            tracked,
-            project_id,
-            sender_id,
-            subject,
-            body_md,
-            thread_id,
-            importance,
-            ack_required,
-            attachments,
-            now,
-            Some(&recipients_json_val),
-        )
-        .await
     );
 
     let row = MessageRow {

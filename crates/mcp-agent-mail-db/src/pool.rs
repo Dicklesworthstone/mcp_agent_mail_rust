@@ -2102,6 +2102,44 @@ pub struct DbPool {
     run_migrations: bool,
     skip_startup_init: bool,
     stats_sampler: Arc<DbPoolStatsSampler>,
+    /// Shared, process-wide monotonic message-id allocator for this database
+    /// (mcp_agent_mail#176). Resolved once at construction so all `DbPool`
+    /// wrappers of the same underlying connection pool share one high-water
+    /// mark; see [`shared_message_id_allocator`].
+    message_id_allocator: Arc<crate::id_floor::MessageIdAllocator>,
+}
+
+/// Registry of per-database message-id allocators, keyed by the shared
+/// connection pool's `Arc` pointer identity (mcp_agent_mail#176).
+///
+/// All `DbPool` wrappers of the same underlying `Arc<Pool<DbConn>>` resolve to
+/// the same allocator, so the in-process high-water mark is shared "across
+/// pool connections". Independent pools — including each fresh `:memory:` test
+/// pool — get their own. Entries are pruned by `Weak` liveness on every
+/// resolve, so a pointer address reused by a *new* pool after the old one is
+/// dropped never inherits a stale high-water mark.
+/// Registry value: a weak handle to the shared pool (for liveness pruning)
+/// paired with that pool's message-id allocator.
+type MessageIdAllocatorEntry = (Weak<Pool<DbConn>>, Arc<crate::id_floor::MessageIdAllocator>);
+
+static MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<usize, MessageIdAllocatorEntry>>> =
+    OnceLock::new();
+
+fn shared_message_id_allocator(
+    pool: &Arc<Pool<DbConn>>,
+) -> Arc<crate::id_floor::MessageIdAllocator> {
+    let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    // Drop entries whose pool has been freed so a reused address cannot
+    // resurrect a stale allocator.
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    let key = Arc::as_ptr(pool) as usize;
+    if let Some((_, allocator)) = guard.get(&key) {
+        return allocator.clone();
+    }
+    let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
+    guard.insert(key, (Arc::downgrade(pool), allocator.clone()));
+    allocator
 }
 
 impl DbPool {
@@ -2126,6 +2164,7 @@ impl DbPool {
             config.cache_budget_kb,
         ));
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
+        let message_id_allocator = shared_message_id_allocator(&pool);
 
         Ok(Self {
             pool,
@@ -2137,6 +2176,7 @@ impl DbPool {
             run_migrations: config.run_migrations,
             skip_startup_init,
             stats_sampler,
+            message_id_allocator,
         })
     }
 
@@ -2170,8 +2210,11 @@ impl DbPool {
             .test_on_checkout(true)
             .test_on_return(false);
 
+        let pool = Arc::new(Pool::new(pool_config));
+        let message_id_allocator = shared_message_id_allocator(&pool);
+
         Ok(Self {
-            pool: Arc::new(Pool::new(pool_config)),
+            pool,
             sqlite_path,
             storage_root,
             cache_key,
@@ -2180,6 +2223,7 @@ impl DbPool {
             run_migrations: config.run_migrations,
             skip_startup_init,
             stats_sampler,
+            message_id_allocator,
         })
     }
 
@@ -2637,6 +2681,23 @@ impl DbPool {
             DbError::Sqlite(format!("id_floor: open sqlite for floor advance: {e}"))
         })?;
         crate::id_floor::advance_messages_id_floor(&conn, archive_max)
+    }
+
+    /// The shared, process-wide monotonic message-id allocator for this
+    /// database (mcp_agent_mail#176).
+    ///
+    /// Keyed by the shared connection pool's `Arc` identity so that every
+    /// `DbPool` wrapper of the same underlying pool resolves to one allocator
+    /// — guaranteeing that consecutive message creations can never be handed
+    /// the same id even when the live SQLite's durable `AUTOINCREMENT` state
+    /// fails to advance (the suspect / canonical-fallback mode that defeats
+    /// the startup-only `id_floor` advance). Independent pools, including each
+    /// fresh `:memory:` test pool, get their own isolated allocator. Resolved
+    /// once at construction (see [`shared_message_id_allocator`]); this
+    /// accessor is a cheap clone with no locking on the message hot path.
+    #[must_use]
+    pub fn message_id_allocator(&self) -> Arc<crate::id_floor::MessageIdAllocator> {
+        self.message_id_allocator.clone()
     }
 
     /// Run `integrity::quick_check` on `conn` and, on `IntegrityCorruption`,
@@ -9118,6 +9179,89 @@ mod tests {
             Some(9002),
             "next normal INSERT must allocate strictly above the archive max"
         );
+    }
+
+    #[test]
+    fn message_creation_routes_through_shared_reuse_proof_allocator() {
+        // mcp_agent_mail#176: message creation must allocate ids through the
+        // shared monotonic allocator (so a regressed durable sequence cannot
+        // re-issue a canonical id), and every wrapper of the same underlying
+        // pool must share one high-water mark.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("alloc_route.sqlite3");
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(dir.path().join("storage")),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = get_or_create_pool(&cfg).expect("create pool");
+        // A second wrapper of the same cached pool shares the allocator.
+        let pool2 = get_or_create_pool(&cfg).expect("reuse cached pool");
+        assert!(
+            Arc::ptr_eq(&pool.message_id_allocator(), &pool2.message_id_allocator()),
+            "wrappers of the same cached pool must share one allocator"
+        );
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        rt.block_on(async {
+            let project =
+                crate::queries::ensure_project(&cx, &pool, "/data/projects/am-alloc-route")
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = crate::queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("alloc-route"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+
+            let first = crate::queries::create_message(
+                &cx, &pool, project_id, sender_id, "one", "body", None, "normal", false, "{}",
+            )
+            .await
+            .into_result()
+            .expect("first message");
+            assert_eq!(first.id, Some(1));
+            // The allocator handed out id 1 and tracks it — proving the create
+            // path routes through it rather than relying solely on the live
+            // SQLite's AUTOINCREMENT.
+            assert_eq!(pool.message_id_allocator().current_high_water(), 1);
+
+            let second = crate::queries::create_message(
+                &cx, &pool, project_id, sender_id, "two", "body", None, "normal", false, "{}",
+            )
+            .await
+            .into_result()
+            .expect("second message");
+            assert_eq!(second.id, Some(2));
+            // Tracked on the wrapper that shares the same Arc — proving the
+            // high-water is process-wide for this database, not per-wrapper.
+            assert_eq!(pool2.message_id_allocator().current_high_water(), 2);
+
+            // The allocator's reuse-proofness when the durable sequence
+            // regresses (the actual #176 suspect-mode failure) is covered by
+            // the `id_floor::tests::allocator_reuse_proof_when_durable_floor_regresses`
+            // unit test; here we have established that message creation routes
+            // through that same shared allocator.
+        });
     }
 
     /// Verify PRAGMA settings contain `busy_timeout=60000` matching legacy Python.
