@@ -903,7 +903,14 @@ fn renewal_filter_matches(
     paths: Option<&[String]>,
     reservation_ids: Option<&[i64]>,
 ) -> bool {
-    if row.released_ts.is_some() {
+    // A row is active per the canonical ACTIVE_RESERVATION_PREDICATE when
+    // released_ts IS NULL OR released_ts <= 0; only a positive released_ts means
+    // genuinely released. `list_unreleased_file_reservations` can surface a
+    // defensively-active row as released_ts = Some(0), so gate on `> 0` (not the
+    // any-`Some` check) to match the SQL predicate the unfiltered release path
+    // uses — otherwise path/id-filtered release+renew would skip a row the
+    // blanket "release all" branch still acts on.
+    if row.released_ts.is_some_and(|ts| ts > 0) {
         return false;
     }
     if row.agent_id != agent_id {
@@ -3718,6 +3725,24 @@ mod tests {
             Some(&["src/main.rs".to_string()]),
             None,
         ));
+    }
+
+    #[test]
+    fn renewal_filter_matches_includes_defensively_active_nonpositive_released_ts() {
+        // released_ts <= 0 is ACTIVE per the canonical predicate, so a path/id
+        // filtered release/renew must still match it — consistent with the
+        // unfiltered "release all" SQL branch.
+        let active_zero = reservation_row(42, 7, "src/**", 1, Some(0));
+        assert!(
+            renewal_filter_matches(&active_zero, 7, Some(&["src/main.rs".to_string()]), None),
+            "released_ts=0 is active and must match for renew/release"
+        );
+        // A genuinely released row (positive released_ts) stays excluded.
+        let released = reservation_row(43, 7, "src/**", 1, Some(1_700_000_000_000_000));
+        assert!(
+            !renewal_filter_matches(&released, 7, Some(&["src/main.rs".to_string()]), None),
+            "a positively-released reservation must not match for renew/release"
+        );
     }
 
     #[test]
