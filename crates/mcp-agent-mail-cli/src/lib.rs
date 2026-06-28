@@ -2093,6 +2093,12 @@ pub enum MailCommand {
 const PENDING_SEND_SCHEMA_VERSION: &str = "am.pending_send.v1";
 const PENDING_SEND_RECEIPT_SCHEMA_VERSION: &str = "am.pending_send_receipt.v1";
 const PENDING_SEND_UNSENT_STATUS: &str = "UNSENT_UNTIL_REPLAY";
+/// Safety bound on how many byte-identical pending-send artifacts may queue
+/// for one content hash across separate outages (br-0ycog). Each replayed
+/// duplicate spills to `{hash}.2.json`, `{hash}.3.json`, … so an unbounded
+/// loop (a stuck producer re-sending the same message every outage) cannot
+/// fill the disk silently.
+const PENDING_SEND_MAX_DUPLICATE_SLOTS: u32 = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingMailSendEnvelope {
@@ -30567,6 +30573,40 @@ fn pending_send_receipt_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_file_name(format!("{stem}.sent.json"))
 }
 
+/// Resolve which pending-send artifact path to (re)use for a content hash
+/// whose canonical path is `base_path` (`{hash}.json`).
+///
+/// br-0ycog: an artifact whose sibling `.sent.json` receipt exists has already
+/// been replayed (consumed). A later byte-identical send is a *new* message —
+/// deduping it into the spent slot would make `am mail replay-queued` report
+/// `already_replayed` and silently drop it. So when the canonical slot is
+/// consumed, walk `{hash}.2.json`, `{hash}.3.json`, … and return the first slot
+/// that is NOT consumed (either free, or a still-pending duplicate from the
+/// current outage that the caller should legitimately dedupe into). The
+/// canonical `{hash}.json` slot is always preferred while it remains
+/// un-replayed, preserving the documented reproducible-path contract for the
+/// common (single-outage) case.
+fn resolve_unconsumed_pending_send_path(base_path: &Path) -> CliResult<PathBuf> {
+    if !pending_send_receipt_path(base_path).exists() {
+        return Ok(base_path.to_path_buf());
+    }
+    let stem = base_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("pending-send")
+        .to_string();
+    for n in 2..=PENDING_SEND_MAX_DUPLICATE_SLOTS {
+        let candidate = base_path.with_file_name(format!("{stem}.{n}.json"));
+        if !pending_send_receipt_path(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(CliError::Other(format!(
+        "too many replayed duplicates of pending-send {stem} (limit {PENDING_SEND_MAX_DUPLICATE_SLOTS}); \
+         refusing to queue another byte-identical message — investigate the producer re-sending the same content every outage"
+    )))
+}
+
 fn pending_send_failure_from_error(error: &CliError) -> Option<PendingSendFailure> {
     match error {
         CliError::InvalidArgument(_) | CliError::Usage(_) | CliError::ExitCode(_) => return None,
@@ -30720,7 +30760,13 @@ fn create_pending_send_artifact(
     use std::io::Write as _;
 
     let content_hash = pending_send_content_hash(envelope)?;
-    let artifact_path = pending_send_artifact_path(&config.storage_root, &content_hash);
+    let base_path = pending_send_artifact_path(&config.storage_root, &content_hash);
+    // br-0ycog: reuse the canonical {hash}.json slot for an in-flight (not yet
+    // replayed) duplicate, but spill to a fresh {hash}.N.json slot when the
+    // canonical one has already been consumed (replayed), so a byte-identical
+    // message sent during a *later* outage is never deduped into a spent slot
+    // and silently dropped.
+    let artifact_path = resolve_unconsumed_pending_send_path(&base_path)?;
     if artifact_path.exists() {
         let artifact = load_pending_send_artifact(&artifact_path)?;
         validate_pending_send_artifact(&artifact_path, &artifact)?;
@@ -33623,6 +33669,65 @@ mod mail_server_cli_bridge_tests {
             validate_pending_send_receipt(&mismatched_receipt_path, &artifact, &mismatched_receipt)
                 .expect_err("mismatched receipt hash should be rejected");
         assert!(mismatch.to_string().contains("content_hash mismatch"));
+    }
+
+    #[test]
+    fn create_pending_send_mints_fresh_slot_after_canonical_is_consumed() {
+        // br-0ycog: once {hash}.json has been replayed (receipt written), a
+        // later byte-identical send must queue under a NEW slot ({hash}.2.json)
+        // instead of deduping into the spent canonical slot — which
+        // `replay-queued` would skip as `already_replayed`, silently dropping
+        // the genuinely-new second message.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = config_with_storage_root(temp.path());
+        let envelope = pending_send_test_envelope();
+        let failure =
+            pending_send_failure_from_error(&CliError::Other("database is locked".to_string()))
+                .expect("lock failure should be queueable");
+
+        // First outage: canonical {hash}.json slot.
+        let (first_path, first_artifact) =
+            create_pending_send_artifact(&config, &envelope, failure.clone(), false)
+                .expect("create first artifact");
+
+        // Same content during the SAME outage (not yet replayed) must dedupe
+        // into the canonical slot — no duplicate artifact.
+        let (dedup_path, _) =
+            create_pending_send_artifact(&config, &envelope, failure.clone(), false)
+                .expect("dedupe while un-replayed");
+        assert_eq!(
+            dedup_path, first_path,
+            "an un-replayed duplicate must reuse the canonical slot"
+        );
+
+        // Replay (consume) the canonical slot by writing its receipt.
+        let response = serde_json::json!({"id": 7, "to": ["WindyGate"]});
+        write_pending_send_receipt(&first_path, &first_artifact, &response).expect("write receipt");
+
+        // Second outage, byte-identical content: must mint a FRESH slot, never
+        // reuse the consumed canonical one.
+        let (second_path, second_artifact) =
+            create_pending_send_artifact(&config, &envelope, failure, false)
+                .expect("create after canonical consumed");
+        assert_ne!(
+            second_path, first_path,
+            "a byte-identical send after replay must not reuse the consumed slot"
+        );
+        assert!(
+            second_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".2.")),
+            "fresh slot should carry the .2 suffix: {}",
+            second_path.display()
+        );
+        // The fresh artifact is independently replayable (no receipt yet) and
+        // carries the same envelope content hash — the reproducible-hash
+        // contract is on the `content_hash` field, not the filename.
+        assert!(!pending_send_receipt_path(&second_path).exists());
+        assert_eq!(second_artifact.content_hash, first_artifact.content_hash);
+        validate_pending_send_artifact(&second_path, &second_artifact)
+            .expect("fresh suffixed artifact validates");
     }
 
     #[test]
