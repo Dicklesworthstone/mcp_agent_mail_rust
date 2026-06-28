@@ -636,15 +636,24 @@ fn read_queued_release_intents(config: &Config) -> std::io::Result<Vec<QueuedRel
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut replayed = HashSet::new();
+    let mut terminal = HashSet::new();
     let mut intents = Vec::new();
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         match value.get("kind").and_then(Value::as_str) {
+            // A replay marker is terminal when the intent either succeeded
+            // ("replayed") or is permanently un-replayable ("abandoned" — e.g.
+            // the agent or project no longer exists). Both clear the queued
+            // intent so it is not retried forever (mirrors the ack-intent
+            // design in messaging.rs); only a retryable "failed" marker leaves
+            // the intent queued for the next replay attempt.
             Some(RELEASE_INTENT_REPLAY_KIND)
-                if value.get("status").and_then(Value::as_str) == Some("replayed") =>
+                if matches!(
+                    value.get("status").and_then(Value::as_str),
+                    Some("replayed" | "abandoned")
+                ) =>
             {
                 if !release_replay_record_has_valid_hash(&value) {
                     tracing::warn!("skipping replay marker with invalid content hash");
@@ -656,7 +665,7 @@ fn read_queued_release_intents(config: &Config) -> std::io::Result<Vec<QueuedRel
                     else {
                         continue;
                     };
-                    replayed.insert((intent_id.to_string(), intent_content_sha256.to_string()));
+                    terminal.insert((intent_id.to_string(), intent_content_sha256.to_string()));
                 }
             }
             Some(RELEASE_INTENT_KIND) => {
@@ -672,7 +681,7 @@ fn read_queued_release_intents(config: &Config) -> std::io::Result<Vec<QueuedRel
         }
     }
     intents.retain(|intent| {
-        !replayed.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
+        !terminal.contains(&(intent.intent_id.clone(), intent.content_sha256.clone()))
     });
     Ok(intents)
 }
@@ -719,16 +728,16 @@ async fn replay_single_release_intent(
     pool: &mcp_agent_mail_db::DbPool,
     config: &Config,
     intent: &QueuedReleaseIntent,
-) -> Result<usize, String> {
+) -> Result<usize, (String, bool)> {
     if intent.kind != RELEASE_INTENT_KIND {
         return Ok(0);
     }
     let project = resolve_project(ctx, pool, &intent.project_key)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
     let project_id = project.id.unwrap_or(0);
     let normalized_paths = normalize_filter_paths(&project.human_key, intent.paths.clone())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
     let agent = resolve_agent(
         ctx,
         pool,
@@ -738,7 +747,7 @@ async fn replay_single_release_intent(
         &project.human_key,
     )
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| (error.to_string(), mcp_error_supports_release_intent(&error)))?;
     let agent_id = agent.id.unwrap_or(0);
     let ids_to_release = if normalized_paths.is_some() || intent.file_reservation_ids.is_some() {
         let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
@@ -749,10 +758,14 @@ async fn replay_single_release_intent(
         .await
         {
             asupersync::Outcome::Ok(rows) => rows,
-            asupersync::Outcome::Err(error) => return Err(error.to_string()),
-            asupersync::Outcome::Cancelled(reason) => return Err(format!("cancelled: {reason:?}")),
+            asupersync::Outcome::Err(error) => {
+                return Err((error.to_string(), db_error_supports_release_intent(&error)));
+            }
+            asupersync::Outcome::Cancelled(reason) => {
+                return Err((format!("cancelled: {reason:?}"), true));
+            }
             asupersync::Outcome::Panicked(panic) => {
-                return Err(format!("panicked: {}", panic.message()));
+                return Err((format!("panicked: {}", panic.message()), true));
             }
         };
         let mut ids = Vec::new();
@@ -783,10 +796,14 @@ async fn replay_single_release_intent(
     .await
     {
         asupersync::Outcome::Ok(rows) => rows,
-        asupersync::Outcome::Err(error) => return Err(error.to_string()),
-        asupersync::Outcome::Cancelled(reason) => return Err(format!("cancelled: {reason:?}")),
+        asupersync::Outcome::Err(error) => {
+            return Err((error.to_string(), db_error_supports_release_intent(&error)));
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            return Err((format!("cancelled: {reason:?}"), true));
+        }
         asupersync::Outcome::Panicked(panic) => {
-            return Err(format!("panicked: {}", panic.message()));
+            return Err((format!("panicked: {}", panic.message()), true));
         }
     };
     dispatch_release_archive_write(&project, &agent, &released_rows, config);
@@ -817,18 +834,24 @@ async fn replay_queued_release_intents(
                     None,
                 );
             }
-            Err(error) => {
+            Err((detail, retryable)) => {
+                // Retryable (DB still degraded) → "failed", left queued for the
+                // next replay. Non-retryable (agent/project gone, malformed
+                // paths) → "abandoned", a terminal marker that clears the intent
+                // so it is not retried — and re-appended — forever.
+                let status = if retryable { "failed" } else { "abandoned" };
                 append_release_replay_record(
                     config,
                     &intent.intent_id,
                     &intent.content_sha256,
-                    "failed",
+                    status,
                     0,
-                    Some(&error),
+                    Some(&detail),
                 );
                 tracing::warn!(
                     intent_id = intent.intent_id,
-                    error = %error,
+                    retryable,
+                    error = %detail,
                     "queued release intent replay failed"
                 );
             }
@@ -3161,6 +3184,47 @@ mod tests {
     }
 
     #[test]
+    fn release_intent_reader_suppresses_abandoned_intents() {
+        with_serialized_reservations(|| {
+            let config = Config::get();
+            let receipt = append_release_intent(
+                &config,
+                "/tmp/abandoned-release",
+                "BlueLake",
+                None,
+                Some(vec![42]),
+                "list_unreleased_file_reservations",
+                "database is locked",
+            )
+            .expect("append release intent");
+
+            assert_eq!(
+                read_queued_release_intents(&config)
+                    .expect("read pending release intent")
+                    .len(),
+                1
+            );
+            // A permanently un-replayable intent records a terminal "abandoned"
+            // marker; the reader must clear it just like "replayed" so it is not
+            // retried (and re-appended) forever.
+            append_release_replay_record(
+                &config,
+                &receipt.intent_id,
+                &receipt.content_sha256,
+                "abandoned",
+                0,
+                Some("agent no longer exists"),
+            );
+            assert!(
+                read_queued_release_intents(&config)
+                    .expect("read after abandon")
+                    .is_empty(),
+                "abandoned release intent must be terminal, not retried forever"
+            );
+        });
+    }
+
+    #[test]
     fn release_intent_reader_ignores_unhashed_replay_marker() {
         with_serialized_reservations(|| {
             let config = Config::get();
@@ -3320,6 +3384,51 @@ mod tests {
                         .expect("read queued release intents")
                         .is_empty(),
                     "successfully replayed intents should not be replayed again"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn replay_abandons_release_intent_for_missing_agent() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/abandon-release-intent-{}", unique_suffix());
+                // Create the project but never register the queued agent, so the
+                // replay's resolve_agent returns NOT_FOUND — a permanent,
+                // non-retryable failure (mirrors the ack abandon test).
+                let project = ensure_project(&cx, &pool, &project_key).await;
+
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    "GhostAgent",
+                    None,
+                    Some(vec![1]),
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("append release intent");
+                assert_eq!(
+                    read_queued_release_intents(&config)
+                        .expect("read queued release intents")
+                        .len(),
+                    1
+                );
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                // Idempotent: a permanently un-replayable intent must clear on the
+                // first replay and stay cleared, never retried forever.
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+
+                assert!(
+                    read_queued_release_intents(&config)
+                        .expect("read after abandon")
+                        .is_empty(),
+                    "release intent for a missing agent should be abandoned, not retried forever"
                 );
             });
         });
