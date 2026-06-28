@@ -29,6 +29,17 @@ pub struct ReservationParityDriftSummary {
     pub agent_id_mismatches: usize,
     pub released_ts_mismatches: usize,
     pub active_status_mismatches: usize,
+    /// The reserved path glob diverges between the DB row and its archive
+    /// artifact (GH#112's core concern — the reserved *path* is the subject of
+    /// reservation DB↔archive divergence). Only counted when the archive
+    /// artifact actually carries a `path_pattern`; a legacy artifact that omits
+    /// it is not drift (br-xyy95), mirroring the conservative comparison used
+    /// for `released_ts`/`reason` so absence never manufactures a false drift.
+    pub path_pattern_mismatches: usize,
+    /// The `exclusive` flag diverges between the DB row and its archive
+    /// artifact. Like `path_pattern_mismatches`, only counted when the archive
+    /// artifact carries an `exclusive` value (br-xyy95).
+    pub exclusive_mismatches: usize,
     pub thread_provenance_mismatches: usize,
     pub parse_errors: usize,
 }
@@ -42,6 +53,8 @@ impl ReservationParityDriftSummary {
             + self.agent_id_mismatches
             + self.released_ts_mismatches
             + self.active_status_mismatches
+            + self.path_pattern_mismatches
+            + self.exclusive_mismatches
             + self.thread_provenance_mismatches
             + self.parse_errors
     }
@@ -118,6 +131,15 @@ impl ReservationParityReport {
                 self.drift.active_status_mismatches
             ));
         }
+        if self.drift.path_pattern_mismatches > 0 {
+            fields.push(format!(
+                "path_pattern={}",
+                self.drift.path_pattern_mismatches
+            ));
+        }
+        if self.drift.exclusive_mismatches > 0 {
+            fields.push(format!("exclusive={}", self.drift.exclusive_mismatches));
+        }
         if self.drift.thread_provenance_mismatches > 0 {
             fields.push(format!(
                 "thread_provenance={}",
@@ -157,6 +179,8 @@ struct DbReservationState {
     project_slug: String,
     agent_name: String,
     reason: String,
+    path_pattern: String,
+    exclusive: bool,
     reservation_released_ts: Option<i64>,
     ledger_released_ts: Option<i64>,
 }
@@ -181,6 +205,12 @@ struct ArchiveReservationState {
     project_slug: String,
     agent_name: String,
     thread_provenance: String,
+    /// `None` when the archive artifact omits `path_pattern`/`path` entirely
+    /// (legacy or hand-authored). Absence is NOT drift — only a present-but-
+    /// divergent value is (br-xyy95).
+    path_pattern: Option<String>,
+    /// `None` when the archive artifact omits `exclusive` (br-xyy95).
+    exclusive: Option<bool>,
     released_ts: Option<i64>,
 }
 
@@ -211,6 +241,8 @@ where
                 p.slug AS project_slug,
                 COALESCE(a.name, '<missing-agent-id:' || fr.agent_id || '>') AS agent_name,
                 COALESCE(fr.reason, '') AS reason,
+                COALESCE(fr.path_pattern, '') AS path_pattern,
+                fr.exclusive AS exclusive,
                 fr.released_ts AS reservation_released_ts,
                 rr.released_ts AS ledger_released_ts
          FROM file_reservations fr
@@ -236,6 +268,13 @@ where
                 reason: row
                     .get_named::<String>("reason")
                     .map_err(|error| error.to_string())?,
+                path_pattern: row
+                    .get_named::<String>("path_pattern")
+                    .map_err(|error| error.to_string())?,
+                exclusive: row
+                    .get_named::<i64>("exclusive")
+                    .map_err(|error| error.to_string())?
+                    != 0,
                 reservation_released_ts: row
                     .get_named::<Option<i64>>("reservation_released_ts")
                     .map_err(|error| error.to_string())?,
@@ -471,6 +510,47 @@ fn compare_reservation_pair(
         });
     }
 
+    // The reserved path glob is GH#112's core divergence subject. Only compare
+    // when the archive carries a value — a legacy artifact that omits
+    // `path_pattern` must not be reported as drift (br-xyy95), mirroring the
+    // conservative handling of `released_ts`. `json_string` already trims the
+    // archive side, so trim the DB side too.
+    if let Some(archive_path) = archive.path_pattern.as_deref()
+        && db.path_pattern.trim() != archive_path.trim()
+    {
+        drift.path_pattern_mismatches += 1;
+        examples.push(ReservationParityExample {
+            reservation_id: db.reservation_id,
+            project_slug: db.project_slug.clone(),
+            field: "path_pattern".to_string(),
+            db_value: db.path_pattern.clone(),
+            archive_value: archive_path.to_string(),
+            detail: format!(
+                "reservation_id={} db_path_pattern={} archive_path_pattern={}",
+                db.reservation_id, db.path_pattern, archive_path
+            ),
+        });
+    }
+
+    // The exclusive flag — same conservative rule: skip when the archive omits
+    // it (br-xyy95).
+    if let Some(archive_exclusive) = archive.exclusive
+        && db.exclusive != archive_exclusive
+    {
+        drift.exclusive_mismatches += 1;
+        examples.push(ReservationParityExample {
+            reservation_id: db.reservation_id,
+            project_slug: db.project_slug.clone(),
+            field: "exclusive".to_string(),
+            db_value: db.exclusive.to_string(),
+            archive_value: archive_exclusive.to_string(),
+            detail: format!(
+                "reservation_id={} db_exclusive={} archive_exclusive={}",
+                db.reservation_id, db.exclusive, archive_exclusive
+            ),
+        });
+    }
+
     // The archive reader trims this field (json_string) while the DB stores the
     // reason verbatim, so compare both trimmed — otherwise a reason with
     // surrounding/only whitespace produces spurious parity drift on an
@@ -597,6 +677,10 @@ fn parse_archive_reservation(
         .or_else(|| json_string(&json, "thread"))
         .or_else(|| json_string(&json, "reason"))
         .unwrap_or_default();
+    // The canonical archive key is `path_pattern`; older artifacts may have used
+    // `path`. Absent entirely -> None (not drift). br-xyy95.
+    let path_pattern = json_string(&json, "path_pattern").or_else(|| json_string(&json, "path"));
+    let exclusive = json.get("exclusive").and_then(serde_json::Value::as_bool);
     let released_ts = parse_json_micros(&json, "released_ts");
 
     Ok(ArchiveReservationState {
@@ -604,6 +688,8 @@ fn parse_archive_reservation(
         project_slug: project_slug.to_string(),
         agent_name,
         thread_provenance,
+        path_pattern,
+        exclusive,
         released_ts,
     })
 }
@@ -636,4 +722,117 @@ fn parse_json_micros(json: &serde_json::Value, key: &str) -> Option<i64> {
 
 fn path_is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db_state(path: &str, exclusive: bool) -> DbReservationState {
+        DbReservationState {
+            reservation_id: 1,
+            project_slug: "proj".to_string(),
+            agent_name: "Agent".to_string(),
+            reason: "r".to_string(),
+            path_pattern: path.to_string(),
+            exclusive,
+            reservation_released_ts: None,
+            ledger_released_ts: None,
+        }
+    }
+
+    fn archive_state(path: Option<&str>, exclusive: Option<bool>) -> ArchiveReservationState {
+        ArchiveReservationState {
+            reservation_id: 1,
+            project_slug: "proj".to_string(),
+            agent_name: "Agent".to_string(),
+            thread_provenance: "r".to_string(),
+            path_pattern: path.map(str::to_string),
+            exclusive,
+            released_ts: None,
+        }
+    }
+
+    fn run_compare(
+        db: &DbReservationState,
+        archive: &ArchiveReservationState,
+    ) -> (ReservationParityDriftSummary, Vec<ReservationParityExample>) {
+        let mut drift = ReservationParityDriftSummary::default();
+        let mut examples = Vec::new();
+        compare_reservation_pair(db, archive, &mut drift, &mut examples);
+        (drift, examples)
+    }
+
+    #[test]
+    fn path_pattern_divergence_is_drift() {
+        // GH#112 / br-xyy95: a DB row and archive artifact that agree on agent,
+        // released_ts, and reason but reserve DIFFERENT paths must be drift —
+        // previously this passed parity clean (the reserved path was ignored).
+        let (drift, examples) = run_compare(
+            &db_state("src/a.rs", true),
+            &archive_state(Some("src/b.rs"), Some(true)),
+        );
+        assert_eq!(drift.path_pattern_mismatches, 1);
+        assert_eq!(drift.exclusive_mismatches, 0);
+        assert_eq!(drift.total(), 1);
+        assert!(examples.iter().any(|e| e.field == "path_pattern"
+            && e.detail.contains("db_path_pattern=src/a.rs")
+            && e.detail.contains("archive_path_pattern=src/b.rs")));
+    }
+
+    #[test]
+    fn exclusive_divergence_is_drift() {
+        let (drift, examples) = run_compare(
+            &db_state("src/a.rs", true),
+            &archive_state(Some("src/a.rs"), Some(false)),
+        );
+        assert_eq!(drift.exclusive_mismatches, 1);
+        assert_eq!(drift.path_pattern_mismatches, 0);
+        assert_eq!(drift.total(), 1);
+        assert!(examples.iter().any(|e| e.field == "exclusive"));
+    }
+
+    #[test]
+    fn matching_path_and_exclusive_is_clean_trimmed() {
+        // json_string trims the archive side; the comparison trims the DB side
+        // too, so surrounding whitespace must not manufacture drift.
+        let (drift, _) = run_compare(
+            &db_state("src/a.rs", true),
+            &archive_state(Some("  src/a.rs  "), Some(true)),
+        );
+        assert_eq!(drift.total(), 0);
+    }
+
+    #[test]
+    fn archive_omitting_path_or_exclusive_is_not_drift() {
+        // The false-positive guard (br-xyy95, the A2 lesson): a legacy/hand-
+        // authored artifact that omits path_pattern/exclusive must NOT be
+        // reported as drift — absence is not divergence.
+        let (drift, _) = run_compare(&db_state("src/a.rs", true), &archive_state(None, None));
+        assert_eq!(
+            drift.total(),
+            0,
+            "absent archive path_pattern/exclusive must not manufacture drift"
+        );
+    }
+
+    #[test]
+    fn health_line_surfaces_path_and_exclusive_fields() {
+        let report = ReservationParityReport {
+            schema_version: RESERVATION_PARITY_SCHEMA_VERSION,
+            ok: false,
+            db_reservations: 1,
+            archive_reservations: 1,
+            drift: ReservationParityDriftSummary {
+                path_pattern_mismatches: 1,
+                exclusive_mismatches: 1,
+                ..ReservationParityDriftSummary::default()
+            },
+            examples: Vec::new(),
+        };
+        let line = report.health_line();
+        assert!(line.contains("path_pattern=1"), "{line}");
+        assert!(line.contains("exclusive=1"), "{line}");
+        assert!(line.contains("total=2"), "{line}");
+    }
 }
