@@ -38,6 +38,18 @@ slow-timeout = { period = "60s", terminate-after = 4, grace-period = "10s" }
 # nextest from reaping the test; fail such a test instead of waiting forever.
 leak-timeout = "1s"
 
+# Known-slow exception (br-54b92): the ATC rollup *property* test runs its full
+# proptest case set against a file-backed DB and legitimately takes ~4 minutes
+# wall-clock — it is I/O-bound (per-case fsync across the case set), not hung
+# (the proptest case count and every DB op it performs are bounded). That trips
+# the blanket 4-minute kill above, reporting a passing test as TIMEOUT. Give just
+# this test a longer leash so the suite stays green under nextest, while still
+# bounding a genuine hang to ~8 minutes rather than days. The fix is the runner
+# budget, NOT reducing the property test's coverage.
+[[profile.default.overrides]]
+filter = 'test(refresh_rollups_conserves_counts)'
+slow-timeout = { period = "120s", terminate-after = 4, grace-period = "10s" }
+
 # CI profile inherits the same protections with a shorter slow-warning cadence
 # and an automatic single retry for flakes, while keeping the same hard kill.
 [profile.ci]
@@ -45,3 +57,8 @@ slow-timeout = { period = "30s", terminate-after = 8, grace-period = "10s" }
 leak-timeout = "1s"
 retries = 1
 fail-fast = false
+
+# Same known-slow exception under CI (per-profile; overrides do not inherit).
+[[profile.ci.overrides]]
+filter = 'test(refresh_rollups_conserves_counts)'
+slow-timeout = { period = "120s", terminate-after = 4, grace-period = "10s" }
