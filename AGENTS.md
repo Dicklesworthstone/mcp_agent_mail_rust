@@ -330,7 +330,7 @@ Illustrative auto-fix entries (one per Op variant):
 | `fm-db-state-files-legacy-fts-residue` | P2 | `Op::DbExec` | db_state_files |
 | `fm-doctor-state-files-dangling-latest-symlink` | P2 | `Op::SymlinkAtomic` | doctor_state_files |
 | `fm-mcp-config-files-wrong-http-url-or-scheme` | P1 | `Op::WriteFile` | mcp_config_files |
-| `fm-db-state-files-reservation-db-archive-parity` | P1 | `Op::Rename` (cross-project global-id collision quarantine; other drift detect-only) | db_state_files |
+| `fm-db-state-files-reservation-db-archive-parity` | P1 | `Op::DbExec`/`Op::WriteFile`/`Op::Rename` (reconcile #112 holder+release drift; collision quarantine; path/exclusive/thread/unresolved-holder stay detect-only) | db_state_files |
 
 Op coverage across the 25 auto-fix FMs (2026-06-26): `Op::WriteFile`×7,
 `Op::Chmod`×5, `Op::Rename`×7 (incl. directory-tree, symlink, and

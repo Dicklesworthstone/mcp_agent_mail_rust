@@ -482,9 +482,9 @@ pub fn registry() -> Vec<FixerSpec> {
             id: reservation_db_archive_parity::FM_ID,
             severity: "P1",
             subsystem: "db_state_files",
-            op_pattern: "Op::Rename",
+            op_pattern: "Op::DbExec + Op::WriteFile + Op::Rename",
             auto_fixable: true,
-            one_line_description: "File reservation SQLite rows and stable archive JSON artifacts disagree on holder, released_ts, active status, or thread provenance. Auto-fix quarantines only cross-project global-id collisions (a duplicate id-<id>.json whose id is owned by another project in SQLite); all other drift stays detect-only for manual reconcile.",
+            one_line_description: "File reservation SQLite rows and stable archive JSON artifacts disagree on holder, released_ts, active status, etc. Auto-fix reconciles the two #112 drift classes through the reversible mutate() chokepoint — release is monotonic (released wins, sync the lagging store) and the immutable acquire-time archive wins for the holder of a still-active reservation (when that agent is registered) — and quarantines cross-project global-id collisions; path/exclusive/thread/missing-archive/unresolved-holder drift stays detect-only for manual reconcile.",
             source_module: "doctor::fixers::reservation_db_archive_parity",
         },
         FixerSpec {
@@ -2543,7 +2543,10 @@ mod tests {
 
     #[test]
     fn registry_entries_use_canonical_op_patterns() {
-        // Op patterns must be one of the 7 canonical variants OR detect-only.
+        // Op patterns are "detect-only" OR one-or-more of the 7 canonical
+        // variants joined by " + " (a fixer may legitimately use several ops,
+        // e.g. a DB reconcile that also rewrites an archive artifact and
+        // quarantines a stale duplicate — `reservation_db_archive_parity`).
         let allowed: &[&str] = &[
             "Op::WriteFile",
             "Op::AppendFile",
@@ -2552,15 +2555,18 @@ mod tests {
             "Op::DbExec",
             "Op::DbMigrate",
             "Op::SymlinkAtomic",
-            "detect-only",
         ];
         for spec in registry() {
-            assert!(
-                allowed.contains(&spec.op_pattern),
-                "fixer {} has non-canonical op_pattern {}",
-                spec.id,
-                spec.op_pattern,
-            );
+            if spec.op_pattern != "detect-only" {
+                for token in spec.op_pattern.split(" + ") {
+                    assert!(
+                        allowed.contains(&token),
+                        "fixer {} has non-canonical op_pattern token `{token}` in `{}`",
+                        spec.id,
+                        spec.op_pattern,
+                    );
+                }
+            }
             assert!(
                 ["P0", "P1", "P2", "P3"].contains(&spec.severity),
                 "fixer {} has non-canonical severity {}",
