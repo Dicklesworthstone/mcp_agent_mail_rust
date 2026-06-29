@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -175,11 +175,193 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
     None
 }
 
+/// The single chokepoint every reservation mutation (acquire / renew / release /
+/// force-release) and the reconcile-on-read healer funnel their archive write
+/// through, so `SQLite` and the Git/JSON archive cannot drift independently (F1,
+/// GH#112).
+///
+/// The pre-commit guard reads the `id-<id>.json` reservation artifacts directly,
+/// so a stale archive yields a *wrong holder* — the exact #112 divergence. A bare
+/// enqueue + best-effort flush silently advances the DB while the archive stays
+/// stale whenever the drain thread stalls (a wedged git index lock), because
+/// `wbq_flush` only warns on timeout. So this verifies the flush actually
+/// drained; if it did not, the op is written synchronously on this thread before
+/// returning. Re-emission is idempotent (`write_file_reservation_records`
+/// overwrites the artifact), so a later drain of the same enqueued op is a
+/// harmless rewrite.
 fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
-    try_dispatch_archive_write(op, context);
-    // The pre-commit guard reads reservation JSON artifacts directly. Keep
-    // reservation mutations visible once the tool call returns.
-    mcp_agent_mail_storage::wbq_flush();
+    try_dispatch_archive_write(op.clone(), context);
+    match mcp_agent_mail_storage::wbq_flush_status() {
+        // Drained: the artifact is on disk. NoQueue: the enqueue path already
+        // handled an unavailable queue (it falls back to a synchronous write).
+        mcp_agent_mail_storage::WbqFlushOutcome::Drained
+        | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue => {}
+        // The drain thread is stuck or gone — the enqueued op may never land.
+        // Write it now so the archive the guard reads is durable on return.
+        mcp_agent_mail_storage::WbqFlushOutcome::TimedOut
+        | mcp_agent_mail_storage::WbqFlushOutcome::Disconnected => {
+            if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
+                tracing::warn!(
+                    error = %error,
+                    "{context}; synchronous archive fallback failed after the WBQ flush did not drain"
+                );
+            }
+        }
+    }
+}
+
+/// Build the canonical archive JSON for one active reservation row, authored from
+/// the authoritative DB state. Mirrors the object the acquire/renew paths emit so
+/// a healed artifact is byte-identical to one written by the original mutation.
+fn active_reservation_artifact_json(
+    project_human_key: &str,
+    agent_name: &str,
+    row: &mcp_agent_mail_db::FileReservationRow,
+) -> Value {
+    json!({
+        "id": row.id.unwrap_or(0),
+        "project": project_human_key,
+        "agent": agent_name,
+        "path_pattern": &row.path_pattern,
+        "exclusive": row.exclusive != 0,
+        "reason": &row.reason,
+        "created_ts": micros_to_iso(row.created_ts),
+        "expires_ts": micros_to_iso(row.expires_ts),
+    })
+}
+
+fn ts_is_positive(ts: Option<i64>) -> bool {
+    ts.is_some_and(|value| value > 0)
+}
+
+/// Does the present archive artifact diverge from the authoritative active DB
+/// row? Conservative, matching `reservation_parity`: a field the artifact *omits*
+/// is never treated as divergence (br-xyy95) — only a present-but-different value
+/// is. An active DB row (`released_ts` absent) whose artifact records a release is
+/// divergence (the #112 stuck-`released_ts` class).
+fn active_archive_artifact_diverges(
+    view: &crate::reservation_parity::ArchiveReservationView,
+    row: &mcp_agent_mail_db::FileReservationRow,
+    agent_name: &str,
+) -> bool {
+    if view.agent_name.trim() != agent_name.trim() {
+        return true;
+    }
+    if let Some(archive_path) = view.path_pattern.as_deref()
+        && archive_path.trim() != row.path_pattern.trim()
+    {
+        return true;
+    }
+    if let Some(archive_exclusive) = view.exclusive
+        && archive_exclusive != (row.exclusive != 0)
+    {
+        return true;
+    }
+    // Active DB row -> the archive must not record this reservation as released.
+    if ts_is_positive(view.released_ts) != ts_is_positive(row.released_ts) {
+        return true;
+    }
+    false
+}
+
+/// Pure decision for reconcile-on-read: given the project's active DB
+/// reservations, the `agent_id -> name` map, and the archive artifacts currently
+/// present, return the artifact JSONs that must be (re)written so the on-disk
+/// archive the pre-commit guard reads matches the authoritative DB.
+///
+/// A row is healed when its `id-<id>.json` artifact is missing (the crash-gap
+/// between DB-commit and archive-write — F1's acceptance) or diverges from the DB
+/// (#112 wrong-holder). A row whose `agent_id` is absent from `agent_names` is
+/// skipped: we cannot author a faithful artifact without the holder's name, and
+/// guessing would risk writing a *wrong* holder — the very failure we heal.
+fn reservation_rows_needing_archive_heal(
+    project_human_key: &str,
+    active_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    archive_present: &BTreeMap<i64, crate::reservation_parity::ArchiveReservationView>,
+) -> Vec<Value> {
+    let mut heal = Vec::new();
+    for row in active_rows {
+        let Some(id) = row.id else {
+            continue;
+        };
+        let Some(agent_name) = agent_names.get(&row.agent_id) else {
+            continue;
+        };
+        let needs_heal = archive_present
+            .get(&id)
+            .is_none_or(|view| active_archive_artifact_diverges(view, row, agent_name));
+        if needs_heal {
+            heal.push(active_reservation_artifact_json(
+                project_human_key,
+                agent_name,
+                row,
+            ));
+        }
+    }
+    heal
+}
+
+/// Reconcile the Git archive reservation artifacts for `project` against the
+/// authoritative active DB reservations, healing any that are missing or stale
+/// (F1 reconcile-on-read). Returns the number of artifacts re-emitted.
+///
+/// Cheap and safe on the reservation read path: it reads only the *active* rows'
+/// own `id-<id>.json` artifacts (bounded by the active set, not the project's
+/// full reservation history), and dispatches an archive write only when genuine
+/// drift is found — so the steady state costs a handful of stats. This is what
+/// makes F1's acceptance hold — a crash between a reservation's DB-commit and its
+/// archive-write converges to a consistent archive (no wrong holder) on the next
+/// `file_reservation_paths` call, with no operator action.
+fn reconcile_active_reservation_archive(
+    project: &mcp_agent_mail_db::ProjectRow,
+    active_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    config: &Config,
+) -> usize {
+    if active_rows.is_empty() {
+        return 0;
+    }
+    // Look up only the active reservations' artifacts — never the whole archive.
+    let mut present = BTreeMap::new();
+    for row in active_rows {
+        if let Some(id) = row.id
+            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
+                &config.storage_root,
+                &project.slug,
+                id,
+            )
+        {
+            present.insert(id, view);
+        }
+    }
+    let heal = reservation_rows_needing_archive_heal(
+        &project.human_key,
+        active_rows,
+        agent_names,
+        &present,
+    );
+    if heal.is_empty() {
+        return 0;
+    }
+    let healed = heal.len();
+    tracing::debug!(
+        "reconcile-on-read healed {healed} stale/missing reservation archive artifact(s) for project={}",
+        project.slug
+    );
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: heal,
+    };
+    dispatch_reservation_archive_write(
+        op,
+        &format!(
+            "reservation archive reconcile-on-read project={}",
+            project.slug
+        ),
+    );
+    healed
 }
 
 fn path_looks_absolute(input: &str) -> bool {
@@ -1191,6 +1373,24 @@ pub async fn file_reservation_paths(
         &paths,
         "file_reservation_paths",
     )?;
+
+    // F1 reconcile-on-read: before granting, heal any *existing* active
+    // reservation whose archive artifact is missing or stale (a crash between
+    // that reservation's DB-commit and its archive-write — GH#112). This is the
+    // "next access converges" guarantee: the pre-commit guard reads the artifacts
+    // directly, so without this a wrong/absent holder would slip through. The
+    // healer fires an archive write only on genuine drift, so the steady state is
+    // just one directory scan. Best-effort: a failed agent lookup never fails the
+    // reserve.
+    if let asupersync::Outcome::Ok(agent_rows) =
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
+    {
+        let agent_names: HashMap<i64, String> = agent_rows
+            .into_iter()
+            .filter_map(|row| row.id.map(|id| (id, row.name)))
+            .collect();
+        reconcile_active_reservation_archive(&project, &active, &agent_names, &Config::get());
+    }
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
     let mut seen_paths: HashSet<&str> = HashSet::new();
@@ -2707,6 +2907,320 @@ mod tests {
         let map = collect_previous_expiries(&rows, 5, None, Some(&[11]));
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&11), Some(&11_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 (br-bvq1x.6.1): reconcile-on-read — heal a reservation whose archive
+    // artifact is missing/stale after a crash between DB-commit and archive-write
+    // -----------------------------------------------------------------------
+
+    fn archive_view(
+        id: i64,
+        agent: &str,
+        path_pattern: Option<&str>,
+        exclusive: Option<bool>,
+        released_ts: Option<i64>,
+    ) -> crate::reservation_parity::ArchiveReservationView {
+        crate::reservation_parity::ArchiveReservationView {
+            reservation_id: id,
+            agent_name: agent.to_string(),
+            reason: String::new(),
+            path_pattern: path_pattern.map(str::to_string),
+            exclusive,
+            released_ts,
+        }
+    }
+
+    fn names(pairs: &[(i64, &str)]) -> HashMap<i64, String> {
+        pairs
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn heal_emits_missing_artifact() {
+        // The crash-gap case: DB row committed, archive artifact never written.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let present = BTreeMap::new();
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "a missing artifact must be healed");
+        assert_eq!(heal[0]["id"], 1);
+        assert_eq!(heal[0]["agent"], "GreenCastle");
+        assert_eq!(heal[0]["path_pattern"], "src/**");
+        assert_eq!(heal[0]["exclusive"], true);
+        assert_eq!(heal[0]["project"], "/abs/proj");
+    }
+
+    #[test]
+    fn heal_emits_stale_holder() {
+        // GH#112's wrong-holder class: the archive names a different agent than
+        // the authoritative DB row.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "RustyOtter", Some("src/**"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1);
+        assert_eq!(
+            heal[0]["agent"], "GreenCastle",
+            "the healed artifact must carry the authoritative DB holder"
+        );
+    }
+
+    #[test]
+    fn heal_emits_stale_path_pattern() {
+        let rows = vec![reservation_row(1, 7, "src/a.rs", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/b.rs"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "a divergent reserved path must be healed");
+        assert_eq!(heal[0]["path_pattern"], "src/a.rs");
+    }
+
+    #[test]
+    fn heal_emits_stale_exclusive_flag() {
+        // DB row is shared (exclusive=0) but the archive claims exclusive.
+        let mut row = reservation_row(1, 7, "src/**", 9_999, None);
+        row.exclusive = 0;
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &[row],
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1);
+        assert_eq!(heal[0]["exclusive"], false);
+    }
+
+    #[test]
+    fn heal_emits_when_archive_claims_released_for_active_db_row() {
+        // #112 stuck-released_ts class: the DB row is active but the archive
+        // records it released (a stale release artifact would hide a live holder).
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), Some(123)),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1);
+    }
+
+    #[test]
+    fn heal_is_noop_when_consistent() {
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), None),
+        );
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "a consistent artifact must not be re-emitted"
+        );
+    }
+
+    #[test]
+    fn heal_skips_row_with_unknown_agent() {
+        // We must never *guess* a holder — that would write the wrong holder, the
+        // exact failure being healed. A row whose agent_id is unresolvable is left
+        // untouched.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let present = BTreeMap::new();
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(9, "Other")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "an unresolvable holder must be skipped, never guessed"
+        );
+    }
+
+    #[test]
+    fn heal_does_not_flag_archive_that_omits_path_or_exclusive() {
+        // br-xyy95 conservatism: a legacy/hand-authored artifact that omits
+        // path_pattern/exclusive is not divergence. With a matching agent and no
+        // release mismatch, it must not be re-emitted.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut present = BTreeMap::new();
+        present.insert(1, archive_view(1, "GreenCastle", None, None, None));
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "absent archive path_pattern/exclusive must not manufacture a heal"
+        );
+    }
+
+    #[test]
+    fn healed_artifact_json_round_trips_through_archive_scan() {
+        // The consistency proof: the artifact the healer authors, written to disk
+        // and scanned back, agrees with the DB row — so re-emitting converges
+        // (does not itself become a new source of drift).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-roundtrip";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+
+        let row = reservation_row(1, 7, "src/**", 9_999, None);
+        let artifact = active_reservation_artifact_json("/abs/proj", "GreenCastle", &row);
+        std::fs::write(
+            reservation_dir.join("id-1.json"),
+            serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
+        )
+        .expect("write artifact");
+
+        let view =
+            crate::reservation_parity::read_project_archive_reservation(&storage_root, slug, 1)
+                .expect("artifact scanned back");
+        assert_eq!(view.agent_name, "GreenCastle");
+        assert_eq!(view.path_pattern.as_deref(), Some("src/**"));
+        assert_eq!(view.exclusive, Some(true));
+        assert_eq!(view.released_ts, None);
+        assert!(
+            !active_archive_artifact_diverges(&view, &row, "GreenCastle"),
+            "a freshly healed artifact must read back as consistent with the DB row"
+        );
+    }
+
+    #[test]
+    fn reconcile_on_read_heals_missing_artifact_after_crash_gap() {
+        // The bead acceptance (br-bvq1x.6.1): a crafted crash between a
+        // reservation's DB-commit and its archive-write reconciles to a consistent
+        // state on next access — no wrong holder, no operator action.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f1-reconcile-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                // Reserve src/** through the real tool so the DB row + archive
+                // artifact are both written, then flush so the artifact lands.
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    Some("f1 reconcile holder".to_string()),
+                )
+                .await
+                .expect("initial reservation");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                let reservation_id = active
+                    .iter()
+                    .find(|row| row.agent_id == holder_id)
+                    .and_then(|row| row.id)
+                    .expect("reserved row exists");
+
+                let artifact_path = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations")
+                    .join(format!("id-{reservation_id}.json"));
+                assert!(
+                    artifact_path.exists(),
+                    "archive artifact must exist after the initial reservation"
+                );
+
+                // Inject the crash gap: the DB row stays committed but its archive
+                // artifact vanishes (the archive write was lost).
+                std::fs::remove_file(&artifact_path).expect("inject crash gap");
+                assert!(!artifact_path.exists(), "crash gap injected");
+
+                // Next access: a second agent reserves a *different* path. The
+                // reconcile-on-read pass over the active set must heal the missing
+                // artifact for the first holder.
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["docs/**".to_string()],
+                    Some(3600),
+                    Some(false),
+                    Some("f1 reconcile next access".to_string()),
+                )
+                .await
+                .expect("second reservation triggers reconcile-on-read");
+                mcp_agent_mail_storage::wbq_flush();
+
+                assert!(
+                    artifact_path.exists(),
+                    "reconcile-on-read must heal the missing archive artifact on next access"
+                );
+                let healed: Value = serde_json::from_slice(
+                    &std::fs::read(&artifact_path).expect("read healed artifact"),
+                )
+                .expect("healed artifact is valid JSON");
+                assert_eq!(
+                    healed["agent"], "GreenCastle",
+                    "healed artifact must name the authoritative holder (no wrong holder)"
+                );
+                assert_eq!(healed["path_pattern"], "src/**");
+                assert_eq!(healed["exclusive"], true);
+            });
+        });
     }
 
     // -----------------------------------------------------------------------

@@ -611,36 +611,12 @@ fn scan_archive_reservations(storage_root: &Path) -> ArchiveScan {
             continue;
         };
         let reservation_dir = project_path.join("file_reservations");
-        let Ok(entries) = std::fs::read_dir(&reservation_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path_is_symlink(&path)
-                || !entry.file_type().is_ok_and(|file_type| file_type.is_file())
-                || path.extension().is_none_or(|extension| extension != "json")
-            {
-                continue;
-            }
-            let Some(raw_id) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("id-"))
-                .and_then(|name| name.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            let Ok(reservation_id) = raw_id.parse::<i64>() else {
-                continue;
-            };
-            if reservation_id <= 0 {
-                continue;
-            }
-            match parse_archive_reservation(&path, &project_slug, reservation_id) {
-                Ok(reservation) => reservations.push(reservation),
-                Err(detail) => parse_errors.push(ArchiveParseError { path, detail }),
-            }
-        }
+        scan_reservation_dir(
+            &reservation_dir,
+            &project_slug,
+            &mut reservations,
+            &mut parse_errors,
+        );
     }
 
     reservations.sort_by(|left, right| {
@@ -652,6 +628,108 @@ fn scan_archive_reservations(storage_root: &Path) -> ArchiveScan {
         reservations,
         parse_errors,
     }
+}
+
+/// Scan a single project's `file_reservations/` directory, appending every
+/// well-formed `id-<id>.json` artifact to `reservations` and any parse failure
+/// to `parse_errors`. Symlink-safe (skips symlinked entries, never derefs). A
+/// missing directory is silently treated as "no artifacts".
+fn scan_reservation_dir(
+    reservation_dir: &Path,
+    project_slug: &str,
+    reservations: &mut Vec<ArchiveReservationState>,
+    parse_errors: &mut Vec<ArchiveParseError>,
+) {
+    let Ok(entries) = std::fs::read_dir(reservation_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path_is_symlink(&path)
+            || !entry.file_type().is_ok_and(|file_type| file_type.is_file())
+            || path.extension().is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let Some(raw_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("id-"))
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(reservation_id) = raw_id.parse::<i64>() else {
+            continue;
+        };
+        if reservation_id <= 0 {
+            continue;
+        }
+        match parse_archive_reservation(&path, project_slug, reservation_id) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(detail) => parse_errors.push(ArchiveParseError { path, detail }),
+        }
+    }
+}
+
+/// A read-only view of one archive reservation artifact, exposed for the F1
+/// reconcile-on-read healing path (`reservations::reconcile_active_reservation_archive`).
+///
+/// Mirrors the fields the parity check compares. `path_pattern`/`exclusive` are
+/// `None` when the artifact omits them (legacy / hand-authored) — absence is not
+/// divergence (br-xyy95), matching the conservative comparison used elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveReservationView {
+    pub reservation_id: i64,
+    pub agent_name: String,
+    pub reason: String,
+    pub path_pattern: Option<String>,
+    pub exclusive: Option<bool>,
+    pub released_ts: Option<i64>,
+}
+
+impl From<ArchiveReservationState> for ArchiveReservationView {
+    fn from(state: ArchiveReservationState) -> Self {
+        Self {
+            reservation_id: state.reservation_id,
+            agent_name: state.agent_name,
+            reason: state.thread_provenance,
+            path_pattern: state.path_pattern,
+            exclusive: state.exclusive,
+            released_ts: state.released_ts,
+        }
+    }
+}
+
+/// Read a single project's archive reservation artifact `id-<id>.json`, if it
+/// exists and parses (symlink-safe — a symlinked artifact is never dereferenced).
+///
+/// This is the F1 reconcile-on-read primitive: the reservation read path looks up
+/// only the *active* reservations' artifacts (bounded by the active set, never the
+/// project's full reservation history), so detecting a missing/stale artifact and
+/// healing it on next access stays cheap even on a long-lived mailbox. A missing
+/// or malformed artifact returns `None` (it must never block a reservation call);
+/// the caller treats `None` as "needs healing".
+#[must_use]
+pub fn read_project_archive_reservation(
+    storage_root: &Path,
+    project_slug: &str,
+    reservation_id: i64,
+) -> Option<ArchiveReservationView> {
+    if reservation_id <= 0 {
+        return None;
+    }
+    let path = storage_root
+        .join("projects")
+        .join(project_slug)
+        .join("file_reservations")
+        .join(format!("id-{reservation_id}.json"));
+    if path_is_symlink(&path) {
+        return None;
+    }
+    parse_archive_reservation(&path, project_slug, reservation_id)
+        .ok()
+        .map(ArchiveReservationView::from)
 }
 
 fn parse_archive_reservation(

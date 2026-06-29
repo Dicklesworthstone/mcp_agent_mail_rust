@@ -635,30 +635,66 @@ pub fn write_op_sync(op: &WriteOp) -> Result<()> {
     wbq_execute_op(op)
 }
 
-/// Block until all pending write ops have been drained.
+/// Outcome of a write-behind-queue flush, so a durability-sensitive caller can
+/// tell "the archive is now on disk" from "the drain thread never confirmed".
+///
+/// [`wbq_flush`] discards this and only warns; callers that MUST see their write
+/// land before returning (the reservation archive chokepoint — the pre-commit
+/// guard reads reservation JSON artifacts directly, so a stale archive yields a
+/// wrong holder, GH#112) should use [`wbq_flush_status`] and fall back to
+/// [`write_op_sync`] on anything other than `Drained`/`NoQueue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WbqFlushOutcome {
+    /// The drain thread acknowledged the flush; all enqueued ops are on disk.
+    Drained,
+    /// The flush did not complete within the 30s budget — the drain thread is
+    /// stuck (e.g. a wedged git index lock). Enqueued ops may not be durable.
+    TimedOut,
+    /// The drain thread's channel is gone (it panicked / shut down). Enqueued
+    /// ops after the disconnect are not durable.
+    Disconnected,
+    /// The queue was never initialized (or its sender is gone). Nothing to flush.
+    NoQueue,
+}
+
+/// Block until all pending write ops have been drained, reporting the outcome.
 ///
 /// Uses a blocking `send` so the Flush message is guaranteed to enter the
 /// channel even when it is temporarily full.  If the drain thread has
 /// panicked (receiver dropped), `send` returns `Err` immediately – no
 /// deadlock risk.
-pub fn wbq_flush() {
-    if let Some(wbq) = WBQ.get() {
-        let Some(sender) = wbq_sender_clone(wbq) else {
-            return;
-        };
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        if sender.send(WbqMsg::Flush(done_tx)).is_ok() {
-            match done_rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    tracing::warn!("wbq_flush timed out after 30s; drain thread may be stuck");
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    tracing::warn!("wbq_flush: drain thread channel disconnected");
-                }
-            }
+#[must_use]
+pub fn wbq_flush_status() -> WbqFlushOutcome {
+    let Some(wbq) = WBQ.get() else {
+        return WbqFlushOutcome::NoQueue;
+    };
+    let Some(sender) = wbq_sender_clone(wbq) else {
+        return WbqFlushOutcome::NoQueue;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    if sender.send(WbqMsg::Flush(done_tx)).is_err() {
+        return WbqFlushOutcome::Disconnected;
+    }
+    match done_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(()) => WbqFlushOutcome::Drained,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!("wbq_flush timed out after 30s; drain thread may be stuck");
+            WbqFlushOutcome::TimedOut
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!("wbq_flush: drain thread channel disconnected");
+            WbqFlushOutcome::Disconnected
         }
     }
+}
+
+/// Block until all pending write ops have been drained.
+///
+/// Best-effort variant of [`wbq_flush_status`]: it waits for the drain
+/// acknowledgement and only warns on timeout/disconnect. Durability-sensitive
+/// callers should prefer [`wbq_flush_status`].
+pub fn wbq_flush() {
+    let _ = wbq_flush_status();
 }
 
 /// Drain remaining ops, stop the drain thread, and join it.
@@ -15027,6 +15063,21 @@ mod tests {
         wbq_flush();
         let stats = wbq_stats();
         assert!(stats.drained > 0, "drain count should be > 0 after flush");
+    }
+
+    #[test]
+    fn wbq_flush_status_reports_drained_on_healthy_queue() {
+        // The durability-sensitive variant (F1): a healthy enqueue + flush must
+        // report Drained so the reservation chokepoint knows the archive landed
+        // and does NOT need its synchronous write_op_sync fallback.
+        wbq_start();
+        let op = wbq_test_clear_signal_op("test-flush-status");
+        wbq_enqueue(op);
+        assert_eq!(
+            wbq_flush_status(),
+            WbqFlushOutcome::Drained,
+            "a healthy drain thread must acknowledge the flush"
+        );
     }
 
     #[test]
