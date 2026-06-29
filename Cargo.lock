@@ -407,7 +407,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2000,7 +2000,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsqlite"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -2014,14 +2014,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-types",
 ]
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2073,14 +2073,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2176,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "argon2",
  "bumpalo",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2279,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2296,6 +2296,7 @@ dependencies = [
 [[package]]
 name = "ft-api"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=c305306b251753099620ad5fe02e78c07c167cf6#c305306b251753099620ad5fe02e78c07c167cf6"
 dependencies = [
  "ft-autograd",
  "ft-core",
@@ -2310,6 +2311,7 @@ dependencies = [
 [[package]]
 name = "ft-autograd"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=c305306b251753099620ad5fe02e78c07c167cf6#c305306b251753099620ad5fe02e78c07c167cf6"
 dependencies = [
  "ft-core",
  "ft-dispatch",
@@ -2321,6 +2323,7 @@ dependencies = [
 [[package]]
 name = "ft-core"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=c305306b251753099620ad5fe02e78c07c167cf6#c305306b251753099620ad5fe02e78c07c167cf6"
 dependencies = [
  "half",
  "num-complex",
@@ -2329,6 +2332,7 @@ dependencies = [
 [[package]]
 name = "ft-dispatch"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=c305306b251753099620ad5fe02e78c07c167cf6#c305306b251753099620ad5fe02e78c07c167cf6"
 dependencies = [
  "ft-core",
  "ft-kernel-cpu",
@@ -2337,6 +2341,7 @@ dependencies = [
 [[package]]
 name = "ft-kernel-cpu"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=c305306b251753099620ad5fe02e78c07c167cf6#c305306b251753099620ad5fe02e78c07c167cf6"
 dependencies = [
  "ft-core",
  "libm",
@@ -2348,6 +2353,7 @@ dependencies = [
 [[package]]
 name = "ft-runtime"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentorch?rev=c305306b251753099620ad5fe02e78c07c167cf6#c305306b251753099620ad5fe02e78c07c167cf6"
 dependencies = [
  "ft-core",
 ]
@@ -5102,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "clap",
  "criterion",
@@ -5129,7 +5135,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -5177,7 +5183,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "asupersync",
  "chrono",
@@ -5202,7 +5208,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "chrono",
  "criterion",
@@ -5229,7 +5235,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "asupersync",
  "chrono",
@@ -5271,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "chrono",
  "git2",
@@ -5287,7 +5293,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "chrono",
  "criterion",
@@ -5316,7 +5322,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -5361,7 +5367,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5382,7 +5388,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -5410,7 +5416,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "git2",
  "tempfile",
@@ -5419,7 +5425,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "arbitrary",
  "asupersync",
