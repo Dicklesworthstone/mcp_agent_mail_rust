@@ -201,6 +201,24 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
     apply_snapshot_migrations(conn, schema::schema_migrations_base(), "base")
 }
 
+/// Recreate the ATC schema family that base mode intentionally omits.
+///
+/// `schema_migrations_base()` excludes the ATC schema family (`atc_experiences`
+/// and its v17 ALTERs, `atc_leader_lease`, `atc_rollup_snapshots`, …) because
+/// FrankenConnection can't host it — at runtime that family is applied by the
+/// canonical follow-up runner. Reconstruction runs on the canonical engine, so a
+/// rebuilt DB must recreate the full ATC surface here; otherwise the ATC
+/// subsystem has no tables to write to after recovery (the `v17` schema-surface
+/// regression). The migrations are ordered (`atc_experiences` created before its
+/// ALTERs) and the per-migration preflight skips anything already present.
+fn apply_atc_schema_after_base(conn: &DbConn) -> DbResult<()> {
+    apply_snapshot_migrations(
+        conn,
+        schema::schema_migrations_atc_runtime_canonical_followup(),
+        "atc-canonical-followup",
+    )
+}
+
 /// Statistics returned after a reconstruction attempt.
 #[derive(Debug, Clone, Default)]
 pub struct ReconstructStats {
@@ -1271,6 +1289,12 @@ fn reconstruct_from_archive_impl(
         // while preflighting `ALTER TABLE` additions so latest-schema columns are
         // not duplicated.
         apply_base_migrations_after_snapshot(&conn)?;
+
+        // Base mode omits the ATC schema family (FrankenConnection can't host it);
+        // reconstruction runs on the canonical engine, so recreate that family here
+        // — otherwise a rebuilt DB is missing the ATC v17 schema surface and the
+        // ATC subsystem has no tables to write to after recovery.
+        apply_atc_schema_after_base(&conn)?;
 
         // Clean up any FTS artifacts that may have been left by prior migrations.
         // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical
