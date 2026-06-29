@@ -1837,6 +1837,24 @@ pub async fn release_file_reservations(
     dispatch_release_archive_write(&project, &agent, &released_rows, &config);
     replay_queued_release_intents(ctx, &pool, &config).await;
 
+    // F3 (br-bvq1x.6.3): releasing reconciles both stores. The released rows'
+    // artifacts were just rewritten above; now heal any *remaining* active
+    // reservation whose archive artifact drifted (the same reconcile-on-read pass
+    // the acquire path runs, GH#112), so a release access converges the archive
+    // the pre-commit guard reads. Best-effort: a failed lookup never fails the
+    // release, which must degrade gracefully (ts2/css incident).
+    if let asupersync::Outcome::Ok(active_rows) =
+        mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await
+        && let asupersync::Outcome::Ok(agent_rows) =
+            mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
+    {
+        let agent_names: HashMap<i64, String> = agent_rows
+            .into_iter()
+            .filter_map(|row| row.id.map(|id| (id, row.name)))
+            .collect();
+        reconcile_active_reservation_archive(&project, &active_rows, &agent_names, &config);
+    }
+
     let response = ReleaseResult {
         released: i32::try_from(released_rows.len()).unwrap_or(i32::MAX),
         released_at: micros_to_iso(mcp_agent_mail_db::now_micros()),
@@ -3219,6 +3237,258 @@ mod tests {
                 );
                 assert_eq!(healed["path_pattern"], "src/**");
                 assert_eq!(healed["exclusive"], true);
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // F3 (br-bvq1x.6.3): idempotent, parity-aware release_file_reservations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn release_double_release_is_a_clean_noop() {
+        // Acceptance: releasing an already-released lease is a no-op success, not
+        // an error — release_reservations_by_ids is eligibility-checked, so the
+        // second release matches nothing.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f3-double-release-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("reserve");
+
+                let first: Value = serde_json::from_str(
+                    &release_file_reservations(
+                        &ctx,
+                        project_key.clone(),
+                        "GreenCastle".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("first release"),
+                )
+                .expect("release json");
+                assert!(
+                    first["released"].as_i64().unwrap_or(0) >= 1,
+                    "first release should release the held lease"
+                );
+
+                let second: Value = serde_json::from_str(
+                    &release_file_reservations(
+                        &ctx,
+                        project_key.clone(),
+                        "GreenCastle".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("second release must not error"),
+                )
+                .expect("release json");
+                assert_eq!(
+                    second["released"].as_i64(),
+                    Some(0),
+                    "double release must be a clean no-op (0 released, no error)"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn release_reconciles_missing_archive_artifact_for_other_active_holder() {
+        // Acceptance: releasing reconciles both stores. A still-active holder's
+        // archive artifact that drifted (missing after a crash gap) is healed when
+        // ANY agent releases — the release path runs the same reconcile-on-read
+        // pass as the acquire path.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f3-release-reconcile-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("holder reserve");
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["docs/**".to_string()],
+                    Some(3600),
+                    Some(false),
+                    None,
+                )
+                .await
+                .expect("releaser reserve");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                let holder_reservation_id = active
+                    .iter()
+                    .find(|row| row.agent_id == holder_id)
+                    .and_then(|row| row.id)
+                    .expect("holder reservation exists");
+                let artifact_path = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations")
+                    .join(format!("id-{holder_reservation_id}.json"));
+                assert!(artifact_path.exists(), "holder artifact written");
+                std::fs::remove_file(&artifact_path).expect("inject crash gap");
+
+                // BlueLake releases its OWN reservation; the release path reconciles
+                // the still-active holder's drifted artifact.
+                release_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("release triggers reconcile");
+                mcp_agent_mail_storage::wbq_flush();
+
+                assert!(
+                    artifact_path.exists(),
+                    "release must reconcile the other holder's missing archive artifact"
+                );
+                let healed: Value =
+                    serde_json::from_slice(&std::fs::read(&artifact_path).expect("read healed"))
+                        .expect("valid json");
+                assert_eq!(healed["agent"], "GreenCastle");
+                assert_eq!(healed["path_pattern"], "src/**");
+            });
+        });
+    }
+
+    #[test]
+    fn replay_release_intent_does_not_release_lease_reacquired_by_other_agent() {
+        // The bead REVISION: a queued release-intent replay must re-validate, never
+        // blindly release a lease another agent now legitimately holds. The intent
+        // is left pending by releasing the original lease via the DB directly (the
+        // tool's own release auto-replays, which would consume it too early).
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/f3-replay-revalidate-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                let reacquirer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let reacquirer_id = reacquirer.id.unwrap_or(0);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("holder reserve");
+                let holder_reservation_id =
+                    match queries::get_active_reservations(&cx, &pool, project_id).await {
+                        Outcome::Ok(rows) => rows
+                            .iter()
+                            .find(|row| row.agent_id == holder_id)
+                            .and_then(|row| row.id)
+                            .expect("holder reservation"),
+                        other => panic!("get_active_reservations failed: {other:?}"),
+                    };
+
+                // Queue a durable release-intent for the holder (simulating a
+                // DB-unavailable release), then release the lease via the DB
+                // directly so the intent stays pending.
+                append_release_intent(
+                    &config,
+                    &project.human_key,
+                    "GreenCastle",
+                    Some(vec!["src/**".to_string()]),
+                    None,
+                    "injected_db_unavailable",
+                    "database disk image is malformed",
+                )
+                .expect("queue release intent");
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[holder_reservation_id]),
+                )
+                .await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("direct release failed: {other:?}"),
+                }
+
+                // BlueLake now legitimately RE-ACQUIRES src/**.
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                )
+                .await
+                .expect("reacquire");
+
+                // Replaying the prior holder's intent must NOT release BlueLake's
+                // re-acquired lease — the replay is agent-scoped + eligibility-checked.
+                replay_queued_release_intents(&ctx, &pool, &config).await;
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                assert!(
+                    active
+                        .iter()
+                        .any(|row| row.agent_id == reacquirer_id && row.released_ts.is_none()),
+                    "replay of the prior holder's intent must not release the re-acquired lease"
+                );
             });
         });
     }
