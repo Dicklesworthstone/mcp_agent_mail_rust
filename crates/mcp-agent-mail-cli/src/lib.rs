@@ -34110,6 +34110,7 @@ mod mail_server_cli_bridge_tests {
 
     #[test]
     fn trusted_tmux_pane_header_value_only_accepts_bare_pane_ids() {
+        use crate::trusted_tmux_pane_header_value;
         // Accepted: a bare `%<digits>` pane id (trimmed), matching the server's
         // is_trusted_tmux_pane_header allowlist so the daemon will honor it.
         assert_eq!(
