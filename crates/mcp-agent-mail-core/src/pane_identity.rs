@@ -136,6 +136,22 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         }
     }
 
+    // 1c. If pane_id is a BARE tmux pane id (e.g. `%97`, no `:`), normalize it to
+    //     its composite `session:window:pane` key via tmux and try the canonical
+    //     composite path. Identity files are keyed by the composite, so a caller
+    //     that supplies a bare pane id — an explicit `resolve_pane_identity`
+    //     call, or a trusted `X-Tmux-Pane` header — would otherwise miss its own
+    //     composite-keyed identity (GH#177 Defect 2).
+    if !pane_id.contains(':')
+        && let Some(composite) = composite_for_bare_pane(pane_id)
+        && composite != pane_id
+    {
+        let composite_canonical = canonical_identity_path(project_key, &composite);
+        if let Some(name) = read_identity_file(&composite_canonical) {
+            return Some((name, composite_canonical));
+        }
+    }
+
     // 2. Legacy Claude Code path: ~/.claude/agent-mail/identity.$TMUX_PANE
     if let Some(home) = home_dir() {
         let sanitized = sanitize_pane_id(pane_id);
@@ -768,6 +784,36 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
     Some(pane_target)
 }
 
+/// Resolve a bare tmux pane id (e.g. `%97`) to its composite
+/// `session:window:pane` key via `tmux display-message -t <pane>`.
+///
+/// Unlike [`get_composite_tmux_pane_id`], this targets an *explicitly supplied*
+/// pane rather than the caller's own `$TMUX_PANE`, so it is safe to call from
+/// the daemon for a caller-provided pane (GH#177 Defect 2). Returns `None` when
+/// tmux is unavailable, the pane is unknown, or the answer isn't a composite key.
+#[must_use]
+fn composite_for_bare_pane(pane_id: &str) -> Option<String> {
+    let pane = pane_id.trim();
+    if pane.is_empty() {
+        return None;
+    }
+    let output = tmux_command()
+        .args([
+            "display-message",
+            "-t",
+            pane,
+            "-p",
+            "#{session_name}:#{window_index}:#{pane_index}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let composite = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    composite.contains(':').then_some(composite)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1370,6 +1416,56 @@ mod tests {
                     None,
                     "caller must not inherit the active pane's identity under the daemon"
                 );
+            },
+        );
+        drop(config);
+    }
+
+    /// GH#177 Defect 2: a bare pane id (e.g. `%97`) must be normalized to its
+    /// composite `session:window:pane` key before lookup, otherwise an explicit
+    /// `resolve_pane_identity(pane_id="%97")` (or a trusted `X-Tmux-Pane` header)
+    /// misses its own composite-keyed identity file and returns not-found.
+    #[cfg(unix)]
+    #[test]
+    fn bare_pane_id_normalizes_to_composite_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("backend");
+
+        // The caller's pane %97 has composite key main:14:1, which owns the
+        // identity (files are keyed by the composite, not the bare id).
+        write_identity(&project, "main:14:1", "BlueLake").expect("write composite identity");
+
+        let temp = tempfile::tempdir().expect("tmux stub tempdir");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let tmux_path = bin_dir.join("tmux");
+        // Fake tmux: display-message -t %97 -> main:14:1; anything else fails.
+        let script = "#!/bin/sh\n\
+             tgt=\"\"; prev=\"\"\n\
+             for a in \"$@\"; do if [ \"$prev\" = \"-t\" ]; then tgt=\"$a\"; fi; prev=\"$a\"; done\n\
+             if [ \"$tgt\" = \"%97\" ]; then printf 'main:14:1\\n'; exit 0; fi\n\
+             exit 1\n";
+        std::fs::write(&tmux_path, script).expect("write tmux stub");
+        let mut perms = std::fs::metadata(&tmux_path)
+            .expect("tmux stub metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmux_path, perms).expect("chmod tmux stub");
+        let tmux_bin = tmux_path.to_string_lossy().into_owned();
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                // Bare %97 normalizes to main:14:1 and resolves the identity.
+                assert_eq!(
+                    resolve_identity(&project, "%97").as_deref(),
+                    Some("BlueLake"),
+                    "bare %97 must normalize to its composite key and resolve the identity"
+                );
+                // A bare pane tmux doesn't know still returns None (no false match).
+                assert_eq!(resolve_identity(&project, "%99"), None);
             },
         );
         drop(config);
