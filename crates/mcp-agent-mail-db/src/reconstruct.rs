@@ -201,21 +201,41 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
     apply_snapshot_migrations(conn, schema::schema_migrations_base(), "base")
 }
 
-/// Recreate the ATC schema family that base mode intentionally omits.
+/// Recreate the ATC schema family in the dedicated `atc.sqlite3` sidecar.
 ///
-/// `schema_migrations_base()` excludes the ATC schema family (`atc_experiences`
-/// and its v17 ALTERs, `atc_leader_lease`, `atc_rollup_snapshots`, …) because
-/// FrankenConnection can't host it — at runtime that family is applied by the
-/// canonical follow-up runner. Reconstruction runs on the canonical engine, so a
-/// rebuilt DB must recreate the full ATC surface here; otherwise the ATC
-/// subsystem has no tables to write to after recovery (the `v17` schema-surface
-/// regression). The migrations are ordered (`atc_experiences` created before its
-/// ALTERs) and the per-migration preflight skips anything already present.
-fn apply_atc_schema_after_base(conn: &DbConn) -> DbResult<()> {
+/// ATC telemetry is isolated into a sidecar DB next to the primary mailbox DB
+/// (br-bvq1x.11.7) and MUST NOT live in the primary mailbox DB — pool init drops
+/// any `atc_*` it finds there, and `reconstruct_with_agent_profile` asserts the
+/// rebuilt primary DB has no `atc_*` tables. `schema_migrations_base()` omits the
+/// ATC family (`atc_experiences` and its v17 ALTERs, `atc_leader_lease`,
+/// `atc_rollup_snapshots`, …) because FrankenConnection can't host it; at runtime
+/// the canonical follow-up runner applies that family to the sidecar. Since
+/// reconstruction rebuilds the primary DB, recreate the sidecar's ATC schema here
+/// too — otherwise the ATC subsystem has no tables to write to after recovery (the
+/// `v17` schema-surface regression). The sidecar opens through canonical SQLite
+/// (which can host the family); the migrations are ordered (`atc_experiences`
+/// created before its ALTERs) and the per-migration preflight skips anything
+/// already present. The tables come up empty (ATC state isn't archived), the
+/// correct post-recovery state. A `:memory:` target keeps ATC co-located, so there
+/// is no sidecar to build.
+fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()> {
+    let Some(primary) = primary_db_path.to_str() else {
+        return Ok(());
+    };
+    if primary == ":memory:" {
+        return Ok(());
+    }
+    let sidecar_path = crate::pool::atc_sidecar_sqlite_path(primary);
+    let sidecar = DbConn::open_file(&sidecar_path).map_err(|error| {
+        DbError::Sqlite(format!(
+            "reconstruct: open ATC sidecar {sidecar_path}: {error}"
+        ))
+    })?;
+    let _ = sidecar.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL);
     apply_snapshot_migrations(
-        conn,
+        &sidecar,
         schema::schema_migrations_atc_runtime_canonical_followup(),
-        "atc-canonical-followup",
+        "atc-sidecar-followup",
     )
 }
 
@@ -1290,11 +1310,12 @@ fn reconstruct_from_archive_impl(
         // not duplicated.
         apply_base_migrations_after_snapshot(&conn)?;
 
-        // Base mode omits the ATC schema family (FrankenConnection can't host it);
-        // reconstruction runs on the canonical engine, so recreate that family here
-        // — otherwise a rebuilt DB is missing the ATC v17 schema surface and the
-        // ATC subsystem has no tables to write to after recovery.
-        apply_atc_schema_after_base(&conn)?;
+        // The ATC telemetry family is isolated in the atc.sqlite3 sidecar
+        // (br-bvq1x.11.7) and must NOT be materialized in the primary mailbox DB
+        // (pool init drops any atc_* there). Base mode omits the family, so rebuild
+        // the sidecar's ATC schema here — otherwise the ATC subsystem has no tables
+        // to write to after recovery.
+        recreate_atc_sidecar_schema(db_path)?;
 
         // Clean up any FTS artifacts that may have been left by prior migrations.
         // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical

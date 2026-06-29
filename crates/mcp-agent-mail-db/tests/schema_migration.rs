@@ -660,7 +660,13 @@ fn reconstruct_from_archive_recreates_atc_v17_schema_surface() {
     mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
         .expect("reconstruct database from archive");
 
-    let conn = SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite");
+    // ATC telemetry is isolated in the atc.sqlite3 sidecar (br-bvq1x.11.7), a
+    // sibling of the primary mailbox DB. Reconstruct rebuilds the ATC v17 schema
+    // surface in the SIDECAR, not the primary DB (the primary must stay free of
+    // atc_* tables — see `reconstruct_with_agent_profile`).
+    let sidecar_path = db_path.with_file_name("atc.sqlite3");
+    let conn =
+        SqliteConnection::open_file(sidecar_path.display().to_string()).expect("open atc sidecar");
     conn.execute_raw(PRAGMA_SETTINGS_SQL)
         .expect("apply sqlite pragmas");
     assert_atc_v17_schema_surface(&conn);
