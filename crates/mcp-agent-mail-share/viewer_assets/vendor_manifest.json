@@ -1,4 +1,31 @@
 {
+  "tailwind": {
+    "version": "play-cdn snapshot (cdn.tailwindcss.com)",
+    "source": "https://cdn.tailwindcss.com",
+    "files": {
+      "tailwind.min.js": {
+        "sha256": "176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15"
+      }
+    }
+  },
+  "lucide": {
+    "version": "0.460.0",
+    "source": "https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js",
+    "files": {
+      "lucide.min.js": {
+        "sha256": "1b22c6c04a1c69b75a41c64c7ea992657e8f628dabd6324984ffc61c3761a56a"
+      }
+    }
+  },
+  "alpinejs": {
+    "version": "3.14.1",
+    "source": "https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js",
+    "files": {
+      "alpine.min.js": {
+        "sha256": "358d9afbb1ab5befa2f48061a30776e5bcd7707f410a606ba985f98bc3b1c034"
+      }
+    }
+  },
   "sql_js": {
     "version": "1.10.1",
     "source": "https://github.com/sql-js/sql.js/releases/tag/v1.10.1",
