@@ -717,33 +717,40 @@ fn list_live_tmux_panes() -> Vec<String> {
     }
 }
 
-/// Get a composite tmux pane identifier for the current pane.
+/// Get a composite tmux pane identifier for the **caller's own** pane.
 ///
 /// Runs `tmux display-message -t $TMUX_PANE -p
 /// '#{session_name}:#{window_index}:#{pane_index}'` to produce a key like
-/// `main:0:2` that is unique across tmux sessions.
+/// `main:0:2` that is unique across tmux sessions, falling back to the bare
+/// `$TMUX_PANE` value if `display-message` is unavailable.
 ///
-/// Falls back to the bare `$TMUX_PANE` environment variable if the tmux
-/// command fails (e.g., tmux is not running, or `display-message` is
-/// unavailable).
+/// **Fails closed when `$TMUX_PANE` is unset/empty** (GH#177). A process with no
+/// caller pane env — most importantly the `serve-http` daemon, which does not
+/// run in the caller's pane — must NOT run a `-t`-less `display-message`: tmux
+/// resolves that to the *currently-active* pane, so `macro_start_session` /
+/// `resolve_pane_identity` would bind the caller to whatever identity happens to
+/// occupy the active pane, sending mail under another live agent's name with
+/// `verified_sender=false`. Returning `None` instead lets the caller mint a
+/// fresh identity rather than hijack the active pane's.
 ///
-/// Returns `None` if neither the composite key nor `$TMUX_PANE` can be
-/// determined.
+/// Returns `None` when `$TMUX_PANE` cannot be determined.
 #[must_use]
 pub fn get_composite_tmux_pane_id() -> Option<String> {
-    // Try the composite key first via tmux display-message.
-    let pane_target = tmux_pane_env();
-    let mut cmd = tmux_command();
-    cmd.arg("display-message");
-    if let Some(target) = pane_target
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        cmd.args(["-t", target]);
-    }
-    let output = cmd
-        .args(["-p", "#{session_name}:#{window_index}:#{pane_index}"])
+    // Fail closed: only resolve the caller's *own* pane. With no caller pane env
+    // we return None rather than letting a `-t`-less display-message stand in
+    // with the active pane (GH#177 Defect 1).
+    let pane_target = tmux_pane_env()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+
+    let output = tmux_command()
+        .args([
+            "display-message",
+            "-t",
+            &pane_target,
+            "-p",
+            "#{session_name}:#{window_index}:#{pane_index}",
+        ])
         .output();
 
     if let Ok(out) = output
@@ -755,8 +762,10 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
         }
     }
 
-    // Fallback to bare $TMUX_PANE
-    pane_target
+    // Fallback to the bare caller pane id when display-message didn't yield a
+    // composite (e.g. tmux unavailable) — still the *caller's* pane, never the
+    // active one.
+    Some(pane_target)
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,6 +1320,59 @@ mod tests {
             args.contains("-t\n%7\n-p"),
             "tmux display-message must target TMUX_PANE, got args: {args:?}"
         );
+    }
+
+    /// GH#177 Defect 1: under `serve-http` the daemon has no caller `TMUX_PANE`,
+    /// so it must FAIL CLOSED rather than run a `-t`-less `display-message` (which
+    /// tmux resolves to the *active* pane) and bind the caller to whatever
+    /// identity occupies it.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_without_caller_pane_fails_closed_not_active_pane_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("backend");
+
+        // The active / orchestrator pane already owns a composite-keyed identity.
+        write_identity(&project, "main:19:1", "OliveSparrow").expect("write active-pane identity");
+
+        // Fake tmux: display-message WITHOUT -t -> ACTIVE pane (main:19:1);
+        //            display-message -t %97      -> caller pane (main:14:1, no identity file).
+        let temp = tempfile::tempdir().expect("tmux stub tempdir");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let tmux_path = bin_dir.join("tmux");
+        let script = "#!/bin/sh\n\
+             tgt=\"\"; prev=\"\"\n\
+             for a in \"$@\"; do if [ \"$prev\" = \"-t\" ]; then tgt=\"$a\"; fi; prev=\"$a\"; done\n\
+             if [ \"$tgt\" = \"%97\" ]; then printf 'main:14:1\\n'; else printf 'main:19:1\\n'; fi\n";
+        std::fs::write(&tmux_path, script).expect("write tmux stub");
+        let mut perms = std::fs::metadata(&tmux_path)
+            .expect("tmux stub metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmux_path, perms).expect("chmod tmux stub");
+        let tmux_bin = tmux_path.to_string_lossy().into_owned();
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_TEST_TMUX_BIN", tmux_bin.as_str()), ("TMUX_PANE", "")],
+            || {
+                // Fix: no caller TMUX_PANE -> None, NOT the active pane (main:19:1).
+                assert_eq!(
+                    get_composite_tmux_pane_id(),
+                    None,
+                    "daemon with no caller TMUX_PANE must fail closed, not adopt the active pane"
+                );
+                // ...so the caller is NOT handed the active pane's OliveSparrow identity.
+                assert_eq!(
+                    resolve_identity_current_pane(&project),
+                    None,
+                    "caller must not inherit the active pane's identity under the daemon"
+                );
+            },
+        );
+        drop(config);
     }
 
     #[test]
