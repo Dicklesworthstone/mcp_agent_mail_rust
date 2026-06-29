@@ -4027,6 +4027,10 @@ mod tests {
             &viewer_sri,
         ));
         manifest["generated_at"] = Value::String("<TIMESTAMP>".to_string());
+        // Normalize the exporter version like the timestamp: it tracks
+        // `CARGO_PKG_VERSION`, so pinning a literal made this golden go stale on
+        // every release bump (it sat at 0.3.11 through several releases).
+        manifest["exporter_version"] = Value::String("<VERSION>".to_string());
         let actual = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
 
         assert_repo_golden("share/bundle/manifest_standard.json", &actual);
