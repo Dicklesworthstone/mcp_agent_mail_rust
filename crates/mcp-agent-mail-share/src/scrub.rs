@@ -450,6 +450,19 @@ pub fn scrub_snapshot(
             }
         }
 
+        // Secret-scrub the free-text columns that aren't message bodies. Agent
+        // task descriptions and sibling-suggestion rationales can carry tokens /
+        // keys just like a message body (e.g. "deploying with ghp_… to prod"),
+        // and the in-browser viewer loads the raw DB, so the static-HTML defense
+        // doesn't protect them. Path redaction already ran on these columns
+        // above; this applies the same secret scanning messages get.
+        if cfg.scrub_secrets {
+            secrets_replaced +=
+                scrub_secrets_in_text_column(&conn, RedactTextColumn::AgentTaskDescription)?;
+            secrets_replaced +=
+                scrub_secrets_in_text_column(&conn, RedactTextColumn::SiblingSuggestionRationale)?;
+        }
+
         // Generate a stable salt for pseudonymization reproducibility (matches Python).
         let pseudonym_salt = preset.as_str().to_string();
         Ok(ScrubSummary {
@@ -867,6 +880,48 @@ fn redact_project_paths_in_text_column(
     }
 
     Ok(())
+}
+
+/// Secret-scrub a free-text column (agent `task_description`, sibling-suggestion
+/// `rationale`) the same way message subjects/bodies are scrubbed. Returns the
+/// number of secret replacements applied so the caller can fold it into the
+/// `secrets_replaced` total.
+fn scrub_secrets_in_text_column(conn: &Conn, target: RedactTextColumn) -> Result<i64, ShareError> {
+    let table = target.table();
+    let column = target.column();
+    if !column_exists(conn, table, column)? {
+        return Ok(0);
+    }
+
+    let rows = conn
+        .query_sync(target.select_sql(), &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("SELECT {table}.{column} failed: {e}"),
+        })?;
+
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| {
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let value: String = row.get_named(column).unwrap_or_default();
+            (id, value)
+        })
+        .collect();
+
+    let mut replaced = 0i64;
+    for (id, original) in values {
+        let (scrubbed, count) = scrub_text(&original);
+        if count > 0 {
+            exec_count(
+                conn,
+                target.update_sql(),
+                &[SqlValue::Text(scrubbed), SqlValue::BigInt(id)],
+            )?;
+            replaced += count;
+        }
+    }
+
+    Ok(replaced)
 }
 
 fn redact_project_paths(conn: &Conn) -> Result<Vec<ProjectPathRedaction>, ShareError> {
@@ -1539,6 +1594,72 @@ mod tests {
         }
         assert!(rendered.contains("[project path redacted: test]"));
         assert!(rendered.contains("data-redaction-reason=\"body_redacted\""));
+    }
+
+    #[test]
+    fn standard_scrub_removes_secrets_from_task_description_and_rationale() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+
+        // A GitHub PAT (ghp_ + 36 chars) tucked into an agent's task_description
+        // and a sibling-suggestion rationale — neither is a message field, so
+        // before the fix these shipped verbatim in a shared bundle's DB.
+        let secret_token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        conn.execute_raw(&format!(
+            "UPDATE agents SET task_description = 'Deploy with {secret_token} to prod' WHERE id = 1"
+        ))
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE project_sibling_suggestions (
+                id INTEGER PRIMARY KEY,
+                project_a_id INTEGER NOT NULL,
+                project_b_id INTEGER NOT NULL,
+                score REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'suggested',
+                rationale TEXT NOT NULL DEFAULT '',
+                created_ts TEXT NOT NULL DEFAULT '',
+                evaluated_ts TEXT NOT NULL DEFAULT '',
+                confirmed_ts TEXT,
+                dismissed_ts TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(&format!(
+            "INSERT INTO project_sibling_suggestions (id, project_a_id, project_b_id, score, rationale) \
+             VALUES (1, 1, 1, 0.9, 'shared deploy key {secret_token}')"
+        ))
+        .unwrap();
+
+        let summary = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+
+        let task: String = conn
+            .query_sync("SELECT task_description FROM agents WHERE id = 1", &[])
+            .unwrap()[0]
+            .get_named("task_description")
+            .unwrap();
+        let rationale: String = conn
+            .query_sync(
+                "SELECT rationale FROM project_sibling_suggestions WHERE id = 1",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named("rationale")
+            .unwrap();
+
+        assert!(
+            !task.contains(secret_token),
+            "task_description secret must be scrubbed, got {task:?}"
+        );
+        assert!(
+            !rationale.contains(secret_token),
+            "sibling-suggestion rationale secret must be scrubbed, got {rationale:?}"
+        );
+        assert!(
+            summary.secrets_replaced >= 2,
+            "both non-message-field secrets should be counted, got {}",
+            summary.secrets_replaced
+        );
     }
 
     #[test]

@@ -487,6 +487,34 @@ def scrub_snapshot(snapshot_path: Path, *, preset: str = "standard") -> ScrubSum
                 f"UPDATE messages SET body_md = {_sql_quote(body)} WHERE id = {msg_id}"
             )
 
+    if scrub_secrets:
+        # Secret-scrub the free-text columns that aren't message bodies. Agent
+        # task descriptions and sibling-suggestion rationales can carry tokens /
+        # keys too, and the in-browser viewer queries the raw DB — so the Rust
+        # implementation scrubs them, and this reference mirrors it. (The shipped
+        # fixtures seed no secrets in these columns, so regenerating produces no
+        # change; this keeps the reference behaviourally aligned for future seeds.)
+        for table, column in (
+            ("agents", "task_description"),
+            ("project_sibling_suggestions", "rationale"),
+        ):
+            try:
+                column_rows = _db_query_json(
+                    snapshot_path,
+                    f"SELECT id, {column} AS value FROM {table} ORDER BY id",
+                )
+            except Exception:
+                continue
+            for row in column_rows:
+                original = row.get("value") or ""
+                scrubbed, replacements = _scrub_text(original)
+                if replacements > 0:
+                    secrets_replaced += replacements
+                    script_lines.append(
+                        f"UPDATE {table} SET {column} = {_sql_quote(scrubbed)} "
+                        f"WHERE id = {int(row['id'])}"
+                    )
+
     script_lines.append("COMMIT")
     _db_exec(snapshot_path, ";\n".join(script_lines) + ";\n")
 
