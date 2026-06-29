@@ -34109,6 +34109,31 @@ mod mail_server_cli_bridge_tests {
     }
 
     #[test]
+    fn trusted_tmux_pane_header_value_only_accepts_bare_pane_ids() {
+        // Accepted: a bare `%<digits>` pane id (trimmed), matching the server's
+        // is_trusted_tmux_pane_header allowlist so the daemon will honor it.
+        assert_eq!(
+            trusted_tmux_pane_header_value(Some("%97")).as_deref(),
+            Some("%97")
+        );
+        assert_eq!(
+            trusted_tmux_pane_header_value(Some("  %3 ")).as_deref(),
+            Some("%3")
+        );
+        // Rejected: composite key (the daemon normalizes %NN itself), missing %,
+        // non-digit, empty, none, and over-long (CRLF/header-injection guard).
+        assert_eq!(trusted_tmux_pane_header_value(Some("main:14:1")), None);
+        assert_eq!(trusted_tmux_pane_header_value(Some("%")), None);
+        assert_eq!(trusted_tmux_pane_header_value(Some("%1a")), None);
+        assert_eq!(trusted_tmux_pane_header_value(Some("3")), None);
+        assert_eq!(trusted_tmux_pane_header_value(Some("%1\r\nEvil: x")), None);
+        assert_eq!(trusted_tmux_pane_header_value(Some("")), None);
+        assert_eq!(trusted_tmux_pane_header_value(None), None);
+        let too_long = format!("%{}", "9".repeat(80));
+        assert_eq!(trusted_tmux_pane_header_value(Some(&too_long)), None);
+    }
+
+    #[test]
     fn blocking_http_get_returns_after_content_length_without_close() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -70424,6 +70449,29 @@ fn connect_blocking_http(
     )))
 }
 
+/// Validate a candidate `$TMUX_PANE` value as a trusted `X-Tmux-Pane` header.
+///
+/// Mirrors the server's `is_trusted_tmux_pane_header` allowlist (`%<digits>`)
+/// so the value round-trips: the daemon only accepts the bare pane id, then
+/// normalizes it to the composite key for identity lookup.
+fn trusted_tmux_pane_header_value(raw: Option<&str>) -> Option<String> {
+    let pane = raw?.trim();
+    let digits = pane.strip_prefix('%')?;
+    (!digits.is_empty() && pane.len() <= 64 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| pane.to_string())
+}
+
+/// The caller's own tmux pane id as a trusted `X-Tmux-Pane` header value.
+///
+/// The `am` CLI runs inside the calling agent's tmux pane, so it can carry the
+/// pane to the `serve-http` daemon (which does not run in the pane and a static
+/// MCP `url` config can't attach a per-request header — GH#177 Defect 3). The
+/// daemon injects this into identity-tool args so pane-identity reuse works for
+/// CLI-routed identity calls.
+fn caller_tmux_pane_header() -> Option<String> {
+    trusted_tmux_pane_header_value(std::env::var("TMUX_PANE").ok().as_deref())
+}
+
 fn post_jsonrpc_request_blocking_http(
     server_url: &str,
     bearer: Option<&str>,
@@ -70452,12 +70500,18 @@ fn post_jsonrpc_request_blocking_http(
     } else {
         String::new()
     };
+    // Carry the caller's tmux pane to the daemon (GH#177 Defect 3). The value is
+    // validated to `%<digits>`, so it can't inject CRLF/extra headers.
+    let x_tmux_pane = caller_tmux_pane_header()
+        .map(|pane| format!("X-Tmux-Pane: {pane}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mcp-agent-mail-cli\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}{}\r\n",
         target.request_target,
         target.host_header,
         body.len(),
-        authorization
+        authorization,
+        x_tmux_pane
     );
     std::io::Write::write_all(&mut stream, head.as_bytes()).map_err(|error| {
         CliError::Other(format!("transport failure calling {server_url}: {error}"))
@@ -70652,6 +70706,10 @@ async fn post_jsonrpc_request(
     let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     if let Some(tok) = bearer.filter(|s| !s.is_empty()) {
         headers.push(("Authorization".to_string(), format!("Bearer {tok}")));
+    }
+    // Carry the caller's tmux pane to the daemon (GH#177 Defect 3).
+    if let Some(pane) = caller_tmux_pane_header() {
+        headers.push(("X-Tmux-Pane".to_string(), pane));
     }
 
     let cx = asupersync::Cx::for_testing();
