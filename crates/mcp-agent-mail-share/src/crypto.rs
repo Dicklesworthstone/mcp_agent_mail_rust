@@ -371,8 +371,10 @@ fn verify_database_payload(
         .get("chunked")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-
-    let mut hasher = Sha256::new();
+    let db_rel = database
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mailbox.sqlite3");
 
     if chunked {
         let Some(chunk_count) = database
@@ -384,6 +386,9 @@ fn verify_database_payload(
                 "chunked database manifest is missing chunk_count".to_string(),
             )));
         };
+        // Verify the reassembled chunks against the signed hash: streamed in
+        // index order, which is byte-identical to the original database file.
+        let mut hasher = Sha256::new();
         for index in 0..chunk_count {
             let chunk_rel = format!("chunks/{index:05}.bin");
             let chunk_path = match resolve_sri_file_path(bundle_root, &chunk_rel) {
@@ -397,27 +402,46 @@ fn verify_database_payload(
                 return Ok(Some(Err(format!("failed to read {chunk_rel}: {err}"))));
             }
         }
-    } else {
-        let db_rel = database
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("mailbox.sqlite3");
-        let db_path = match resolve_sri_file_path(bundle_root, db_rel) {
-            Ok(path) => path,
-            Err(err) => return Ok(Some(Err(err))),
-        };
-        if !crate::is_real_file(&db_path) {
-            // No database artifact present (e.g. a metadata-only bundle) — nothing
-            // to verify, so don't claim a check happened.
-            return Ok(None);
+        if !hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected) {
+            return Ok(Some(Err(
+                "reassembled database chunks do not match the signed manifest hash".to_string(),
+            )));
         }
-        if let Err(err) = hash_file_into(&db_path, &mut hasher) {
-            return Ok(Some(Err(format!("failed to read {db_rel}: {err}"))));
-        }
+        // A chunked bundle also ships the standalone `mailbox.sqlite3`; if present
+        // it must match the same signed hash, so a swapped standalone DB (with the
+        // chunks left intact) cannot pass verification either.
+        return Ok(Some(
+            verify_db_file_against_hash(bundle_root, db_rel, expected)?.unwrap_or(Ok(())),
+        ));
     }
 
-    let actual = hex::encode(hasher.finalize());
-    if actual.eq_ignore_ascii_case(expected) {
+    // Non-chunked: verify the standalone database file. Absent (e.g. an encrypted
+    // or metadata-only bundle) → not checked.
+    verify_db_file_against_hash(bundle_root, db_rel, expected)
+}
+
+/// Hash the database file at `db_rel` (if present) and compare to `expected`.
+///
+/// Returns `Ok(None)` when the file is absent (nothing to verify),
+/// `Ok(Some(Ok(())))` on a match, and `Ok(Some(Err(_)))` on a mismatch, an
+/// unreadable file, or a rejected path (symlink / traversal).
+fn verify_db_file_against_hash(
+    bundle_root: &Path,
+    db_rel: &str,
+    expected: &str,
+) -> ShareResult<Option<Result<(), String>>> {
+    let db_path = match resolve_sri_file_path(bundle_root, db_rel) {
+        Ok(path) => path,
+        Err(err) => return Ok(Some(Err(err))),
+    };
+    if !crate::is_real_file(&db_path) {
+        return Ok(None);
+    }
+    let mut hasher = Sha256::new();
+    if let Err(err) = hash_file_into(&db_path, &mut hasher) {
+        return Ok(Some(Err(format!("failed to read {db_rel}: {err}"))));
+    }
+    if hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected) {
         Ok(Some(Ok(())))
     } else {
         Ok(Some(Err(
@@ -1188,6 +1212,86 @@ mod tests {
             tampered.error.is_some(),
             "a database mismatch must surface an error"
         );
+    }
+
+    #[test]
+    fn chunked_bundle_verifies_both_chunks_and_standalone_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A small "database" split into two chunks; the standalone file is the
+        // concatenation, and the signed manifest hash is over that concatenation
+        // (exactly how the exporter computes db_sha256, then chunks).
+        let part0 = b"chunk-zero-contents-".to_vec();
+        let part1 = b"chunk-one-contents!!".to_vec();
+        let db_bytes: Vec<u8> = part0.iter().chain(part1.iter()).copied().collect();
+        let db_hash = hex_sha256(&db_bytes);
+
+        std::fs::create_dir_all(root.join("chunks")).unwrap();
+        std::fs::write(root.join("chunks/00000.bin"), &part0).unwrap();
+        std::fs::write(root.join("chunks/00001.bin"), &part1).unwrap();
+        std::fs::write(root.join("mailbox.sqlite3"), &db_bytes).unwrap();
+
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": db_bytes.len(),
+                "sha256": db_hash,
+                "chunked": true,
+                "chunk_manifest": { "version": 1, "chunk_count": 2 },
+            },
+        });
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let key_path = root.join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+        let sig_path = root.join("manifest.sig.json");
+        let public_key = sign_manifest(&manifest_path, &key_path, &sig_path, false)
+            .unwrap()
+            .public_key;
+
+        // Pristine: both the reassembled chunks and the standalone DB match.
+        let ok = verify_bundle(root, Some(&public_key)).unwrap();
+        assert!(ok.signature_verified);
+        assert!(
+            ok.database_checked && ok.database_verified,
+            "pristine chunked bundle should verify"
+        );
+        assert!(ok.error.is_none());
+
+        // Swap the standalone mailbox.sqlite3 (chunks left intact). A consumer
+        // that loads the standalone DB would otherwise get attacker content while
+        // verify reported green — so this MUST fail.
+        std::fs::write(
+            root.join("mailbox.sqlite3"),
+            b"attacker-controlled standalone db",
+        )
+        .unwrap();
+        let swapped_db = verify_bundle(root, Some(&public_key)).unwrap();
+        assert!(
+            swapped_db.signature_verified,
+            "manifest signature untouched"
+        );
+        assert!(
+            !swapped_db.database_verified,
+            "a swapped standalone DB must fail verification even when chunks are intact"
+        );
+        assert!(swapped_db.error.is_some());
+
+        // Restore the standalone DB and tamper a chunk instead — must also fail.
+        std::fs::write(root.join("mailbox.sqlite3"), &db_bytes).unwrap();
+        std::fs::write(root.join("chunks/00001.bin"), b"tampered-chunk").unwrap();
+        let swapped_chunk = verify_bundle(root, Some(&public_key)).unwrap();
+        assert!(
+            !swapped_chunk.database_verified,
+            "a tampered chunk must fail verification"
+        );
+        assert!(swapped_chunk.error.is_some());
     }
 
     #[test]
