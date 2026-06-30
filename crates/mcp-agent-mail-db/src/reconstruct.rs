@@ -232,6 +232,12 @@ fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()> {
         ))
     })?;
     let _ = sidecar.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL);
+    // A sidecar-schema failure here is intentionally fatal to the whole
+    // reconstruct (propagated via `?`): a recovery that silently half-succeeds is
+    // worse than one that fails loudly. ATC telemetry is "trivially droppable"
+    // and the live runtime re-applies this same follower on next open, so the
+    // operator can also just delete the sidecar and re-run — but recovery
+    // integrity wins by default.
     apply_snapshot_migrations(
         &sidecar,
         schema::schema_migrations_atc_runtime_canonical_followup(),

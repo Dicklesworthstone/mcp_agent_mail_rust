@@ -192,7 +192,11 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
 fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
     try_dispatch_archive_write(op.clone(), context);
     match mcp_agent_mail_storage::wbq_flush_status() {
-        // Drained: the artifact is on disk. NoQueue: the enqueue path already
+        // Drained: every *enqueued* op has been written. (If disk-critical
+        // pressure made `wbq_enqueue` skip this op, nothing was enqueued and the
+        // empty queue still drains clean — that skip is the intended disk-pressure
+        // behavior, DB remains authoritative, and a later reconcile-on-read heals
+        // the archive once pressure clears.) NoQueue: the enqueue path already
         // handled an unavailable queue (it falls back to a synchronous write).
         mcp_agent_mail_storage::WbqFlushOutcome::Drained
         | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue => {}
