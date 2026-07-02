@@ -15022,6 +15022,33 @@ fn active_reservation_predicate_sql(table_ref: &str) -> String {
     mcp_agent_mail_db::queries::active_reservation_predicate_for(table_ref)
 }
 
+/// GH#180: the `released_ts`-only active-reservation predicate (no `NOT IN`
+/// anti-join). Active-view CLI queries that carry a `LEFT JOIN agents` use this
+/// to fetch candidate rows and then subtract the released reservation IDs (via
+/// [`cli_released_reservation_ids`]) in Rust, avoiding the O(N·M) per-join-row
+/// rescan of the uncorrelated `NOT IN` subquery under sqlmodel-frankensqlite.
+fn active_reservation_candidate_predicate_sql(table_ref: &str) -> String {
+    mcp_agent_mail_db::queries::active_reservation_candidate_predicate_for(table_ref)
+}
+
+/// GH#180: fetch the set of released reservation IDs from the sidecar ledger so
+/// active-view CLI queries can subtract them in Rust (a single-column scan,
+/// cheap in any engine) instead of relying on the slow `NOT IN` anti-join.
+fn cli_released_reservation_ids(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> CliResult<std::collections::HashSet<i64>> {
+    let rows = conn
+        .query_sync(mcp_agent_mail_db::queries::RELEASED_RESERVATION_IDS_SQL, &[])
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    let mut set = std::collections::HashSet::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(id) = row.get_named::<i64>("reservation_id") {
+            set.insert(id);
+        }
+    }
+    Ok(set)
+}
+
 fn reservation_patterns_overlap(left: &str, right: &str) -> bool {
     let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
     let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
@@ -15073,7 +15100,7 @@ fn handle_file_reservations_with_conn(
                 return Ok(());
             };
             let active_reservation_predicate =
-                active_reservation_predicate_sql("file_reservations");
+                active_reservation_candidate_predicate_sql("file_reservations");
             let sql = if active_only {
                 &format!(
                     "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
@@ -15116,6 +15143,22 @@ fn handle_file_reservations_with_conn(
                 .query_sync(sql, &params)
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
 
+            // GH#180: the active branches fetch candidate rows with the cheap
+            // `released_ts` predicate; subtract the release ledger in Rust so
+            // released reservations never show as active. The `all` branch lists
+            // every reservation and is not filtered.
+            let rows = if all {
+                rows
+            } else {
+                let released_ids = cli_released_reservation_ids(conn)?;
+                rows.into_iter()
+                    .filter(|r| {
+                        let id: i64 = r.get_named("id").unwrap_or(0);
+                        !released_ids.contains(&id)
+                    })
+                    .collect::<Vec<_>>()
+            };
+
             if rows.is_empty() {
                 output::empty_result(false, "No file reservations found.");
                 return Ok(());
@@ -15148,7 +15191,10 @@ fn handle_file_reservations_with_conn(
             };
             let limit = limit.unwrap_or(50);
             let active_reservation_predicate =
-                active_reservation_predicate_sql("file_reservations");
+                active_reservation_candidate_predicate_sql("file_reservations");
+            // GH#180: fetch candidate rows ordered, then subtract the release
+            // ledger in Rust and apply the limit AFTER filtering. The `LIMIT` is
+            // applied in Rust (not SQL) so released rows do not consume the limit.
             let sql = format!(
                 "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
                         file_reservations.expires_ts, \
@@ -15156,19 +15202,27 @@ fn handle_file_reservations_with_conn(
                  FROM file_reservations \
                  LEFT JOIN agents a ON a.id = file_reservations.agent_id \
                  WHERE file_reservations.project_id = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
-                 ORDER BY file_reservations.expires_ts ASC \
-                 LIMIT ?"
+                 ORDER BY file_reservations.expires_ts ASC"
             );
-            let rows = conn
+            let candidate_rows = conn
                 .query_sync(
                     &sql,
                     &[
                         sqlmodel_core::Value::BigInt(project.id),
                         sqlmodel_core::Value::BigInt(now_us),
-                        sqlmodel_core::Value::BigInt(limit),
                     ],
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let released_ids = cli_released_reservation_ids(conn)?;
+            let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+            let rows = candidate_rows
+                .into_iter()
+                .filter(|r| {
+                    let id: i64 = r.get_named("id").unwrap_or(0);
+                    !released_ids.contains(&id)
+                })
+                .take(limit_usize)
+                .collect::<Vec<_>>();
 
             if rows.is_empty() {
                 ftui_runtime::ftui_println!("No active reservations.");
@@ -15194,7 +15248,7 @@ fn handle_file_reservations_with_conn(
             let minutes = minutes.unwrap_or(30);
             let threshold_us = now_us.saturating_add(saturating_minutes_to_micros(minutes));
             let active_reservation_predicate =
-                active_reservation_predicate_sql("file_reservations");
+                active_reservation_candidate_predicate_sql("file_reservations");
             let sql = format!(
                 "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.expires_ts, \
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
@@ -15214,6 +15268,17 @@ fn handle_file_reservations_with_conn(
                     ],
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+
+            // GH#180: subtract the release ledger in Rust (candidate predicate
+            // has no `NOT IN` anti-join).
+            let released_ids = cli_released_reservation_ids(conn)?;
+            let rows = rows
+                .into_iter()
+                .filter(|r| {
+                    let id: i64 = r.get_named("id").unwrap_or(0);
+                    !released_ids.contains(&id)
+                })
+                .collect::<Vec<_>>();
 
             if rows.is_empty() {
                 ftui_runtime::ftui_println!("No reservations expiring within {} minutes.", minutes);
@@ -15251,7 +15316,9 @@ fn handle_file_reservations_with_conn(
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Check conflicts: find active exclusive reservations that overlap.
-            let active_reservation_predicate = active_reservation_predicate_sql("fr");
+            // GH#180: candidate predicate (no `NOT IN` anti-join) + Rust ledger
+            // subtraction, so the reserve conflict check stays fast under load.
+            let active_reservation_predicate = active_reservation_candidate_predicate_sql("fr");
             let active_rows = conn
                 .query_sync(
                     &format!(
@@ -15269,6 +15336,14 @@ fn handle_file_reservations_with_conn(
                     ],
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let released_ids = cli_released_reservation_ids(conn)?;
+            let active_rows = active_rows
+                .into_iter()
+                .filter(|r| {
+                    let id: i64 = r.get_named("id").unwrap_or(0);
+                    !released_ids.contains(&id)
+                })
+                .collect::<Vec<_>>();
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
             let mut conflicted_paths: BTreeSet<String> = BTreeSet::new();
             for path in &paths {
@@ -15501,7 +15576,9 @@ fn handle_file_reservations_with_conn(
             let project_id = project.id;
 
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
-            let active_reservation_predicate = active_reservation_predicate_sql("fr");
+            // GH#180: candidate predicate (no `NOT IN` anti-join) + Rust ledger
+            // subtraction.
+            let active_reservation_predicate = active_reservation_candidate_predicate_sql("fr");
             let active_rows = conn
                 .query_sync(
                     &format!(
@@ -15518,6 +15595,14 @@ fn handle_file_reservations_with_conn(
                     ],
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+            let released_ids = cli_released_reservation_ids(conn)?;
+            let active_rows = active_rows
+                .into_iter()
+                .filter(|r| {
+                    let id: i64 = r.get_named("id").unwrap_or(0);
+                    !released_ids.contains(&id)
+                })
+                .collect::<Vec<_>>();
             for path in &paths {
                 for r in &active_rows {
                     let holder: String = r.get_named("agent_name").unwrap_or_default();
