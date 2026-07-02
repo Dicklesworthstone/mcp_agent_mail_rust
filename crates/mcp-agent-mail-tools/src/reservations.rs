@@ -190,26 +190,38 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
 /// overwrites the artifact), so a later drain of the same enqueued op is a
 /// harmless rewrite.
 fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
-    try_dispatch_archive_write(op.clone(), context);
-    match mcp_agent_mail_storage::wbq_flush_status() {
-        // Drained: every *enqueued* op has been written. (If disk-critical
-        // pressure made `wbq_enqueue` skip this op, nothing was enqueued and the
-        // empty queue still drains clean — that skip is the intended disk-pressure
-        // behavior, DB remains authoritative, and a later reconcile-on-read heals
-        // the archive once pressure clears.) NoQueue: the enqueue path already
-        // handled an unavailable queue (it falls back to a synchronous write).
-        mcp_agent_mail_storage::WbqFlushOutcome::Drained
-        | mcp_agent_mail_storage::WbqFlushOutcome::NoQueue => {}
-        // The drain thread is stuck or gone — the enqueued op may never land.
-        // Write it now so the archive the guard reads is durable on return.
-        mcp_agent_mail_storage::WbqFlushOutcome::TimedOut
-        | mcp_agent_mail_storage::WbqFlushOutcome::Disconnected => {
-            if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
-                tracing::warn!(
-                    error = %error,
-                    "{context}; synchronous archive fallback failed after the WBQ flush did not drain"
-                );
-            }
+    // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
+    // return because the pre-commit guard reads it directly; a stale artifact
+    // yields the *wrong holder* (GH#112). The previous implementation enqueued
+    // the op onto the shared write-behind queue and then flushed the ENTIRE
+    // queue (`wbq_flush_status`), which turned every reservation grant into a
+    // global FIFO barrier behind unrelated archive work (message-bundle writes
+    // from other agents). Under concurrent swarm load that fence produced
+    // long-tail 30s-ceiling reservation stalls even though the authoritative DB
+    // grant had already committed.
+    //
+    // Write the artifact synchronously and directly instead. This writes only
+    // *this* reservation's JSON files (a cheap, bounded, local filesystem write)
+    // and defers the git commit to the async commit coalescer, so the reservation
+    // hot path is never coupled to another agent's archive-drain latency. The
+    // durability guarantee the guard depends on is strictly stronger: the
+    // artifact is proven on disk on return (or a hard error is surfaced), rather
+    // than merely warned about on a 30s flush timeout.
+    match mcp_agent_mail_storage::write_op_sync_direct(&op) {
+        // Written: the guard-visible artifact is durable. SkippedDiskCritical:
+        // intended disk-pressure behavior — DB stays authoritative and
+        // reconcile-on-read heals the archive once pressure clears.
+        mcp_agent_mail_storage::DirectArchiveWrite::Written
+        | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
+        // The direct write failed (e.g. a transient git index lock). The DB grant
+        // is authoritative and the archive is best-effort: fall back to the
+        // write-behind queue so a later drain re-emits the artifact idempotently.
+        mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
+            tracing::warn!(
+                error = %error,
+                "{context}; synchronous reservation archive write failed; enqueueing for background retry"
+            );
+            try_dispatch_archive_write(op, context);
         }
     }
 }

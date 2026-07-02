@@ -635,6 +635,51 @@ pub fn write_op_sync(op: &WriteOp) -> Result<()> {
     wbq_execute_op(op)
 }
 
+/// Outcome of a direct (synchronous, on the caller thread) archive write.
+///
+/// See [`write_op_sync_direct`].
+#[derive(Debug)]
+pub enum DirectArchiveWrite {
+    /// The archive artifact was written to disk on the calling thread. For a
+    /// reservation this means the `id-<id>.json` the pre-commit guard reads is
+    /// durable; the git commit is coalesced asynchronously.
+    Written,
+    /// Skipped because the disk is under critical pressure. The DB remains
+    /// authoritative and reconcile-on-read heals the archive once pressure
+    /// clears (matching the write-behind-queue's disk-critical skip).
+    SkippedDiskCritical,
+    /// The synchronous write failed; the caller should fall back (for example,
+    /// enqueue onto the write-behind queue for a later background retry).
+    Failed(StorageError),
+}
+
+/// Write an archive op synchronously and directly on the caller thread,
+/// honoring disk-critical backpressure.
+///
+/// GH#178: reservation mutations need their JSON artifact on disk before the
+/// tool call returns (the pre-commit guard reads `id-<id>.json` directly, so a
+/// stale artifact yields a *wrong holder*, GH#112). The previous approach —
+/// enqueue onto the shared write-behind queue, then [`wbq_flush`] the ENTIRE
+/// queue — made every reservation grant a global FIFO barrier behind unrelated
+/// archive work (message-bundle writes from other agents), a long-tail hot-path
+/// stall under swarm load. Writing the artifact directly touches only *this*
+/// reservation's JSON files (a cheap, bounded, local filesystem write) and
+/// defers the git commit to the async commit coalescer, so a reservation grant
+/// can never be coupled to another agent's archive-drain latency.
+pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+    let disk_pressure = mcp_agent_mail_core::global_metrics()
+        .system
+        .disk_pressure_level
+        .load();
+    if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return DirectArchiveWrite::SkippedDiskCritical;
+    }
+    match wbq_execute_op(op) {
+        Ok(()) => DirectArchiveWrite::Written,
+        Err(error) => DirectArchiveWrite::Failed(error),
+    }
+}
+
 /// Outcome of a write-behind-queue flush, so a durability-sensitive caller can
 /// tell "the archive is now on disk" from "the drain thread never confirmed".
 ///
