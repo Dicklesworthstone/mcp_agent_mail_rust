@@ -3246,6 +3246,119 @@ async fn execute_v3b_rebuild_projects_created_at_integer_affinity<C: Connection>
     }
 }
 
+/// Execute the `v3_fix_messages_text_timestamps` conversion while working around
+/// a sqlmodel-frankensqlite UPDATE-cursor defect (GH#181).
+///
+/// An in-place `UPDATE messages SET created_ts = ...` on a legacy Python-era
+/// store that carries many accumulated secondary indexes aborts with
+/// "database disk image is malformed: table_seek called on index page ... cursor
+/// is_table flag likely incorrect" while the engine maintains those index btrees
+/// during the row walk. Canonical SQLite runs the identical UPDATE cleanly and
+/// the store passes `integrity_check` / `quick_check` (the abort even survives a
+/// `VACUUM INTO` rebuild), so the data is valid — this is an engine defect, not
+/// corruption.
+///
+/// Sidestep the buggy index-maintenance path deterministically and
+/// page-layout-independently: snapshot and DROP every secondary index on
+/// `messages`, run the timestamp-conversion UPDATE with no index btrees to
+/// maintain, then rebuild each captured index from its original DDL. A fresh
+/// `CREATE INDEX` scans the table and builds the btree bottom-up; it does not
+/// exercise the UPDATE-cursor path, which is the same reason the `v3b` /`v15`
+/// table rebuilds already work on these stores.
+///
+/// On a canonical/fresh DB (no TEXT `created_ts`) this is a no-op guarded by a
+/// cheap `COUNT` so it never churns the `messages` indexes.
+async fn execute_v3_fix_messages_text_timestamps<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    update_sql: &str,
+) -> Outcome<(), SqlError> {
+    // 0. Only legacy stores have TEXT timestamps; skip entirely otherwise so a
+    //    fresh-DB bootstrap pays only one COUNT and no index rebuild.
+    let text_count_rows = match conn
+        .query(
+            cx,
+            "SELECT COUNT(*) AS n FROM messages WHERE typeof(created_ts) = 'text'",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let text_count = text_count_rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("n").ok())
+        .unwrap_or(0);
+    if text_count == 0 {
+        return Outcome::Ok(());
+    }
+
+    // 1. Snapshot the secondary-index DDL for `messages`. Auto-indexes (PK /
+    //    UNIQUE constraints) have a NULL `sql` and are excluded — they are not
+    //    droppable and are not implicated in the UPDATE-cursor abort.
+    let index_rows = match conn
+        .query(
+            cx,
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'messages' AND sql IS NOT NULL",
+            &[],
+        )
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut indexes: Vec<(String, String)> = Vec::with_capacity(index_rows.len());
+    for row in index_rows {
+        let name = match row.get_named::<String>("name") {
+            Ok(name) => name,
+            Err(err) => return Outcome::Err(err),
+        };
+        let sql = match row.get_named::<String>("sql") {
+            Ok(sql) => sql,
+            Err(err) => return Outcome::Err(err),
+        };
+        indexes.push((name, sql));
+    }
+
+    // 2. DROP each captured index so the UPDATE maintains no secondary btrees.
+    for (name, _sql) in &indexes {
+        let drop_sql = format!("DROP INDEX IF EXISTS \"{}\"", name.replace('"', "\"\""));
+        match conn.execute(cx, &drop_sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    // 3. Run the timestamp-conversion UPDATE (identical SQL the migration would
+    //    have run in-place), now with no index maintenance to trip the engine.
+    match conn.execute(cx, update_sql, &[]).await {
+        Outcome::Ok(_) => {}
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    // 4. Rebuild each captured index from its original DDL (a fresh, safe build).
+    for (_name, sql) in &indexes {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
 async fn execute_v10a_dedup_agents_case_insensitive<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -3403,6 +3516,8 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             let statement_result =
                 if migration.id == "v3b_rebuild_projects_created_at_integer_affinity" {
                     execute_v3b_rebuild_projects_created_at_integer_affinity(cx, conn).await
+                } else if migration.id == "v3_fix_messages_text_timestamps" {
+                    execute_v3_fix_messages_text_timestamps(cx, conn, &migration.up).await
                 } else if migration.id == "v10a_dedup_agents_case_insensitive" {
                     execute_v10a_dedup_agents_case_insensitive(cx, conn).await
                 } else if migration.id == "v15_add_recipients_json_to_messages" {
