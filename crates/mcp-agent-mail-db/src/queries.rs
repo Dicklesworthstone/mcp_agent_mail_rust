@@ -801,6 +801,46 @@ pub fn active_reservation_predicate_for(table_ref: &str) -> String {
     ACTIVE_RESERVATION_PREDICATE.replace("file_reservations.", &format!("{table_ref}."))
 }
 
+/// The active-reservation predicate WITHOUT the sidecar release-ledger
+/// exclusion, adjusted for a table reference.
+///
+/// GH#180: [`ACTIVE_RESERVATION_PREDICATE`] ends in an uncorrelated
+/// `id NOT IN (SELECT reservation_id FROM file_reservation_releases)` anti-join.
+/// Under sqlmodel-frankensqlite's join execution that subquery is re-scanned per
+/// join row rather than materialized once, so an active-view query with a
+/// `LEFT JOIN agents` degrades to O(N·M) — ~25s on a 30k-row store (canonical
+/// SQLite materializes it and runs the same query in ~0.01s). The no-join paths
+/// are fine, so this cheap `released_ts`-only predicate is used by the join
+/// sites to fetch *candidate* rows; callers then subtract the released
+/// reservation IDs (see [`RELEASED_RESERVATION_IDS_SQL`]) in Rust for identical
+/// results without the O(N·M) blowup.
+#[must_use]
+pub fn active_reservation_candidate_predicate_for(table_ref: &str) -> String {
+    let table_ref = table_ref.trim().trim_end_matches('.');
+    let qualifier = if table_ref.is_empty() || table_ref == "file_reservations" {
+        "file_reservations.".to_string()
+    } else {
+        format!("{table_ref}.")
+    };
+    // ACTIVE_RESERVATION_LEGACY_PREDICATE references the bare `released_ts`
+    // column; qualify every occurrence with the requested table reference.
+    format!(
+        "({})",
+        ACTIVE_RESERVATION_LEGACY_PREDICATE
+            .replace("released_ts", &format!("{qualifier}released_ts"))
+    )
+}
+
+/// SQL that returns the reservation IDs recorded in the sidecar release ledger.
+///
+/// GH#180: fetch this set separately (a single-column scan, cheap in any engine)
+/// and subtract it from the candidate rows in Rust — this reproduces canonical
+/// SQLite's materialized `NOT IN` semantics without the per-join-row rescan.
+/// Reservation IDs are globally unique primary keys, so the unscoped ledger set
+/// is safe to subtract from project-scoped candidates.
+pub const RELEASED_RESERVATION_IDS_SQL: &str =
+    "SELECT reservation_id FROM file_reservation_releases";
+
 /// Decode `ProductRow` from raw SQL query result using positional (indexed) column access.
 /// Expected column order: `id`, `product_uid`, `name`, `created_at`.
 fn decode_product_row_indexed(row: &SqlRow) -> std::result::Result<ProductRow, DbError> {
@@ -3107,11 +3147,35 @@ fn release_atc_leader_lease_file_backed(
     result
 }
 
-fn is_hard_post_commit_probe_error(_error: &DbError) -> bool {
-    // Post-commit durability probes exist to prove that a write is query-visible
-    // from an independent handle before we report success. Any probe error means
-    // that proof failed, so none of these errors are advisory.
-    true
+fn is_hard_post_commit_probe_error(error: &DbError) -> bool {
+    // GH#179: a post-commit durability probe exists to prove a committed write is
+    // query-visible from an independent handle before we report success. A probe
+    // failure is only "hard" — i.e. positive proof the committed state is
+    // genuinely inconsistent and the row must be rolled back — when the probe
+    // actually RAN and observed the message row (or its recipient rows) to be
+    // absent/mismatched (a "ghost success").
+    //
+    // Every OTHER probe outcome — `SQLITE_BUSY` / "database is locked" / MVCC
+    // snapshot conflict / pool exhaustion / disk IO error / cancel / panic — is a
+    // probe *execution* failure. It says nothing about whether the committed row
+    // is durable; it only means we could not re-prove visibility from a fresh
+    // handle right now. Treating those as hard and deleting the already-committed
+    // `messages` / `message_recipients` rows is data loss under concurrent write
+    // pressure. Such errors are advisory: the committed row stays durable.
+    is_message_visibility_probe_consistency_error(error)
+}
+
+/// Decide whether a post-commit visibility-probe failure justifies destructive
+/// cleanup of the already-committed message.
+///
+/// GH#179: cleanup is only justified when the probe positively observed the
+/// committed state to be inconsistent (a ghost success, per
+/// [`is_hard_post_commit_probe_error`]) AND the writer's own post-commit sample
+/// did not independently confirm the message row landed. A transient/execution
+/// probe failure — or a probe failure contradicted by the writer's own
+/// confirmation that the row is present — must never delete committed data.
+fn post_commit_probe_requires_cleanup(error: &DbError, writer_confirms_durable: bool) -> bool {
+    is_hard_post_commit_probe_error(error) && !writer_confirms_durable
 }
 
 fn post_commit_probe_cancelled_error(operation: &'static str, detail: &str) -> DbError {
@@ -5676,7 +5740,6 @@ pub async fn create_message_with_recipients(
     .await
     {
         Outcome::Ok(()) => None,
-        Outcome::Err(e) if is_hard_post_commit_probe_error(&e) => Some(e),
         Outcome::Err(e) => Some(e),
         Outcome::Cancelled(_) => Some(post_commit_probe_cancelled_error(
             "create_message_with_recipients",
@@ -5689,18 +5752,39 @@ pub async fn create_message_with_recipients(
         )),
     };
     if let Some(error) = post_commit_probe_error {
-        let error =
-            annotate_message_visibility_error_with_writer_counts(error, writer_post_commit_counts);
-        return Outcome::Err(
-            cleanup_message_after_post_commit_probe_failure(
-                cx,
-                pool,
-                project_id,
-                message_id,
-                &recipient_agent_ids,
+        // GH#179: NEVER delete an already-committed message over a *probe*
+        // failure. The write transaction (guarded by `run_with_mvcc_retry`,
+        // ~20s budget) already committed; this fresh-handle probe only re-proves
+        // visibility. Destructive cleanup is justified ONLY when the probe
+        // positively observed a genuine inconsistency (a "ghost success" — the
+        // message/recipient rows absent, per `is_hard_post_commit_probe_error`)
+        // AND the writer's own post-commit sample did not independently confirm
+        // the message row landed. Transient busy/locked/MVCC/pool/IO failures —
+        // and cancel/panic — are advisory: the committed row stays durable and
+        // we return success, avoiding both the data loss and the compensating
+        // DELETE transaction that amplifies contention under swarm load.
+        let writer_confirms_durable = writer_post_commit_counts.message_count == Some(1);
+        if post_commit_probe_requires_cleanup(&error, writer_confirms_durable) {
+            let error = annotate_message_visibility_error_with_writer_counts(
                 error,
-            )
-            .await,
+                writer_post_commit_counts,
+            );
+            return Outcome::Err(
+                cleanup_message_after_post_commit_probe_failure(
+                    cx,
+                    pool,
+                    project_id,
+                    message_id,
+                    &recipient_agent_ids,
+                    error,
+                )
+                .await,
+            );
+        }
+        log_advisory_post_commit_probe_error(
+            "create_message_with_recipients",
+            &format!("{project_id}:{message_id}"),
+            &error.to_string(),
         );
     }
 
@@ -9111,7 +9195,7 @@ async fn get_active_reservations_once(
     project_id: i64,
 ) -> Outcome<Vec<FileReservationRow>, DbError> {
     let now = now_micros();
-    let active_predicate = active_reservation_predicate_for("fr");
+    let candidate_predicate = active_reservation_candidate_predicate_for("fr");
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -9125,46 +9209,80 @@ async fn get_active_reservations_once(
     // Force a fresh WAL snapshot so we never read stale reservation state.
     try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
 
-    let sql = format!(
+    // GH#180: fetch candidate active rows with the cheap `released_ts` predicate
+    // (no release-ledger join, no `NOT IN` subquery), then subtract the release
+    // ledger in Rust. This avoids the O(N·M) per-join-row rescan of the
+    // uncorrelated `NOT IN` subquery under sqlmodel-frankensqlite that made this
+    // a ~24s daemon-dispatch query on a 30k-row store, while producing identical
+    // results. Survivors are (by definition) absent from the release ledger, so
+    // their authoritative `released_ts` is `fr.released_ts`.
+    let candidate_sql = format!(
         "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+                fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
          FROM file_reservations fr \
-         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
-         WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ?"
+         WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ?"
     );
-    let params = [Value::BigInt(project_id), Value::BigInt(now)];
+    let candidate_params = [Value::BigInt(project_id), Value::BigInt(now)];
 
-    let result = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                match decode_file_reservation_row(&row) {
-                    Ok(decoded) => out.push(decoded),
-                    Err(e) => {
-                        rollback_tx(cx, &tracked).await;
-                        return Outcome::Err(e);
+    let mut candidates =
+        match map_sql_outcome(traw_query(cx, &tracked, &candidate_sql, &candidate_params).await) {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_file_reservation_row(&row) {
+                        Ok(decoded) => out.push(decoded),
+                        Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(e);
+                        }
                     }
                 }
+                out
             }
-            Outcome::Ok(out)
-        }
-        Outcome::Err(e) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-        Outcome::Cancelled(r) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Cancelled(r);
-        }
-        Outcome::Panicked(p) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Panicked(p);
-        }
-    };
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
+
+    let released_ids =
+        match map_sql_outcome(traw_query(cx, &tracked, RELEASED_RESERVATION_IDS_SQL, &[]).await) {
+            Outcome::Ok(rows) => {
+                let mut set = std::collections::HashSet::with_capacity(rows.len());
+                for row in &rows {
+                    if let Some(id) = row.get(0).and_then(value_as_i64) {
+                        set.insert(id);
+                    }
+                }
+                set
+            }
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
+
+    candidates.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
 
     // Commit the read-only IMMEDIATE tx to release the write lock promptly.
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    result
+    Outcome::Ok(candidates)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9753,14 +9871,17 @@ async fn list_file_reservations_once(
 
     let (sql, params) = if active_only {
         let now = now_micros();
-        let active_predicate = active_reservation_predicate_for("fr");
+        // GH#180: candidate rows via the cheap `released_ts` predicate (no
+        // release-ledger join, no `NOT IN`); the ledger is subtracted in Rust
+        // below. Survivors are absent from the ledger, so `fr.released_ts` is
+        // their authoritative released_ts.
+        let candidate_predicate = active_reservation_candidate_predicate_for("fr");
         (
             format!(
                 "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                        fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
+                        fr.created_ts, fr.expires_ts, fr.released_ts AS released_ts \
                  FROM file_reservations fr \
-                 LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
-                 WHERE fr.project_id = ? AND ({active_predicate}) AND fr.expires_ts > ? ORDER BY fr.id"
+                 WHERE fr.project_id = ? AND {candidate_predicate} AND fr.expires_ts > ? ORDER BY fr.id"
             ),
             vec![Value::BigInt(project_id), Value::BigInt(now)],
         )
@@ -9791,7 +9912,7 @@ async fn list_file_reservations_once(
     };
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
-    let result = match rows_out {
+    let mut result = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
@@ -9912,6 +10033,36 @@ async fn list_file_reservations_once(
 
     // Commit the read-only IMMEDIATE tx.
     if active_only {
+        // GH#180: subtract the sidecar release ledger in Rust (the candidate
+        // query above intentionally omits the O(N·M) `NOT IN` anti-join).
+        if let Outcome::Ok(rows) = &mut result {
+            let released_ids = match map_sql_outcome(
+                traw_query(cx, &tracked, RELEASED_RESERVATION_IDS_SQL, &[]).await,
+            ) {
+                Outcome::Ok(id_rows) => {
+                    let mut set = std::collections::HashSet::with_capacity(id_rows.len());
+                    for row in &id_rows {
+                        if let Some(id) = row.get(0).and_then(value_as_i64) {
+                            set.insert(id);
+                        }
+                    }
+                    set
+                }
+                Outcome::Err(e) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(p);
+                }
+            };
+            rows.retain(|row| row.id.is_none_or(|id| !released_ids.contains(&id)));
+        }
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     }
     result
@@ -20106,24 +20257,66 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_probe_errors_are_never_advisory() {
-        assert!(is_hard_post_commit_probe_error(&DbError::Sqlite(
-            "disk I/O error".to_string(),
-        )));
-        assert!(is_hard_post_commit_probe_error(&DbError::Pool(
+    fn post_commit_probe_transient_errors_are_advisory_consistency_errors_are_hard() {
+        // GH#179: transient / execution probe failures prove nothing about the
+        // durability of the already-committed row, so they must be advisory
+        // (never trigger destructive cleanup of committed data).
+        assert!(!is_hard_post_commit_probe_error(&DbError::Sqlite(
             "database is locked".to_string(),
         )));
-        assert!(is_hard_post_commit_probe_error(&DbError::PoolExhausted {
+        assert!(!is_hard_post_commit_probe_error(&DbError::Sqlite(
+            "disk I/O error".to_string(),
+        )));
+        assert!(!is_hard_post_commit_probe_error(&DbError::Pool(
+            "database is locked".to_string(),
+        )));
+        assert!(!is_hard_post_commit_probe_error(&DbError::PoolExhausted {
             message: "pool exhausted".to_string(),
             pool_size: 1,
             max_overflow: 0,
         }));
-        assert!(is_hard_post_commit_probe_error(&DbError::ResourceBusy(
-            "probe cancelled".to_string(),
+        assert!(!is_hard_post_commit_probe_error(&DbError::ResourceBusy(
+            "database is busy (snapshot conflict on pages: 5)".to_string(),
+        )));
+        // The cancel/panic wrapper errors are likewise advisory: a cancelled or
+        // panicked probe cannot prove the committed row is inconsistent.
+        assert!(!is_hard_post_commit_probe_error(&post_commit_probe_cancelled_error(
+            "create_message_with_recipients",
+            "1:42",
+        )));
+        assert!(!is_hard_post_commit_probe_error(&post_commit_probe_panicked_error(
+            "create_message_with_recipients",
+            "1:42",
+            "boom",
+        )));
+        // Only a probe that RAN and observed a genuine ghost success is hard.
+        assert!(is_hard_post_commit_probe_error(&DbError::Internal(
+            "message row not visible after commit for message_id=1 project_id=1".to_string(),
         )));
         assert!(is_hard_post_commit_probe_error(&DbError::Internal(
-            "probe panicked".to_string(),
+            "message recipient rows not visible after commit for message_id=1: expected=2 actual=0"
+                .to_string(),
         )));
+    }
+
+    #[test]
+    fn post_commit_probe_requires_cleanup_only_on_proven_inconsistency() {
+        // GH#179 regression: a transient probe error after a committed write must
+        // NOT trigger cleanup, regardless of the writer's own sample.
+        let transient = DbError::Sqlite("database is locked".to_string());
+        assert!(!post_commit_probe_requires_cleanup(&transient, false));
+        assert!(!post_commit_probe_requires_cleanup(&transient, true));
+
+        // A genuine ghost-success verdict triggers cleanup only when the writer's
+        // own post-commit sample also failed to confirm the row is present.
+        let ghost = DbError::Internal(
+            "message recipient rows not visible after commit for message_id=1: expected=2 actual=0"
+                .to_string(),
+        );
+        assert!(post_commit_probe_requires_cleanup(&ghost, false));
+        // Writer confirms the message row landed → cross-handle visibility lag,
+        // not missing data → never delete.
+        assert!(!post_commit_probe_requires_cleanup(&ghost, true));
     }
 
     #[test]
