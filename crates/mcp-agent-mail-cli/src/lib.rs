@@ -15038,7 +15038,10 @@ fn cli_released_reservation_ids(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> CliResult<std::collections::HashSet<i64>> {
     let rows = conn
-        .query_sync(mcp_agent_mail_db::queries::RELEASED_RESERVATION_IDS_SQL, &[])
+        .query_sync(
+            mcp_agent_mail_db::queries::RELEASED_RESERVATION_IDS_SQL,
+            &[],
+        )
         .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
     let mut set = std::collections::HashSet::with_capacity(rows.len());
     for row in &rows {

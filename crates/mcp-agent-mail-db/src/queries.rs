@@ -20280,15 +20280,12 @@ mod tests {
         )));
         // The cancel/panic wrapper errors are likewise advisory: a cancelled or
         // panicked probe cannot prove the committed row is inconsistent.
-        assert!(!is_hard_post_commit_probe_error(&post_commit_probe_cancelled_error(
-            "create_message_with_recipients",
-            "1:42",
-        )));
-        assert!(!is_hard_post_commit_probe_error(&post_commit_probe_panicked_error(
-            "create_message_with_recipients",
-            "1:42",
-            "boom",
-        )));
+        assert!(!is_hard_post_commit_probe_error(
+            &post_commit_probe_cancelled_error("create_message_with_recipients", "1:42",)
+        ));
+        assert!(!is_hard_post_commit_probe_error(
+            &post_commit_probe_panicked_error("create_message_with_recipients", "1:42", "boom",)
+        ));
         // Only a probe that RAN and observed a genuine ghost success is hard.
         assert!(is_hard_post_commit_probe_error(&DbError::Internal(
             "message row not visible after commit for message_id=1 project_id=1".to_string(),
