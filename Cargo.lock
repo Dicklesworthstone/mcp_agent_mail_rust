@@ -1871,6 +1871,7 @@ name = "frankensearch-core"
 version = "0.2.1"
 dependencies = [
  "asupersync",
+ "compact_str",
  "serde",
  "serde_json",
  "sha2 0.11.0",
