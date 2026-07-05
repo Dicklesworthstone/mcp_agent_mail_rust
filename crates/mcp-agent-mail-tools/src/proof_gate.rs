@@ -491,9 +491,14 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// A consumed proof nonce, keyed by the issuer public key it was signed under.
+type NonceKey = (Vec<u8>, String);
+/// Process-wide map of consumed nonces → retain-until timestamp.
+type NonceStore = Mutex<HashMap<NonceKey, i64>>;
+
 /// Process-wide store of consumed `(public_key, nonce)` pairs → retain-until ts.
-fn nonce_store() -> &'static Mutex<HashMap<(Vec<u8>, String), i64>> {
-    static STORE: OnceLock<Mutex<HashMap<(Vec<u8>, String), i64>>> = OnceLock::new();
+fn nonce_store() -> &'static NonceStore {
+    static STORE: OnceLock<NonceStore> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -515,6 +520,7 @@ fn consume_nonce(
         return Err(());
     }
     guard.insert(key, retain_until);
+    drop(guard);
     Ok(())
 }
 
@@ -611,7 +617,7 @@ mod tests {
         }
     }
 
-    fn request<'a>(proof: Option<&'a str>) -> RegistrationRequest<'a> {
+    fn request(proof: Option<&str>) -> RegistrationRequest<'_> {
         RegistrationRequest {
             agent_name: "BlueLake",
             project_key: "/data/projects/backend",
