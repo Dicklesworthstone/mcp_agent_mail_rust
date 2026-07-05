@@ -7,7 +7,7 @@
 //! exactly as an operator would, and asserting:
 //!
 //! - disabled gate  => registration works with no proof (unchanged behavior);
-//! - enabled gate + no proof   => every entry point fails closed (PROOF_REQUIRED);
+//! - enabled gate + no proof   => every entry point fails closed (`PROOF_REQUIRED`);
 //! - enabled gate + valid proof => registration succeeds through the tool and
 //!   through a macro (proving macros forward the proof and cannot bypass it).
 
@@ -106,6 +106,7 @@ fn b64(bytes: &[u8]) -> String {
 /// Reproduce the verifier's canonical signed bytes (see
 /// `mcp_agent_mail_tools::proof_gate::canonical_message`). Any external signer
 /// would reproduce exactly this.
+#[allow(clippy::too_many_arguments)] // mirrors the signed claim set 1:1
 fn canonical_message(
     identity: &str,
     project_key: &str,
