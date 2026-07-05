@@ -278,14 +278,14 @@ if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
         mv "${ALPHA_ARTIFACT}.tmp" "${ALPHA_ARTIFACT}"
     e2e_log "F2: injected path_pattern drift into ${ALPHA_ARTIFACT}"
 
-    amrun "${ART}/f2_health.json" doctor health
-    if grep -q "reservation_parity: drift" "${ART}/f2_health.json" "${ART}/f2_health.json.err" 2>/dev/null; then
+    amrun "${ART}/f2_health.txt" doctor health
+    if grep -q "reservation_parity: drift" "${ART}/f2_health.txt" "${ART}/f2_health.txt.err" 2>/dev/null; then
         e2e_pass "F2: doctor health surfaces reservation_parity drift"
     else
         e2e_fail "F2: doctor health did not report reservation_parity drift"
-        printf '      out: %s\n' "$(head -c 240 "${ART}/f2_health.json" 2>/dev/null | tr '\n' ' ')"
+        printf '      out: %s\n' "$(head -c 240 "${ART}/f2_health.txt" 2>/dev/null | tr '\n' ' ')"
     fi
-    if grep -q "path_pattern" "${ART}/f2_health.json" "${ART}/f2_health.json.err" 2>/dev/null; then
+    if grep -q "path_pattern" "${ART}/f2_health.txt" "${ART}/f2_health.txt.err" 2>/dev/null; then
         e2e_pass "F2: doctor health names the drifted field (path_pattern)"
     else
         e2e_fail "F2: doctor health did not name the drifted field"
@@ -326,12 +326,12 @@ if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
         printf '      got: %s\n' "$(jq -c . "${ALPHA_ARTIFACT}" 2>/dev/null | head -c 240)"
     fi
 
-    amrun "${ART}/f1b_health.json" doctor health
-    if grep -q "reservation_parity: ok" "${ART}/f1b_health.json" "${ART}/f1b_health.json.err" 2>/dev/null; then
+    amrun "${ART}/f1b_health.txt" doctor health
+    if grep -q "reservation_parity: ok" "${ART}/f1b_health.txt" "${ART}/f1b_health.txt.err" 2>/dev/null; then
         e2e_pass "F2: doctor health reports parity ok after the heal"
     else
         e2e_fail "F2: doctor health still reports drift after the heal"
-        printf '      out: %s\n' "$(grep -h reservation_parity "${ART}/f1b_health.json" "${ART}/f1b_health.json.err" 2>/dev/null | head -c 240)"
+        printf '      out: %s\n' "$(grep -h reservation_parity "${ART}/f1b_health.txt" "${ART}/f1b_health.txt.err" 2>/dev/null | head -c 240)"
     fi
 else
     e2e_skip "F1b skipped: no drifted artifact available to heal"
@@ -359,13 +359,13 @@ if [ -n "${RES_ID}" ] && [ -f "${ALPHA_ARTIFACT}" ]; then
         "${ALPHA_ARTIFACT}" '.released_ts != null'
 fi
 
-amrun "${ART}/f3_cli_release.json" file_reservations release "${PROJECT_KEY}" GoldFox \
+amrun "${ART}/f3_cli_release.txt" file_reservations release "${PROJECT_KEY}" GoldFox \
     --paths "src/alpha/**"
-if grep -q "Released 0 reservation(s)" "${ART}/f3_cli_release.json" 2>/dev/null; then
-    e2e_pass "F3: CLI double-release is a clean 'Released 0' no-op (exit $(cat "${ART}/f3_cli_release.json.exit" 2>/dev/null))"
+if grep -q "Released 0 reservation(s)" "${ART}/f3_cli_release.txt" 2>/dev/null; then
+    e2e_pass "F3: CLI double-release is a clean 'Released 0' no-op (exit $(cat "${ART}/f3_cli_release.txt.exit" 2>/dev/null))"
 else
     e2e_fail "F3: CLI double-release did not report a released=0 no-op"
-    printf '      out: %s\n' "$(head -c 240 "${ART}/f3_cli_release.json" 2>/dev/null | tr '\n' ' ')"
+    printf '      out: %s\n' "$(head -c 240 "${ART}/f3_cli_release.txt" 2>/dev/null | tr '\n' ' ')"
 fi
 
 # ---------------------------------------------------------------------------
@@ -378,19 +378,30 @@ stdio_session "${UNAVAIL_DB}" "${ART}/f3_queue.jsonl" \
     "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"SilverWolf\",\"paths\":[\"docs/**\"]}}}"
 
 INTENT_LOG="${STORAGE_ROOT}/degraded_intents/release_file_reservations.jsonl"
-if [ -f "${INTENT_LOG}" ] && grep -q "SilverWolf" "${INTENT_LOG}"; then
+RELEASE_RESPONDED="$(jq -r 'select(.id == 50) | "yes"' "${ART}/f3_queue.jsonl" 2>/dev/null | head -1)"
+if [ "${RELEASE_RESPONDED}" != "yes" ]; then
+    # The stdio server fails CLOSED at boot against a fully-unavailable DB
+    # (its pool/readiness init errors out before any tools/call executes), so
+    # the mid-session release-intent QUEUE path has no black-box trigger here —
+    # same verdict as N10 (test_degraded_intents_replay.sh). The queue write,
+    # auto-replay, and abandon-on-missing semantics are covered in-process by
+    # DB-backed integration tests:
+    #   tools reservations::tests::replay_queued_release_intent_releases_once
+    #   tools reservations::tests::replay_release_intent_does_not_release_lease_reacquired_by_other_agent
+    #   cli robot::tests::build_queued_intents_surfaces_ack_and_send
+    e2e_skip "F3 queue path: serve-stdio fails closed at boot on an unavailable mailbox (no tools/call ran; boot-time unavailability cannot reach the mid-session release-intent queue); queue/replay semantics are covered by the DB-backed integration tests"
+elif [ -f "${INTENT_LOG}" ] && grep -q "SilverWolf" "${INTENT_LOG}"; then
     e2e_pass "F3: durable release intent written to degraded_intents/ (queued, not lost)"
+    amrun "${ART}/f3_robot_queued.json" robot status --project "${PROJECT_KEY}" \
+        --agent SilverWolf --format json
+    if jq -e . "${ART}/f3_robot_queued.json" >/dev/null 2>&1; then
+        check "F3: robot status surfaces the queued release intent" "${ART}/f3_robot_queued.json" \
+            '[.queued_intents[]? | select(.kind == "release_file_reservations")] | length >= 1'
+    else
+        e2e_fail "F3: robot status emitted no JSON while a release intent was queued"
+    fi
 else
-    e2e_fail "F3: no durable release intent found at ${INTENT_LOG}"
-fi
-
-amrun "${ART}/f3_robot_queued.json" robot status --project "${PROJECT_KEY}" \
-    --agent SilverWolf --format json
-if jq -e . "${ART}/f3_robot_queued.json" >/dev/null 2>&1; then
-    check "F3: robot status surfaces the queued release intent" "${ART}/f3_robot_queued.json" \
-        '[.queued_intents[]? | select(.kind == "release_file_reservations")] | length >= 1'
-else
-    e2e_fail "F3: robot status emitted no JSON while a release intent was queued"
+    e2e_fail "F3: release ran against the unavailable mailbox but queued no durable intent (${INTENT_LOG})"
 fi
 
 stdio_session "${HEALTHY_DB}" "${ART}/f3_replay.jsonl" \
@@ -405,7 +416,8 @@ check "F3: healthy release succeeds after the outage" "${ART}/f3_replay.json" \
 amrun "${ART}/f3_robot_cleared.json" robot status --project "${PROJECT_KEY}" \
     --agent SilverWolf --format json
 if jq -e . "${ART}/f3_robot_cleared.json" >/dev/null 2>&1; then
-    check "F3: queued release intent cleared after auto-replay" "${ART}/f3_robot_cleared.json" \
+    check "F3: no queued release intent remains after the healthy release" \
+        "${ART}/f3_robot_cleared.json" \
         '[.queued_intents[]? | select(.kind == "release_file_reservations")] | length == 0'
 else
     e2e_fail "F3: robot status emitted no JSON after the replay"
