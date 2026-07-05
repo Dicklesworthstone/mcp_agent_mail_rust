@@ -349,7 +349,7 @@ mod tests {
         use frankensearch::core::types::ScoreSource;
 
         let fs_result = FsScoredResult {
-            doc_id: "123".to_string(),
+            doc_id: "123".to_string().into(),
             score: 0.95,
             source: ScoreSource::SemanticFast,
             index: None,
@@ -375,7 +375,7 @@ mod tests {
         use frankensearch::core::types::ScoreSource;
 
         let fs_result = FsScoredResult {
-            doc_id: "not-a-u64".to_string(),
+            doc_id: "not-a-u64".to_string().into(),
             score: 0.5,
             source: ScoreSource::Hybrid,
             index: None,
@@ -397,7 +397,7 @@ mod tests {
 
         fn make(id: &str, score: f32) -> FsScoredResult {
             FsScoredResult {
-                doc_id: id.to_string(),
+                doc_id: id.to_string().into(),
                 score,
                 source: ScoreSource::SemanticFast,
                 index: None,
