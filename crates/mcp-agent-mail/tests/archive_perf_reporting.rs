@@ -161,6 +161,11 @@ fn archive_perf_profile_run_emits_extended_artifacts() {
     assert!(profile_md.contains("## Structured Logging Requirements"));
     assert!(profile_md.contains("## Hypothesis Evaluation"));
 
-    assert!(perf_artifact_path("archive_batch_scaling_2026-04-18.csv").exists());
-    assert!(perf_artifact_path("archive_batch_100_spans_2026-04-18.json").exists());
+    // The profile run also emits date-stamped copies of both artifacts. Assert
+    // the files stamped with the date THIS run used — a hardcoded historical
+    // date only exists as an untracked local artifact (tests/artifacts/ is
+    // gitignored), so it fails on any fresh checkout or remote test worker.
+    let stamp = benchmarks::perf_artifact_date();
+    assert!(perf_artifact_path(&format!("archive_batch_scaling_{stamp}.csv")).exists());
+    assert!(perf_artifact_path(&format!("archive_batch_100_spans_{stamp}.json")).exists());
 }

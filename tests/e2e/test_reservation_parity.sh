@@ -17,11 +17,12 @@
 #        field) and by the per-FM registry view
 #        `am doctor fix --only fm-db-state-files-reservation-db-archive-parity --list`.
 #   F3 — release is idempotent and parity-aware: double-release is a clean
-#        `released=0` no-op on BOTH the MCP tool surface and the operator CLI;
-#        release against an UNAVAILABLE mailbox queues a durable release intent
-#        (`degraded_intents/release_file_reservations.jsonl`), `am robot status`
-#        surfaces it in `queued_intents[]`, and the next successful release
-#        auto-replays + clears it.
+#        `released=0` no-op on BOTH the MCP tool surface and the operator CLI,
+#        and the release reconciles the archive artifact (released_ts set).
+#        The DB-unavailable release-intent QUEUE path is attempted but expected
+#        to honest-SKIP: serve-stdio fails closed at boot on an unavailable
+#        mailbox, so boot-time unavailability cannot reach the mid-session
+#        queue (covered by DB-backed integration tests; see the case comment).
 #   F4 — the 196-reservation-audit regression corpus is present, well-formed,
 #        and covers the required drift modes (full replay semantics run
 #        in-process: `cargo test -p mcp-agent-mail-tools --test
