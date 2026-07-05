@@ -77751,6 +77751,14 @@ fn resolve_deploy_tooling_repo_root_uses_bundle_ancestors_instead_of_cwd() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::create_dir_all(&bundle).unwrap();
     std::fs::write(repo_root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    // Hermeticity (br-yceqd): the tempdir may sit INSIDE a real git repo (rch
+    // workers run tests with TMPDIR inside the synced checkout), and git
+    // discovery is consulted before marker discovery — the enclosing real repo
+    // would win over the fixture's Cargo.toml marker. A garbage `.git` FILE at
+    // the tempdir root aborts git upward discovery ("invalid gitfile format"),
+    // and the marker walk finds the fixture's Cargo.toml at repo_root before it
+    // could ever see that file.
+    std::fs::write(dir.path().join(".git"), "not a gitfile\n").unwrap();
 
     let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
     assert_eq!(resolved, repo_root);
@@ -77786,6 +77794,22 @@ fn resolve_deploy_tooling_repo_root_does_not_fall_back_to_unrelated_cwd_repo() {
     let bundle_parent = bundle_root.path().join("exports");
     let bundle = bundle_parent.join("bundle");
     std::fs::create_dir_all(&bundle).unwrap();
+    // Hermeticity: this test needs the bundle to resolve NO enclosing repo, but
+    // the tempdir is not guaranteed to sit outside one (rch workers run tests
+    // with TMPDIR inside the synced repo checkout, br-yceqd). Make bundle_root a
+    // deterministic discovery boundary on every environment:
+    //  - a garbage `.git` FILE aborts git upward discovery ("invalid gitfile
+    //    format"), so git_repo_root() is None;
+    //  - sticky + world-writable (mode 1777, like /tmp) makes bundle_root an
+    //    is_shared_ancestor_boundary(), stopping the marker walk BEFORE it can
+    //    see that `.git` file (the boundary check precedes the marker check).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(bundle_root.path().join(".git"), "not a gitfile\n").unwrap();
+        std::fs::set_permissions(bundle_root.path(), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+    }
 
     let _cwd = LocalCwdGuard::chdir(cwd_repo.path());
     let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
