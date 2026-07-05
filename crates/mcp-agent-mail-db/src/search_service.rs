@@ -3337,7 +3337,7 @@ async fn maybe_apply_hybrid_rerank(
     let mut fs_candidates = merged
         .iter()
         .map(|result| FsScoredResult {
-            doc_id: result.id.to_string(),
+            doc_id: result.id.to_string().into(),
             score: result.score.unwrap_or(0.0) as f32,
             source: fs::core::types::ScoreSource::Hybrid,
             index: None,

@@ -124,7 +124,7 @@ pub fn from_fs_scored_results(
 pub fn to_fs_scored_result(result: &crate::search_two_tier::ScoredResult) -> FsScoredResult {
     use frankensearch::core::types::ScoreSource;
     FsScoredResult {
-        doc_id: doc_id_to_string(result.doc_id),
+        doc_id: doc_id_to_string(result.doc_id).into(),
         score: result.score,
         source: ScoreSource::SemanticFast,
         index: None,
