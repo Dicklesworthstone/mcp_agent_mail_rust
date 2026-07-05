@@ -373,21 +373,23 @@ fn escalate(
                     config: config.clone(),
                     reservations: res_jsons,
                 };
-                match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
-                    mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-                    | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
-                    mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
+                // Write the grant artifact directly (GH#178 semantics), never
+                // via the write-behind queue: a QUEUED active-grant op drained
+                // after the holder's later direct-written release would
+                // resurrect a stale-active artifact (wrong holder until TTL),
+                // and reconcile-on-read only walks active rows so nothing would
+                // heal it. On failure the DB row stays authoritative and
+                // reconcile-on-read re-emits the artifact on the next
+                // reservation read in this project.
+                match mcp_agent_mail_storage::write_op_sync_direct(&op) {
+                    mcp_agent_mail_storage::DirectArchiveWrite::Written
+                    | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
+                    mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
                         warn!(
+                            error = %error,
                             project = %project.slug,
-                            "WBQ unavailable during ACK escalation archive write; falling back to synchronous storage write"
+                            "ACK escalation archive write failed; leaving the artifact to reconcile-on-read"
                         );
-                        if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
-                            warn!(
-                                error = %error,
-                                project = %project.slug,
-                                "ACK escalation archive fallback write failed"
-                            );
-                        }
                     }
                 }
             }

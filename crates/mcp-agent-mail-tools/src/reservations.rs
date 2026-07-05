@@ -249,8 +249,9 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
 /// present and non-null)?
 ///
 /// Terminal release artifacts are safe to re-emit from the write-behind queue at
-/// any later time: reservation ids are never reused (the keyed id allocator,
-/// GH#176), so no later mutation can make a queued release stale. Any op carrying
+/// any later time: `file_reservations.id` is `INTEGER PRIMARY KEY AUTOINCREMENT`
+/// (ids are never reused, even after row deletion), so no later mutation can
+/// make a queued release stale. Any op carrying
 /// an ACTIVE record (grant/renew/reconcile heals) is NOT safe to queue after a
 /// failed direct write — see `dispatch_reservation_archive_write`.
 fn reservation_op_is_terminal_release(op: &mcp_agent_mail_storage::WriteOp) -> bool {
@@ -3122,6 +3123,76 @@ mod tests {
             &present,
         );
         assert_eq!(heal.len(), 1);
+    }
+
+    #[test]
+    fn terminal_release_classifier_gates_the_queued_fallback() {
+        // Only ops whose EVERY record is a terminal release (released_ts present,
+        // non-null) may fall back to the write-behind queue after a failed direct
+        // write: a queued ACTIVE record drained later would resurrect a
+        // stale-active artifact over a newer direct-written release.
+        let fr_op = |records: Vec<Value>| mcp_agent_mail_storage::WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config: Config::get(),
+            reservations: records,
+        };
+        let active = json!({"id": 1, "agent": "GreenCastle", "path_pattern": "src/**"});
+        let active_null_release = json!({"id": 1, "released_ts": null});
+        let released = json!({"id": 1, "released_ts": "2026-07-05T00:00:00.000000Z"});
+
+        assert!(reservation_op_is_terminal_release(&fr_op(vec![
+            released.clone()
+        ])));
+        assert!(!reservation_op_is_terminal_release(&fr_op(vec![
+            active.clone()
+        ])));
+        assert!(!reservation_op_is_terminal_release(&fr_op(vec![
+            active_null_release
+        ])));
+        // A mixed batch carries an active record -> not safe to queue.
+        assert!(!reservation_op_is_terminal_release(&fr_op(vec![
+            released, active
+        ])));
+        // An empty op has nothing terminal about it.
+        assert!(!reservation_op_is_terminal_release(&fr_op(Vec::new())));
+    }
+
+    #[test]
+    fn heal_emits_stale_expires_ts_after_renew() {
+        // A renewal changes ONLY expires_ts. A pre-renew artifact left behind by
+        // a failed direct write must be flagged as divergent, or the pre-commit
+        // guard (which reads the artifact directly) drops protection at the OLD
+        // expiry while the DB lease is still live.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut stale = archive_view(1, "GreenCastle", Some("src/**"), Some(true), None);
+        stale.expires_ts = Some(5_000);
+        let mut present = BTreeMap::new();
+        present.insert(1, stale);
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "stale pre-renew expiry must heal");
+    }
+
+    #[test]
+    fn heal_is_noop_when_expires_ts_matches() {
+        // The exact-match case: same expiry (as after a clean grant/renew write)
+        // must never re-heal, or every read would churn the archive.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, None)];
+        let mut view = archive_view(1, "GreenCastle", Some("src/**"), Some(true), None);
+        view.expires_ts = Some(9_999);
+        let mut present = BTreeMap::new();
+        present.insert(1, view);
+        let heal = reservation_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(heal.is_empty(), "a matching expiry must not re-emit");
     }
 
     #[test]

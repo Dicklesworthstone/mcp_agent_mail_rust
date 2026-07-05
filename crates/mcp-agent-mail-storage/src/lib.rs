@@ -645,11 +645,17 @@ pub enum DirectArchiveWrite {
     /// durable; the git commit is coalesced asynchronously.
     Written,
     /// Skipped because the disk is under critical pressure. The DB remains
-    /// authoritative and reconcile-on-read heals the archive once pressure
-    /// clears (matching the write-behind-queue's disk-critical skip).
+    /// authoritative; for ACTIVE reservation artifacts (grant/renew)
+    /// reconcile-on-read heals the archive once pressure clears (matching the
+    /// write-behind-queue's disk-critical skip). A skipped RELEASE artifact is
+    /// only revisited if the caller re-emits it (reconcile-on-read walks active
+    /// rows only); the guard still stops honoring it at `expires_ts`.
     SkippedDiskCritical,
-    /// The synchronous write failed; the caller should fall back (for example,
-    /// enqueue onto the write-behind queue for a later background retry).
+    /// The synchronous write failed. Callers must choose the fallback by op
+    /// content: a terminal release artifact may be re-queued for background
+    /// retry, but a queued ACTIVE (grant/renew) op drained after a newer
+    /// direct-written release would resurrect a stale-active artifact — see
+    /// `dispatch_reservation_archive_write` in `mcp-agent-mail-tools`.
     Failed(StorageError),
 }
 
@@ -683,11 +689,11 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
 /// Outcome of a write-behind-queue flush, so a durability-sensitive caller can
 /// tell "the archive is now on disk" from "the drain thread never confirmed".
 ///
-/// [`wbq_flush`] discards this and only warns; callers that MUST see their write
-/// land before returning (the reservation archive chokepoint — the pre-commit
-/// guard reads reservation JSON artifacts directly, so a stale archive yields a
-/// wrong holder, GH#112) should use [`wbq_flush_status`] and fall back to
-/// [`write_op_sync`] on anything other than `Drained`/`NoQueue`.
+/// [`wbq_flush`] discards this and only warns. Callers that MUST see their write
+/// land before returning should prefer [`write_op_sync_direct`] (GH#178) — the
+/// reservation archive chokepoint moved to it because an enqueue-then-flush made
+/// every reservation grant a global FIFO barrier behind unrelated archive work.
+/// `wbq_flush_status` remains for drain-the-world callers (shutdown, tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WbqFlushOutcome {
     /// The drain thread acknowledged the flush; all enqueued ops are on disk.

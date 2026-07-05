@@ -242,10 +242,7 @@ fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()> {
             // intervenes. Quarantine the unusable sidecar by rename (never
             // delete) and rebuild a fresh one; only a failure on the fresh
             // file — a genuine environment problem — stays fatal.
-            let quarantine_path = format!(
-                "{sidecar_path}.quarantined-{}",
-                crate::now_micros()
-            );
+            let quarantine_path = format!("{sidecar_path}.quarantined-{}", crate::now_micros());
             std::fs::rename(&sidecar_path, &quarantine_path).map_err(|rename_error| {
                 DbError::Sqlite(format!(
                     "reconstruct: ATC sidecar {sidecar_path} is unusable ({first_error}) and \
@@ -303,10 +300,9 @@ fn apply_atc_sidecar_schema(sidecar_path: &str) -> DbResult<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(error) = std::fs::set_permissions(
-                sidecar_path,
-                std::fs::Permissions::from_mode(0o600),
-            ) {
+            if let Err(error) =
+                std::fs::set_permissions(sidecar_path, std::fs::Permissions::from_mode(0o600))
+            {
                 tracing::warn!(
                     path = %sidecar_path,
                     error = %error,

@@ -670,6 +670,92 @@ fn reconstruct_from_archive_recreates_atc_v17_schema_surface() {
     conn.execute_raw(PRAGMA_SETTINGS_SQL)
         .expect("apply sqlite pragmas");
     assert_atc_v17_schema_surface(&conn);
+
+    // A sidecar created by reconstruct must carry the same private posture as a
+    // runtime-created one: it holds project keys, subjects, and evidence
+    // summaries just like storage.sqlite3.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&sidecar_path)
+            .expect("stat atc sidecar")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "reconstruct-created ATC sidecar must be private (0600), got {mode:o}"
+        );
+    }
+}
+
+#[test]
+fn reconstruct_quarantines_unusable_atc_sidecar_instead_of_wedging_recovery() {
+    // The disk incident that corrupts the primary mailbox DB usually hits its
+    // same-directory sibling too. A corrupt atc.sqlite3 must NOT fatally wedge
+    // recovery of the PRIMARY mailbox (ATC telemetry is droppable by contract):
+    // reconstruct quarantines the unusable sidecar by rename and rebuilds a
+    // fresh one with the full v17 schema surface.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage_root = dir.path().join("storage");
+    let db_path = dir.path().join("reconstructed_quarantine.sqlite3");
+    let agent_dir = storage_root
+        .join("projects")
+        .join("quarantine-project")
+        .join("agents")
+        .join("GrayHeron");
+    std::fs::create_dir_all(&agent_dir).expect("create archive agent dir");
+    std::fs::write(
+        agent_dir.join("profile.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "GrayHeron",
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "task_description": "sidecar quarantine reconstruct test",
+            "inception_ts": "2026-04-18T00:00:00Z",
+            "last_active_ts": "2026-04-18T00:00:00Z",
+            "attachments_policy": "auto",
+            "contact_policy": "auto"
+        }))
+        .expect("serialize profile"),
+    )
+    .expect("write profile");
+
+    // Pre-plant a garbage sidecar where reconstruct will build atc.sqlite3.
+    let sidecar_path = db_path.with_file_name("atc.sqlite3");
+    std::fs::write(&sidecar_path, b"this is not a sqlite database").expect("plant corrupt sidecar");
+
+    mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
+        .expect("reconstruct must succeed despite a corrupt ATC sidecar");
+
+    // The unusable sidecar was quarantined by rename (never deleted)...
+    let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read dir")
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("atc.sqlite3.quarantined-")
+        })
+        .collect();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "expected exactly one quarantined sidecar next to the DB"
+    );
+    let quarantined_bytes = std::fs::read(quarantined[0].path()).expect("read quarantined sidecar");
+    assert_eq!(
+        quarantined_bytes, b"this is not a sqlite database",
+        "quarantine must preserve the original bytes verbatim"
+    );
+
+    // ...and a fresh, valid sidecar with the full v17 surface replaced it.
+    let conn = SqliteConnection::open_file(sidecar_path.display().to_string())
+        .expect("open rebuilt atc sidecar");
+    conn.execute_raw(PRAGMA_SETTINGS_SQL)
+        .expect("apply sqlite pragmas");
+    assert_atc_v17_schema_surface(&conn);
 }
 
 #[test]
