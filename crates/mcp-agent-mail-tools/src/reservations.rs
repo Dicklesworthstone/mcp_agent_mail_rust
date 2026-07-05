@@ -181,14 +181,16 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
 /// GH#112).
 ///
 /// The pre-commit guard reads the `id-<id>.json` reservation artifacts directly,
-/// so a stale archive yields a *wrong holder* — the exact #112 divergence. A bare
-/// enqueue + best-effort flush silently advances the DB while the archive stays
-/// stale whenever the drain thread stalls (a wedged git index lock), because
-/// `wbq_flush` only warns on timeout. So this verifies the flush actually
-/// drained; if it did not, the op is written synchronously on this thread before
-/// returning. Re-emission is idempotent (`write_file_reservation_records`
-/// overwrites the artifact), so a later drain of the same enqueued op is a
-/// harmless rewrite.
+/// so a stale archive yields a *wrong holder* — the exact #112 divergence. The
+/// artifact is written synchronously on this thread (GH#178) so it is durable on
+/// return; the git commit is coalesced asynchronously. When the direct write
+/// fails, the fallback depends on the op's content: a terminal release artifact
+/// (`released_ts` set) is safe to re-emit from the write-behind queue at any
+/// later time, but an ACTIVE grant/renew artifact is NOT — a queued active op
+/// drained after a newer direct-written release would resurrect a stale-active
+/// artifact (wrong holder until TTL), so active ops are dropped and healed by
+/// reconcile-on-read instead (the same convergence path as the disk-critical
+/// skip).
 fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
     // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
     // return because the pre-commit guard reads it directly; a stale artifact
@@ -213,16 +215,55 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
         // reconcile-on-read heals the archive once pressure clears.
         mcp_agent_mail_storage::DirectArchiveWrite::Written
         | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
-        // The direct write failed (e.g. a transient git index lock). The DB grant
-        // is authoritative and the archive is best-effort: fall back to the
-        // write-behind queue so a later drain re-emits the artifact idempotently.
+        // The direct write failed (e.g. ENOSPC, FD exhaustion). The DB state is
+        // authoritative and the archive is best-effort — but the fallback must
+        // not reorder history. A queued op's content is frozen at enqueue time,
+        // and the WBQ drains asynchronously: an ACTIVE (grant/renew/reconcile)
+        // op drained AFTER a newer direct-written release would overwrite the
+        // released artifact with a stale-active one, and reconcile-on-read only
+        // walks active rows, so nothing would ever heal it — the guard would
+        // report a wrong holder until TTL expiry. Terminal release artifacts
+        // can never go stale this way (ids are never reused), so only those are
+        // queued for background retry; active ops rely on reconcile-on-read,
+        // exactly like the disk-critical skip above.
         mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
-            tracing::warn!(
-                error = %error,
-                "{context}; synchronous reservation archive write failed; enqueueing for background retry"
-            );
-            try_dispatch_archive_write(op, context);
+            if reservation_op_is_terminal_release(&op) {
+                tracing::warn!(
+                    error = %error,
+                    "{context}; synchronous release-artifact write failed; enqueueing for background retry"
+                );
+                try_dispatch_archive_write(op, context);
+            } else {
+                tracing::warn!(
+                    error = %error,
+                    "{context}; synchronous reservation archive write failed; \
+                     leaving the artifact to reconcile-on-read (a queued stale-active \
+                     rewrite could shadow a newer release)"
+                );
+            }
         }
+    }
+}
+
+/// Is every record in this archive op a TERMINAL release artifact (`released_ts`
+/// present and non-null)?
+///
+/// Terminal release artifacts are safe to re-emit from the write-behind queue at
+/// any later time: reservation ids are never reused (the keyed id allocator,
+/// GH#176), so no later mutation can make a queued release stale. Any op carrying
+/// an ACTIVE record (grant/renew/reconcile heals) is NOT safe to queue after a
+/// failed direct write — see `dispatch_reservation_archive_write`.
+fn reservation_op_is_terminal_release(op: &mcp_agent_mail_storage::WriteOp) -> bool {
+    match op {
+        mcp_agent_mail_storage::WriteOp::FileReservation { reservations, .. } => {
+            !reservations.is_empty()
+                && reservations.iter().all(|record| {
+                    record
+                        .get("released_ts")
+                        .is_some_and(|value| !value.is_null())
+                })
+        }
+        _ => false,
     }
 }
 
@@ -270,6 +311,17 @@ fn active_archive_artifact_diverges(
     }
     if let Some(archive_exclusive) = view.exclusive
         && archive_exclusive != (row.exclusive != 0)
+    {
+        return true;
+    }
+    // A renewal changes ONLY `expires_ts`, so a stale pre-renew artifact would
+    // otherwise never be flagged — and the pre-commit guard (which reads the
+    // artifact directly) would drop protection at the old expiry. Present-but-
+    // different is drift; absence is not (br-xyy95). The round-trip is exact:
+    // artifacts store `micros_to_iso(row.expires_ts)` and the parser restores
+    // the identical microsecond value, so steady state never re-heals.
+    if let Some(archive_expires) = view.expires_ts
+        && archive_expires != row.expires_ts
     {
         return true;
     }
@@ -2962,6 +3014,7 @@ mod tests {
             path_pattern: path_pattern.map(str::to_string),
             exclusive,
             released_ts,
+            expires_ts: None,
         }
     }
 

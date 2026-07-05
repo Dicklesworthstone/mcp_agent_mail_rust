@@ -226,18 +226,95 @@ fn recreate_atc_sidecar_schema(primary_db_path: &Path) -> DbResult<()> {
         return Ok(());
     }
     let sidecar_path = crate::pool::atc_sidecar_sqlite_path(primary);
-    let sidecar = DbConn::open_file(&sidecar_path).map_err(|error| {
+    // Refuse a symlinked sidecar target, exactly like the primary reconstruct
+    // target and the salvage source: recovery must never write through a
+    // pre-planted link.
+    crate::pool::validate_sqlite_target_path(Path::new(&sidecar_path), "reconstruct ATC sidecar")
+        .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
+    match apply_atc_sidecar_schema(&sidecar_path) {
+        Ok(()) => Ok(()),
+        Err(first_error) if Path::new(&sidecar_path).exists() => {
+            // A pre-existing sidecar that cannot be opened/migrated (the disk
+            // incident that corrupted the primary DB usually hits its
+            // same-directory sibling too) must NOT wedge recovery of the
+            // PRIMARY mailbox: ATC telemetry is droppable by contract, while a
+            // fatal abort here blocks every reconstruct retry until a human
+            // intervenes. Quarantine the unusable sidecar by rename (never
+            // delete) and rebuild a fresh one; only a failure on the fresh
+            // file — a genuine environment problem — stays fatal.
+            let quarantine_path = format!(
+                "{sidecar_path}.quarantined-{}",
+                crate::now_micros()
+            );
+            std::fs::rename(&sidecar_path, &quarantine_path).map_err(|rename_error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: ATC sidecar {sidecar_path} is unusable ({first_error}) and \
+                     could not be quarantined to {quarantine_path}: {rename_error}"
+                ))
+            })?;
+            tracing::warn!(
+                sidecar = %sidecar_path,
+                quarantine = %quarantine_path,
+                error = %first_error,
+                "reconstruct: quarantined unusable ATC sidecar; rebuilding a fresh one"
+            );
+            apply_atc_sidecar_schema(&sidecar_path).map_err(|retry_error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: rebuild ATC sidecar {sidecar_path} after quarantining the \
+                     unusable one at {quarantine_path}: {retry_error}"
+                ))
+            })
+        }
+        // No sidecar file on disk and creation still failed: a real environment
+        // problem (permissions, disk). A recovery that silently half-succeeds is
+        // worse than one that fails loudly, so this stays fatal.
+        Err(error) => Err(error),
+    }
+}
+
+/// Open (creating if needed) the ATC sidecar at `sidecar_path` and apply the
+/// canonical ATC follow-up migration set.
+///
+/// A sidecar created here gets the same posture as one created by the live
+/// runtime (`ensure_file_backed_atc_pool_initialized`): WAL journal mode via
+/// `PRAGMA_DB_INIT_SQL` and private 0600 permissions — it carries project keys,
+/// subjects, and evidence summaries just like `storage.sqlite3`.
+fn apply_atc_sidecar_schema(sidecar_path: &str) -> DbResult<()> {
+    let preexisting = Path::new(sidecar_path).exists();
+    let sidecar = DbConn::open_file(sidecar_path).map_err(|error| {
         DbError::Sqlite(format!(
             "reconstruct: open ATC sidecar {sidecar_path}: {error}"
         ))
     })?;
     let _ = sidecar.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL);
-    // A sidecar-schema failure here is intentionally fatal to the whole
-    // reconstruct (propagated via `?`): a recovery that silently half-succeeds is
-    // worse than one that fails loudly. ATC telemetry is "trivially droppable"
-    // and the live runtime re-applies this same follower on next open, so the
-    // operator can also just delete the sidecar and re-run — but recovery
-    // integrity wins by default.
+    if !preexisting {
+        // journal_mode is DB-wide and intentionally omitted from
+        // PRAGMA_CONN_SETTINGS_SQL; apply it once at sidecar creation, exactly
+        // like the runtime creation path.
+        sidecar
+            .execute_raw(schema::PRAGMA_DB_INIT_SQL)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "reconstruct: set ATC sidecar db pragmas for {sidecar_path}: {error}"
+                ))
+            })?;
+        // Best-effort 0600, matching the runtime creation path: a chmod failure
+        // must not block recovery.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = std::fs::set_permissions(
+                sidecar_path,
+                std::fs::Permissions::from_mode(0o600),
+            ) {
+                tracing::warn!(
+                    path = %sidecar_path,
+                    error = %error,
+                    "reconstruct: failed to restrict ATC sidecar permissions to 0600"
+                );
+            }
+        }
+    }
     apply_snapshot_migrations(
         &sidecar,
         schema::schema_migrations_atc_runtime_canonical_followup(),
@@ -1397,9 +1474,10 @@ fn reconstruct_from_archive_impl(
 
         // ATC telemetry now lives in a dedicated sidecar DB (atc.sqlite3) that
         // is NOT part of the Git archive (br-bvq1x.11.7). Reconstruct rebuilds
-        // only the primary mailbox DB from the archive, so it intentionally
-        // materializes NO atc_* tables here — the sidecar is independent and
-        // untouched by reconstruct/quarantine. Reconstruct intentionally also
+        // the primary mailbox DB from the archive and intentionally materializes
+        // NO atc_* tables here — the sidecar's SCHEMA is (re)applied separately
+        // by `recreate_atc_sidecar_schema` (its data is droppable telemetry and
+        // is never salvaged from the archive). Reconstruct intentionally also
         // leaves FTS-backed message trigger follow-ups to the next live startup.
 
         // Rebuild all index b-trees to ensure consistency after bulk inserts.

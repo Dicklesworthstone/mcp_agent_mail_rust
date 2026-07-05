@@ -212,6 +212,10 @@ struct ArchiveReservationState {
     /// `None` when the archive artifact omits `exclusive` (br-xyy95).
     exclusive: Option<bool>,
     released_ts: Option<i64>,
+    /// `None` when the archive artifact omits `expires_ts` (absence is never
+    /// drift, br-xyy95). Consumed by reconcile-on-read so a stale pre-renew
+    /// artifact heals; the parity drift report intentionally does not count it.
+    expires_ts: Option<i64>,
 }
 
 impl ArchiveReservationState {
@@ -686,6 +690,10 @@ pub struct ArchiveReservationView {
     pub path_pattern: Option<String>,
     pub exclusive: Option<bool>,
     pub released_ts: Option<i64>,
+    /// `None` when the artifact omits `expires_ts` (absence is never drift).
+    /// Lets reconcile-on-read heal a stale pre-renew artifact whose only
+    /// divergence is the expiry.
+    pub expires_ts: Option<i64>,
 }
 
 impl From<ArchiveReservationState> for ArchiveReservationView {
@@ -697,6 +705,7 @@ impl From<ArchiveReservationState> for ArchiveReservationView {
             path_pattern: state.path_pattern,
             exclusive: state.exclusive,
             released_ts: state.released_ts,
+            expires_ts: state.expires_ts,
         }
     }
 }
@@ -760,6 +769,7 @@ fn parse_archive_reservation(
     let path_pattern = json_string(&json, "path_pattern").or_else(|| json_string(&json, "path"));
     let exclusive = json.get("exclusive").and_then(serde_json::Value::as_bool);
     let released_ts = parse_json_micros(&json, "released_ts");
+    let expires_ts = parse_json_micros(&json, "expires_ts");
 
     Ok(ArchiveReservationState {
         reservation_id,
@@ -769,6 +779,7 @@ fn parse_archive_reservation(
         path_pattern,
         exclusive,
         released_ts,
+        expires_ts,
     })
 }
 
@@ -828,6 +839,7 @@ mod tests {
             path_pattern: path.map(str::to_string),
             exclusive,
             released_ts: None,
+            expires_ts: None,
         }
     }
 
