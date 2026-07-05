@@ -36282,11 +36282,21 @@ mod tests {
     /// `am atc explain`/`simulate` snapshot preconditions require. A real
     /// deployment always has the primary (the server acquires pooled
     /// connections constantly); one acquire+release reproduces that.
+    ///
+    /// No-op when the primary already exists: a fixture that pre-created it via
+    /// `am migrate` (model-definition bootstrap + atc_* stripped to the sidecar)
+    /// is NOT ledger-aligned with the pool's incremental migration chain — an
+    /// acquire there would re-run pending migrations against the stripped
+    /// state (`v16_analyze_atc_experiences` → "no such table").
     fn materialize_primary_mailbox_db(
+        db_path: &Path,
         pool: &mcp_agent_mail_db::DbPool,
         runtime: &asupersync::runtime::Runtime,
         cx: &asupersync::Cx,
     ) {
+        if db_path.exists() {
+            return;
+        }
         match runtime.block_on(pool.acquire(cx)) {
             asupersync::Outcome::Ok(conn) => drop(conn),
             asupersync::Outcome::Err(error) => {
@@ -36310,7 +36320,7 @@ mod tests {
             .build()
             .expect("build ATC explain runtime");
         let cx = asupersync::Cx::for_testing();
-        materialize_primary_mailbox_db(&pool, &runtime, &cx);
+        materialize_primary_mailbox_db(db_path, &pool, &runtime, &cx);
         let created_ts_micros = 1_762_000_000_000_000i64;
         let features = mcp_agent_mail_core::FeatureVector {
             version: mcp_agent_mail_core::FEATURE_VERSION,
@@ -36453,7 +36463,7 @@ mod tests {
             .build()
             .expect("build ATC simulate runtime");
         let cx = asupersync::Cx::for_testing();
-        materialize_primary_mailbox_db(&pool, &runtime, &cx);
+        materialize_primary_mailbox_db(db_path, &pool, &runtime, &cx);
         let base_ts = 1_762_100_000_000_000i64;
 
         let blue_features = mcp_agent_mail_core::FeatureVector {
