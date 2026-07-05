@@ -295,7 +295,11 @@ fn test_default_gates_count() {
     use mcp_agent_mail_cli::ci::default_gates;
 
     let gates = default_gates();
-    assert_eq!(gates.len(), 19, "should have 19 default gates");
+    // Keep in lockstep with the registry unit test in ci.rs
+    // (`assert_eq!(gates.len(), 20, ...)`) — this integration copy went stale
+    // at 19 when the N1 reliability-coverage gate landed (0ce61f9a fixed only
+    // the unit-test site).
+    assert_eq!(gates.len(), 20, "should have 20 default gates");
 }
 
 #[test]
