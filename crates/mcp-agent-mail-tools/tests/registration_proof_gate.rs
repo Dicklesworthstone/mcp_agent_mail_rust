@@ -19,7 +19,7 @@ use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
     create_agent_identity, ensure_project, macro_prepare_thread, macro_start_session,
-    register_agent,
+    register_agent, request_contact, send_message, whois,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -409,4 +409,262 @@ fn enabled_gate_allows_valid_proof_through_tool_and_macro() {
             .expect("macro_start_session should succeed with a valid proof");
         },
     );
+}
+
+/// Register `name` through the real `register_agent` tool with a freshly signed,
+/// valid proof (used to seed identities when the gate is enabled).
+async fn register_with_proof(
+    ctx: &McpContext,
+    key: &SigningKey,
+    project_key: &str,
+    name: &str,
+    nonce: &str,
+) {
+    let now = now_unix();
+    let proof = signed_proof(
+        key,
+        name,
+        project_key,
+        "claude-code",
+        "opus-4.1",
+        DEFAULT_CAPS,
+        now,
+        now + 120,
+        nonce,
+    );
+    register_agent(
+        ctx,
+        project_key.to_string(),
+        "claude-code".to_string(),
+        "opus-4.1".to_string(),
+        Some(name.to_string()),
+        Some("valid proof".to_string()),
+        None,
+        None,
+        None,
+        Some(proof),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("register {name} with proof: {e:?}"));
+}
+
+/// With the gate ENABLED, the two implicit auto-register side doors —
+/// `send_message` to an unknown recipient and `request_contact` with an unknown
+/// `from_agent` — must FAIL CLOSED and must NOT mint the identity, while
+/// resolving already-existing identities keeps working.
+#[test]
+fn enabled_gate_blocks_send_message_and_request_contact_auto_register() {
+    let key = SigningKey::from_bytes(&[21u8; 32]);
+    let trusted = b64(key.verifying_key().as_bytes());
+    run_with_env(
+        &[
+            ("AM_REGISTRATION_PROOF_GATE_ENABLED", "true"),
+            ("AM_REGISTRATION_PROOF_TRUSTED_KEYS", trusted.as_str()),
+        ],
+        |cx| async move {
+            let ctx = McpContext::new(cx.clone(), 1);
+            let project_key = format!("/tmp/proof-autoreg-{}", unique_suffix());
+            ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project");
+
+            // A real sender is needed: send_message resolves (never
+            // auto-registers) the sender.
+            register_with_proof(&ctx, &key, &project_key, "BlueLake", "nonce-a-sender").await;
+
+            // send_message to a NON-existent recipient must fail closed.
+            let err = send_message(
+                &ctx,
+                project_key.clone(),
+                "BlueLake".to_string(),
+                vec!["GhostRecipient".to_string()],
+                "hi".to_string(),
+                "body".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("send_message to unknown recipient must fail closed");
+            assert_eq!(error_type(&err), "PROOF_REQUIRED");
+
+            // ...and the recipient identity must NOT have been created.
+            let err = whois(
+                &ctx,
+                project_key.clone(),
+                "GhostRecipient".to_string(),
+                Some(false),
+                None,
+            )
+            .await
+            .expect_err("recipient identity must NOT have been created");
+            assert_eq!(error_type(&err), "AGENT_NOT_FOUND");
+
+            // request_contact with a NON-existent from_agent (register_if_missing
+            // defaults to true) must fail closed.
+            let err = request_contact(
+                &ctx,
+                project_key.clone(),
+                "PhantomSender".to_string(),
+                "BlueLake".to_string(),
+                None,
+                Some("hi".to_string()),
+                None,
+                None,
+                Some("claude-code".to_string()),
+                Some("opus-4.1".to_string()),
+                None,
+            )
+            .await
+            .expect_err("request_contact auto-register must fail closed");
+            assert_eq!(error_type(&err), "PROOF_REQUIRED");
+
+            // ...and the from_agent identity must NOT have been created.
+            let err = whois(
+                &ctx,
+                project_key.clone(),
+                "PhantomSender".to_string(),
+                Some(false),
+                None,
+            )
+            .await
+            .expect_err("from_agent identity must NOT have been created");
+            assert_eq!(error_type(&err), "AGENT_NOT_FOUND");
+
+            // Existing identities still resolve normally (only the create-on-
+            // missing branch is gated): register RedFox with a proof, then a
+            // BlueLake -> RedFox message goes through with no auto-registration.
+            register_with_proof(&ctx, &key, &project_key, "RedFox", "nonce-a-recip").await;
+            send_message(
+                &ctx,
+                project_key.clone(),
+                "BlueLake".to_string(),
+                vec!["RedFox".to_string()],
+                "hi".to_string(),
+                "body".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true), // auto_contact_if_blocked
+                None,
+            )
+            .await
+            .expect("send_message between existing identities should still work");
+        },
+    );
+}
+
+/// With the gate DISABLED (the default), both implicit paths auto-register the
+/// missing identity exactly as before — no behavior change.
+#[test]
+fn disabled_gate_auto_registers_via_send_message_and_request_contact() {
+    run_with_env(&[], |cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_key = format!("/tmp/proof-off-autoreg-{}", unique_suffix());
+        ensure_project(&ctx, project_key.clone(), None)
+            .await
+            .expect("ensure_project");
+
+        register_agent(
+            &ctx,
+            project_key.clone(),
+            "claude-code".to_string(),
+            "opus-4.1".to_string(),
+            Some("BlueLake".to_string()),
+            Some("gate off".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("register sender");
+
+        // send_message auto-registers the unknown recipient.
+        send_message(
+            &ctx,
+            project_key.clone(),
+            "BlueLake".to_string(),
+            vec!["GreenCastle".to_string()],
+            "hi".to_string(),
+            "body".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("send_message should auto-register recipient when gate disabled");
+        whois(
+            &ctx,
+            project_key.clone(),
+            "GreenCastle".to_string(),
+            Some(false),
+            None,
+        )
+        .await
+        .expect("AutoRecip should have been auto-registered");
+
+        register_agent(
+            &ctx,
+            project_key.clone(),
+            "claude-code".to_string(),
+            "opus-4.1".to_string(),
+            Some("RedStone".to_string()),
+            Some("gate off".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("register target");
+
+        // request_contact auto-registers the unknown from_agent.
+        request_contact(
+            &ctx,
+            project_key.clone(),
+            "AmberRiver".to_string(),
+            "RedStone".to_string(),
+            None,
+            Some("hi".to_string()),
+            None,
+            None,
+            Some("claude-code".to_string()),
+            Some("opus-4.1".to_string()),
+            None,
+        )
+        .await
+        .expect("request_contact should auto-register from_agent when gate disabled");
+        whois(
+            &ctx,
+            project_key.clone(),
+            "AmberRiver".to_string(),
+            Some(false),
+            None,
+        )
+        .await
+        .expect("AutoSender should have been auto-registered");
+    });
 }

@@ -1514,8 +1514,15 @@ Check that all parameters have valid values."
     // no-op and registration keeps the self-asserted identity model unchanged.
     // Placed AFTER name/policy resolution (so the proof is checked against the
     // final agent name) and BEFORE the DB write (so a bad proof never
-    // registers). This is the single chokepoint every entry point routes
-    // through (macros call this function; the tool is re-exported once).
+    // registers). This is the chokepoint for every EXPLICIT registration entry
+    // point (macros call this function; the tool is re-exported once), and the
+    // ONLY place a `registration_proof` bundle is actually verified. The two
+    // IMPLICIT auto-register paths that cannot supply a proof —
+    // `messaging::resolve_or_register_agent` (send_message to an unknown
+    // recipient) and `contacts::resolve_or_register_sender` (request_contact
+    // with an unknown from_agent) — are separately guarded to FAIL CLOSED when
+    // the gate is enabled via `proof_gate::reject_auto_registration_if_enabled`,
+    // so the identity namespace has no ungated side door.
     crate::proof_gate::enforce(&crate::proof_gate::RegistrationRequest {
         agent_name: &agent_name,
         project_key: &project_key,

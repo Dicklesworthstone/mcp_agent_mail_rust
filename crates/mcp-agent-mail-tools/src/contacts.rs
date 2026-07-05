@@ -147,6 +147,15 @@ pub(crate) async fn resolve_or_register_sender(
         Ok(a) => Ok(a),
         Err(e) if !register_if_missing => Err(e),
         Err(_) => {
+            // Proof gate (fail-closed): auto-registering a not-yet-known
+            // `from_agent` here cannot carry a signed `registration_proof`
+            // bundle, so when the gate is enabled we refuse instead of minting
+            // an unproven identity. Without this, `request_contact` was a side
+            // door around the gate (it only guarded register_agent /
+            // create_agent_identity / the session macros). Disabled gate = no-op.
+            crate::proof_gate::reject_auto_registration_if_enabled(
+                "request_contact auto-registration of from_agent",
+            )?;
             let program = program.ok_or_else(|| {
                 legacy_tool_error(
                     "MISSING_FIELD",

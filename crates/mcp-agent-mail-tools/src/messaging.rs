@@ -424,6 +424,16 @@ async fn resolve_or_register_agent(
         {
             Outcome::Ok(agent) => Ok(agent),
             Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
+                // Proof gate (fail-closed): auto-registering an unknown recipient
+                // here cannot carry a signed `registration_proof` bundle, so when
+                // the gate is enabled we refuse instead of minting an unproven
+                // identity (program/model="unknown"). Without this, `send_message`
+                // to a non-existent recipient was a side door around the gate.
+                // Disabled gate = no-op, so default auto-register behavior is
+                // preserved exactly.
+                crate::proof_gate::reject_auto_registration_if_enabled(
+                    "send_message auto-registration of recipient",
+                )?;
                 match mcp_agent_mail_db::queries::register_agent(
                     ctx.cx(),
                     pool,

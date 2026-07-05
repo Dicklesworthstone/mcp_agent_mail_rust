@@ -417,6 +417,55 @@ fn enforce_with_config(
     }
 }
 
+/// Fail closed when the proof gate is enabled and a code path is about to
+/// **auto-register** an identity on behalf of a caller or recipient that has no
+/// channel to present a `registration_proof` bundle.
+///
+/// Two tool paths mint identities implicitly:
+///
+/// - `send_message` to a not-yet-registered recipient (when
+///   `messaging_auto_register_recipients` is on, the default), via
+///   `messaging::resolve_or_register_agent`, and
+/// - `request_contact` with a not-yet-registered `from_agent` (when
+///   `register_if_missing` is on, the default), via
+///   `contacts::resolve_or_register_sender`.
+///
+/// Neither call site carries a proof argument, so if they auto-registered while
+/// the gate is enabled they would silently mint an *unproven* identity —
+/// defeating the gate's entire purpose (a non-bypassable identity namespace).
+/// When the gate is enabled these paths therefore MUST fail closed here instead
+/// of creating the row. Resolving an **already-existing** identity is
+/// unaffected: this guard only runs on the create-on-missing branch, so normal
+/// messaging/contact traffic between registered agents keeps working.
+///
+/// When the gate is disabled (the default) this is a no-op returning `Ok(())`,
+/// so auto-registration behaves exactly as before.
+///
+/// # Errors
+///
+/// Returns a `PROOF_REQUIRED` `McpError` when the gate is enabled.
+pub fn reject_auto_registration_if_enabled(context: &str) -> Result<(), McpError> {
+    reject_auto_registration_with_gate(Config::get().proof_gate.enabled, context)
+}
+
+/// Testable core of [`reject_auto_registration_if_enabled`]: takes the gate flag
+/// explicitly so unit tests can exercise both branches deterministically.
+fn reject_auto_registration_with_gate(gate_enabled: bool, context: &str) -> Result<(), McpError> {
+    if !gate_enabled {
+        return Ok(());
+    }
+    Err(mk_error(
+        "PROOF_REQUIRED",
+        format!(
+            "The registration proof gate is enabled: {context} would auto-register a new agent \
+             identity, but an auto-registration path cannot present a signed `registration_proof` \
+             bundle. Register the identity up front via `register_agent` (or \
+             `create_agent_identity`) with a valid proof, then retry."
+        ),
+        json!({ "gate": "registration.proof_gate", "context": context }),
+    ))
+}
+
 /// Build a `Deny` verdict.
 fn deny(code: &'static str, message: impl Into<String>, detail: serde_json::Value) -> Verdict {
     Verdict::Deny {
@@ -815,6 +864,22 @@ mod tests {
         let bundle = ClaimsSpec::valid(now).signed_bundle(&key);
         let err = enforce_with_config(&gate, &request(Some(&bundle)), now).unwrap_err();
         assert_eq!(deny_code(&err), "PROOF_UNTRUSTED_KEY");
+    }
+
+    #[test]
+    fn auto_registration_rejected_when_gate_enabled() {
+        let err =
+            reject_auto_registration_with_gate(true, "send_message recipient auto-registration")
+                .unwrap_err();
+        assert_eq!(deny_code(&err), "PROOF_REQUIRED");
+    }
+
+    #[test]
+    fn auto_registration_noop_when_gate_disabled() {
+        assert!(
+            reject_auto_registration_with_gate(false, "send_message recipient auto-registration")
+                .is_ok()
+        );
     }
 
     #[test]
