@@ -177,6 +177,7 @@ fn test_invalid_format_detection() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("invalid format should fail");

@@ -32,6 +32,7 @@ pub mod macros;
 pub mod messaging;
 pub mod metrics;
 pub mod products;
+pub mod proof_gate;
 pub mod reservation_index;
 pub mod reservation_parity;
 pub mod reservations;

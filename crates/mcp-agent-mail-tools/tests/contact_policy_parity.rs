@@ -107,6 +107,7 @@ async fn setup_project_and_agents(ctx: &McpContext, project_key: &str, agents: &
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("register_agent");

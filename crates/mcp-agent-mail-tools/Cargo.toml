@@ -32,6 +32,9 @@ smallvec = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 fs2 = { workspace = true }
+# Registration proof gate: Ed25519 signature verification of registration proofs.
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 [features]
 default = ["mcp-agent-mail-db/default", "mcp-agent-mail-storage/default"]

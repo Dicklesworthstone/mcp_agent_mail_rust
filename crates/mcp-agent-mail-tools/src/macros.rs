@@ -133,6 +133,7 @@ pub async fn macro_start_session(
     inbox_limit: Option<i32>,
     reaper_exempt: Option<bool>,
     pane_id: Option<String>,
+    registration_proof: Option<String>,
 ) -> McpResult<String> {
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
@@ -178,6 +179,7 @@ pub async fn macro_start_session(
         None,
         reaper_exempt,
         pane_id,
+        registration_proof,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;
@@ -287,6 +289,7 @@ pub async fn macro_prepare_thread(
     llm_mode: Option<bool>,
     llm_model: Option<String>,
     inbox_limit: Option<i32>,
+    registration_proof: Option<String>,
 ) -> McpResult<String> {
     let thread_id_trimmed = thread_id.trim();
     if thread_id_trimmed.is_empty() {
@@ -325,6 +328,7 @@ pub async fn macro_prepare_thread(
             None,
             None,
             None,
+            registration_proof,
         )
         .await?;
         parse_json(agent_json, "agent")?

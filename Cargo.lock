@@ -5432,7 +5432,9 @@ version = "0.3.19"
 dependencies = [
  "arbitrary",
  "asupersync",
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
  "fastmcp-core",
  "fastmcp-protocol",
  "fastmcp-rust",

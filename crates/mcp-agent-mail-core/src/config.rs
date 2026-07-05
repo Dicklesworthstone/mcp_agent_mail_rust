@@ -77,6 +77,62 @@ impl Default for ToolFilterSettings {
     }
 }
 
+/// Optional cryptographic proof gate for agent registration.
+///
+/// # Default posture (disabled)
+///
+/// When [`enabled`](Self::enabled) is `false` — the default — registration keeps
+/// the historical **self-asserted** identity model with *zero* behavior change:
+/// `register_agent` / `create_agent_identity` (and every macro that registers)
+/// accept a caller-chosen identity without any proof. This preserves fast local
+/// trusted multi-agent coordination.
+///
+/// # Enabled posture (fail-closed)
+///
+/// When `enabled` is `true`, registration requires a signed proof bundle whose
+/// Ed25519 signature verifies against one of the configured [`trusted_keys`]
+/// trust anchors AND whose claims bind the requested identity, program, model,
+/// project, and capability scope. On a missing, malformed, untrusted, expired,
+/// not-yet-valid, replayed, or mismatched proof the registration **fails closed**
+/// (no row is written) with a distinct, actionable error.
+///
+/// [`trusted_keys`]: Self::trusted_keys
+#[derive(Debug, Clone)]
+pub struct ProofGateConfig {
+    /// Master switch. `false` (default) => self-asserted registration (unchanged).
+    pub enabled: bool,
+    /// Trust-anchor Ed25519 public keys, base64 (standard alphabet), each
+    /// decoding to exactly 32 raw bytes. Only proofs signed by one of these
+    /// keys are accepted. Empty while `enabled` is `true` means *every*
+    /// registration fails closed (no key can ever be trusted) — this is an
+    /// intentional safe default, not a bypass.
+    pub trusted_keys: Vec<String>,
+    /// Maximum allowed proof lifetime in seconds (`expires_at - issued_at`).
+    /// Rejects proofs minted with an over-long validity window so a single
+    /// leaked proof cannot be replayed indefinitely. Default `300`.
+    pub max_lifetime_seconds: u64,
+    /// Clock-skew tolerance in seconds applied to `issued_at` / `expires_at`
+    /// comparisons against server wall-clock. Default `60`.
+    pub clock_skew_seconds: u64,
+    /// Track consumed nonces in-process and reject replayed proofs. Default
+    /// `true`. The nonce store is per-process (documented as such); it hardens
+    /// against replay within a running server's lifetime and complements the
+    /// mandatory `expires_at` bound.
+    pub require_nonce: bool,
+}
+
+impl Default for ProofGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trusted_keys: Vec::new(),
+            max_lifetime_seconds: 300,
+            clock_skew_seconds: 60,
+            require_nonce: true,
+        }
+    }
+}
+
 /// Main configuration struct for MCP Agent Mail
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -331,6 +387,9 @@ pub struct Config {
 
     // Tool filtering
     pub tool_filter: ToolFilterSettings,
+
+    // Registration proof gate (optional cryptographic gate; default off)
+    pub proof_gate: ProofGateConfig,
 
     // Backpressure shedding
     /// When `true`, the dispatch layer rejects shedable (read-only, deferrable)
@@ -1407,6 +1466,9 @@ impl Default for Config {
             // Tool filtering
             tool_filter: ToolFilterSettings::default(),
 
+            // Registration proof gate (disabled by default)
+            proof_gate: ProofGateConfig::default(),
+
             // Backpressure shedding
             backpressure_shedding_enabled: false,
 
@@ -2223,6 +2285,28 @@ impl Config {
         if let Some(v) = env_value("TOOLS_FILTER_TOOLS") {
             config.tool_filter.tools = parse_csv(&v);
         }
+
+        // Registration proof gate (optional cryptographic gate; default off).
+        // When disabled these have zero effect; registration is unchanged.
+        config.proof_gate.enabled = env_bool(
+            "AM_REGISTRATION_PROOF_GATE_ENABLED",
+            config.proof_gate.enabled,
+        );
+        if let Some(v) = env_value("AM_REGISTRATION_PROOF_TRUSTED_KEYS") {
+            config.proof_gate.trusted_keys = parse_csv(&v);
+        }
+        config.proof_gate.max_lifetime_seconds = env_u64(
+            "AM_REGISTRATION_PROOF_MAX_LIFETIME_SECONDS",
+            config.proof_gate.max_lifetime_seconds,
+        );
+        config.proof_gate.clock_skew_seconds = env_u64(
+            "AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS",
+            config.proof_gate.clock_skew_seconds,
+        );
+        config.proof_gate.require_nonce = env_bool(
+            "AM_REGISTRATION_PROOF_REQUIRE_NONCE",
+            config.proof_gate.require_nonce,
+        );
 
         // TOON output format
         // Encoder binary: TOON_TRU_BIN > TOON_BIN > None (will use default "tru")
@@ -3620,6 +3704,39 @@ mod tests {
         let config = Config::from_env();
         assert!(!config.log_tool_calls_enabled);
         assert_eq!(config.log_tool_calls_result_max_chars, 1234);
+    }
+
+    #[test]
+    fn test_proof_gate_config_defaults() {
+        let config = Config::default();
+        // Off by default => self-asserted registration is unchanged.
+        assert!(!config.proof_gate.enabled);
+        assert!(config.proof_gate.trusted_keys.is_empty());
+        assert_eq!(config.proof_gate.max_lifetime_seconds, 300);
+        assert_eq!(config.proof_gate.clock_skew_seconds, 60);
+        assert!(config.proof_gate.require_nonce);
+    }
+
+    #[test]
+    fn test_proof_gate_config_from_env() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_REGISTRATION_PROOF_GATE_ENABLED", "true"),
+            (
+                "AM_REGISTRATION_PROOF_TRUSTED_KEYS",
+                " aaaa , bbbb ,, cccc ",
+            ),
+            ("AM_REGISTRATION_PROOF_MAX_LIFETIME_SECONDS", "900"),
+            ("AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS", "30"),
+            ("AM_REGISTRATION_PROOF_REQUIRE_NONCE", "false"),
+        ]);
+
+        let config = Config::from_env();
+        assert!(config.proof_gate.enabled);
+        // parse_csv trims and drops empties.
+        assert_eq!(config.proof_gate.trusted_keys, vec!["aaaa", "bbbb", "cccc"]);
+        assert_eq!(config.proof_gate.max_lifetime_seconds, 900);
+        assert_eq!(config.proof_gate.clock_skew_seconds, 30);
+        assert!(!config.proof_gate.require_nonce);
     }
 
     #[test]
