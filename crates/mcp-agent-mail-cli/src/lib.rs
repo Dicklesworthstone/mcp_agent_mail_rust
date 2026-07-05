@@ -12118,6 +12118,18 @@ fn open_atc_simulate_read_pool_with_database_url(
         &opened_path,
         "ATC simulate",
     )?;
+    // ATC experiences live in the atc.sqlite3 SIDECAR next to the primary DB
+    // (br-bvq1x.11.7), and the replay pool below derives its sidecar path from
+    // the SNAPSHOT location — so the sidecar must be snapshotted alongside the
+    // primary or simulate silently replays zero experiences. A missing live
+    // sidecar is legitimate (no ATC data yet): the replay then sees none.
+    let live_sidecar = PathBuf::from(mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(
+        &opened_path.display().to_string(),
+    ));
+    if live_sidecar.is_file() {
+        let snapshot_sidecar = source.actual_path().with_file_name("atc.sqlite3");
+        vacuum_into_sqlite_snapshot(&live_sidecar, &snapshot_sidecar, "ATC simulate sidecar")?;
+    }
     let source_path = source.actual_path().display().to_string();
     let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -36262,12 +36274,43 @@ mod tests {
         .expect("create ATC explain test pool")
     }
 
+    /// Materialize the PRIMARY mailbox DB file for an ATC test fixture.
+    ///
+    /// `DbPool::new` opens no connections and ATC experience writes go straight
+    /// to the `atc.sqlite3` sidecar via canonical SQLite (br-bvq1x.11.7), so a
+    /// fixture that only seeds experiences never creates the primary file the
+    /// `am atc explain`/`simulate` snapshot preconditions require. A real
+    /// deployment always has the primary (the server acquires pooled
+    /// connections constantly); one acquire+release reproduces that.
+    fn materialize_primary_mailbox_db(
+        pool: &mcp_agent_mail_db::DbPool,
+        runtime: &asupersync::runtime::Runtime,
+        cx: &asupersync::Cx,
+    ) {
+        match runtime.block_on(pool.acquire(cx)) {
+            asupersync::Outcome::Ok(conn) => drop(conn),
+            asupersync::Outcome::Err(error) => {
+                panic!("materialize primary mailbox DB: {error}")
+            }
+            asupersync::Outcome::Cancelled(reason) => {
+                panic!("materialize primary mailbox DB cancelled: {reason:?}")
+            }
+            asupersync::Outcome::Panicked(payload) => {
+                panic!(
+                    "materialize primary mailbox DB panicked: {}",
+                    payload.message()
+                )
+            }
+        }
+    }
+
     fn seed_atc_explain_db(db_path: &Path, storage_root: &Path) {
         let pool = atc_explain_test_pool(db_path, storage_root);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build ATC explain runtime");
         let cx = asupersync::Cx::for_testing();
+        materialize_primary_mailbox_db(&pool, &runtime, &cx);
         let created_ts_micros = 1_762_000_000_000_000i64;
         let features = mcp_agent_mail_core::FeatureVector {
             version: mcp_agent_mail_core::FEATURE_VERSION,
@@ -36410,6 +36453,7 @@ mod tests {
             .build()
             .expect("build ATC simulate runtime");
         let cx = asupersync::Cx::for_testing();
+        materialize_primary_mailbox_db(&pool, &runtime, &cx);
         let base_ts = 1_762_100_000_000_000i64;
 
         let blue_features = mcp_agent_mail_core::FeatureVector {
