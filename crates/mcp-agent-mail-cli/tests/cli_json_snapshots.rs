@@ -106,10 +106,14 @@ fn canonicalize_json(v: &Value) -> Value {
 
 fn normalize_json(v: Value, tmp_root: &Path) -> Value {
     let tmp = tmp_root.to_string_lossy().to_string();
-    let tmp_slug = tmp_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| format!("tmp-{}-doctor-repo", name.to_ascii_lowercase()));
+    // Slugify the FULL doctor-repo path with the product's own slug function:
+    // deriving it from the tempdir basename alone assumed tempdirs live at
+    // /tmp-style roots, but rch workers point TMPDIR inside the synced repo
+    // checkout (br-yceqd) and the slug then carries the repo-path prefix
+    // (`data-projects-...-rch-tmp-...`), leaving un-normalized residue.
+    let tmp_slug = Some(mcp_agent_mail_core::slugify(
+        &tmp_root.join("doctor_repo").to_string_lossy(),
+    ));
     let search_index_root = std::env::temp_dir()
         .join("mcp-agent-mail-search-index")
         .to_string_lossy()
