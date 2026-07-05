@@ -1783,6 +1783,41 @@ fn is_message_visibility_probe_consistency_error(error: &DbError) -> bool {
     }
 }
 
+/// Is this ghost-success verdict specifically about the RECIPIENT rows (rather
+/// than the message row itself)?
+///
+/// GH#179: the writer's own post-commit sample can only refute the probe class
+/// it actually contradicts. A present message row refutes a message-row ghost,
+/// but says nothing about a recipient-rows ghost — recipient rows missing means
+/// the message is delivered to nobody, and reporting success there is the exact
+/// silent-loss class the probe exists to catch.
+fn is_recipient_visibility_probe_consistency_error(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Internal(message)
+            if message.contains("message recipient rows not visible after commit")
+    )
+}
+
+/// Does the writer's own post-commit sample independently refute this specific
+/// ghost-success verdict?
+///
+/// - Message-row ghost: refuted when the writer handle saw the message row.
+/// - Recipient-rows ghost: refuted only when the writer handle saw the message
+///   row AND the full expected recipient-row count.
+fn writer_sample_refutes_probe_verdict(
+    error: &DbError,
+    writer_counts: WriterPostCommitCounts,
+    expected_recipients: i64,
+) -> bool {
+    let message_confirmed = writer_counts.message_count == Some(1);
+    if is_recipient_visibility_probe_consistency_error(error) {
+        message_confirmed && writer_counts.recipient_count == Some(expected_recipients)
+    } else {
+        message_confirmed
+    }
+}
+
 fn annotate_message_visibility_error_with_writer_counts(
     error: DbError,
     writer_counts: WriterPostCommitCounts,
@@ -5763,7 +5798,19 @@ pub async fn create_message_with_recipients(
         // and cancel/panic — are advisory: the committed row stays durable and
         // we return success, avoiding both the data loss and the compensating
         // DELETE transaction that amplifies contention under swarm load.
-        let writer_confirms_durable = writer_post_commit_counts.message_count == Some(1);
+        //
+        // The writer's own sample can only refute the ghost class it actually
+        // contradicts: a present message row refutes a message-row ghost, but a
+        // recipient-rows ghost is refuted only when the writer also saw the full
+        // expected recipient-row count (otherwise "success" would deliver the
+        // message to nobody).
+        let expected_recipients =
+            i64::try_from(normalize_expected_recipients(recipients).len()).unwrap_or(i64::MAX);
+        let writer_confirms_durable = writer_sample_refutes_probe_verdict(
+            &error,
+            writer_post_commit_counts,
+            expected_recipients,
+        );
         if post_commit_probe_requires_cleanup(&error, writer_confirms_durable) {
             let error = annotate_message_visibility_error_with_writer_counts(
                 error,
@@ -20314,6 +20361,64 @@ mod tests {
         // Writer confirms the message row landed → cross-handle visibility lag,
         // not missing data → never delete.
         assert!(!post_commit_probe_requires_cleanup(&ghost, true));
+    }
+
+    #[test]
+    fn writer_sample_refutation_is_scoped_to_the_probe_verdict_class() {
+        // GH#179 follow-up: the writer's own sample only refutes the ghost class
+        // it actually contradicts.
+        let message_ghost = DbError::Internal(
+            "message row not visible after commit for message_id=1 project_id=1".to_string(),
+        );
+        let recipient_ghost = DbError::Internal(
+            "message recipient rows not visible after commit for message_id=1: expected=2 actual=0"
+                .to_string(),
+        );
+        let both = WriterPostCommitCounts {
+            message_count: Some(1),
+            recipient_count: Some(2),
+        };
+        let message_only = WriterPostCommitCounts {
+            message_count: Some(1),
+            recipient_count: Some(0),
+        };
+        let none = WriterPostCommitCounts::default();
+
+        // A message-row ghost is refuted by the message row alone.
+        assert!(writer_sample_refutes_probe_verdict(&message_ghost, both, 2));
+        assert!(writer_sample_refutes_probe_verdict(
+            &message_ghost,
+            message_only,
+            2
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &message_ghost,
+            none,
+            2
+        ));
+
+        // A recipient-rows ghost needs the full expected recipient count too:
+        // a present message row with zero recipient rows is delivered to nobody.
+        assert!(writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            both,
+            2
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            message_only,
+            2
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            both,
+            3
+        ));
+        assert!(!writer_sample_refutes_probe_verdict(
+            &recipient_ghost,
+            none,
+            2
+        ));
     }
 
     #[test]

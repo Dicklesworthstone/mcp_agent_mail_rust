@@ -15148,11 +15148,11 @@ fn handle_file_reservations_with_conn(
 
             // GH#180: the active branches fetch candidate rows with the cheap
             // `released_ts` predicate; subtract the release ledger in Rust so
-            // released reservations never show as active. The `all` branch lists
-            // every reservation and is not filtered.
-            let rows = if all {
-                rows
-            } else {
+            // released reservations never show as active. Mirror the SQL branch
+            // condition exactly (`--active-only` wins over `--all`, matching the
+            // params selection above): only the pure `--all` listing is
+            // unfiltered.
+            let rows = if active_only || !all {
                 let released_ids = cli_released_reservation_ids(conn)?;
                 rows.into_iter()
                     .filter(|r| {
@@ -15160,6 +15160,8 @@ fn handle_file_reservations_with_conn(
                         !released_ids.contains(&id)
                     })
                     .collect::<Vec<_>>()
+            } else {
+                rows
             };
 
             if rows.is_empty() {
@@ -32147,6 +32149,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             }
 
+            reject_local_registration_if_proof_gate_enabled("agents register")?;
             let ctx = context::AsyncCliContext::open()?;
             let cx = asupersync::Cx::for_request();
 
@@ -32250,6 +32253,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             }
 
+            reject_local_registration_if_proof_gate_enabled("agents create")?;
             let ctx = context::AsyncCliContext::open()?;
             let cx = asupersync::Cx::for_request();
 
@@ -32756,6 +32760,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 }
             }
 
+            reject_local_registration_if_proof_gate_enabled("macros start-session")?;
             let ctx = context::AsyncCliContext::open()?;
             let cx = asupersync::Cx::for_request();
 
@@ -32880,6 +32885,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
 
             // Register or resolve agent
             let agent = if should_register {
+                reject_local_registration_if_proof_gate_enabled("macros prepare-thread")?;
                 let program =
                     parse_cli_macro_required_text("macros prepare-thread", "program", program)?;
                 let model = parse_cli_macro_required_text("macros prepare-thread", "model", model)?;
@@ -33180,6 +33186,9 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let to_agent = match find_agent_async(&cx, &ctx.pool, target_pid, &to).await? {
                 Some(agent) => agent,
                 None if register_missing => {
+                    reject_local_registration_if_proof_gate_enabled(
+                        "macros contact-handshake --register-missing",
+                    )?;
                     let program = reg_program.unwrap_or_else(|| "unknown".to_string());
                     let model = reg_model.unwrap_or_else(|| "unknown".to_string());
                     outcome_to_result(
@@ -33547,7 +33556,8 @@ mod mail_server_cli_bridge_tests {
         pending_send_failure_from_error, pending_send_receipt_path, persist_sender_identity_token,
         persist_sender_identity_token_from_agent_payload, post_jsonrpc_request_blocking_http,
         product_inbox_row_to_json, reject_local_fallback_with_ownership_probe,
-        resolve_sender_token, server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        reject_local_registration_when_gate, resolve_sender_token,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
         validate_pending_send_artifact, validate_pending_send_receipt, write_pending_send_receipt,
     };
@@ -34928,6 +34938,23 @@ mod mail_server_cli_bridge_tests {
         assert!(message.contains("mail send could not be proxied"));
         assert!(message.contains("Refusing local SQLite fallback"));
         assert!(message.contains("another Agent Mail server owns the mailbox database"));
+    }
+
+    #[test]
+    fn local_registration_fallback_fails_closed_when_proof_gate_enabled() {
+        // The registration proof gate can only verify `registration_proof`
+        // bundles on the tool surface; the CLI's direct local-DB fallback must
+        // refuse to register rather than become an ungated side door.
+        let error = reject_local_registration_when_gate(true, "agents register")
+            .expect_err("enabled gate must block local registration fallback");
+        let message = error.to_string();
+        assert!(message.contains("agents register"));
+        assert!(message.contains("registration proof gate"));
+        assert!(message.contains("cannot verify"));
+
+        // Default (gate off): unchanged self-asserted registration.
+        reject_local_registration_when_gate(false, "agents register")
+            .expect("disabled gate leaves the local fallback unchanged");
     }
 
     #[test]
@@ -71437,6 +71464,34 @@ fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
         || server_rejection_is_transient_resource_busy(message)
 }
 
+/// Fail closed when the registration proof gate is enabled and a CLI code path
+/// is about to register/create an agent via the DIRECT local-DB fallback.
+///
+/// The gated tool surface (`register_agent` / `create_agent_identity` and the
+/// session macros, via `proof_gate::enforce`) is the only place a
+/// `registration_proof` bundle can be verified; the CLI's local-SQLite fallback
+/// has no proof argument and must not become an ungated side door that turns
+/// "server unavailable" into "identity gate bypassed".
+pub(crate) fn reject_local_registration_if_proof_gate_enabled(
+    command_label: &str,
+) -> CliResult<()> {
+    reject_local_registration_when_gate(Config::get().proof_gate.enabled, command_label)
+}
+
+/// Testable core of [`reject_local_registration_if_proof_gate_enabled`].
+fn reject_local_registration_when_gate(gate_enabled: bool, command_label: &str) -> CliResult<()> {
+    if gate_enabled {
+        return Err(CliError::Other(format!(
+            "{command_label}: the registration proof gate ([registration.proof_gate] / \
+             AM_REGISTRATION_PROOF_GATE_ENABLED) is enabled, and agent registration through \
+             the local database fallback cannot verify a registration_proof bundle. \
+             Register through the running MCP server instead (start it with `am serve-http` \
+             or fix connectivity), or disable the gate for this environment."
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn reject_local_fallback_if_mailbox_owned(
     command_label: &str,
     server_url: &str,
@@ -73243,6 +73298,7 @@ async fn apply_agent_start_fix(report: &AgentStartReport) -> CliResult<AgentStar
         ));
     };
 
+    reject_local_registration_if_proof_gate_enabled("agent-start --fix")?;
     let ctx = context::AsyncCliContext::open()?;
     let cx = asupersync::Cx::for_request();
     let project = resolve_project_async(&cx, &ctx.pool, &report.project.key).await?;
