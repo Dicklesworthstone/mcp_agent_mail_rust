@@ -164,7 +164,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -175,7 +175,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1453,7 +1453,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1595,7 +1595,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2003,7 +2003,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsqlite"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -2017,14 +2017,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-types",
 ]
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2076,14 +2076,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "argon2",
  "bumpalo",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2228,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2363,9 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "840b2e48d02452bba049c1c37e30d79d9077fb27b5c8ba4982ed848edc29f0ed"
+version = "0.5.0"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2379,9 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f73877d6a133e36b66828eed0e70c5bfc3408dca2d9d29be7fac46fd8cccf53"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2389,9 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1805460e28e2b12f6e88fba0ef6a62b78f5cffabb120b528312e0d89eda8625"
+version = "0.5.0"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2399,9 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5862ed88a7cc2db31ceb4b7a2b39bcabc6ad88a110d40098c6b741e60a6f666"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2420,9 +2412,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5b1eb70e89436ba145f6b5032eddf17e5dd27092691e1ed38d4ea2607a784c5"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2442,9 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-harness"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b395f5698905786ecb1a6583566e215d5cd3b1e6189393d07452261797fa226e"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "ftui-core",
@@ -2462,15 +2450,11 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee8f4f829c34a27ff3b5bb204ba39a12cf56340472f9d5ece47af870a6b990bd"
+version = "0.5.0"
 
 [[package]]
 name = "ftui-layout"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94da108567972716d2bf0019190434f4ee90a1d4429e6ead72d1dd3b9fc11caa"
+version = "0.5.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2481,9 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a8cb2dac0b06f1705ecbe8573dd5ac701b8f16d0361a3bdcc99fb6e391902c9"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "bitflags",
@@ -2498,9 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3165e091600ab40ad1637fc432410f8c5d27f9c17bd2e085f1be2186160f15d"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2519,9 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c17d6774595455d51378c874052b1dc17eb68c971226a8cadb6314ee1c9c6a6c"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2531,9 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb3d1f2248ab3643629c48df62cb7dd54a500c0ee276f8197b5dd88a552e9c2b"
+version = "0.5.0"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2550,9 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b08efcf468fb11f01b22c7b8cc33943fe6d3879bb713c18cf95574299c5380ad"
+version = "0.5.0"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2564,9 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab7e17b5a2063bcdb80ea57c3125fde95a9363fcd0ec813bc5f8f3829907caa3"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "bitflags",
@@ -3463,7 +3435,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5690,7 +5662,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5927,7 +5899,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6753,7 +6725,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7216,7 +7188,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7613,7 +7585,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8442,7 +8414,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8996,55 +8968,3 @@ dependencies = [
 [[patch.unused]]
 name = "beads_rust"
 version = "0.2.17"
-
-[[patch.unused]]
-name = "ftui"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-backend"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-core"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-extras"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-harness"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-i18n"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-layout"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-render"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-runtime"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-style"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-text"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-tty"
-version = "0.5.0"
-
-[[patch.unused]]
-name = "ftui-widgets"
-version = "0.5.0"

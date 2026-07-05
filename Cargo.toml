@@ -44,13 +44,13 @@ sqlmodel-pool = "0.2.2"
 sqlmodel-frankensqlite = "0.2.2"
 sqlmodel-sqlite = "0.2.2"
 
-ftui = "0.4.0"
-ftui-runtime = { version = "0.4.0" }
-ftui-extras = { version = "0.4.0", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
-ftui-widgets = { version = "0.4.0", features = ["debug-overlay", "regex-search"] }
-ftui-tty = "0.4.0"
-ftui-harness = "0.4.0"
-ftui-render = "0.4.0"
+ftui = "0.5.0"
+ftui-runtime = { version = "0.5.0" }
+ftui-extras = { version = "0.5.0", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
+ftui-widgets = { version = "0.5.0", features = ["debug-overlay", "regex-search"] }
+ftui-tty = "0.5.0"
+ftui-harness = "0.5.0"
+ftui-render = "0.5.0"
 beads_rust = { version = "0.2.15", default-features = false }
 toon = { version = "0.2.3", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
