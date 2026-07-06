@@ -11,19 +11,19 @@
 //! - enabled gate + valid proof => registration succeeds through the tool and
 //!   through a macro (proving macros forward the proof and cannot bypass it).
 
-use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::Cx;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use fastmcp::prelude::McpContext;
-use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
+use mcp_agent_mail_core::{config::with_process_env_overrides_for_test, Config};
 use mcp_agent_mail_tools::{
     create_agent_identity, ensure_project, macro_prepare_thread, macro_start_session,
     register_agent, request_contact, send_message, whois,
 };
 use serde_json::Value;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -407,6 +407,101 @@ fn enabled_gate_allows_valid_proof_through_tool_and_macro() {
             )
             .await
             .expect("macro_start_session should succeed with a valid proof");
+        },
+    );
+}
+
+#[test]
+fn enabled_gate_rejects_replayed_nonce_durably() {
+    let key = SigningKey::from_bytes(&[23u8; 32]);
+    let trusted = b64(key.verifying_key().as_bytes());
+    run_with_env(
+        &[
+            ("AM_REGISTRATION_PROOF_GATE_ENABLED", "true"),
+            ("AM_REGISTRATION_PROOF_TRUSTED_KEYS", trusted.as_str()),
+        ],
+        |cx| async move {
+            let ctx = McpContext::new(cx.clone(), 1);
+            let project_key = format!("/tmp/proof-replay-{}", unique_suffix());
+            ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project");
+
+            let now = now_unix();
+
+            // First registration with nonce "shared-nonce" succeeds and durably
+            // records the nonce in the DB.
+            let proof1 = signed_proof(
+                &key,
+                "BlueLake",
+                &project_key,
+                "claude-code",
+                "opus-4.1",
+                DEFAULT_CAPS,
+                now,
+                now + 120,
+                "shared-nonce",
+            );
+            register_agent(
+                &ctx,
+                project_key.clone(),
+                "claude-code".to_string(),
+                "opus-4.1".to_string(),
+                Some("BlueLake".to_string()),
+                Some("first".to_string()),
+                None,
+                None,
+                None,
+                Some(proof1),
+            )
+            .await
+            .expect("first registration with a fresh nonce succeeds");
+
+            // A DIFFERENT, independently-valid proof (different agent) that REUSES
+            // the same nonce must be rejected as a replay. The rejection comes
+            // from the durable DB store — the only nonce record now that the
+            // in-memory store is gone — so it also holds across process restarts
+            // and separate processes, which the previous in-memory store could
+            // not guarantee. Each register_agent call is an independent tool
+            // invocation, exactly the cross-invocation scenario that matters.
+            let proof2 = signed_proof(
+                &key,
+                "GreenCastle",
+                &project_key,
+                "claude-code",
+                "opus-4.1",
+                DEFAULT_CAPS,
+                now,
+                now + 120,
+                "shared-nonce",
+            );
+            let err = register_agent(
+                &ctx,
+                project_key.clone(),
+                "claude-code".to_string(),
+                "opus-4.1".to_string(),
+                Some("GreenCastle".to_string()),
+                Some("replay".to_string()),
+                None,
+                None,
+                None,
+                Some(proof2),
+            )
+            .await
+            .expect_err("reusing a consumed nonce must fail closed");
+            assert_eq!(error_type(&err), "PROOF_REPLAYED_NONCE");
+
+            // The replayed registration must not have created the identity.
+            let err = whois(
+                &ctx,
+                project_key.clone(),
+                "GreenCastle".to_string(),
+                Some(false),
+                None,
+            )
+            .await
+            .expect_err("replayed registration must not create the identity");
+            assert_eq!(error_type(&err), "AGENT_NOT_FOUND");
         },
     );
 }

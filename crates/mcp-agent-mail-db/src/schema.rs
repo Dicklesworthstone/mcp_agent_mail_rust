@@ -159,6 +159,22 @@ CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
     UNIQUE(project_a_id, project_b_id)
 );
 
+-- Consumed registration-proof nonces (durable replay prevention for the
+-- optional proof gate). A proof's (issuer_key, nonce) pair may be accepted at
+-- most once. The composite PRIMARY KEY makes the consume atomic: an INSERT that
+-- hits the constraint is a replay. `retain_until` is the proof's skewed expiry;
+-- rows are pruned after that, so the table stays bounded. Durable + shared DB =
+-- replay prevention that survives process restarts and spans processes, unlike
+-- the previous in-memory store.
+CREATE TABLE IF NOT EXISTS proof_gate_consumed_nonces (
+    issuer_key TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    retain_until INTEGER NOT NULL,
+    consumed_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer_key, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_proof_nonces_retain_until ON proof_gate_consumed_nonces(retain_until);
+
 -- FTS5 virtual table for message search
 -- Porter stemmer: run/running/runs → run. Unicode61: Unicode-aware tokenization.
 -- remove_diacritics 2: normalize accented characters. prefix='2 3': fast prefix queries.

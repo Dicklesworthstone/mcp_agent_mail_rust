@@ -1523,14 +1523,19 @@ Check that all parameters have valid values."
     // with an unknown from_agent) — are separately guarded to FAIL CLOSED when
     // the gate is enabled via `proof_gate::reject_auto_registration_if_enabled`,
     // so the identity namespace has no ungated side door.
-    crate::proof_gate::enforce(&crate::proof_gate::RegistrationRequest {
-        agent_name: &agent_name,
-        project_key: &project_key,
-        program: &program,
-        model: &model,
-        granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
-        proof: registration_proof.as_deref(),
-    })?;
+    crate::proof_gate::enforce(
+        ctx.cx(),
+        &pool,
+        &crate::proof_gate::RegistrationRequest {
+            agent_name: &agent_name,
+            project_key: &project_key,
+            program: &program,
+            model: &model,
+            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+            proof: registration_proof.as_deref(),
+        },
+    )
+    .await?;
 
     // Tool-layer retry wrapper for #98: `register_agent` is the entry tool
     // that every multi-agent swarm calls first, so it sees the tallest
@@ -1818,14 +1823,19 @@ Check that all parameters have valid values."
     // Optional cryptographic proof gate (off by default). Mirrors the gate on
     // `register_agent` so this alternate registration entry point cannot be
     // used to bypass it. No-op when disabled; fail-closed when enabled.
-    crate::proof_gate::enforce(&crate::proof_gate::RegistrationRequest {
-        agent_name: &agent_name,
-        project_key: &project_key,
-        program: &program,
-        model: &model,
-        granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
-        proof: registration_proof.as_deref(),
-    })?;
+    crate::proof_gate::enforce(
+        ctx.cx(),
+        &pool,
+        &crate::proof_gate::RegistrationRequest {
+            agent_name: &agent_name,
+            project_key: &project_key,
+            program: &program,
+            model: &model,
+            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+            proof: registration_proof.as_deref(),
+        },
+    )
+    .await?;
 
     // Atomic insert-if-absent: eliminates TOCTOU race between a separate
     // get_agent check and register_agent upsert. Returns Duplicate if the

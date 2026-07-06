@@ -5065,6 +5065,118 @@ fn re_enqueue_touches(scope: &str, pending: &std::collections::HashMap<i64, i64>
     }
 }
 
+/// Outcome of attempting to consume a registration-proof nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceOutcome {
+    /// The nonce had not been seen before; it is now durably recorded.
+    Fresh,
+    /// The nonce was already consumed within its validity window (a replay).
+    Replayed,
+}
+
+/// Durably record a consumed registration-proof nonce, atomically detecting
+/// replays.
+///
+/// `issuer_key` is a stable string id for the trusted public key the proof was
+/// signed under (base64 of the 32-byte Ed25519 key). The `(issuer_key, nonce)`
+/// pair may be consumed at most once: the composite PRIMARY KEY on
+/// `proof_gate_consumed_nonces` makes the INSERT itself the atomic check — a
+/// fresh insert (rows-affected 1) is [`NonceOutcome::Fresh`], a conflict
+/// (rows-affected 0) is [`NonceOutcome::Replayed`]. Two racing consumes of the
+/// same nonce resolve correctly: one commits `Fresh`, the other's commit
+/// conflicts, retries, then sees the row and returns `Replayed`. Because the
+/// record lives in the shared database the guarantee survives process restarts
+/// and holds across processes, unlike an in-memory store.
+///
+/// Expired rows (`retain_until < now`) are pruned in the same transaction so the
+/// table stays bounded without a background sweeper.
+///
+/// The caller MUST fail closed on any non-`Ok` outcome: if the nonce cannot be
+/// durably recorded we cannot prove the proof is not being replayed, so
+/// registration must be refused.
+pub async fn consume_proof_nonce(
+    cx: &Cx,
+    pool: &DbPool,
+    issuer_key: &str,
+    nonce: &str,
+    retain_until: i64,
+    now: i64,
+) -> Outcome<NonceOutcome, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    run_with_mvcc_retry(cx, "consume_proof_nonce", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        // Prune expired nonces (housekeeping; keeps the table bounded).
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "DELETE FROM proof_gate_consumed_nonces WHERE retain_until < ?",
+                    &[Value::BigInt(now)],
+                )
+                .await
+            )
+        );
+
+        // Atomic replay check: INSERT the nonce; a conflict (already consumed)
+        // affects 0 rows, a fresh insert affects 1.
+        let affected = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    &tracked,
+                    "INSERT INTO proof_gate_consumed_nonces \
+                     (issuer_key, nonce, retain_until, consumed_at) \
+                     VALUES (?, ?, ?, ?) \
+                     ON CONFLICT(issuer_key, nonce) DO NOTHING",
+                    &[
+                        Value::Text(issuer_key.to_string()),
+                        Value::Text(nonce.to_string()),
+                        Value::BigInt(retain_until),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
+
+        let outcome = if affected >= 1 {
+            NonceOutcome::Fresh
+        } else {
+            NonceOutcome::Replayed
+        };
+
+        match commit_tx(cx, &tracked).await {
+            Outcome::Ok(()) => Outcome::Ok(outcome),
+            Outcome::Err(e) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                Outcome::Err(e)
+            }
+            Outcome::Cancelled(r) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                Outcome::Cancelled(r)
+            }
+            Outcome::Panicked(p) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                Outcome::Panicked(p)
+            }
+        }
+    })
+    .await
+}
+
 /// Update agent's `contact_policy`
 pub async fn set_agent_contact_policy(
     cx: &Cx,

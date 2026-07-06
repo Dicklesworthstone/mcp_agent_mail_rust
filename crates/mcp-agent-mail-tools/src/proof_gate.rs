@@ -57,12 +57,10 @@
 use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 use fastmcp::McpError;
-use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::config::ProofGateConfig;
+use mcp_agent_mail_core::Config;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 /// Domain-separation tag prefixed to every canonical signed message. Bumping the
 /// version invalidates every previously issued proof.
@@ -121,8 +119,24 @@ struct ProofBundle {
 /// `Allow` means the proof is authentic, trusted, unexpired, and binds the exact
 /// registration being attempted. Every `Deny` carries a distinct, stable machine
 /// code (`PROOF_*`) plus a human-actionable message.
+/// Parameters for durably recording a consumed proof nonce (replay prevention).
+///
+/// Surfaced by the synchronous verifier so the asynchronous [`enforce`] can
+/// perform the actual atomic DB write. `issuer_key` is the base64 of the trusted
+/// public key the proof was signed under; `retain_until` is the proof's skewed
+/// expiry, past which the record can be pruned.
+#[derive(Debug, Clone)]
+struct NonceConsume {
+    issuer_key: String,
+    nonce: String,
+    retain_until: i64,
+}
+
 enum Verdict {
-    Allow,
+    /// The proof is fully valid. Carries the nonce-consume parameters when
+    /// `require_nonce` is enabled, so the async caller can atomically record the
+    /// nonce in the durable store; `None` when nonce enforcement is off.
+    Allow(Option<NonceConsume>),
     Deny {
         code: &'static str,
         message: String,
@@ -338,10 +352,12 @@ impl ProofVerifier for Ed25519TrustAnchorVerifier<'_> {
             );
         }
 
-        // 8. Replay: consume the nonce LAST, so a proof that fails any earlier
-        //    check never burns its nonce. Only reached once the proof is fully
-        //    authentic, fresh, and correctly bound.
-        if cfg.require_nonce {
+        // 8. Replay: surface the nonce-consume parameters LAST, so a proof that
+        //    fails any earlier check never records a nonce. The actual consume is
+        //    a durable, atomic DB write done by the async `enforce` (a replay
+        //    that survives restarts / spans processes). Only reached once the
+        //    proof is fully authentic, fresh, and correctly bound.
+        let nonce_consume = if cfg.require_nonce {
             if claims.nonce.trim().is_empty() {
                 return deny(
                     "PROOF_MALFORMED",
@@ -349,19 +365,20 @@ impl ProofVerifier for Ed25519TrustAnchorVerifier<'_> {
                     json!({ "stage": "nonce" }),
                 );
             }
-            // Keep the consumed nonce recorded until its (skewed) expiry so a
-            // replay within the proof's validity window is rejected.
-            let retain_until = claims.expires_at.saturating_add(skew);
-            if consume_nonce(&pk_bytes, claims.nonce.trim(), retain_until, now_unix).is_err() {
-                return deny(
-                    "PROOF_REPLAYED_NONCE",
-                    "registration_proof nonce has already been used",
-                    json!({ "nonce": claims.nonce }),
-                );
-            }
-        }
+            Some(NonceConsume {
+                // Canonical base64 of the verified key bytes (normalized so two
+                // encodings of the same key can't be treated as distinct issuers).
+                issuer_key: base64::engine::general_purpose::STANDARD.encode(pk_bytes),
+                nonce: claims.nonce.trim().to_string(),
+                // Retain the record until the proof's (skewed) expiry so a replay
+                // within the proof's validity window is rejected.
+                retain_until: claims.expires_at.saturating_add(skew),
+            })
+        } else {
+            None
+        };
 
-        Verdict::Allow
+        Verdict::Allow(nonce_consume)
     }
 }
 
@@ -371,28 +388,80 @@ impl ProofVerifier for Ed25519TrustAnchorVerifier<'_> {
 /// with zero behavior change. When enabled, it verifies the proof and returns an
 /// `Err` (registration must abort, fail-closed) on any problem.
 ///
+/// Nonce replay prevention is durable: a valid proof's nonce is recorded
+/// atomically in the shared database ([`mcp_agent_mail_db::queries::consume_proof_nonce`]),
+/// so a replay is rejected even across process restarts and across processes.
+/// If the nonce cannot be durably recorded (DB unavailable), this fails closed
+/// and refuses the registration rather than risk accepting a replay.
+///
 /// # Errors
 ///
 /// Returns a `McpError` (tool error payload with a distinct `PROOF_*` type) when
 /// the gate is enabled and the proof is missing, malformed, untrusted, has a bad
 /// signature, is expired / not-yet-valid / over-long-lived, does not bind the
-/// requested identity / project / program / model / capability scope, or replays
-/// a previously consumed nonce.
-pub fn enforce(request: &RegistrationRequest<'_>) -> Result<(), McpError> {
+/// requested identity / project / program / model / capability scope, replays a
+/// previously consumed nonce, or the nonce store is unavailable.
+pub async fn enforce(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    request: &RegistrationRequest<'_>,
+) -> Result<(), McpError> {
     let config = Config::get();
-    enforce_with_config(&config.proof_gate, request, now_unix_seconds())
+    let consume = enforce_with_config(&config.proof_gate, request, now_unix_seconds())?;
+    if let Some(nc) = consume {
+        consume_nonce_durably(cx, pool, &nc).await?;
+    }
+    Ok(())
 }
 
-/// Testable core of [`enforce`]: takes an explicit gate config and clock so unit
-/// tests can exercise every branch deterministically.
+/// Durably consume a verified proof nonce, failing closed on replay or any DB
+/// problem. Split out so [`enforce`] stays readable and the fail-closed policy
+/// is explicit and centralized.
+async fn consume_nonce_durably(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    nc: &NonceConsume,
+) -> Result<(), McpError> {
+    use mcp_agent_mail_db::queries::{consume_proof_nonce, NonceOutcome};
+    match consume_proof_nonce(
+        cx,
+        pool,
+        &nc.issuer_key,
+        &nc.nonce,
+        nc.retain_until,
+        now_unix_seconds(),
+    )
+    .await
+    {
+        asupersync::Outcome::Ok(NonceOutcome::Fresh) => Ok(()),
+        asupersync::Outcome::Ok(NonceOutcome::Replayed) => Err(mk_error(
+            "PROOF_REPLAYED_NONCE",
+            "registration_proof nonce has already been used",
+            json!({ "nonce": nc.nonce }),
+        )),
+        // Fail closed: without a durable record we cannot prove the proof is not
+        // being replayed, so registration must be refused.
+        other => Err(mk_error(
+            "PROOF_NONCE_STORE_UNAVAILABLE",
+            "could not durably record the registration_proof nonce for replay prevention; \
+             refusing to register (fail-closed)",
+            json!({ "nonce": nc.nonce, "detail": format!("{other:?}") }),
+        )),
+    }
+}
+
+/// Testable core of [`enforce`]: the fully-synchronous crypto/freshness/binding
+/// checks. Returns the nonce-consume parameters to record durably (when
+/// `require_nonce` is on) so unit tests can exercise every branch deterministically
+/// without a database; [`enforce`] performs the durable consume.
 fn enforce_with_config(
     gate: &ProofGateConfig,
     request: &RegistrationRequest<'_>,
     now_unix: i64,
-) -> Result<(), McpError> {
+) -> Result<Option<NonceConsume>, McpError> {
     if !gate.enabled {
         // Self-asserted registration: unchanged behavior, no proof required.
-        return Ok(());
+        return Ok(None);
     }
 
     // Proof presence is checked here (not inside the verifier) so a missing proof
@@ -408,7 +477,7 @@ fn enforce_with_config(
 
     let verifier = Ed25519TrustAnchorVerifier { config: gate };
     match verifier.verify(raw, request, now_unix) {
-        Verdict::Allow => Ok(()),
+        Verdict::Allow(nonce_consume) => Ok(nonce_consume),
         Verdict::Deny {
             code,
             message,
@@ -540,38 +609,10 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-/// A consumed proof nonce, keyed by the issuer public key it was signed under.
-type NonceKey = (Vec<u8>, String);
-/// Process-wide map of consumed nonces → retain-until timestamp.
-type NonceStore = Mutex<HashMap<NonceKey, i64>>;
-
-/// Process-wide store of consumed `(public_key, nonce)` pairs → retain-until ts.
-fn nonce_store() -> &'static NonceStore {
-    static STORE: OnceLock<NonceStore> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Record a nonce as consumed. Returns `Err(())` if it was already consumed
-/// (replay). Expired entries are pruned opportunistically to bound memory.
-fn consume_nonce(
-    public_key: &[u8],
-    nonce: &str,
-    retain_until: i64,
-    now_unix: i64,
-) -> Result<(), ()> {
-    let store = nonce_store();
-    let mut guard = store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.retain(|_, expiry| *expiry >= now_unix);
-    let key = (public_key.to_vec(), nonce.to_string());
-    if guard.contains_key(&key) {
-        return Err(());
-    }
-    guard.insert(key, retain_until);
-    drop(guard);
-    Ok(())
-}
+// Nonce replay prevention is now durable and lives in the database
+// (`proof_gate_consumed_nonces`, consumed via
+// `mcp_agent_mail_db::queries::consume_proof_nonce`). The former process-local
+// in-memory store did not survive restarts and did not span processes.
 
 #[cfg(test)]
 mod tests {
@@ -839,20 +880,30 @@ mod tests {
     }
 
     #[test]
-    fn replayed_nonce_fails_closed() {
+    fn valid_proof_surfaces_nonce_consume_for_durable_recording() {
+        // The sync verifier no longer consumes nonces in-process; it surfaces the
+        // consume parameters so the async `enforce` records them durably in the
+        // DB. Replay REJECTION is covered by the DB-backed integration tests
+        // (registration_proof_gate.rs), which exercise the durable store across
+        // connections. Here we assert the sync layer returns the correct consume
+        // params for a valid proof when require_nonce is on.
         let key = signing_key(14);
         let gate = gate_with_anchor(&key);
         let now = 11_000_000;
-        // Unique nonce/key per test run to avoid cross-test interference in the
-        // process-global nonce store.
         let mut spec = ClaimsSpec::valid(now);
-        spec.nonce = "replay-fixed-nonce".to_string();
+        spec.nonce = "durable-nonce".to_string();
         let bundle = spec.signed_bundle(&key);
-        // First use succeeds and consumes the nonce.
-        assert!(enforce_with_config(&gate, &request(Some(&bundle)), now).is_ok());
-        // Second identical use is a replay.
-        let err = enforce_with_config(&gate, &request(Some(&bundle)), now).unwrap_err();
-        assert_eq!(deny_code(&err), "PROOF_REPLAYED_NONCE");
+        let consume = enforce_with_config(&gate, &request(Some(&bundle)), now)
+            .expect("valid proof is allowed")
+            .expect("nonce consume params surfaced when require_nonce is on");
+        assert_eq!(consume.nonce, "durable-nonce");
+        // issuer_key is the canonical base64 of the signing key's public key.
+        assert_eq!(consume.issuer_key, b64(key.verifying_key().as_bytes()));
+        // retain_until is the proof's expiry plus the configured clock skew.
+        assert_eq!(
+            consume.retain_until,
+            spec.expires_at + i64::try_from(gate.clock_skew_seconds).unwrap()
+        );
     }
 
     #[test]
@@ -876,10 +927,11 @@ mod tests {
 
     #[test]
     fn auto_registration_noop_when_gate_disabled() {
-        assert!(
-            reject_auto_registration_with_gate(false, "send_message recipient auto-registration")
-                .is_ok()
-        );
+        assert!(reject_auto_registration_with_gate(
+            false,
+            "send_message recipient auto-registration"
+        )
+        .is_ok());
     }
 
     #[test]
