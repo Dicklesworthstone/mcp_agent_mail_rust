@@ -35,7 +35,10 @@ use ftui_extras::theme::ThemeId;
 use ftui_render::budget::DegradationLevel;
 use ftui_runtime::program::{Cmd, Model};
 use ftui_runtime::subscription::Subscription;
-use ftui_runtime::tick_strategy::ScreenTickDispatch;
+use ftui_runtime::tick_strategy::{
+    ActiveOnly, ActivePlusAdjacent, Predictive, PredictiveStrategyConfig, ScreenTickDispatch,
+    TickDecision, TickStrategy, Uniform,
+};
 use mcp_agent_mail_db::DbPoolConfig;
 
 use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};
@@ -116,16 +119,16 @@ const TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY: u32 = 64;
 const TUI_DIFF_DEFAULT_AUTO_FLIP_THRESHOLD: u32 = 3;
 const TUI_DIFF_FRAME_BUDGET_MS: f64 = 16.6;
 
-/// Nearby (adjacent) inactive screens tick every Nth frame.
+/// Nearby (adjacent) inactive screens must tick at least every Nth frame.
 const NEARBY_SCREEN_TICK_DIVISOR: u64 = 3;
-/// High-priority inactive screens tick every Nth frame.
+/// High-priority inactive screens must tick at least every Nth frame.
 const HIGH_PRIORITY_SCREEN_TICK_DIVISOR: u64 = 4;
-/// Inactive screens tick only every Nth frame in the fallback path.
-const INACTIVE_SCREEN_TICK_DIVISOR: u64 = 12;
-/// Low-priority/background screens tick at the slowest cadence.
-const BACKGROUND_SCREEN_TICK_DIVISOR: u64 = 24;
 /// Urgent paths can bypass slower cadences when mailbox pressure is high.
 const URGENT_BYPASS_SCREEN_TICK_DIVISOR: u64 = 2;
+/// Default fallback divisor for the tick strategy in hermetic contexts
+/// (tests, `MailAppModel::new` without a `Config`). Matches the tuned
+/// inactive-screen cadence and `Config::default().tui_tick_divisor`.
+const DEFAULT_TICK_FALLBACK_DIVISOR: u64 = 12;
 
 const fn screen_tick_key(id: MailScreenId) -> &'static str {
     match id {
@@ -195,27 +198,6 @@ impl Drop for LoopHeartbeatSuccessGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScreenCadenceTier {
-    Active,
-    Nearby,
-    Inactive,
-    Background,
-}
-
-fn screen_cadence_tier(screen: MailScreenId, active: MailScreenId) -> ScreenCadenceTier {
-    if screen == active {
-        return ScreenCadenceTier::Active;
-    }
-    if are_adjacent_screens(screen, active) {
-        return ScreenCadenceTier::Nearby;
-    }
-    if is_background_screen(screen) {
-        return ScreenCadenceTier::Background;
-    }
-    ScreenCadenceTier::Inactive
-}
-
 fn are_adjacent_screens(a: MailScreenId, b: MailScreenId) -> bool {
     let len = ALL_SCREEN_IDS.len();
     if len <= 1 {
@@ -230,13 +212,6 @@ fn are_adjacent_screens(a: MailScreenId, b: MailScreenId) -> bool {
     let prev = (a_idx + len - 1) % len;
     let next = (a_idx + 1) % len;
     b_idx == prev || b_idx == next
-}
-
-const fn is_background_screen(id: MailScreenId) -> bool {
-    matches!(
-        id,
-        MailScreenId::Analytics | MailScreenId::Attachments | MailScreenId::ArchiveBrowser
-    )
 }
 
 const fn is_high_priority_screen(id: MailScreenId) -> bool {
@@ -259,29 +234,98 @@ const fn is_urgent_path_screen(id: MailScreenId) -> bool {
     )
 }
 
-const fn screen_cadence_base_divisor(tier: ScreenCadenceTier) -> u64 {
-    match tier {
-        ScreenCadenceTier::Active => 1,
-        ScreenCadenceTier::Nearby => NEARBY_SCREEN_TICK_DIVISOR,
-        ScreenCadenceTier::Inactive => INACTIVE_SCREEN_TICK_DIVISOR,
-        ScreenCadenceTier::Background => BACKGROUND_SCREEN_TICK_DIVISOR,
-    }
-}
-
 fn urgent_poller_bypass_active(state: &TuiSharedState) -> bool {
     state.urgent_cadence_bypass_active(now_micros())
 }
 
-fn screen_tick_divisor(screen: MailScreenId, active: MailScreenId, urgent_bypass: bool) -> u64 {
-    let tier = screen_cadence_tier(screen, active);
-    let mut divisor = screen_cadence_base_divisor(tier);
+/// App-level maximum-staleness bound for an inactive screen, applied OVER the
+/// configured tick strategy's decision.
+///
+/// The strategy (Predictive/Uniform/Adjacent/ActiveOnly, `AM_TUI_TICK_*`)
+/// decides how OFTEN screens tick; these clamps guarantee how STALE the
+/// critical paths may ever get, regardless of strategy choice or predictor
+/// state: adjacent screens refresh at least every `NEARBY` ticks (instant-
+/// feeling tab switches), high-priority screens at least every
+/// `HIGH_PRIORITY` ticks, and urgent-path screens at least every
+/// `URGENT_BYPASS` ticks while mailbox pressure is high. Returns `None` when
+/// no bound applies (the strategy alone decides).
+fn cadence_clamp_divisor(
+    screen: MailScreenId,
+    active: MailScreenId,
+    urgent_bypass: bool,
+) -> Option<u64> {
+    let mut clamp: Option<u64> = None;
+    let mut apply = |divisor: u64| {
+        clamp = Some(clamp.map_or(divisor, |current| current.min(divisor)));
+    };
+    if are_adjacent_screens(screen, active) {
+        apply(NEARBY_SCREEN_TICK_DIVISOR);
+    }
     if is_high_priority_screen(screen) {
-        divisor = divisor.min(HIGH_PRIORITY_SCREEN_TICK_DIVISOR);
+        apply(HIGH_PRIORITY_SCREEN_TICK_DIVISOR);
     }
     if urgent_bypass && is_urgent_path_screen(screen) {
-        divisor = divisor.min(URGENT_BYPASS_SCREEN_TICK_DIVISOR);
+        apply(URGENT_BYPASS_SCREEN_TICK_DIVISOR);
     }
-    divisor.max(1)
+    clamp
+}
+
+/// Build the screen tick strategy selected by `AM_TUI_TICK_*` configuration.
+///
+/// Unrecognized strategy strings are normalized to `predictive` by the config
+/// layer; this match keeps the same conservative fallback defensively. The
+/// Predictive strategy persists transition data under the storage root when
+/// `tui_tick_persist` is enabled so warm starts predict from prior sessions.
+fn build_tick_strategy(config: &mcp_agent_mail_core::Config) -> Box<dyn TickStrategy> {
+    let divisor = config.tui_tick_divisor.max(1);
+    match config.tui_tick_strategy.as_str() {
+        "active_only" => Box::new(ActiveOnly),
+        "uniform" => Box::new(Uniform::new(divisor)),
+        "adjacent" => {
+            let keys: Vec<&str> = ALL_SCREEN_IDS
+                .iter()
+                .map(|&id| screen_tick_key(id))
+                .collect();
+            let mut strategy = ActivePlusAdjacent::from_tab_order(&keys, divisor);
+            // The tab order is circular: close the wrap-around edge so the
+            // first and last screens count as neighbors, matching
+            // `are_adjacent_screens`.
+            if keys.len() > 1 {
+                let (first, last) = (keys[0], keys[keys.len() - 1]);
+                strategy.add_adjacency(first, &[last]);
+                strategy.add_adjacency(last, &[first]);
+            }
+            Box::new(strategy)
+        }
+        _ => {
+            let strategy_config = PredictiveStrategyConfig {
+                fallback_divisor: divisor,
+                min_observations: config.tui_tick_min_observations.max(1),
+                decay_factor: config.tui_tick_decay_factor.clamp(0.0, 1.0),
+                ..PredictiveStrategyConfig::default()
+            };
+            if config.tui_tick_persist {
+                let path = config.storage_root.join("tick_transitions.json");
+                Box::new(Predictive::with_persistence(
+                    strategy_config,
+                    &path,
+                    config.tui_tick_decay_factor.clamp(0.0, 1.0),
+                ))
+            } else {
+                Box::new(Predictive::new(strategy_config))
+            }
+        }
+    }
+}
+
+/// Hermetic default strategy for constructors that have no `Config`
+/// (unit tests, `MailAppModel::new`): predictive decisions with the tuned
+/// fallback cadence and NO filesystem persistence.
+fn default_tick_strategy() -> Box<dyn TickStrategy> {
+    Box::new(Predictive::new(PredictiveStrategyConfig {
+        fallback_divisor: DEFAULT_TICK_FALLBACK_DIVISOR,
+        ..PredictiveStrategyConfig::default()
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1467,6 +1511,10 @@ pub struct MailAppModel {
     notifications: NotificationQueue,
     last_toast_seq: u64,
     tick_count: u64,
+    /// Screen tick strategy (Predictive Screen Tick Management): decides
+    /// which inactive screens tick each frame. The tick loop applies
+    /// `cadence_clamp_divisor` staleness bounds over its decisions.
+    tick_strategy: Box<dyn TickStrategy>,
     scheduled_tick_interval: Duration,
     /// Global cursor for per-tick shared event ingestion batch.
     tick_event_batch_last_seq: u64,
@@ -1636,6 +1684,7 @@ impl MailAppModel {
             notifications: NotificationQueue::new(QueueConfig::default()),
             last_toast_seq,
             tick_count: 0,
+            tick_strategy: default_tick_strategy(),
             scheduled_tick_interval: IDLE_TICK_INTERVAL,
             tick_event_batch_last_seq: 0,
             last_dispatched_resize: None,
@@ -1700,6 +1749,7 @@ impl MailAppModel {
         let hints_path = crate::tui_persist::dismissed_hints_path(&config.console_persist_path);
         model.coach_hints = CoachHintManager::new().with_persist_path(hints_path);
         model.coach_hints.enabled = config.tui_coach_hints_enabled;
+        model.tick_strategy = build_tick_strategy(config);
         model.toast_severity = ToastSeverityThreshold::from_config(config);
         model.toast_muted = !config.tui_toast_enabled;
         model.git_segfault_toast_enabled = config.tui_git_segfault_toast_enabled;
@@ -1980,6 +2030,10 @@ impl MailAppModel {
         // Force-tick the newly active screen so it shows fresh data
         // immediately (inactive screens tick at a reduced rate).
         if from != to {
+            // Feed the transition to the tick strategy so Predictive learns
+            // which screen the operator is likely to visit next.
+            self.tick_strategy
+                .on_screen_transition(screen_tick_key(from), screen_tick_key(to));
             self.request_contrast_guard_pass();
             let tick_count = self.tick_count;
             let tick_state = &self.state;
@@ -4401,17 +4455,31 @@ impl Model for MailAppModel {
                 let urgent_bypass = urgent_poller_bypass_active(&self.state);
                 // Always tick the active screen.
                 self.tick_screen_with_panic_guard(active, tick_count);
-                // Inactive screens use tiered cadence classes so nearby and
-                // high-priority paths stay fresh without forcing all-screen churn.
+                // Inactive screens: the configured tick strategy
+                // (Predictive/Uniform/Adjacent/ActiveOnly, AM_TUI_TICK_*)
+                // decides cadence, and app-level clamps bound how stale the
+                // nearby / high-priority / urgent paths may ever get. The
+                // strategy is consulted for EVERY inactive screen every tick
+                // so its transition statistics stay complete.
+                let active_key = screen_tick_key(active);
                 for &id in ALL_SCREEN_IDS {
                     if id == active {
                         continue;
                     }
-                    let divisor = screen_tick_divisor(id, active, urgent_bypass);
-                    if tick_count.is_multiple_of(divisor) {
+                    let strategy_ticks = matches!(
+                        self.tick_strategy
+                            .should_tick(screen_tick_key(id), tick_count, active_key),
+                        TickDecision::Tick
+                    );
+                    let clamp_ticks = cadence_clamp_divisor(id, active, urgent_bypass)
+                        .is_some_and(|divisor| tick_count.is_multiple_of(divisor));
+                    if strategy_ticks || clamp_ticks {
                         self.tick_screen_with_panic_guard(id, tick_count);
                     }
                 }
+                // Strategy maintenance: temporal decay + periodic persistence
+                // auto-save (both internally interval-gated, cheap per tick).
+                self.tick_strategy.maintenance_tick(tick_count);
                 let housekeeping_cmd = self.run_housekeeping_tick(elapsed_tick);
                 let post_tick_resize_cmd = self.flush_pending_resize_event();
                 let tick_schedule_cmd = self.update_tick_schedule();
@@ -5454,6 +5522,9 @@ impl ScreenTickDispatch for MailAppModel {
 impl Drop for MailAppModel {
     fn drop(&mut self) {
         self.persist_palette_usage();
+        // Flush tick-strategy state (Predictive saves transition data if
+        // dirty and persistence is configured; other strategies no-op).
+        self.tick_strategy.shutdown();
     }
 }
 
@@ -12801,16 +12872,18 @@ first body
     }
 
     #[test]
-    fn event_tick_fallback_background_screen_uses_slowest_divisor() {
+    fn event_tick_background_screen_follows_strategy_fallback_divisor() {
         let mut model = test_model();
         let mut screen = PanickingScreen::new();
         screen.panic_on_tick = true;
         model.set_screen(MailScreenId::ArchiveBrowser, Box::new(screen));
 
         // ArchiveBrowser wraps adjacent to Dashboard in the circular tab order,
-        // so select a non-adjacent active screen before validating background cadence.
+        // so select a non-adjacent active screen: with no clamp applicable the
+        // cold-start Predictive strategy alone decides, ticking unknown
+        // screens at the fallback divisor.
         model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
-        for _ in 0..(BACKGROUND_SCREEN_TICK_DIVISOR - 1) {
+        for _ in 0..(DEFAULT_TICK_FALLBACK_DIVISOR - 1) {
             let _ = model.update(MailMsg::Terminal(Event::Tick));
         }
         assert!(
@@ -12818,7 +12891,7 @@ first body
                 .screen_panics
                 .borrow()
                 .contains_key(&MailScreenId::ArchiveBrowser),
-            "background screen should not tick before background divisor"
+            "unclamped background screen should not tick before the strategy fallback divisor"
         );
 
         let _ = model.update(MailMsg::Terminal(Event::Tick));
@@ -12827,7 +12900,7 @@ first body
                 .screen_panics
                 .borrow()
                 .contains_key(&MailScreenId::ArchiveBrowser),
-            "background screen should tick at background divisor"
+            "unclamped background screen should tick at the strategy fallback divisor"
         );
     }
 
@@ -12861,6 +12934,171 @@ first body
                 .borrow()
                 .contains_key(&MailScreenId::Messages),
             "message screen should be accelerated by urgent bypass cadence"
+        );
+    }
+
+    // ── Tick strategy selection + loop integration (bd-1nl75 F/H) ─────
+
+    fn tick_config(strategy: &str) -> Config {
+        Config {
+            tui_tick_strategy: strategy.to_string(),
+            // Never touch the filesystem from unit tests.
+            tui_tick_persist: false,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn build_tick_strategy_maps_every_config_string() {
+        assert_eq!(
+            build_tick_strategy(&tick_config("active_only")).name(),
+            "ActiveOnly"
+        );
+        assert_eq!(
+            build_tick_strategy(&tick_config("uniform")).name(),
+            "Uniform"
+        );
+        assert_eq!(
+            build_tick_strategy(&tick_config("adjacent")).name(),
+            "ActivePlusAdjacent"
+        );
+        assert_eq!(
+            build_tick_strategy(&tick_config("predictive")).name(),
+            "Predictive"
+        );
+        // Defensive fallback: the config layer normalizes unknown strings,
+        // but the builder must also resolve them to Predictive.
+        assert_eq!(
+            build_tick_strategy(&tick_config("warp_speed")).name(),
+            "Predictive"
+        );
+    }
+
+    #[test]
+    fn adjacent_strategy_closes_the_circular_tab_order() {
+        let config = tick_config("adjacent");
+        let divisor = config.tui_tick_divisor.max(1);
+        let keys: Vec<&str> = ALL_SCREEN_IDS
+            .iter()
+            .map(|&id| screen_tick_key(id))
+            .collect();
+        let mut strategy = ActivePlusAdjacent::from_tab_order(&keys, divisor);
+        strategy.add_adjacency(keys[0], &[keys[keys.len() - 1]]);
+        strategy.add_adjacency(keys[keys.len() - 1], &[keys[0]]);
+        let adjacency = strategy.adjacency();
+        let first = keys[0];
+        let last = keys[keys.len() - 1];
+        assert!(
+            adjacency[first].iter().any(|n| n == last),
+            "first screen must neighbor the last (circular wrap)"
+        );
+        assert!(
+            adjacency[last].iter().any(|n| n == first),
+            "last screen must neighbor the first (circular wrap)"
+        );
+    }
+
+    #[test]
+    fn with_config_selects_the_configured_strategy() {
+        let config = tick_config("uniform");
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::with_config(state, &config);
+        assert_eq!(model.tick_strategy.name(), "Uniform");
+    }
+
+    #[test]
+    fn cadence_clamp_bounds_critical_paths_only() {
+        // Adjacent + high-priority: tightest of nearby/high-priority.
+        assert_eq!(
+            cadence_clamp_divisor(MailScreenId::Messages, MailScreenId::Dashboard, false),
+            Some(NEARBY_SCREEN_TICK_DIVISOR)
+        );
+        // High-priority, not adjacent: high-priority bound.
+        assert_eq!(
+            cadence_clamp_divisor(MailScreenId::Timeline, MailScreenId::Dashboard, false),
+            Some(HIGH_PRIORITY_SCREEN_TICK_DIVISOR)
+        );
+        // Urgent bypass tightens urgent-path screens further.
+        assert_eq!(
+            cadence_clamp_divisor(MailScreenId::Messages, MailScreenId::Dashboard, true),
+            Some(URGENT_BYPASS_SCREEN_TICK_DIVISOR)
+        );
+        // Background screens have no staleness bound: the strategy decides.
+        assert_eq!(
+            cadence_clamp_divisor(MailScreenId::Analytics, MailScreenId::Messages, false),
+            None
+        );
+    }
+
+    /// Probe strategy proving the tick loop drives the trait contract:
+    /// `should_tick` for every inactive screen each tick, `maintenance_tick`
+    /// once per tick, and `on_screen_transition` on every screen switch.
+    #[derive(Debug, Default)]
+    struct ProbeStrategy {
+        should_tick_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        maintenance_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        transitions: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl TickStrategy for ProbeStrategy {
+        fn should_tick(
+            &mut self,
+            _screen_id: &str,
+            _tick_count: u64,
+            _active_screen: &str,
+        ) -> TickDecision {
+            self.should_tick_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TickDecision::Skip
+        }
+
+        fn on_screen_transition(&mut self, from: &str, to: &str) {
+            self.transitions
+                .lock()
+                .expect("probe transitions lock")
+                .push((from.to_string(), to.to_string()));
+        }
+
+        fn maintenance_tick(&mut self, _tick_count: u64) {
+            self.maintenance_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // The `TickStrategy` trait fixes this signature; the literal cannot
+        // be promoted to `&'static str` here.
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "Probe"
+        }
+    }
+
+    #[test]
+    fn tick_loop_drives_strategy_contract_end_to_end() {
+        let mut model = test_model();
+        let probe = ProbeStrategy::default();
+        let should_tick_calls = std::sync::Arc::clone(&probe.should_tick_calls);
+        let maintenance_calls = std::sync::Arc::clone(&probe.maintenance_calls);
+        let transitions = std::sync::Arc::clone(&probe.transitions);
+        model.tick_strategy = Box::new(probe);
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+        assert_eq!(
+            should_tick_calls.load(std::sync::atomic::Ordering::Relaxed),
+            ALL_SCREEN_IDS.len() - 1,
+            "the strategy must be consulted for every inactive screen"
+        );
+        assert_eq!(
+            maintenance_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "maintenance must run once per tick"
+        );
+
+        model.update(MailMsg::SwitchScreen(MailScreenId::Threads));
+        let recorded = transitions.lock().expect("probe transitions lock").clone();
+        assert_eq!(
+            recorded,
+            vec![("dashboard".to_string(), "threads".to_string())],
+            "screen switches must be reported to the strategy"
         );
     }
 

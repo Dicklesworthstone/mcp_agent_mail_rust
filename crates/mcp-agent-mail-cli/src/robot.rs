@@ -14553,6 +14553,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 #[serde(skip_serializing_if = "Option::is_none")]
                 host: Option<mcp_agent_mail_core::host_health::HostHealthReport>,
                 tui_liveness: TuiLivenessReport,
+                // Screen tick strategy resolved from AM_TUI_TICK_* config so
+                // operators can verify cadence configuration without a TUI
+                // session (Predictive Screen Tick Management, H.3/I.7).
+                tui_tick: serde_json::Value,
                 // I4: unified process-owner model (five runtime-ownership
                 // dimensions) plus the classified divergences/respawn loop.
                 process_owner: crate::doctor::process_owner::ProcessOwnerModel,
@@ -14639,6 +14643,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     search_index: search_index_snapshot,
                     host: host_report,
                     tui_liveness,
+                    tui_tick: serde_json::json!({
+                        "strategy": config.resolved_tick_strategy_label(),
+                        "configured": config.tui_tick_strategy,
+                        "divisor": config.tui_tick_divisor,
+                        "persist": config.tui_tick_persist,
+                        "min_observations": config.tui_tick_min_observations,
+                        "decay_factor": config.tui_tick_decay_factor,
+                    }),
                     process_owner,
                     process_owner_divergences,
                     supervisor_respawn: process_owner_respawn,

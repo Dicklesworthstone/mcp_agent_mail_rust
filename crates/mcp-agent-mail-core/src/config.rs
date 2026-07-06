@@ -467,6 +467,18 @@ pub struct Config {
     /// Enable one-shot contextual coach hints on first screen visit.
     pub tui_coach_hints_enabled: bool,
 
+    // TUI screen tick strategy (Predictive Screen Tick Management).
+    /// Screen tick strategy: `predictive`, `uniform`, `adjacent`, `active_only`.
+    pub tui_tick_strategy: String,
+    /// Divisor for the Uniform strategy; fallback divisor for Predictive.
+    pub tui_tick_divisor: u64,
+    /// Persist screen-transition data across TUI sessions.
+    pub tui_tick_persist: bool,
+    /// Minimum observed transitions before Predictive predictions are trusted.
+    pub tui_tick_min_observations: u64,
+    /// Temporal decay factor for transition counts (0.0–1.0).
+    pub tui_tick_decay_factor: f64,
+
     // ATC (Air Traffic Controller) — proactive agent coordination
     /// Master switch for the ATC engine.
     pub atc_enabled: bool,
@@ -1558,6 +1570,14 @@ impl Default for Config {
             tui_toast_error_dismiss_secs: 15,
             tui_git_segfault_toast_enabled: true,
             tui_coach_hints_enabled: true,
+            tui_tick_strategy: "predictive".to_string(),
+            // Matches the tuned in-tree inactive-screen cadence (the original
+            // plan said 5, but the TUI was later re-tuned to 12 to stop
+            // background churn; the Predictive fallback keeps that envelope).
+            tui_tick_divisor: 12,
+            tui_tick_persist: true,
+            tui_tick_min_observations: 20,
+            tui_tick_decay_factor: 0.85,
             atc_enabled: true,
             atc_probe_interval_secs: 120,
             atc_advisory_cooldown_secs: 300,
@@ -2526,6 +2546,32 @@ impl Config {
         config.tui_coach_hints_enabled =
             console_bool("AM_TUI_COACH_HINTS_ENABLED", config.tui_coach_hints_enabled);
 
+        // TUI screen tick strategy. An unrecognized strategy string keeps the
+        // default ("predictive") — the conservative fallback the TUI applies.
+        if let Some(v) = console_value("AM_TUI_TICK_STRATEGY") {
+            let lower = v.trim().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "predictive" | "uniform" | "adjacent" | "active_only"
+            ) {
+                config.tui_tick_strategy = lower;
+            }
+        }
+        config.tui_tick_divisor =
+            console_u64("AM_TUI_TICK_DIVISOR", config.tui_tick_divisor).max(1);
+        config.tui_tick_persist = console_bool("AM_TUI_TICK_PERSIST", config.tui_tick_persist);
+        config.tui_tick_min_observations = console_u64(
+            "AM_TUI_TICK_MIN_OBSERVATIONS",
+            config.tui_tick_min_observations,
+        )
+        .max(1);
+        if let Some(v) = console_value("AM_TUI_TICK_DECAY_FACTOR")
+            && let Ok(parsed) = v.trim().parse::<f64>()
+            && (0.0..=1.0).contains(&parsed)
+        {
+            config.tui_tick_decay_factor = parsed;
+        }
+
         // ATC (Air Traffic Controller) configuration
         config.atc_enabled = console_bool("AM_ATC_ENABLED", config.atc_enabled);
         config.atc_probe_interval_secs =
@@ -2691,6 +2737,19 @@ impl Config {
     #[must_use]
     pub fn is_production(&self) -> bool {
         self.app_environment == AppEnvironment::Production
+    }
+
+    /// Canonical tick-strategy label for diagnostics surfaces (`am robot
+    /// health`, tracing). Mirrors the strategy the TUI actually constructs:
+    /// unknown strings resolve to `Predictive`, the conservative fallback.
+    #[must_use]
+    pub fn resolved_tick_strategy_label(&self) -> &'static str {
+        match self.tui_tick_strategy.as_str() {
+            "active_only" => "ActiveOnly",
+            "uniform" => "Uniform",
+            "adjacent" => "ActivePlusAdjacent",
+            _ => "Predictive",
+        }
     }
 
     /// Determine if a tool should be exposed based on tool filter settings.
@@ -5805,6 +5864,38 @@ mod tests {
                 "deny mode must prevent reroute for {path}"
             );
         }
+    }
+
+    #[test]
+    fn default_tick_strategy_config_is_predictive_with_tuned_cadence() {
+        let config = Config::default();
+        assert_eq!(
+            config.tui_tick_strategy, "predictive",
+            "default tick strategy must be predictive"
+        );
+        assert_eq!(
+            config.tui_tick_divisor, 12,
+            "fallback divisor must match the tuned inactive-screen cadence"
+        );
+        assert!(config.tui_tick_persist, "persistence defaults on");
+        assert_eq!(config.tui_tick_min_observations, 20);
+        assert!((config.tui_tick_decay_factor - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolved_tick_strategy_label_maps_every_strategy_string() {
+        let mut config = Config::default();
+        assert_eq!(config.resolved_tick_strategy_label(), "Predictive");
+        config.tui_tick_strategy = "uniform".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "Uniform");
+        config.tui_tick_strategy = "adjacent".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "ActivePlusAdjacent");
+        config.tui_tick_strategy = "active_only".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "ActiveOnly");
+        // Unknown strings resolve to the conservative fallback rather than
+        // failing: the TUI must always have a working strategy.
+        config.tui_tick_strategy = "warp_speed".to_string();
+        assert_eq!(config.resolved_tick_strategy_label(), "Predictive");
     }
 
     #[test]
