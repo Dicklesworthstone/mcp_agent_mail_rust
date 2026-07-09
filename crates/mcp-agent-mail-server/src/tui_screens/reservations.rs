@@ -1367,7 +1367,12 @@ impl ReservationsScreen {
             return Cmd::None;
         };
 
-        let cx = Cx::for_testing();
+        // Borrow the runtime-backed ambient Cx<cap::All> installed by
+        // `Runtime::block_on` instead of the test-only `Cx::for_testing()`
+        // constructor (gated behind `test-internals`).
+        let cx = block_on(async {
+            Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+        });
         let ctx = McpContext::new(cx, 1);
         let result = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
             &ctx,

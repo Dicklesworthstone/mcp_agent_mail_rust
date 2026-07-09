@@ -11568,7 +11568,12 @@ fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
 
-        let cx = asupersync::Cx::for_testing();
+        // Use the runtime-backed ambient Cx installed by the enclosing
+        // `run_async` (Runtime::block_on) rather than the test-only
+        // `Cx::for_testing()` constructor, which is gated behind
+        // `test-internals` and must not be relied on in production.
+        let cx = asupersync::Cx::current()
+            .expect("run_async's Runtime::block_on installs an ambient Cx for the polled future");
         let request = Box::pin(crate::products_http_client().request(
             &cx,
             Method::Get,

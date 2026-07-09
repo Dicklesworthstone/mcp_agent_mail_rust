@@ -96,6 +96,12 @@ loom-tests = []
 s3fifo = []
 
 [dev-dependencies]
+# asupersync `Cx::for_testing()` (the `Cx<cap::All>` constructor) is gated
+# behind `test-internals` (br-asupersync-2x6hbi) so production code cannot
+# forge a full-capability Cx. Enable it for TEST/BENCH builds only: the
+# release build excludes dev-dependencies, so the capability-security gate
+# stays intact for the shipped binary.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
 loom.workspace = true
 proptest.workspace = true

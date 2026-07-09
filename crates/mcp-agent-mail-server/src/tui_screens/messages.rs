@@ -1624,7 +1624,14 @@ impl MessageBrowserScreen {
             ));
         }
 
-        let cx = Cx::for_testing();
+        // Borrow the runtime-backed ambient Cx<cap::All> installed by
+        // `Runtime::block_on` (INFINITE budget) instead of the test-only
+        // `Cx::for_testing()` constructor, which is gated behind
+        // `test-internals`. The Cx is Arc-backed and remains valid for the
+        // McpContext used by the send below.
+        let cx = block_on(async {
+            Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+        });
         let ctx = McpContext::new(cx, 1);
         let result = block_on(mcp_agent_mail_tools::messaging::send_message(
             &ctx,
@@ -1727,7 +1734,12 @@ impl MessageBrowserScreen {
 
         let ack_required = self.quick_reply_form.as_ref().map(|form| form.ack_required);
 
-        let cx = Cx::for_testing();
+        // Borrow the runtime-backed ambient Cx<cap::All> installed by
+        // `Runtime::block_on` instead of the test-only `Cx::for_testing()`
+        // constructor (gated behind `test-internals`).
+        let cx = block_on(async {
+            Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+        });
         let ctx = McpContext::new(cx, 1);
         let result = block_on(mcp_agent_mail_tools::messaging::reply_message(
             &ctx,

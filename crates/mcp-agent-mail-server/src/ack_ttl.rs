@@ -188,7 +188,15 @@ fn run_ack_ttl_cycle_with_state(
     pool: &DbPool,
     previously_overdue: &mut HashSet<OverdueAckKey>,
 ) -> Result<(usize, usize), String> {
-    let cx = Cx::for_testing();
+    // This worker runs on a dedicated OS thread outside the async runtime, so
+    // there is no parent Cx to derive from. Rather than forge a full-capability
+    // Cx with the test-only `Cx::for_testing()` (gated behind `test-internals`),
+    // borrow the runtime-backed ambient Cx<cap::All> (INFINITE budget) that
+    // `Runtime::block_on` installs. It is Arc-backed, so the clone returned here
+    // stays valid across the subsequent block_on calls in this function.
+    let cx = block_on(async {
+        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    });
     let now = now_micros();
     let ttl_us = i64::try_from(config.ack_ttl_seconds)
         .unwrap_or(1800)

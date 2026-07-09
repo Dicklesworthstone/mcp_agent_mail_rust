@@ -15026,7 +15026,12 @@ fn readiness_check_with_integrity(
         cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
 
-    let cx = Cx::for_testing();
+    // Borrow the runtime-backed ambient Cx<cap::All> that `Runtime::block_on`
+    // installs (INFINITE budget) rather than the test-only `Cx::for_testing()`
+    // constructor, which is gated behind `test-internals`.
+    let cx = block_on(async {
+        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    });
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,

@@ -17957,7 +17957,12 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
 
     let api_url = self_update_api_url();
     let response = match rt.block_on(async move {
-        let cx = asupersync::Cx::for_testing();
+        // Runtime::block_on installs an ambient, runtime-backed Cx<cap::All>
+        // (INFINITE budget) for the duration of the poll; use it rather than
+        // the test-only `Cx::for_testing()` so this production path does not
+        // depend on the `test-internals` capability-gate bypass.
+        let cx = asupersync::Cx::current()
+            .expect("Runtime::block_on installs an ambient Cx for the polled future");
         let client = asupersync::http::h1::HttpClient::new();
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
@@ -18247,7 +18252,10 @@ fn download_streaming(
     let cap_label = sink.cap_label();
 
     rt.block_on(async move {
-        let cx = asupersync::Cx::for_testing();
+        // Use the runtime-backed ambient Cx installed by Runtime::block_on
+        // rather than the test-only `Cx::for_testing()` constructor.
+        let cx = asupersync::Cx::current()
+            .expect("Runtime::block_on installs an ambient Cx for the polled future");
         // Build without an explicit max_body_size: we enforce our own cap
         // below before writing each chunk to the sink. Using the streaming
         // API means the asupersync default 16 MiB cap is not applied — it

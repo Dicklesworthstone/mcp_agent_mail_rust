@@ -82,4 +82,8 @@ portable = [
 ]
 
 [dev-dependencies]
+# Enable asupersync `test-internals` for TEST builds only so tests can
+# construct `Cx::for_testing()`; the release build excludes dev-deps and keeps
+# the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
+asupersync = { workspace = true, features = ["test-internals"] }
 similar.workspace = true

@@ -46,6 +46,11 @@ portable = [
 ]
 
 [dev-dependencies]
+# benches import `Cx` via `fastmcp` (which re-exports asupersync's Cx) and call
+# `Cx::for_testing()`. Enable asupersync `test-internals` for the bench build
+# only; the release binary excludes dev-deps and keeps the capability-security
+# gate intact. See mcp-agent-mail-db/Cargo.toml.
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 fastmcp = { workspace = true }
 fastmcp-core = { workspace = true }

@@ -218,11 +218,16 @@ fn run_cleanup_cycle_with_cache(
     pool: &DbPool,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<(usize, usize), String> {
-    // This worker runs on a dedicated OS thread outside the async runtime,
-    // so there is no parent Cx to derive from. Cx::for_testing() provides
-    // Budget::INFINITE which is correct for a long-running background worker
-    // that should never be cancelled by budget exhaustion.
-    let cx = Cx::for_testing();
+    // This worker runs on a dedicated OS thread outside the async runtime, so
+    // there is no parent Cx to derive from. Borrow the runtime-backed ambient
+    // Cx<cap::All> that `Runtime::block_on` installs (INFINITE budget, correct
+    // for a long-running worker that must never be cancelled by budget
+    // exhaustion) instead of the test-only `Cx::for_testing()` constructor,
+    // which is gated behind `test-internals`. The Cx is Arc-backed, so the
+    // clone returned here stays valid across the later block_on calls below.
+    let cx = block_on(async {
+        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    });
 
     // Get all project IDs with active reservations.
     let project_ids =
