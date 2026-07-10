@@ -63,6 +63,8 @@ SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX="${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX:-30}"
 SOAK_BUDGET_CPU_DRIFT_PCT_MAX="${SOAK_BUDGET_CPU_DRIFT_PCT_MAX:-35}"
 SOAK_BUDGET_WAKE_DRIFT_PCT_MAX="${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX:-40}"
 SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX="${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX:-60}"
+SOAK_BUDGET_LOW_VISIBILITY_FRACTION="${SOAK_BUDGET_LOW_VISIBILITY_FRACTION:-0.15}"
+SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX="${SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX:-0.05}"
 
 for cmd in python3 curl; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -72,6 +74,13 @@ for cmd in python3 curl; do
         exit 0
     fi
 done
+
+if ! python3 -c "import pyte" >/dev/null 2>&1; then
+    e2e_log "python3 pyte not found; skipping suite"
+    e2e_skip "pyte required for visible terminal-state validation"
+    e2e_summary
+    exit 0
+fi
 
 e2e_fatal() {
     local msg="$1"
@@ -203,6 +212,16 @@ case "${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}" in
         e2e_fatal "Invalid SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX='${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}'. Expected numeric ratio."
         ;;
 esac
+case "${SOAK_BUDGET_LOW_VISIBILITY_FRACTION}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_LOW_VISIBILITY_FRACTION='${SOAK_BUDGET_LOW_VISIBILITY_FRACTION}'. Expected numeric ratio."
+        ;;
+esac
+case "${SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX}" in
+    ''|*[!0-9.]*|*.*.*)
+        e2e_fatal "Invalid SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX='${SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX}'. Expected numeric ratio."
+        ;;
+esac
 if [ "${SOAK_DURATION_SECONDS}" -lt 120 ]; then
     e2e_fatal "SOAK_DURATION_SECONDS must be >=120 (multi-minute minimum), got '${SOAK_DURATION_SECONDS}'"
 fi
@@ -216,7 +235,7 @@ e2e_log "Pressure budgets: first_byte_p95<=${PRESSURE_BUDGET_FIRST_BYTE_P95_MS}m
 e2e_log "Resize-storm budgets: first_byte_p95<=${RESIZE_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${RESIZE_BUDGET_QUIESCE_P95_MS}ms, repaint_burst<=${RESIZE_BUDGET_REPAINT_BURST_MAX}x"
 e2e_log "Flash budgets: empty_frame_ratio<=${FLASH_BUDGET_EMPTY_FRAME_RATIO_MAX}, frame_bounce_ratio<=${FLASH_BUDGET_FRAME_BOUNCE_RATIO_MAX}, repaint_ops_per_kb<=${FLASH_BUDGET_REPAINT_OPS_PER_KB_MAX}"
 e2e_log "Soak setup: duration=${SOAK_DURATION_SECONDS}s, step_delay=${SOAK_STEP_DELAY_MS}ms"
-e2e_log "Soak budgets: first_byte_p95<=${SOAK_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${SOAK_BUDGET_QUIESCE_P95_MS}ms, quiesce_p99<=${SOAK_BUDGET_QUIESCE_P99_MS}ms, latency_drift<=${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}%, cpu_drift<=${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}%, wake_drift<=${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}%, repaint_ops_per_kb<=${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}"
+e2e_log "Soak budgets: first_byte_p95<=${SOAK_BUDGET_FIRST_BYTE_P95_MS}ms, quiesce_p95<=${SOAK_BUDGET_QUIESCE_P95_MS}ms, quiesce_p99<=${SOAK_BUDGET_QUIESCE_P99_MS}ms, latency_drift<=${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}%, cpu_drift<=${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}%, wake_drift<=${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}%, repaint_ops_per_kb<=${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}, low_visibility<=${SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX} at <${SOAK_BUDGET_LOW_VISIBILITY_FRACTION} of p90 cells"
 
 pick_port() {
 python3 - <<'PY'
@@ -290,6 +309,7 @@ run_timed_pty_interaction() {
     e2e_log "PTY timed interaction (${label}): running ${*}"
 
     python3 - "${raw_output}" "${timing_file}" "${keystroke_script}" "$@" <<'PYEOF' 2>"${pty_stderr}"
+import codecs
 import datetime
 import hashlib
 import json
@@ -305,6 +325,7 @@ import time
 import fcntl
 import termios
 import shutil
+import pyte
 
 output_file = sys.argv[1]
 timing_file = sys.argv[2]
@@ -348,6 +369,9 @@ else:
     os.close(slave_fd)
     chunks = []
     timings = []
+    terminal_screen = pyte.Screen(cols, rows)
+    terminal_stream = pyte.Stream(terminal_screen)
+    terminal_decoder = codecs.getincrementaldecoder("utf-8")("replace")
     profile_processes = []
     profile_meta = {
         "enabled": profile_capture,
@@ -414,6 +438,28 @@ else:
                 os.path.join(profile_dir, f"{profile_label}_strace_runner_stdout.txt"),
             )
 
+    def capture_chunk(chunk):
+        chunks.append(chunk)
+        try:
+            terminal_stream.feed(terminal_decoder.decode(chunk))
+        except Exception:
+            # Preserve the raw capture even if a terminal-specific extension
+            # is not understood by the emulator.
+            pass
+
+    def visible_terminal_state():
+        display = terminal_screen.display
+        nonblank_cells = sum(1 for row in display for char in row if not char.isspace())
+        nonblank_lines = sum(1 for row in display if row.strip())
+        total_cells = max(1, terminal_screen.columns * terminal_screen.lines)
+        return {
+            "terminal_nonblank_cells": nonblank_cells,
+            "terminal_nonblank_lines": nonblank_lines,
+            "terminal_occupancy_ratio": round(nonblank_cells / total_cells, 6),
+            "terminal_columns": terminal_screen.columns,
+            "terminal_lines": terminal_screen.lines,
+        }
+
     def read_available(timeout=0.3):
         """Read all available output until timeout, return bytes read."""
         deadline = time.monotonic() + timeout
@@ -428,7 +474,7 @@ else:
                     chunk = os.read(master_fd, 65536)
                     if not chunk:
                         break
-                    chunks.append(chunk)
+                    capture_chunk(chunk)
                     got += len(chunk)
                 except OSError:
                     break
@@ -469,7 +515,7 @@ else:
                     chunk = os.read(master_fd, 65536)
                     if not chunk:
                         break
-                    chunks.append(chunk)
+                    capture_chunk(chunk)
                     now = time.monotonic()
                     got += len(chunk)
                     if first_byte_t is None:
@@ -519,6 +565,7 @@ else:
         "render_ms": init["render_ms"],
         "output_bytes": init["total_bytes"],
         "saw_alt_screen": init["saw_alt_screen"],
+        **visible_terminal_state(),
     })
 
     def apply_resize(step):
@@ -534,6 +581,7 @@ else:
         step_cols = max(24, min(step_cols, 320))
         winsize_step = struct.pack("HHHH", step_rows, step_cols, 0, 0)
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize_step)
+        terminal_screen.resize(lines=step_rows, columns=step_cols)
         try:
             os.kill(pid, signal.SIGWINCH)
         except ProcessLookupError:
@@ -599,6 +647,7 @@ else:
             "frame_clear_ops": frame_clear_ops,
             "frame_erase_line_ops": frame_erase_line_ops,
             "saw_alt_screen": r["saw_alt_screen"],
+            **visible_terminal_state(),
         })
 
     # Final read
@@ -1902,6 +1951,8 @@ def analyze(doc, prefix):
     n = len(steps)
     hashes = [str(s.get("frame_hash", "empty") or "empty") for s in steps]
     frame_chars = [int(s.get("frame_chars", 0) or 0) for s in steps]
+    visible_cells = [int(s.get("terminal_nonblank_cells", 0) or 0) for s in steps]
+    visible_lines = [int(s.get("terminal_nonblank_lines", 0) or 0) for s in steps]
     cursor_home = [int(s.get("frame_cursor_home_ops", 0) or 0) for s in steps]
     clear_ops = [int(s.get("frame_clear_ops", 0) or 0) for s in steps]
     erase_ops = [int(s.get("frame_erase_line_ops", 0) or 0) for s in steps]
@@ -1910,7 +1961,11 @@ def analyze(doc, prefix):
     transitions = sum(1 for i in range(1, n) if hashes[i] != hashes[i - 1])
     # A-B-A pattern can indicate unstable redraw oscillation.
     bounce = sum(1 for i in range(2, n) if hashes[i] == hashes[i - 2] and hashes[i] != hashes[i - 1])
-    empty_frames = sum(1 for h, chars in zip(hashes, frame_chars) if h == "empty" or chars < 5)
+    # Evaluate the emulated terminal state, not merely bytes emitted during
+    # this step. A healthy incremental frame can emit zero bytes while the
+    # screen remains populated; conversely a repaint full of spaces emits many
+    # bytes while leaving the operator with a blank display.
+    empty_frames = sum(1 for cells, lines in zip(visible_cells, visible_lines) if cells < 5 or lines < 2)
 
     repaint_ops_total = sum(cursor_home) + sum(clear_ops) + sum(erase_ops)
     bytes_total = sum(bytes_out)
@@ -1923,6 +1978,8 @@ def analyze(doc, prefix):
         "frame_bounce_ratio": round(bounce / max(n - 2, 1), 4),
         "empty_frame_count": empty_frames,
         "empty_frame_ratio": round(empty_frames / max(n, 1), 4),
+        "terminal_nonblank_cells_min": min(visible_cells, default=0),
+        "terminal_nonblank_lines_min": min(visible_lines, default=0),
         "repaint_ops_total": repaint_ops_total,
         "repaint_ops_per_kb": round(repaint_ops_per_kb, 4),
         "bytes_total": round(bytes_total, 2),
@@ -2136,7 +2193,8 @@ fi
 if python3 - "${TIMINGS}" "${SOAK_REPORT}" "${SOAK_MIN_STEPS}" "${SOAK_DURATION_SECONDS}" \
     "${SOAK_BUDGET_FIRST_BYTE_P95_MS}" "${SOAK_BUDGET_QUIESCE_P95_MS}" "${SOAK_BUDGET_QUIESCE_P99_MS}" \
     "${SOAK_BUDGET_LATENCY_DRIFT_PCT_MAX}" "${SOAK_BUDGET_CPU_DRIFT_PCT_MAX}" "${SOAK_BUDGET_WAKE_DRIFT_PCT_MAX}" \
-    "${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}" "${SOAK_PROFILE_DIR}" <<'PYEOF'
+    "${SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX}" "${SOAK_BUDGET_LOW_VISIBILITY_FRACTION}" \
+    "${SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX}" "${SOAK_PROFILE_DIR}" <<'PYEOF'
 import datetime
 import json
 import re
@@ -2155,8 +2213,10 @@ from pathlib import Path
     cpu_drift_budget_s,
     wake_drift_budget_s,
     repaint_budget_s,
+    low_visibility_fraction_s,
+    low_visibility_ratio_budget_s,
     profile_dir_s,
-) = sys.argv[1:13]
+) = sys.argv[1:15]
 
 min_steps = int(min_steps_s)
 duration_seconds = int(duration_s)
@@ -2167,6 +2227,8 @@ latency_drift_budget = float(latency_drift_budget_s)
 cpu_drift_budget = float(cpu_drift_budget_s)
 wake_drift_budget = float(wake_drift_budget_s)
 repaint_budget = float(repaint_budget_s)
+low_visibility_fraction = float(low_visibility_fraction_s)
+low_visibility_ratio_budget = float(low_visibility_ratio_budget_s)
 profile_dir = Path(profile_dir_s)
 
 with open(timing_path, "r", encoding="utf-8") as f:
@@ -2241,6 +2303,8 @@ bytes_out = [float(s.get("output_bytes_delta", 0) or 0) for s in steps]
 cursor_home = [int(s.get("frame_cursor_home_ops", 0) or 0) for s in steps]
 clear_ops = [int(s.get("frame_clear_ops", 0) or 0) for s in steps]
 erase_ops = [int(s.get("frame_erase_line_ops", 0) or 0) for s in steps]
+visible_cells = [int(s.get("terminal_nonblank_cells", 0) or 0) for s in steps]
+visible_lines = [int(s.get("terminal_nonblank_lines", 0) or 0) for s in steps]
 
 count = len(steps)
 window = max(1, count // 3)
@@ -2265,6 +2329,14 @@ wake_growth = max(0.0, wake_drift)
 repaint_ops_total = sum(cursor_home) + sum(clear_ops) + sum(erase_ops)
 bytes_total = sum(bytes_out)
 repaint_ops_per_kb = repaint_ops_total / max(bytes_total / 1024.0, 1.0)
+visible_cells_p90 = percentile(visible_cells, 0.90)
+low_visibility_threshold = max(5.0, visible_cells_p90 * low_visibility_fraction)
+low_visibility_count = sum(
+    1
+    for cells, lines in zip(visible_cells, visible_lines)
+    if cells < low_visibility_threshold or lines < 2
+)
+low_visibility_ratio = low_visibility_count / max(len(visible_cells), 1)
 
 duration_ms_actual = float(total_entry.get("wall_ms", 0) or 0)
 duration_ms_expected = float(duration_seconds * 1000)
@@ -2296,6 +2368,14 @@ summary = {
     "repaint_ops_total": repaint_ops_total,
     "repaint_ops_per_kb": round(repaint_ops_per_kb, 4),
     "bytes_total": round(bytes_total, 2),
+    "terminal_nonblank_cells_p10": round(percentile(visible_cells, 0.10), 2),
+    "terminal_nonblank_cells_p50": round(percentile(visible_cells, 0.50), 2),
+    "terminal_nonblank_cells_p90": round(visible_cells_p90, 2),
+    "terminal_nonblank_cells_min": min(visible_cells, default=0),
+    "terminal_nonblank_lines_min": min(visible_lines, default=0),
+    "low_visibility_threshold_cells": round(low_visibility_threshold, 2),
+    "low_visibility_count": low_visibility_count,
+    "low_visibility_ratio": round(low_visibility_ratio, 4),
 }
 
 reasons = []
@@ -2321,6 +2401,8 @@ elif summary["wake_growth_pct"] > wake_drift_budget:
     reasons.append("wake_drift_exceeded")
 if summary["repaint_ops_per_kb"] > repaint_budget:
     reasons.append("repaint_churn_exceeded")
+if summary["low_visibility_ratio"] > low_visibility_ratio_budget:
+    reasons.append("low_terminal_visibility_exceeded")
 
 sample = {
     "scenario": "multi_minute_soak",
@@ -2337,6 +2419,8 @@ sample = {
         "cpu_growth_pct_max": cpu_drift_budget,
         "wake_growth_pct_max": wake_drift_budget,
         "repaint_ops_per_kb_max": repaint_budget,
+        "low_visibility_fraction_of_p90": low_visibility_fraction,
+        "low_visibility_ratio_max": low_visibility_ratio_budget,
     },
     "ansi_metrics": timing_doc.get("ansi_metrics", {}),
 }
@@ -2365,6 +2449,8 @@ report = {
             "SOAK_BUDGET_CPU_DRIFT_PCT_MAX": cpu_drift_budget,
             "SOAK_BUDGET_WAKE_DRIFT_PCT_MAX": wake_drift_budget,
             "SOAK_BUDGET_REPAINT_OPS_PER_KB_MAX": repaint_budget,
+            "SOAK_BUDGET_LOW_VISIBILITY_FRACTION": low_visibility_fraction,
+            "SOAK_BUDGET_LOW_VISIBILITY_RATIO_MAX": low_visibility_ratio_budget,
         },
     },
 }
@@ -2381,7 +2467,9 @@ print(
     f"first_p95={summary['first_byte_p95_ms']:.2f}, quiesce_norm_p95={summary['quiesce_p95_ms']:.2f}, "
     f"quiesce_norm_p99={summary['quiesce_p99_ms']:.2f}, quiesce_raw_p95={summary['quiesce_raw_p95_ms']:.2f}, "
     f"latency_growth={summary['latency_growth_pct']:.2f}%, "
-    f"cpu_growth={summary['cpu_growth_pct']:.2f}%, wake_growth={summary['wake_growth_pct']:.2f}%)"
+    f"cpu_growth={summary['cpu_growth_pct']:.2f}%, wake_growth={summary['wake_growth_pct']:.2f}%, "
+    f"visible_p10={summary['terminal_nonblank_cells_p10']:.0f}, "
+    f"low_visibility={summary['low_visibility_ratio']:.4f})"
 )
 if reasons:
     print("  failing=" + ",".join(reasons))
@@ -2424,6 +2512,9 @@ for key in (
     "cpu_growth_pct",
     "wake_growth_pct",
     "repaint_ops_per_kb",
+    "terminal_nonblank_cells_p10",
+    "terminal_nonblank_cells_p90",
+    "low_visibility_ratio",
 ):
     assert key in sample["summary"]
 PYEOF

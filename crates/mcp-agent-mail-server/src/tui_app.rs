@@ -117,7 +117,10 @@ const TUI_DIFF_TRACE_TARGET: &str = "mcp_agent_mail::tui::diff";
 const TUI_DIFF_DEFAULT_SAFE_MODE: bool = true;
 const TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY: u32 = 64;
 const TUI_DIFF_DEFAULT_AUTO_FLIP_THRESHOLD: u32 = 3;
-const TUI_DIFF_FRAME_BUDGET_MS: f64 = 16.6;
+/// App-level diff telemetry uses the same budget as the 100ms fast render
+/// cadence. A stale 16.6ms (60fps) budget made healthy 10fps frames look
+/// overloaded and biased the advisory strategy toward `Deferred`.
+const TUI_DIFF_FRAME_BUDGET_MS: f64 = 100.0;
 
 /// Nearby (adjacent) inactive screens must tick at least every Nth frame.
 const NEARBY_SCREEN_TICK_DIVISOR: u64 = 3;
@@ -2841,14 +2844,19 @@ impl MailAppModel {
         }
     }
 
-    fn apply_diff_frame_decision(&self, decision: TuiDiffFrameDecision, frame: &mut Frame<'_>) {
+    fn apply_diff_frame_decision(&self, decision: TuiDiffFrameDecision, _frame: &mut Frame<'_>) {
         match decision.action {
             DiffAction::Incremental => {}
             DiffAction::Full => self.request_contrast_guard_pass(),
             DiffAction::Deferred => {
                 self.diff_deferred_frames
                     .set(self.diff_deferred_frames.get().saturating_add(1));
-                frame.set_degradation(DegradationLevel::EssentialOnly);
+                // This strategy is an app-level telemetry signal; the
+                // TerminalWriter owns the actual incremental diff. Rendering
+                // an EssentialOnly buffer here erased most of the screen even
+                // though no work was truly deferred. Keep the frame complete
+                // and use the conservative full-frame guard path instead.
+                self.request_contrast_guard_pass();
             }
         }
     }
@@ -7751,6 +7759,11 @@ mod tests {
 
         assert!(settings.safe_mode);
         assert_eq!(
+            TUI_DIFF_FRAME_BUDGET_MS,
+            FAST_TICK_INTERVAL.as_secs_f64() * 1_000.0,
+            "app diff telemetry and the fast render cadence must share a budget"
+        );
+        assert_eq!(
             settings.full_diff_audit_every,
             TUI_DIFF_DEFAULT_FULL_AUDIT_EVERY
         );
@@ -7827,7 +7840,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_bayes_deferred_uses_degraded_frame_instead_of_blank_skip() {
+    fn tui_bayes_deferred_keeps_full_fidelity_frame() {
         let model = test_model();
         let state = TuiDiffFrameState {
             change_ratio: 1.0,
@@ -7847,7 +7860,7 @@ mod tests {
 
         model.apply_diff_frame_decision(decision, &mut frame);
 
-        assert_eq!(frame.degradation, DegradationLevel::EssentialOnly);
+        assert_eq!(frame.degradation, DegradationLevel::Full);
         assert_eq!(model.diff_deferred_frames.get(), 1);
     }
 
@@ -7960,7 +7973,7 @@ mod tests {
         );
         assert!(
             within_budget >= 950,
-            "{within_budget}/{FRAME_COUNT} frames completed within the 16.6ms budget"
+            "{within_budget}/{FRAME_COUNT} frames completed within the 100ms budget"
         );
     }
 

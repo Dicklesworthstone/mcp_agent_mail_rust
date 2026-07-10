@@ -450,6 +450,12 @@ jobs:
           SUSTAINED_LOAD_SECS: "5"
           SOAK_DURATION_SECS: "5"
 
+      - name: Install TUI terminal emulator
+        run: |
+          python3 -m venv /tmp/am-tui-pyte
+          /tmp/am-tui-pyte/bin/pip install --disable-pip-version-check pyte==0.8.2
+          echo "/tmp/am-tui-pyte/bin" >> "$GITHUB_PATH"
+
       - name: TUI traversal + flash + soak regression gate
         run: am e2e run --project . tui_full_traversal
         env:

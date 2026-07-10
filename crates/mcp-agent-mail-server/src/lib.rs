@@ -4563,34 +4563,7 @@ fn run_tui_main_thread(
 
     let model = tui_app::MailAppModel::with_config(Arc::clone(tui_state), config);
 
-    // Explicit resize coalescer wiring keeps bursty terminal resize streams
-    // (mux panes, split toggles, drag-resize) from forcing repeated redraws.
-    let resize_coalescer = ftui_runtime::resize_coalescer::CoalescerConfig {
-        steady_delay_ms: 12,
-        burst_delay_ms: 44,
-        hard_deadline_ms: 96,
-        cooldown_frames: 4,
-        enable_logging: env_truthy("AM_TUI_RESIZE_LOG"),
-        ..ftui_runtime::resize_coalescer::CoalescerConfig::default().with_bocpd()
-    };
-    let tui_config = ftui_runtime::program::ProgramConfig::fullscreen()
-        .with_mouse()
-        .with_diff_config(stable_tui_diff_config())
-        .with_budget(ftui_render::budget::FrameBudgetConfig {
-            total: Duration::from_millis(100), // Match FAST_TICK_INTERVAL
-            allow_frame_skip: false,           // Never blank frames
-            degradation_cooldown: 5,           // 500ms between level changes
-            upgrade_threshold: 0.5,
-            ..Default::default()
-        })
-        .with_conformal_config(ftui_runtime::conformal_predictor::ConformalConfig {
-            alpha: 0.10,      // 90% coverage
-            min_samples: 20,  // Calibrate after ~2s
-            window_size: 100, // ~10s sliding window
-            ..Default::default()
-        })
-        .with_resize_behavior(ftui_runtime::program::ResizeBehavior::Throttled)
-        .with_resize_coalescer(resize_coalescer);
+    let tui_config = stable_tui_program_config();
 
     // frankentui's native ftui-tty backend (`with_native_backend`) is `#[cfg(unix)]`.
     // On non-Unix targets (Windows) use the crossterm-compat backend instead —
@@ -4601,6 +4574,53 @@ fn run_tui_main_thread(
     #[cfg(not(unix))]
     let mut program = Program::with_config(model, tui_config)?;
     program.run()
+}
+
+/// Build the fullscreen runtime policy used by the operations console.
+///
+/// Agent Mail sheds background screen work through its tick strategy, so
+/// frame-time pressure must never be translated into missing visible content.
+/// FrankenTUI's conformal gate is intentionally able to bypass the adaptive
+/// controller's quality floor; leaving it enabled let repeated risk signals
+/// ratchet a healthy TUI through `EssentialOnly` and `Skeleton`.
+fn stable_tui_program_config() -> ftui_runtime::program::ProgramConfig {
+    use ftui_render::budget::{BudgetControllerConfig, DegradationLevel, FrameBudgetConfig};
+    use ftui_runtime::program::{LoadGovernorConfig, ProgramConfig, ResizeBehavior};
+
+    // Explicit resize coalescer wiring keeps bursty terminal resize streams
+    // (mux panes, split toggles, drag-resize) from forcing repeated redraws.
+    let resize_coalescer = ftui_runtime::resize_coalescer::CoalescerConfig {
+        steady_delay_ms: 12,
+        burst_delay_ms: 44,
+        hard_deadline_ms: 96,
+        cooldown_frames: 4,
+        enable_logging: env_truthy("AM_TUI_RESIZE_LOG"),
+        ..ftui_runtime::resize_coalescer::CoalescerConfig::default().with_bocpd()
+    };
+    ProgramConfig::fullscreen()
+        .with_mouse()
+        .with_diff_config(stable_tui_diff_config())
+        .with_budget(FrameBudgetConfig {
+            total: Duration::from_millis(100), // Match FAST_TICK_INTERVAL
+            allow_frame_skip: false,
+            degradation_cooldown: 5, // 500ms between level changes
+            upgrade_threshold: 0.5,
+            ..Default::default()
+        })
+        .with_load_governor(LoadGovernorConfig::enabled().with_budget_controller(
+            BudgetControllerConfig {
+                // Preserve all visible content. Agent Mail already adapts
+                // workload cadence independently of render fidelity.
+                degradation_floor: DegradationLevel::Full,
+                ..Default::default()
+            },
+        ))
+        // The conformal gate can deliberately degrade past the controller
+        // floor, so it is not compatible with the console's visibility
+        // invariant.
+        .without_conformal()
+        .with_resize_behavior(ResizeBehavior::Throttled)
+        .with_resize_coalescer(resize_coalescer)
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -16115,6 +16135,22 @@ mod tests {
         assert!(
             config.full_redraw_max_interval.is_some(),
             "wall-clock terminal resync must be enabled by default"
+        );
+    }
+
+    #[test]
+    fn stable_tui_program_config_preserves_visible_content_under_load() {
+        let config = stable_tui_program_config();
+
+        assert!(!config.budget.allow_frame_skip);
+        assert_eq!(
+            config.load_governor.budget_controller.degradation_floor,
+            ftui_render::budget::DegradationLevel::Full,
+            "frame-time pressure must not remove console content"
+        );
+        assert!(
+            config.conformal_config.is_none(),
+            "the conformal gate can bypass the configured quality floor"
         );
     }
 
