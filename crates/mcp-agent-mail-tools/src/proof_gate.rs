@@ -57,8 +57,8 @@
 use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 use fastmcp::McpError;
-use mcp_agent_mail_core::config::ProofGateConfig;
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::config::ProofGateConfig;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -422,7 +422,7 @@ async fn consume_nonce_durably(
     pool: &mcp_agent_mail_db::DbPool,
     nc: &NonceConsume,
 ) -> Result<(), McpError> {
-    use mcp_agent_mail_db::queries::{consume_proof_nonce, NonceOutcome};
+    use mcp_agent_mail_db::queries::{NonceOutcome, consume_proof_nonce};
     match consume_proof_nonce(
         cx,
         pool,
@@ -927,11 +927,10 @@ mod tests {
 
     #[test]
     fn auto_registration_noop_when_gate_disabled() {
-        assert!(reject_auto_registration_with_gate(
-            false,
-            "send_message recipient auto-registration"
-        )
-        .is_ok());
+        assert!(
+            reject_auto_registration_with_gate(false, "send_message recipient auto-registration")
+                .is_ok()
+        );
     }
 
     #[test]

@@ -11,19 +11,19 @@
 //! - enabled gate + valid proof => registration succeeds through the tool and
 //!   through a macro (proving macros forward the proof and cannot bypass it).
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::Cx;
+use asupersync::runtime::RuntimeBuilder;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use fastmcp::prelude::McpContext;
-use mcp_agent_mail_core::{config::with_process_env_overrides_for_test, Config};
+use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
     create_agent_identity, ensure_project, macro_prepare_thread, macro_start_session,
     register_agent, request_contact, send_message, whois,
 };
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
