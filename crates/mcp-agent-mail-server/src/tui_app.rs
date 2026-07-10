@@ -32,6 +32,7 @@ use ftui::{
 use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};
 use ftui_extras::theme::ThemeId;
+#[cfg(test)]
 use ftui_render::budget::DegradationLevel;
 use ftui_runtime::program::{Cmd, Model};
 use ftui_runtime::subscription::Subscription;
