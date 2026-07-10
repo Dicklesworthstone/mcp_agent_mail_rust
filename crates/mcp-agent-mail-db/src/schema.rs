@@ -3113,10 +3113,36 @@ async fn migration_statement_already_satisfied<C: Connection>(
     migration: &Migration,
     err: &SqlError,
 ) -> Outcome<bool, SqlError> {
+    // ANALYZE migrations are query-planner statistics refreshes: they change
+    // no schema and no data. When the target table is absent (e.g. the legacy
+    // atc_* tables now live in the ATC sidecar, or an older reconstruct
+    // rebuilt the primary without them), a bare `ANALYZE <table>` hard-fails
+    // with "no such table" — and one failing statistics migration must not
+    // abort `migrate_to_latest` and wedge the whole server into DB-degraded
+    // mode where every MCP op returns a generic database error (GH#185).
+    // Skipping is safe: there is nothing to analyze, so the migration is
+    // vacuously satisfied. Record it and move on.
+    if is_analyze_migration(&migration.id) && is_missing_table_error(err) {
+        tracing::warn!(
+            migration_id = %migration.id,
+            error = %err,
+            "ANALYZE migration target table is absent; recording the migration \
+             as applied without executing (statistics-only, safe to skip)"
+        );
+        return Outcome::Ok(true);
+    }
     if !is_duplicate_column_error(err) {
         return Outcome::Ok(false);
     }
     migration_preflight_already_satisfied(cx, conn, migration).await
+}
+
+/// True when `err` is SQLite's "no such table: …" complaint (any table).
+#[must_use]
+fn is_missing_table_error(err: &SqlError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("no such table")
 }
 
 async fn migration_preflight_already_satisfied<C: Connection>(

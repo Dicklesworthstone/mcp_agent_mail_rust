@@ -70,6 +70,14 @@ pub fn handle_robot_docs() -> CliResult<()> {
 /// Reads `.doctor/latest/report.json` if available; else returns a stub
 /// directing the agent to `am doctor` first. JSON only.
 ///
+/// In addition to the cached report, triage always runs the same cheap
+/// read-only live-mailbox probe as `am doctor health` and injects a synthetic
+/// P0 finding when it fails (GH#185): the cached report describes the LAST
+/// doctor run, and returning `total_findings: 0` during an active corruption
+/// incident made triage look "all clear" while `health` was failing in the
+/// same minute. The probe verdict is also surfaced verbatim under
+/// `live_health`.
+///
 /// `quick=true` is recorded as metadata in the envelope. Detector-level
 /// filtering is available once the detector registry is wired; today the
 /// `quick_mode_eligible` attribute lives on the capabilities side.
@@ -91,16 +99,77 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
         .get("summary")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let findings = report_value
+    let mut findings = report_value
         .get("findings")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
-    let total_findings = summary
+    let mut total_findings = summary
         .get("total_findings")
         .and_then(|n| n.as_u64())
         .unwrap_or_else(|| findings.as_array().map(|arr| arr.len() as u64).unwrap_or(0));
 
-    let recommended_command = if total_findings == 0 {
+    // GH#185: live read-only mailbox probe (identical to `am doctor health`,
+    // safe while a server owns the mailbox). A failing live probe must never
+    // hide behind a stale-but-green cached report.
+    let db_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let core_config = Config::from_env();
+    let (live_health, live_finding, live_recommended) =
+        match crate::doctor_database_fix_strategy_read_only(
+            &db_cfg.database_url,
+            &core_config.storage_root,
+        ) {
+            Ok(crate::DoctorDatabaseFixStrategy::None(detail)) => (
+                serde_json::json!({ "status": "ok", "detail": detail }),
+                None,
+                None,
+            ),
+            Ok(crate::DoctorDatabaseFixStrategy::Repair(detail)) => (
+                serde_json::json!({ "status": "fail", "detail": detail }),
+                Some(serde_json::json!({
+                    "id": "live-mailbox-needs-repair",
+                    "severity": "P0",
+                    "source": "live_probe",
+                    "summary": format!("live mailbox needs repair: {detail}"),
+                    "remediation": "am doctor repair --dry-run",
+                })),
+                Some("am doctor repair --dry-run".to_string()),
+            ),
+            Ok(crate::DoctorDatabaseFixStrategy::Reconstruct(detail)) => (
+                serde_json::json!({ "status": "fail", "detail": detail }),
+                Some(serde_json::json!({
+                    "id": "live-mailbox-needs-reconstruct",
+                    "severity": "P0",
+                    "source": "live_probe",
+                    "summary": format!("live mailbox needs reconstruct: {detail}"),
+                    "remediation": "am doctor reconstruct --dry-run",
+                })),
+                Some("am doctor reconstruct --dry-run".to_string()),
+            ),
+            Err(error) => (
+                serde_json::json!({ "status": "error", "detail": error.to_string() }),
+                Some(serde_json::json!({
+                    "id": "live-mailbox-probe-failed",
+                    "severity": "P0",
+                    "source": "live_probe",
+                    "summary": format!("live mailbox health probe failed: {error}"),
+                    "remediation": "am doctor health",
+                })),
+                Some("am doctor health".to_string()),
+            ),
+        };
+    if let Some(finding) = live_finding {
+        if let Some(arr) = findings.as_array_mut() {
+            arr.insert(0, finding);
+        } else {
+            findings = serde_json::json!([finding]);
+        }
+        total_findings = total_findings.saturating_add(1);
+    }
+
+    let recommended_command = if let Some(live) = live_recommended {
+        // An active live-probe failure outranks any cached-report advice.
+        live
+    } else if total_findings == 0 {
         if report_path.is_none() {
             "am doctor".to_string()
         } else {
@@ -128,6 +197,20 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
                 .filter_map(|f| {
                     let id = f.get("id")?.as_str()?;
                     let severity = f.get("severity").and_then(|s| s.as_str()).unwrap_or("P3");
+                    // Synthetic live-probe findings have no registered fixer id;
+                    // their action is the remediation command itself.
+                    if f.get("source").and_then(|s| s.as_str()) == Some("live_probe") {
+                        let remediation = f
+                            .get("remediation")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("am doctor health");
+                        return Some(serde_json::json!({
+                            "id": id,
+                            "severity": severity,
+                            "fix_command": remediation,
+                            "explain_command": "am doctor health",
+                        }));
+                    }
                     Some(serde_json::json!({
                         "id": id,
                         "severity": severity,
@@ -147,6 +230,7 @@ pub fn handle_triage(target: &std::path::Path, quick: bool) -> CliResult<()> {
         "quick": quick,
         "report_available": report_path.is_some(),
         "report_path": report_path.map(|p| p.to_string_lossy().into_owned()),
+        "live_health": live_health,
         "summary": summary,
         "total_findings": total_findings,
         "findings": findings,

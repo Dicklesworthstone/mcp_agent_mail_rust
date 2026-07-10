@@ -4836,6 +4836,21 @@ fn sqlite_canonical_file_check_is_ok(
     sqlite_pragma_check_is_ok_canonical(&conn, kind)
 }
 
+/// Whether a primary-probe corruption complaint is the KNOWN frankensqlite
+/// `COLLATE NOCASE` index-order false positive (GH#185, upstream fsqlite#112):
+/// the primary `PRAGMA integrity_check` compares index leaf entries with raw
+/// byte order when the loaded index metadata lacks the declared `NOCASE`
+/// collation, so a healthy, correctly NOCASE-ordered index (e.g.
+/// `idx_agents_project_name_nocase`) is reported as "entries are out of order
+/// for their declared key directions". Canonical SQLite applies the collation
+/// and accepts the file — callers must only use this classifier AFTER a
+/// canonical probe has confirmed the file is healthy.
+#[must_use]
+fn is_known_nocase_index_order_false_positive(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("entries are out of order") && lower.contains("nocase")
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_primary_check_is_ok_with_canonical_fallback(
     path: &Path,
@@ -4849,12 +4864,30 @@ fn sqlite_primary_check_is_ok_with_canonical_fallback(
 
     match sqlite_canonical_file_check_is_ok(path, kind) {
         Ok(true) => {
-            tracing::warn!(
-                path = %path.display(),
-                check = %kind,
-                primary_error = primary_result.as_ref().err().map(ToString::to_string).as_deref(),
-                "primary sqlite integrity probe did not accept the file but canonical SQLite did; treating as healthy"
-            );
+            let primary_error_msg = primary_result.as_ref().err().map(ToString::to_string);
+            // GH#185: demote the known COLLATE NOCASE index-order false
+            // positive to INFO once canonical SQLite has verified the file
+            // (see `is_known_nocase_index_order_false_positive`).
+            if primary_error_msg
+                .as_deref()
+                .is_some_and(is_known_nocase_index_order_false_positive)
+            {
+                tracing::info!(
+                    path = %path.display(),
+                    check = %kind,
+                    primary_error = primary_error_msg.as_deref(),
+                    "primary sqlite integrity probe raised the known COLLATE NOCASE \
+                     index-order false positive; canonical SQLite verified the file \
+                     healthy (not corruption — safe to ignore)"
+                );
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    check = %kind,
+                    primary_error = primary_error_msg.as_deref(),
+                    "primary sqlite integrity probe did not accept the file but canonical SQLite did; treating as healthy"
+                );
+            }
             Ok(true)
         }
         Ok(false) => Ok(false),
@@ -4920,13 +4953,35 @@ fn reconcile_with_canonical(
         Ok(res) => Ok(res),
         Err(DbError::IntegrityCorruption { message, details }) => match canonical_probe() {
             Ok(true) => {
-                tracing::warn!(
-                    phase,
-                    path = %path_for_log,
-                    check = %kind,
-                    primary_error = %message,
-                    "integrity probe rejected the file but canonical SQLite accepted it; treating as healthy"
-                );
+                // GH#185: the `COLLATE NOCASE` index-order complaint (e.g.
+                // `idx_agents_project_name_nocase` "entries are out of order
+                // for their declared key directions") is a KNOWN primary-probe
+                // false positive that reproduces on every startup after a
+                // reconstruct and survives REINDEX — the file is genuinely
+                // healthy (canonical SQLite proves it every time). Logging it
+                // as a WARN that quotes "database disk image is malformed"
+                // pollutes operator logs and erodes trust in the health
+                // signal, so classify it and log at INFO with an explicit
+                // explanation. Any OTHER divergence stays a WARN.
+                if is_known_nocase_index_order_false_positive(&message) {
+                    tracing::info!(
+                        phase,
+                        path = %path_for_log,
+                        check = %kind,
+                        primary_error = %message,
+                        "primary integrity probe raised the known COLLATE NOCASE \
+                         index-order false positive; canonical SQLite verified the \
+                         file healthy (not corruption — safe to ignore)"
+                    );
+                } else {
+                    tracing::warn!(
+                        phase,
+                        path = %path_for_log,
+                        check = %kind,
+                        primary_error = %message,
+                        "integrity probe rejected the file but canonical SQLite accepted it; treating as healthy"
+                    );
+                }
                 Ok(integrity::IntegrityCheckResult {
                     ok: true,
                     details: vec!["ok (canonical fallback)".to_string()],
@@ -8045,24 +8100,57 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
         }
     }
 
-    // Slow path: exclusive write lock to create a new pool (rare), or to
-    // evict dead weak entries left after all callers dropped a pool.
+    // Slow path: create a new pool (rare), or refresh a dead weak entry left
+    // after all callers dropped a pool.
+    //
+    // GH#184: the pool is constructed WITHOUT holding the registry lock.
+    // `DbPool::new` runs the full startup init (integrity probes, WAL
+    // checkpoint, recovery, migrations), which can take tens of seconds on a
+    // large mailbox — and, for a second in-process pool on a live file, can
+    // block outright against the live pool's engine-level coordination.
+    // Holding the registry write lock across that init made EVERY
+    // `get_or_create_pool` caller (including all MCP dispatch threads, which
+    // only need the already-cached live pool) block behind one slow
+    // bootstrap, wedging the entire server. The per-path `SQLITE_INIT_GATES`
+    // once-cell still serializes the heavy on-disk init, so a rare creation
+    // race costs at most one redundant pool that is dropped unused below.
+    let pool = DbPool::new(config)?;
+
     let mut guard = cache.write();
-    // Double-check after acquiring write lock — another thread may have won the race.
-    if let Some(pool) = guard.get(&cache_key)
-        && let Some(shared_pool) = pool.upgrade()
+    // Double-check after acquiring the write lock — another thread may have
+    // won the race while we were bootstrapping. Prefer the published pool so
+    // all callers share one instance; ours (unpublished, unused) drops.
+    if let Some(existing) = guard.get(&cache_key)
+        && let Some(shared_pool) = existing.upgrade()
         && !shared_pool.is_closed()
     {
+        drop(guard);
         return DbPool::from_shared_pool(config, shared_pool);
     }
-    if guard.contains_key(&cache_key) {
-        guard.remove(&cache_key);
-    }
-
-    let pool = DbPool::new(config)?;
     guard.insert(cache_key, Arc::downgrade(&pool.pool));
     drop(guard);
     Ok(pool)
+}
+
+/// Return the already-open cached pool for `config` if one is live in this
+/// process — the fast path of [`get_or_create_pool`] — WITHOUT ever creating
+/// one.
+///
+/// GH#184: in-process consumers that merely want to observe the live mailbox
+/// (e.g. the mail web UI running inside `serve-http`) must reuse the server's
+/// existing pool instead of bootstrapping a second pool on the same live
+/// file: a second `DbPool::new` re-runs the full startup init and can block
+/// against the live pool's engine-level coordination.
+#[must_use]
+pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
+    let cache = POOL_CACHE.get()?;
+    let guard = cache.read();
+    let shared_pool = guard.get(&pool_cache_key(config))?.upgrade()?;
+    if shared_pool.is_closed() {
+        return None;
+    }
+    drop(guard);
+    DbPool::from_shared_pool(config, shared_pool).ok()
 }
 
 fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<Pool<DbConn>>>> {

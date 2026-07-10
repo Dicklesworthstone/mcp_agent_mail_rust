@@ -32,6 +32,13 @@ pub enum DebrisCategory {
     /// A quarantined corrupt DB / sidecar sibling of the live database, e.g.
     /// `storage.sqlite3.corrupt-<ts>` or `storage.sqlite3-wal.reconstruct-failed-<ts>`.
     CorruptQuarantine,
+    /// A startup-time WAL/SHM sidecar snapshot next to the live database, e.g.
+    /// `storage.sqlite3-wal.startup-precheckpoint-<ts>` (copied before the
+    /// startup `wal_checkpoint(TRUNCATE)`) or `*.startup-quarantine-<ts>`.
+    /// These are written on every startup that finds a non-empty stale WAL and
+    /// previously had NO retention at all, so they accumulate without bound
+    /// (GH#185 reported 66 of them dating back weeks).
+    SidecarSnapshot,
 }
 
 impl DebrisCategory {
@@ -41,6 +48,7 @@ impl DebrisCategory {
         match self {
             Self::ForensicBundle => "forensic_bundle",
             Self::CorruptQuarantine => "corrupt_quarantine",
+            Self::SidecarSnapshot => "sidecar_snapshot",
         }
     }
 }
@@ -143,7 +151,9 @@ pub fn select_recovery_debris_to_reclaim(
 /// Enumerate all recovery debris under `storage_root` / next to `db_path`.
 ///
 /// Combines forensic bundles (`doctor/forensics/.../`) with quarantine siblings
-/// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`, `<db>.archive-reconcile-restore-*`).
+/// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`, `<db>.archive-reconcile-restore-*`)
+/// and startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
+/// `<db>-shm.startup-precheckpoint-*`, `<db>*.startup-quarantine-*`).
 #[must_use]
 pub fn enumerate_recovery_debris(storage_root: &Path, db_path: &Path) -> Vec<DebrisArtifact> {
     let mut out = enumerate_forensic_bundles(storage_root);
@@ -208,9 +218,16 @@ pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
         let Some(name) = name_os.to_str() else {
             continue;
         };
-        if !name.starts_with(db_name) || !is_quarantine_name(name) {
+        if !name.starts_with(db_name) {
             continue;
         }
+        let category = if is_quarantine_name(name) {
+            DebrisCategory::CorruptQuarantine
+        } else if is_sidecar_snapshot_name(name) {
+            DebrisCategory::SidecarSnapshot
+        } else {
+            continue;
+        };
         let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -222,7 +239,7 @@ pub fn enumerate_corrupt_quarantines(db_path: &Path) -> Vec<DebrisArtifact> {
             bytes: meta.len(),
             modified_us: mtime_us(&meta),
             path,
-            category: DebrisCategory::CorruptQuarantine,
+            category,
         });
     }
     out
@@ -236,6 +253,16 @@ pub fn is_quarantine_name(name: &str) -> bool {
     name.contains(".corrupt-")
         || name.contains(".reconstruct-failed-")
         || name.contains(".archive-reconcile-restore-")
+}
+
+/// Whether a filename is a startup-time WAL/SHM sidecar snapshot
+/// (`*.startup-precheckpoint-<ts>` / `*.startup-quarantine-<ts>`), as opposed
+/// to the live DB, a `.bak`, or a live `-wal`/`-shm` sidecar. These snapshots
+/// are forensic copies taken before the startup checkpoint and are safe to
+/// reclaim under the same bounded-retention policy as quarantines (GH#185).
+#[must_use]
+pub fn is_sidecar_snapshot_name(name: &str) -> bool {
+    name.contains(".startup-precheckpoint-") || name.contains(".startup-quarantine-")
 }
 
 /// Outcome of [`consolidate_debris`].
@@ -510,6 +537,86 @@ mod tests {
         assert!(!is_quarantine_name("storage.sqlite3-wal"));
         assert!(!is_quarantine_name("storage.sqlite3-shm"));
         assert!(!is_quarantine_name("storage.sqlite3.bak.meta.json"));
+    }
+
+    #[test]
+    fn sidecar_snapshot_name_classification() {
+        assert!(is_sidecar_snapshot_name(
+            "storage.sqlite3-wal.startup-precheckpoint-20260625_120000_000"
+        ));
+        assert!(is_sidecar_snapshot_name(
+            "storage.sqlite3-shm.startup-precheckpoint-20260625_120000_000"
+        ));
+        assert!(is_sidecar_snapshot_name(
+            "storage.sqlite3-wal.startup-quarantine-20260625_120000_000"
+        ));
+        // Live DB / backup / live sidecars are NOT snapshots.
+        assert!(!is_sidecar_snapshot_name("storage.sqlite3"));
+        assert!(!is_sidecar_snapshot_name("storage.sqlite3.bak"));
+        assert!(!is_sidecar_snapshot_name("storage.sqlite3-wal"));
+        assert!(!is_sidecar_snapshot_name("storage.sqlite3-shm"));
+        // Quarantines are a different category.
+        assert!(!is_sidecar_snapshot_name(
+            "storage.sqlite3.corrupt-20260618_145230_042"
+        ));
+    }
+
+    #[test]
+    fn enumerates_startup_precheckpoint_snapshots_as_sidecar_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path();
+        let db_path = storage_root.join("storage.sqlite3");
+        std::fs::write(&db_path, b"live-db").unwrap();
+        std::fs::write(storage_root.join("storage.sqlite3-wal"), b"live-wal").unwrap();
+        for ts in [
+            "20260625_120000_000",
+            "20260626_120000_000",
+            "20260627_120000_000",
+        ] {
+            std::fs::write(
+                storage_root.join(format!("storage.sqlite3-wal.startup-precheckpoint-{ts}")),
+                vec![0_u8; 100],
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            storage_root.join("storage.sqlite3-shm.startup-precheckpoint-20260625_120000_000"),
+            vec![0_u8; 50],
+        )
+        .unwrap();
+
+        let debris = enumerate_recovery_debris(storage_root, &db_path);
+        let snapshots: Vec<_> = debris
+            .iter()
+            .filter(|a| a.category == DebrisCategory::SidecarSnapshot)
+            .collect();
+        assert_eq!(snapshots.len(), 4, "debris: {debris:?}");
+        // The live DB and live WAL sidecar are never enumerated as debris.
+        assert!(debris.iter().all(|a| a.path != db_path));
+        assert!(
+            debris
+                .iter()
+                .all(|a| a.path != storage_root.join("storage.sqlite3-wal"))
+        );
+
+        // All are reclaimable under keep_min=0/max_age=0 and consolidate cleanly.
+        let plan = select_recovery_debris_to_reclaim(
+            debris,
+            RetentionPolicy {
+                keep_min: 0,
+                max_age_secs: 0,
+            },
+            i64::MAX,
+        );
+        assert_eq!(plan.prune.len(), 4);
+        let dest = storage_root.join("doctor").join("reclaimable").join("run");
+        let outcome = consolidate_debris(&plan, &dest).unwrap();
+        assert_eq!(outcome.moved, 4, "failures: {:?}", outcome.failures);
+        assert!(
+            !storage_root
+                .join("storage.sqlite3-wal.startup-precheckpoint-20260625_120000_000")
+                .exists()
+        );
     }
 
     #[test]

@@ -276,6 +276,7 @@ pub use pool::{
     ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive,
     evaluate_write_route,
+    get_cached_pool,
     get_or_create_pool,
     inspect_mailbox_db_inventory,
     inspect_mailbox_recovery_lock,

@@ -54,7 +54,7 @@ quarantines via rename.
 | `am doctor robot-docs` | This handbook. | No | 0 |
 | `am doctor health` | One-line liveness summary. For CI. | No | 0 / 1 |
 | `am doctor ls` | List `.doctor/runs/` entries. | No | 0 |
-| `am doctor triage` | Mega-command: status + findings + plan + capabilities URL in one envelope. | No | 0 |
+| `am doctor triage` | Mega-command: status + findings + plan + capabilities URL in one envelope; always includes a live mailbox probe (`live_health`) so it cannot report all-clear during an active failure. | No | 0 |
 | `am doctor selftest` | Exercise mutate() primitives end-to-end in a tempdir. | No | 0 / 1 |
 
 Legacy verbs preserved (use the typed forms above for new work):

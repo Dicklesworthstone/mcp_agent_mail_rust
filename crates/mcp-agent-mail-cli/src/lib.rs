@@ -15014,6 +15014,16 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
             | FileReservationsCommand::Renew { .. }
             | FileReservationsCommand::Release { .. }
     ) {
+        // GH#185: route mutating reservation verbs through a running
+        // serve-http daemon first, exactly like `mail send` and the mutating
+        // `contacts` verbs (#171). Previously these always took the local
+        // path and failed with a raw "mailbox activity lock is busy ...
+        // another Agent Mail process already owns the mailbox" whenever a
+        // server was up — the normal state — making first-class verbs
+        // unusable. Local fallback still applies when no daemon is present.
+        if try_proxy_file_reservations_mutation(&action)? {
+            return Ok(());
+        }
         let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
         let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
         let conn = open_db_sync_while_holding_mailbox_lock()?;
@@ -15028,6 +15038,171 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         "file reservations",
     )?;
     handle_file_reservations_with_conn(opened.conn(), action)
+}
+
+/// Attempt a mutating `file_reservations` verb (reserve / renew / release)
+/// through a running serve-http daemon, the same way `mail send` proxies via
+/// [`send_mail_envelope_via_server_or_local`] and the mutating `contacts`
+/// verbs proxy via [`try_proxy_contacts_mutation`] (#171, GH#185).
+///
+/// Returns `Ok(true)` when the daemon handled the call (output already
+/// emitted), `Ok(false)` when no daemon owns the mailbox and the caller should
+/// fall back to the local SQLite path. Returns `Err` when the daemon rejected
+/// the call in a way that disallows local fallback, or when a daemon owns the
+/// mailbox but its HTTP endpoint is unreachable (refusing a local mutation the
+/// owner would block anyway).
+fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> CliResult<bool> {
+    let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+    let server_url = local_server_url_from_parts(
+        &server_config.http_host,
+        server_config.http_port,
+        &server_config.http_path,
+    );
+    let bearer = local_server_bearer_token(&server_config);
+
+    let (tool_name, command_label, arguments) = match action {
+        FileReservationsCommand::Reserve {
+            project,
+            agent,
+            paths,
+            ttl,
+            exclusive,
+            shared,
+            reason,
+        } => {
+            let exclusive_val = if *shared { false } else { *exclusive };
+            (
+                "file_reservation_paths",
+                "file_reservations reserve",
+                serde_json::json!({
+                    "project_key": project,
+                    "agent_name": agent,
+                    "paths": paths,
+                    "ttl_seconds": ttl,
+                    "exclusive": exclusive_val,
+                    "reason": reason,
+                }),
+            )
+        }
+        FileReservationsCommand::Renew {
+            project,
+            agent,
+            extend_seconds,
+            paths,
+            ids,
+        } => (
+            "renew_file_reservations",
+            "file_reservations renew",
+            serde_json::json!({
+                "project_key": project,
+                "agent_name": agent,
+                "extend_seconds": extend_seconds,
+                "paths": if paths.is_empty() { serde_json::Value::Null } else { serde_json::json!(paths) },
+                "file_reservation_ids": if ids.is_empty() { serde_json::Value::Null } else { serde_json::json!(ids) },
+            }),
+        ),
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => (
+            "release_file_reservations",
+            "file_reservations release",
+            serde_json::json!({
+                "project_key": project,
+                "agent_name": agent,
+                "paths": if paths.is_empty() { serde_json::Value::Null } else { serde_json::json!(paths) },
+                "file_reservation_ids": if ids.is_empty() { serde_json::Value::Null } else { serde_json::json!(ids) },
+            }),
+        ),
+        _ => return Ok(false),
+    };
+
+    let storage_root = server_config.storage_root.clone();
+    let payload = context::run_async(async move {
+        call_contacts_tool_via_server(
+            &server_url,
+            bearer.as_deref(),
+            &database_url,
+            &storage_root,
+            command_label,
+            tool_name,
+            arguments,
+        )
+        .await
+    })?;
+
+    let Some(payload) = payload else {
+        return Ok(false);
+    };
+
+    emit_proxied_file_reservations_output(action, &payload);
+    Ok(true)
+}
+
+/// Emit CLI output for a reservation verb handled by the daemon, matching the
+/// shape the local path emits so scripts see consistent results regardless of
+/// whether a daemon owns the mailbox.
+fn emit_proxied_file_reservations_output(
+    action: &FileReservationsCommand,
+    payload: &serde_json::Value,
+) {
+    match action {
+        FileReservationsCommand::Reserve { .. } => {
+            // Local shape: pretty `{granted, conflicts}` JSON + conflict warning.
+            ftui_runtime::ftui_println!(
+                "{}",
+                serde_json::to_string_pretty(payload).unwrap_or_default()
+            );
+            let conflicts = payload
+                .get("conflicts")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            if conflicts > 0 {
+                output::warn(&format!(
+                    "{conflicts} conflict(s) detected — conflicting reservations were not created."
+                ));
+            }
+        }
+        FileReservationsCommand::Renew { .. } => {
+            let rows = payload
+                .get("file_reservations")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            output::success(&format!("Renewed {} reservation(s).", rows.len()));
+            let mut table = output::CliTable::new(vec!["ID", "PATTERN", "NEW EXPIRES"]);
+            for r in &rows {
+                let id = r.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let pattern = r
+                    .get("path_pattern")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let expires = r
+                    .get("new_expires_ts")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                table.add_row(vec![
+                    id.to_string(),
+                    pattern.to_string(),
+                    expires.get(..20).unwrap_or(expires).to_string(),
+                ]);
+            }
+            table.render();
+        }
+        FileReservationsCommand::Release { project, agent, .. } => {
+            let released = payload
+                .get("released")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            output::success(&format!(
+                "Released {released} reservation(s) for {agent} in {project}."
+            ));
+        }
+        _ => {}
+    }
 }
 
 fn active_reservation_predicate_sql(table_ref: &str) -> String {
@@ -33046,12 +33221,78 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             format,
             json,
         } => {
-            let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
             let fmt = output::CliOutputFormat::resolve(format, json);
             let is_exclusive = context::resolve_bool(exclusive, no_exclusive, true);
 
             validate_reservation_ttl_seconds(ttl)?;
+
+            let reason_str = reason.unwrap_or_else(|| "macro-file_reservation".to_string());
+
+            // GH#185: mirror `mail send` / `contact-handshake` — route through a
+            // running serve-http daemon when one owns the mailbox. Previously
+            // this macro always took the local pool path and died with a raw
+            // "mailbox activity lock is busy" error whenever the server was up
+            // (the normal state), making a first-class verb unusable.
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "macro_file_reservation_cycle",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "agent_name": &agent_name,
+                    "paths": &paths,
+                    "ttl_seconds": ttl,
+                    "exclusive": is_exclusive,
+                    "reason": &reason_str,
+                    "auto_release": auto_release,
+                }),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let payload =
+                        coerce_tool_result_json_or_error("macro_file_reservation_cycle", result)?;
+                    output::emit_output(&payload, fmt, || {
+                        let granted = payload
+                            .pointer("/file_reservations/granted")
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(0, Vec::len);
+                        output::success(&format!(
+                            "{granted} reservation(s) granted for {agent_name}"
+                        ));
+                        if let Some(released) = payload
+                            .pointer("/released/released")
+                            .and_then(serde_json::Value::as_i64)
+                        {
+                            output::kv("Released", &released.to_string());
+                        }
+                    });
+                    return Ok(());
+                }
+                ServerToolCall::Unavailable(message) => {
+                    reject_local_fallback_if_mailbox_owned(
+                        "macros file-reservation-cycle",
+                        &server_url,
+                        &message,
+                        &database_url,
+                        server_config.storage_root.as_path(),
+                    )?;
+                }
+                ServerToolCall::Rejected(message) => {
+                    if !mail_server_rejection_allows_local_fallback(&message) {
+                        return Err(CliError::Other(format!(
+                            "macro_file_reservation_cycle via server failed: {message}"
+                        )));
+                    }
+                    tracing::debug!(
+                        message = %message,
+                        "macros file-reservation-cycle fell back to local path after server scope mismatch"
+                    );
+                }
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
@@ -33059,7 +33300,6 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let aid = agent.id.unwrap_or(0);
 
             let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-            let reason_str = reason.unwrap_or_else(|| "macro-file_reservation".to_string());
 
             let reservations = outcome_to_result(
                 mcp_agent_mail_db::queries::create_file_reservations(

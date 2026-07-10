@@ -934,6 +934,40 @@ For operations guidance and troubleshooting, see
 [docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md). For copy-paste operator
 recipes, see [docs/OPERATOR_COOKBOOK.md](docs/OPERATOR_COOKBOOK.md).
 
+### Registration Proof Gate (optional, off by default)
+
+By default Agent Mail uses a **self-asserted** identity model: any caller may
+`register_agent` under any well-formed name. That is the right trade-off for
+local, trusted, single-operator multi-agent coordination and remains the
+default — nothing changes unless you opt in.
+
+Deployments where agents come from **different operators or less-trusted
+sources** can require a cryptographic proof before any identity is persisted.
+When enabled, `register_agent` (and every other path that can implicitly
+create an agent row, including `send_message` / `request_contact`
+auto-registration and the CLI) demands a `registration_proof` argument: a JSON
+bundle binding the final agent name, project key, program, model, capability
+scope, an `issued_at`/`expires_at` window, and a single-use nonce, signed
+(Ed25519) by one of your configured trust anchors. Verification is
+**fail-closed**: a missing, malformed, untrusted, expired, replayed, or
+mismatched proof rejects the registration and writes nothing. Consumed nonces
+are persisted in the database, so replay protection survives server restarts.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AM_REGISTRATION_PROOF_GATE_ENABLED` | `false` | Master switch. Off = self-asserted identity (unchanged default). |
+| `AM_REGISTRATION_PROOF_TRUSTED_KEYS` | (empty) | Comma-separated base64 Ed25519 public keys (32 raw bytes each). Enabled with no keys = every registration fails closed. |
+| `AM_REGISTRATION_PROOF_MAX_LIFETIME_SECONDS` | `300` | Maximum allowed `expires_at - issued_at` window. |
+| `AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS` | `60` | Clock-skew tolerance for the validity window. |
+| `AM_REGISTRATION_PROOF_REQUIRE_NONCE` | `true` | Require and consume a single-use nonce per proof (replay protection). |
+
+The canonical signing bytes are explicit (domain-separation tag +
+newline-delimited `field=value` lines; capabilities sorted and de-duplicated),
+so issuers can be written in any language. Verification is expressed through a
+pluggable `ProofVerifier` trait (`crates/mcp-agent-mail-tools/src/proof_gate.rs`);
+the shipped implementation is the Ed25519 trust-anchor verifier, and external
+verifier backends can be added without touching registration call sites.
+
 ---
 
 ## Architecture

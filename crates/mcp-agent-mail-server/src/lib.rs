@@ -10198,6 +10198,18 @@ impl HttpState {
         if let Some(resp) = self.handle_special_routes(&req, &path) {
             return resp;
         }
+
+        // GH#184: `/mail` dispatch runs synchronous DB work (pool bootstrap,
+        // queries, template render). Running it inline on an async worker let
+        // ONE slow browser request starve the whole HTTP runtime — accept
+        // loop, timers, and every `/mcp` request — until restart. Route it
+        // through the same bounded, cancellable blocking-dispatch pool the
+        // MCP JSON-RPC path uses, so a wedged mail request can only consume a
+        // dispatch permit and a worker thread, never the async runtime.
+        if path == "/mail" || path.starts_with("/mail/") {
+            return self.dispatch_mail_route_blocking(req, path).await;
+        }
+
         if !self.path_allowed(&path) {
             return self.error_response(&req, 404, "Not Found");
         }
@@ -10490,15 +10502,21 @@ impl HttpState {
             return Some(self.json_response(req, 501, &BROWSER_TUI_DEFERRED_JSON));
         }
 
-        if path == "/mail" || path.starts_with("/mail/") {
-            return Some(self.handle_mail_dispatch(req, path));
-        }
+        // NOTE: general `/mail` + `/mail/*` dispatch intentionally does NOT
+        // happen here. It runs synchronous DB work (pool bootstrap, queries,
+        // template render) and is routed through the bounded blocking-dispatch
+        // pool in `handle_inner` (GH#184) so it can never occupy an async
+        // worker thread. The cheap `/mail/ws-*` + `/mail/api/locks` routes
+        // above stay inline.
 
         // Static file serving from optional web/ SPA directory.
         // Only serve for GET requests on non-API paths (legacy Python: _is_api_path check).
+        // `/mail` + `/mail/*` are excluded: they belong to the mail UI dispatch
+        // in `handle_inner` (which used to run before this branch, GH#184).
         if let Some(ref web_root) = self.web_root
             && matches!(req.method, Http1Method::Get)
             && !self.path_allowed(path)
+            && !(path == "/mail" || path.starts_with("/mail/"))
             && let Some((content_type, body)) = web_root.serve(path)
         {
             let mut resp = self.raw_response(req, 200, content_type, body);
@@ -10590,6 +10608,87 @@ impl HttpState {
                     );
                 }
                 self.error_response(req, status, &msg)
+            }
+        }
+    }
+
+    /// GH#184: run [`Self::handle_mail_dispatch`] on the bounded, cancellable
+    /// blocking-dispatch pool with the request timeout, keeping async workers
+    /// free.
+    ///
+    /// The mail UI layer is synchronous (per-request pool access, DB queries,
+    /// template rendering) and — on a large, long-lived mailbox — its pool
+    /// bootstrap can take tens of seconds or block outright against the live
+    /// pool's engine-level coordination. Inline execution on an async worker
+    /// starved the accept loop and timers, permanently wedging `/mcp` for all
+    /// agents after a single browser `GET /mail`. Here the worst case is a
+    /// consumed dispatch permit + one blocking thread, and the client gets a
+    /// 503 when the request times out.
+    async fn dispatch_mail_route_blocking(
+        &self,
+        req: Http1Request,
+        path: String,
+    ) -> Http1Response {
+        let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            // self_ref not set or HttpState already dropped — fall back to the
+            // legacy inline path (tests construct HttpState without self_ref).
+            return self.handle_mail_dispatch(&req, &path);
+        };
+
+        let Some(permit) = DispatchPermit::try_acquire() else {
+            tracing::warn!(
+                path = %path,
+                inflight = MAX_CONCURRENT_DISPATCHES,
+                "mail route admission control: too many concurrent requests, rejecting",
+            );
+            return self.error_response(
+                &req,
+                503,
+                "Server overloaded, too many concurrent requests",
+            );
+        };
+
+        // Capture response-shaping context before `req` moves into the worker.
+        let cors_origin = self.cors_origin(&req);
+        let dispatch_timeout_secs = self.request_timeout_secs;
+        let dispatch_cx = self.request_cx();
+        let method_label = format!("mail-ui:{path}");
+        let result = run_cancellable_blocking_dispatch(
+            method_label,
+            dispatch_timeout_secs,
+            dispatch_cx,
+            DispatchCancel::new(),
+            Arc::new(Mutex::new(Some(permit))),
+            move |_cancel| Ok(arc_self.handle_mail_dispatch(&req, &path)),
+        )
+        .await;
+
+        match result {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "mail route dispatch timed out or failed; MCP surface unaffected"
+                );
+                let body = serde_json::json!({
+                    "detail": "mail UI request timed out or was rejected; \
+                               the MCP surface remains available"
+                });
+                let mut resp = Http1Response::new(
+                    503,
+                    default_reason(503),
+                    serde_json::to_vec(&body).unwrap_or_default(),
+                );
+                resp.headers
+                    .push(("content-type".to_string(), "application/json".to_string()));
+                apply_cors_headers(
+                    &mut resp,
+                    cors_origin,
+                    self.config.http_cors_allow_credentials,
+                    &self.config.http_cors_allow_methods,
+                    &self.config.http_cors_allow_headers,
+                );
+                resp
             }
         }
     }

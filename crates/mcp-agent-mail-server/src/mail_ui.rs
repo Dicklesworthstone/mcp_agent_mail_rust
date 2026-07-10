@@ -60,12 +60,25 @@ pub fn dispatch(
     // Cx::for_testing() was previously used here, which provides no
     // timeout enforcement and could let slow queries block indefinitely.
     let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
-    let read_pool_owner = if method == "GET" {
+    // GH#184: when this dispatch runs inside a live server process, the
+    // server's pool for this database is already open — reuse it for BOTH
+    // reads and writes instead of bootstrapping a fresh observability pool
+    // per GET request. A second in-process `DbPool::new` on the live file
+    // re-runs the entire startup init (integrity probes, WAL checkpoint,
+    // recovery) and can block outright against the live pool's engine-level
+    // coordination — exactly the wedge that took the whole HTTP surface
+    // down. The observability read pool (with its archive-snapshot fallback)
+    // remains the GET path when no live pool exists in this process
+    // (CLI/static-export contexts and tests).
+    let cached_live_owner = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env());
+    let read_pool_owner = if method == "GET" && cached_live_owner.is_none() {
         open_mail_ui_read_pool()?
     } else {
         None
     };
-    let live_pool_owner = if method == "GET" && read_pool_owner.is_some() {
+    let live_pool_owner = if cached_live_owner.is_some() {
+        cached_live_owner
+    } else if method == "GET" && read_pool_owner.is_some() {
         None
     } else {
         Some(get_pool()?)
