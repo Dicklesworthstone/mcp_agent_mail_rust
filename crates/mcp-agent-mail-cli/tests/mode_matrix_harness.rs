@@ -710,7 +710,13 @@ fn maybe_update_golden_snapshot(name: &str, content: &str) {
 
 fn normalize_snapshot_text(text: &str) -> String {
     let normalized = mcp_agent_mail_cli::golden::normalize_output(text);
-    normalized.trim_end().to_string()
+    normalized
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
 }
 
 fn assert_snapshot_match(case_label: &str, expected: &str, actual: &str, update_hint: &str) {

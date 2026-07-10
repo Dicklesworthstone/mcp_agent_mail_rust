@@ -285,15 +285,18 @@ fn capabilities_fm_fixers_mirror_registry_exactly() {
         "Op::DbExec",
         "Op::DbMigrate",
         "Op::SymlinkAtomic",
-        "detect-only",
     ];
     for spec in &report.fm_fixers {
-        assert!(
-            allowed_ops.contains(&spec.op_pattern),
-            "fm_fixer {} declares non-canonical op_pattern {}",
-            spec.id,
-            spec.op_pattern,
-        );
+        if spec.op_pattern != "detect-only" {
+            for token in spec.op_pattern.split(" + ") {
+                assert!(
+                    allowed_ops.contains(&token),
+                    "fm_fixer {} declares non-canonical op_pattern token `{token}` in `{}`",
+                    spec.id,
+                    spec.op_pattern,
+                );
+            }
+        }
         assert!(
             ["P0", "P1", "P2", "P3"].contains(&spec.severity),
             "fm_fixer {} declares non-canonical severity {}",

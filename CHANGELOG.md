@@ -39,7 +39,7 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 - Added configurable predictive TUI tick scheduling while retaining the full
   rendering invariant above.
-- Migrated the workspace to Asupersync 0.3.6.
+- Migrated the workspace to Asupersync 0.3.7.
 - The pre-commit guard no longer depends on Python's private
   `fnmatch.translate` output shape and fails closed on invalid glob compilation,
   including Python 3.14 environments.

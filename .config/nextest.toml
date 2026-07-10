@@ -50,6 +50,14 @@ leak-timeout = "1s"
 filter = 'test(refresh_rollups_conserves_counts)'
 slow-timeout = { period = "120s", terminate-after = 4, grace-period = "10s" }
 
+# This artifact-contract test intentionally runs the complete Git-backed archive
+# profile (102 measured batches plus warmups, up to 1,000 messages per batch).
+# On a contended release host it completes in roughly 7.5 minutes, so retain a
+# finite watchdog while keeping the blanket four-minute policy for normal tests.
+[[profile.default.overrides]]
+filter = 'test(archive_perf_profile_run_emits_extended_artifacts)'
+slow-timeout = { period = "180s", terminate-after = 5, grace-period = "10s" }
+
 # CI profile inherits the same protections with a shorter slow-warning cadence
 # and an automatic single retry for flakes, while keeping the same hard kill.
 [profile.ci]
@@ -62,3 +70,7 @@ fail-fast = false
 [[profile.ci.overrides]]
 filter = 'test(refresh_rollups_conserves_counts)'
 slow-timeout = { period = "120s", terminate-after = 4, grace-period = "10s" }
+
+[[profile.ci.overrides]]
+filter = 'test(archive_perf_profile_run_emits_extended_artifacts)'
+slow-timeout = { period = "180s", terminate-after = 5, grace-period = "10s" }

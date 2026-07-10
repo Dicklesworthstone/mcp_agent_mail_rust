@@ -1,32 +1,35 @@
+Diagnose and repair mailbox, archive, and database health
+
 Usage: am doctor <COMMAND>
 
 Commands:
-  check              
-  repair             
-  backups            
-  restore            
-  reconstruct        Reconstruct the database from the Git archive
-  drain              Report the supervised drain/restart protocol for the current mailbox owner without killing any process (read-only)
+  archive-normalize  Normalize safe archive hygiene issues non-destructively
   archive-scan       Audit archive hygiene without mutating the mailbox archive
   archive-verify     Cross-check archive artifacts against SQLite for tamper evidence
-  archive-normalize  Normalize safe archive hygiene issues non-destructively
+  artifacts          Inventory test, perf, forensic, and e2e artifact roots without deleting anything
+  backups
+  capabilities       Print the agent-facing contract: detectors, fixers, exit codes, env vars, run-artifact schema. JSON only
+  check
+  drain              Report the supervised drain/restart protocol for the current mailbox owner without killing any process (read-only)
+  explain            Expand a single finding by id with full evidence + remediation
   fix                Attempt automatic remediation for detected issues
   fix-orphan-refs    Detect and optionally prune refs whose target objects are missing from the repo's object database. These refs are produced when a crashing writer (e.g., git 2.51.0 segfault mid-stash) leaves a ref pointing at an oid that was never written to the ODB
-  pack-archive       Run git maintenance (loose-object repack) on the archive repository
-  artifacts          Inventory test, perf, forensic, and e2e artifact roots without deleting anything
-  support-bundle     Build a sanitized incident bundle for maintainer support
-  capabilities       Print the agent-facing contract: detectors, fixers, exit codes, env vars, run-artifact schema. JSON only
-  robot-docs         Print the paste-ready agent handbook (Markdown)
-  undo               Restore from `.doctor/runs/<run-id>/backups/`
-  ls                 List runs in `.doctor/runs/` with `{run_id, started_at, exit_code, action_count, finding_count, bytes_backed_up}`
+  fixers             List all per-FM detector+fixer pairs registered in this build
   health             Cheap one-line liveness summary from live mailbox state and latest run history
   locks              Inspect mailbox activity locks and live owners without mutating state
-  triage             Mega-command: returns `{summary, findings, actions_planned, recommended_command, capabilities_url}` in a single round-trip
-  explain            Expand a single finding by id with full evidence + remediation
-  selftest           End-to-end self-test of the mutate() chokepoint primitives
-  write-selftest     Real write-path self-test in an isolated scratch mailbox
+  ls                 List runs in `.doctor/runs/` with `{run_id, started_at, exit_code, action_count, finding_count, bytes_backed_up}`
   mcp-selftest       MCP JSON-RPC decode + dispatch self-test in an isolated scratch mailbox
-  fixers             List all per-FM detector+fixer pairs registered in this build
+  pack-archive       Run git maintenance (loose-object repack) on the archive repository
+  reclaim            Reclaim stale recovery debris (forensic bundles + corrupt-DB quarantines)
+  reconstruct        Reconstruct the database from the Git archive
+  repair
+  restore
+  robot-docs         Print the paste-ready agent handbook (Markdown)
+  selftest           End-to-end self-test of the mutate() chokepoint primitives
+  support-bundle     Build a sanitized incident bundle for maintainer support
+  triage             Mega-command: returns `{summary, findings, actions_planned, recommended_command, capabilities_url}` in a single round-trip
+  undo               Restore from `.doctor/runs/<run-id>/backups/`
+  write-selftest     Real write-path self-test in an isolated scratch mailbox
   help               Print this message or the help of the given subcommand(s)
 
 Options:
