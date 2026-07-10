@@ -12,6 +12,42 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.21](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.21) — 2026-07-10 **[Release]**
+
+### Fixed: the TUI no longer degrades into a mostly blank screen
+
+- The app-level Bayesian diff advisory no longer translates `Deferred` into an
+  `EssentialOnly` frame. That path did not defer terminal output; it erased most
+  of the model before FrankenTUI's real diff writer saw it.
+- The advisory frame budget now matches the TUI's 100 ms fast cadence instead of
+  retaining a stale 16.6 ms/60 fps threshold that classified healthy frames as
+  late.
+- The runtime load governor is pinned to full-fidelity rendering and the
+  conformal degradation gate is disabled for this operator console, so load
+  shedding cannot remove visible content.
+- The full traversal E2E now reconstructs the terminal with `pyte` and measures
+  visible cells. Pressure, resize, flash, and a 180-second/360-step soak therefore
+  fail on an actually blank screen rather than relying on emitted ANSI byte
+  counts. The release candidate recorded zero empty frames and zero low-visibility
+  soak samples.
+- FrankenTUI's native-only runtime now routes recoverable panic boundaries
+  through its backend-neutral cleanup API, fixing production builds that do not
+  enable the legacy crossterm backend. An isolated native-only CI feature gate
+  prevents workspace feature unification from masking this again.
+
+### Runtime, guard, and security hardening
+
+- Added configurable predictive TUI tick scheduling while retaining the full
+  rendering invariant above.
+- Migrated the workspace to Asupersync 0.3.6.
+- The pre-commit guard no longer depends on Python's private
+  `fnmatch.translate` output shape and fails closed on invalid glob compilation,
+  including Python 3.14 environments.
+- Registration-proof nonces are stored durably in the database, so replay
+  protection survives process restarts.
+
+---
+
 ## [v0.3.14](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.14) — 2026-06-20 **[Release]**
 
 ### Fixed: real on-disk `storage.sqlite3` corruption under multi-agent swarm load (#152, #156)

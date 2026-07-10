@@ -7759,9 +7759,9 @@ mod tests {
         let settings = TuiDiffSettings::from_sources(None, None, None);
 
         assert!(settings.safe_mode);
-        assert_eq!(
-            TUI_DIFF_FRAME_BUDGET_MS,
-            FAST_TICK_INTERVAL.as_secs_f64() * 1_000.0,
+        assert!(
+            (TUI_DIFF_FRAME_BUDGET_MS - FAST_TICK_INTERVAL.as_secs_f64() * 1_000.0).abs()
+                < f64::EPSILON,
             "app diff telemetry and the fast render cadence must share a budget"
         );
         assert_eq!(
