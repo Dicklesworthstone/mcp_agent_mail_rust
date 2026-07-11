@@ -23,6 +23,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+const TEST_BEARER_TOKEN: &str = "gh184-http-surface-isolation-token";
+
 /// Bind an ephemeral port, remember it, and release it for the server to use.
 /// Racy in principle, but retried by the caller.
 fn pick_free_port() -> u16 {
@@ -82,14 +84,21 @@ fn http_status(port: u16, request_head: &str, body: &str, deadline: Duration) ->
 fn post_mcp_status(port: u16, deadline: Duration) -> Option<u16> {
     http_status(
         port,
-        "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nAccept: application/json\r\n",
+        &format!(
+            "POST /mcp HTTP/1.1\r\nAuthorization: Bearer {TEST_BEARER_TOKEN}\r\nContent-Type: application/json\r\nAccept: application/json\r\n"
+        ),
         "{}",
         deadline,
     )
 }
 
 fn get_status(port: u16, path: &str, deadline: Duration) -> Option<u16> {
-    http_status(port, &format!("GET {path} HTTP/1.1\r\n"), "", deadline)
+    http_status(
+        port,
+        &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer {TEST_BEARER_TOKEN}\r\n"),
+        "",
+        deadline,
+    )
 }
 
 fn spawn_server(am_bin: &Path, work: &Path, port: u16) -> std::io::Result<Child> {
@@ -99,7 +108,9 @@ fn spawn_server(am_bin: &Path, work: &Path, port: u16) -> std::io::Result<Child>
     Command::new(am_bin)
         .args(["serve-http", "--no-tui"])
         .current_dir(work)
-        .env_remove("HTTP_BEARER_TOKEN")
+        // Authenticate the test requests so GET /mail reaches the blocking UI
+        // dispatch under test instead of passing through a fast 401 guard.
+        .env("HTTP_BEARER_TOKEN", TEST_BEARER_TOKEN)
         .env_remove("HTTP_JWT_ENABLED")
         .env("DATABASE_URL", format!("sqlite:///{}", db_path.display()))
         .env("STORAGE_ROOT", &storage_root)
@@ -156,7 +167,7 @@ fn non_mcp_requests_do_not_wedge_the_mcp_surface() {
     }
     let (guard, port) = spawned.expect("server did not become ready on any attempted port");
 
-    // 1. Baseline: /mcp answers (unauthenticated empty JSON body → fast 4xx).
+    // 1. Baseline: /mcp answers (authenticated empty JSON body → fast 4xx).
     let baseline = post_mcp_status(port, Duration::from_secs(30))
         .expect("baseline POST /mcp must answer before any /mail traffic");
     assert!(
@@ -182,24 +193,21 @@ fn non_mcp_requests_do_not_wedge_the_mcp_surface() {
         );
     }
 
-    // 3. The /mail request itself must complete (any well-formed response —
-    //    200 HTML, 401 when auth is configured, 503 timeout — but never a hang).
+    // 3. The authenticated /mail request itself must complete (200 HTML or a
+    //    bounded 503 timeout, but never a hang).
     let mail_status = mail_thread
         .join()
         .expect("mail thread panicked")
         .expect("GET /mail received no response at all — GH#184 wedge");
     assert!(
-        (200..600).contains(&mail_status),
-        "unexpected GET /mail status {mail_status}"
+        matches!(mail_status, 200 | 503),
+        "authenticated GET /mail did not reach the UI dispatch: status {mail_status}"
     );
 
     // 4. A bogus 404 path (the other reported trigger) must not wedge either.
     let bogus = get_status(port, "/definitely-not-a-route", Duration::from_secs(30))
         .expect("GET on a bogus path received no response — GH#184 wedge");
-    assert!(
-        (400..500).contains(&bogus),
-        "unexpected bogus-path status {bogus}"
-    );
+    assert_eq!(bogus, 404, "unexpected bogus-path status {bogus}");
 
     // 5. And /mcp still answers afterwards (the reporter's step 3/4).
     for attempt in 1..=2 {

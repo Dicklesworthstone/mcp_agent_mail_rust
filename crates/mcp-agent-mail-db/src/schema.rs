@@ -4182,6 +4182,49 @@ mod tests {
     }
 
     #[test]
+    fn analyze_migration_records_when_target_table_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("analyze_missing_atc_table.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(
+                    &cx,
+                    conn,
+                    &Migration::new(
+                        "v16_analyze_atc_experiences".to_string(),
+                        "analyze ATC experiences after adding indexes".to_string(),
+                        "ANALYZE atc_experiences".to_string(),
+                        String::new(),
+                    ),
+                )
+                .await
+                .into_result()
+                .expect("missing statistics target is vacuously satisfied");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                &format!("SELECT id FROM {MIGRATIONS_TABLE_NAME} WHERE id = $1"),
+                &[Value::Text("v16_analyze_atc_experiences".to_string())],
+            )
+            .expect("query migration row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "missing ANALYZE target should still record the migration"
+        );
+    }
+
+    #[test]
     fn recipients_column_rebuild_drops_stale_inbox_triggers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir

@@ -15061,63 +15061,9 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
     );
     let bearer = local_server_bearer_token(&server_config);
 
-    let (tool_name, command_label, arguments) = match action {
-        FileReservationsCommand::Reserve {
-            project,
-            agent,
-            paths,
-            ttl,
-            exclusive,
-            shared,
-            reason,
-        } => {
-            let exclusive_val = if *shared { false } else { *exclusive };
-            (
-                "file_reservation_paths",
-                "file_reservations reserve",
-                serde_json::json!({
-                    "project_key": project,
-                    "agent_name": agent,
-                    "paths": paths,
-                    "ttl_seconds": ttl,
-                    "exclusive": exclusive_val,
-                    "reason": reason,
-                }),
-            )
-        }
-        FileReservationsCommand::Renew {
-            project,
-            agent,
-            extend_seconds,
-            paths,
-            ids,
-        } => (
-            "renew_file_reservations",
-            "file_reservations renew",
-            serde_json::json!({
-                "project_key": project,
-                "agent_name": agent,
-                "extend_seconds": extend_seconds,
-                "paths": if paths.is_empty() { serde_json::Value::Null } else { serde_json::json!(paths) },
-                "file_reservation_ids": if ids.is_empty() { serde_json::Value::Null } else { serde_json::json!(ids) },
-            }),
-        ),
-        FileReservationsCommand::Release {
-            project,
-            agent,
-            paths,
-            ids,
-        } => (
-            "release_file_reservations",
-            "file_reservations release",
-            serde_json::json!({
-                "project_key": project,
-                "agent_name": agent,
-                "paths": if paths.is_empty() { serde_json::Value::Null } else { serde_json::json!(paths) },
-                "file_reservation_ids": if ids.is_empty() { serde_json::Value::Null } else { serde_json::json!(ids) },
-            }),
-        ),
-        _ => return Ok(false),
+    let Some((tool_name, command_label, arguments)) = file_reservations_proxy_request(action)
+    else {
+        return Ok(false);
     };
 
     let storage_root = server_config.storage_root.clone();
@@ -15140,6 +15086,89 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
 
     emit_proxied_file_reservations_output(action, &payload);
     Ok(true)
+}
+
+/// Translate a mutating reservation command into its MCP tool request.
+///
+/// Optional filters must be omitted when the caller did not supply them. MCP
+/// input schemas distinguish an absent optional array from JSON `null`, and
+/// sending `null` makes the live server reject otherwise-valid renew/release
+/// commands with `-32602` before the tool can run.
+fn file_reservations_proxy_request(
+    action: &FileReservationsCommand,
+) -> Option<(&'static str, &'static str, serde_json::Value)> {
+    match action {
+        FileReservationsCommand::Reserve {
+            project,
+            agent,
+            paths,
+            ttl,
+            exclusive,
+            shared,
+            reason,
+        } => {
+            let exclusive_val = if *shared { false } else { *exclusive };
+            Some((
+                "file_reservation_paths",
+                "file_reservations reserve",
+                serde_json::json!({
+                    "project_key": project,
+                    "agent_name": agent,
+                    "paths": paths,
+                    "ttl_seconds": ttl,
+                    "exclusive": exclusive_val,
+                    "reason": reason,
+                }),
+            ))
+        }
+        FileReservationsCommand::Renew {
+            project,
+            agent,
+            extend_seconds,
+            paths,
+            ids,
+        } => {
+            let mut arguments = serde_json::json!({
+                "project_key": project,
+                "agent_name": agent,
+                "extend_seconds": extend_seconds,
+            });
+            if !paths.is_empty() {
+                arguments["paths"] = serde_json::json!(paths);
+            }
+            if !ids.is_empty() {
+                arguments["file_reservation_ids"] = serde_json::json!(ids);
+            }
+            Some((
+                "renew_file_reservations",
+                "file_reservations renew",
+                arguments,
+            ))
+        }
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => {
+            let mut arguments = serde_json::json!({
+                "project_key": project,
+                "agent_name": agent,
+            });
+            if !paths.is_empty() {
+                arguments["paths"] = serde_json::json!(paths);
+            }
+            if !ids.is_empty() {
+                arguments["file_reservation_ids"] = serde_json::json!(ids);
+            }
+            Some((
+                "release_file_reservations",
+                "file_reservations release",
+                arguments,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Emit CLI output for a reservation verb handled by the daemon, matching the
@@ -36337,6 +36366,54 @@ mod tests {
                 "root help correction text should mention {required}"
             );
         }
+    }
+
+    #[test]
+    fn file_reservations_proxy_request_omits_absent_optional_filters() {
+        for action in [
+            FileReservationsCommand::Renew {
+                project: "/tmp/project".to_string(),
+                agent: "GreenBear".to_string(),
+                extend_seconds: 120,
+                paths: Vec::new(),
+                ids: Vec::new(),
+            },
+            FileReservationsCommand::Release {
+                project: "/tmp/project".to_string(),
+                agent: "GreenBear".to_string(),
+                paths: Vec::new(),
+                ids: Vec::new(),
+            },
+        ] {
+            let (_, _, arguments) =
+                file_reservations_proxy_request(&action).expect("mutating command is proxied");
+            let arguments = arguments.as_object().expect("arguments are an object");
+            assert!(
+                !arguments.contains_key("paths"),
+                "an absent paths filter must be omitted, not serialized as null"
+            );
+            assert!(
+                !arguments.contains_key("file_reservation_ids"),
+                "absent reservation IDs must be omitted, not serialized as null"
+            );
+        }
+
+        let action = FileReservationsCommand::Renew {
+            project: "/tmp/project".to_string(),
+            agent: "GreenBear".to_string(),
+            extend_seconds: 120,
+            paths: vec!["src/**".to_string()],
+            ids: vec![17, 23],
+        };
+        let (tool_name, command_label, arguments) =
+            file_reservations_proxy_request(&action).expect("renew command is proxied");
+        assert_eq!(tool_name, "renew_file_reservations");
+        assert_eq!(command_label, "file_reservations renew");
+        assert_eq!(arguments["paths"], serde_json::json!(["src/**"]));
+        assert_eq!(
+            arguments["file_reservation_ids"],
+            serde_json::json!([17, 23])
+        );
     }
 
     #[test]
