@@ -148,11 +148,9 @@ fn non_mcp_requests_do_not_wedge_the_mcp_surface() {
         let deadline = Instant::now() + Duration::from_secs(120);
         let mut ready = false;
         while Instant::now() < deadline {
-            if let Some(status) = get_status(port, "/healthz", Duration::from_secs(2)) {
-                if status == 200 {
-                    ready = true;
-                    break;
-                }
+            if get_status(port, "/healthz", Duration::from_secs(2)) == Some(200) {
+                ready = true;
+                break;
             }
             // Bail out early if the process already died (port collision).
             if let Ok(Some(_)) = guard.0.try_wait() {
