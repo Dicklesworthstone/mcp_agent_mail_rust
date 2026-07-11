@@ -255,11 +255,13 @@ pub fn is_quarantine_name(name: &str) -> bool {
         || name.contains(".archive-reconcile-restore-")
 }
 
-/// Whether a filename is a startup-time WAL/SHM sidecar snapshot
-/// (`*.startup-precheckpoint-<ts>` / `*.startup-quarantine-<ts>`), as opposed
-/// to the live DB, a `.bak`, or a live `-wal`/`-shm` sidecar. These snapshots
-/// are forensic copies taken before the startup checkpoint and are safe to
-/// reclaim under the same bounded-retention policy as quarantines (GH#185).
+/// Whether a filename is a startup-time WAL/SHM sidecar snapshot.
+///
+/// Matches `*.startup-precheckpoint-<ts>` / `*.startup-quarantine-<ts>`, as
+/// opposed to the live DB, a `.bak`, or a live `-wal`/`-shm` sidecar. These
+/// snapshots are forensic copies taken before the startup checkpoint and are
+/// safe to reclaim under the same bounded-retention policy as quarantines
+/// (GH#185).
 #[must_use]
 pub fn is_sidecar_snapshot_name(name: &str) -> bool {
     name.contains(".startup-precheckpoint-") || name.contains(".startup-quarantine-")
@@ -586,11 +588,11 @@ mod tests {
         .unwrap();
 
         let debris = enumerate_recovery_debris(storage_root, &db_path);
-        let snapshots: Vec<_> = debris
+        let snapshots = debris
             .iter()
             .filter(|a| a.category == DebrisCategory::SidecarSnapshot)
-            .collect();
-        assert_eq!(snapshots.len(), 4, "debris: {debris:?}");
+            .count();
+        assert_eq!(snapshots, 4, "debris: {debris:?}");
         // The live DB and live WAL sidecar are never enumerated as debris.
         assert!(debris.iter().all(|a| a.path != db_path));
         assert!(

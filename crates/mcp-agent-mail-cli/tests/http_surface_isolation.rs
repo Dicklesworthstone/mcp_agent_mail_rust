@@ -41,7 +41,9 @@ fn http_status(port: u16, request_head: &str, body: &str, deadline: Duration) ->
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().ok()?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).ok()?;
     stream.set_read_timeout(Some(deadline)).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
     let request = format!(
         "{request_head}Host: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
@@ -166,7 +168,8 @@ fn non_mcp_requests_do_not_wedge_the_mcp_surface() {
     //    that /mcp keeps answering. Pre-fix, the /mail request could occupy an
     //    async worker in a blocking pool bootstrap while holding the global
     //    pool-registry lock — starving every other request until restart.
-    let mail_thread = std::thread::spawn(move || get_status(port, "/mail", Duration::from_secs(90)));
+    let mail_thread =
+        std::thread::spawn(move || get_status(port, "/mail", Duration::from_secs(90)));
     std::thread::sleep(Duration::from_millis(200));
 
     for attempt in 1..=3 {
@@ -201,7 +204,9 @@ fn non_mcp_requests_do_not_wedge_the_mcp_surface() {
     // 5. And /mcp still answers afterwards (the reporter's step 3/4).
     for attempt in 1..=2 {
         let status = post_mcp_status(port, Duration::from_secs(30)).unwrap_or_else(|| {
-            panic!("POST /mcp attempt {attempt} after /mail+404 received no response — GH#184 wedge")
+            panic!(
+                "POST /mcp attempt {attempt} after /mail+404 received no response — GH#184 wedge"
+            )
         });
         assert!(
             (400..500).contains(&status),

@@ -10624,11 +10624,7 @@ impl HttpState {
     /// agents after a single browser `GET /mail`. Here the worst case is a
     /// consumed dispatch permit + one blocking thread, and the client gets a
     /// 503 when the request times out.
-    async fn dispatch_mail_route_blocking(
-        &self,
-        req: Http1Request,
-        path: String,
-    ) -> Http1Response {
+    async fn dispatch_mail_route_blocking(&self, req: Http1Request, path: String) -> Http1Response {
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             // self_ref not set or HttpState already dropped — fall back to the
             // legacy inline path (tests construct HttpState without self_ref).
