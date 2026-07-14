@@ -3,13 +3,42 @@
 //! Exposes blocking DB queries used by UI loops and backgrounds threads
 //! that cannot easily integrate with the async `sqlmodel_pool`.
 
-use crate::DbConn;
 use crate::error::DbError;
 use crate::models::MessageRow;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
-use sqlmodel_core::Value;
+use crate::{CanonicalDbConn, DbConn};
+use sqlmodel_core::{Row as SqlRow, Value};
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
+
+trait InboxReadConnection {
+    fn execute_inbox_raw(&self, sql: &str) -> Result<(), DbError>;
+    fn query_inbox_rows(&self, sql: &str, params: &[Value]) -> Result<Vec<SqlRow>, DbError>;
+}
+
+impl InboxReadConnection for DbConn {
+    fn execute_inbox_raw(&self, sql: &str) -> Result<(), DbError> {
+        self.execute_raw(sql)
+            .map_err(|error| DbError::Sqlite(error.to_string()))
+    }
+
+    fn query_inbox_rows(&self, sql: &str, params: &[Value]) -> Result<Vec<SqlRow>, DbError> {
+        self.query_sync(sql, params)
+            .map_err(|error| DbError::Sqlite(error.to_string()))
+    }
+}
+
+impl InboxReadConnection for CanonicalDbConn {
+    fn execute_inbox_raw(&self, sql: &str) -> Result<(), DbError> {
+        self.execute_raw(sql)
+            .map_err(|error| DbError::Sqlite(error.to_string()))
+    }
+
+    fn query_inbox_rows(&self, sql: &str, params: &[Value]) -> Result<Vec<SqlRow>, DbError> {
+        self.query_sync(sql, params)
+            .map_err(|error| DbError::Sqlite(error.to_string()))
+    }
+}
 
 /// Synchronously update the thread ID of a message.
 ///
@@ -160,6 +189,44 @@ pub fn fetch_inbox_ack_overdue_metadata_rows_from_conn(
     )
 }
 
+/// Fetch inbox rows from a canonical SQLite connection.
+///
+/// File-backed Agent Mail inbox reads use this path to avoid the FrankenSQLite
+/// read engine's file-lock tail latency. Callers configure the connection as
+/// query-only before invoking this helper.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fetch_inbox_rows_from_canonical_conn(
+    conn: &CanonicalDbConn,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    urgent_only: bool,
+    unread_only: bool,
+    ack_required_only: bool,
+    ack_overdue_before: Option<i64>,
+    include_bodies: bool,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        since_ts,
+        limit,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            ack_overdue_before,
+            body_policy: if include_bodies {
+                InboxBodyPolicy::Full
+            } else {
+                InboxBodyPolicy::MetadataOnly
+            },
+        },
+    )
+}
+
 #[derive(Clone, Copy)]
 enum InboxBodyPolicy {
     Full,
@@ -175,15 +242,15 @@ struct InboxFetchOptions {
     body_policy: InboxBodyPolicy,
 }
 
-fn fetch_inbox_rows_from_conn_impl(
-    conn: &DbConn,
+fn fetch_inbox_rows_from_conn_impl<C: InboxReadConnection>(
+    conn: &C,
     project_id: i64,
     agent_id: i64,
     since_ts: Option<i64>,
     limit: usize,
     options: InboxFetchOptions,
 ) -> Result<Vec<InboxRow>, DbError> {
-    let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
+    let _ = conn.execute_inbox_raw("PRAGMA busy_timeout = 250");
     let body_select = match options.body_policy {
         InboxBodyPolicy::Full => "m.body_md",
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
@@ -223,9 +290,7 @@ fn fetch_inbox_rows_from_conn_impl(
     sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
     params.push(Value::BigInt(limit_i64));
 
-    let rows = conn
-        .query_sync(&sql, &params)
-        .map_err(|e| DbError::Sqlite(e.to_string()))?;
+    let rows = conn.query_inbox_rows(&sql, &params)?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -974,6 +1039,68 @@ mod tests {
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
         );
+    }
+
+    #[test]
+    fn canonical_inbox_reader_returns_metadata_without_body() {
+        let dir = tempfile::tempdir().expect("create temporary directory");
+        let db_path = dir.path().join("inbox.sqlite3");
+        let conn =
+            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open file-backed db");
+        conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply PRAGMAs");
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                schema::migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init schema migrations");
+            }
+        });
+
+        let pid = insert_project(&conn);
+        let sender_id = insert_agent(&conn, pid, "Sender");
+        let recipient_id = insert_agent(&conn, pid, "Recipient");
+        let msg_id = insert_message(&conn, pid, sender_id, "thread-1");
+        conn.execute_sync(
+            "UPDATE messages SET body_md = ? WHERE id = ?",
+            &[
+                Value::Text("canonical read should not hydrate this body".repeat(8)),
+                Value::BigInt(msg_id),
+            ],
+        )
+        .expect("update message body");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+            &[Value::BigInt(msg_id), Value::BigInt(recipient_id)],
+        )
+        .expect("insert recipient");
+        crate::close_db_conn(conn, "canonical inbox reader test setup");
+
+        let canonical = CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open canonical sqlite reader");
+        canonical
+            .execute_raw("PRAGMA query_only = ON")
+            .expect("make canonical reader query-only");
+        let rows = fetch_inbox_rows_from_canonical_conn(
+            &canonical,
+            pid,
+            recipient_id,
+            None,
+            10,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("fetch canonical inbox metadata");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.id, Some(msg_id));
+        assert_eq!(rows[0].message.subject, "test subject");
+        assert!(rows[0].message.body_md.is_empty());
     }
 
     // ── update_message_thread_id tests ───────────────────────────────

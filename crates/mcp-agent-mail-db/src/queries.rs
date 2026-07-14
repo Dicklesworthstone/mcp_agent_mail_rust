@@ -7073,6 +7073,49 @@ struct InboxQueryOptions {
     body_policy: InboxBodyPolicy,
 }
 
+/// Read file-backed inbox rows through canonical SQLite.
+///
+/// FrankenSQLite remains the main backend, but its file-backed read path can
+/// stall behind its own lock bookkeeping even when canonical SQLite can serve
+/// the same snapshot immediately. This connection is query-only and short-lived
+/// so it cannot alter mailbox state or inherit a stale snapshot.
+#[allow(clippy::too_many_arguments)]
+fn fetch_inbox_file_backed_canonical(
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxQueryOptions,
+) -> std::result::Result<Vec<InboxRow>, DbError> {
+    let conn = crate::CanonicalDbConn::open_file(pool.sqlite_path())
+        .map_err(|error| DbError::Sqlite(format!("open canonical inbox reader: {error}")))?;
+    let result = (|| {
+        conn.execute_raw("PRAGMA busy_timeout = 250")
+            .map_err(|error| {
+                DbError::Sqlite(format!("configure canonical inbox reader: {error}"))
+            })?;
+        conn.execute_raw("PRAGMA query_only = ON")
+            .map_err(|error| {
+                DbError::Sqlite(format!("configure canonical inbox reader: {error}"))
+            })?;
+        crate::sync::fetch_inbox_rows_from_canonical_conn(
+            &conn,
+            project_id,
+            agent_id,
+            since_ts,
+            limit,
+            options.urgent_only,
+            options.unread_only,
+            options.ack_required_only,
+            options.ack_overdue_before,
+            matches!(options.body_policy, InboxBodyPolicy::Full),
+        )
+    })();
+    close_canonical_db_conn(conn, "file-backed canonical inbox reader");
+    result
+}
+
 #[allow(clippy::too_many_lines)]
 async fn fetch_inbox_impl(
     cx: &Cx,
@@ -7086,6 +7129,15 @@ async fn fetch_inbox_impl(
     let Ok(_limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
+
+    if pool.sqlite_path() != ":memory:" {
+        return match fetch_inbox_file_backed_canonical(
+            pool, project_id, agent_id, since_ts, limit, options,
+        ) {
+            Ok(rows) => Outcome::Ok(rows),
+            Err(error) => Outcome::Err(error),
+        };
+    }
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => conn,

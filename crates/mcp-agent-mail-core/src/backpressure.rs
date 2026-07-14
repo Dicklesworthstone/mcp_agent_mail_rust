@@ -165,17 +165,25 @@ impl HealthSignals {
     /// `now_us` is the current time in microseconds (Unix epoch).
     #[must_use]
     pub const fn from_snapshot(snap: &GlobalMetricsSnapshot, now_us: u64) -> Self {
-        let pool_over_80_for_s = duration_since_s(snap.db.pool_over_80_since_us, now_us);
+        // Pool totals are lazily populated, so one active connection out of one
+        // opened connection is normal until another caller must wait. Only treat
+        // pool gauges and their cumulative latency as pressure when the pool has
+        // an actual waiter.
+        let pool_has_waiters = snap.db.pool_pending_requests > 0;
+        let pool_over_80_for_s = if pool_has_waiters {
+            duration_since_s(snap.db.pool_over_80_since_us, now_us)
+        } else {
+            0
+        };
         let wbq_over_80_for_s = duration_since_s(snap.storage.wbq_over_80_since_us, now_us);
         let commit_over_80_for_s = duration_since_s(snap.storage.commit_over_80_since_us, now_us);
-        // Pool-acquire latency is a cumulative histogram. If the pool is currently
-        // idle, historical spikes should not keep health stuck in yellow/red.
-        let pool_is_idle =
-            snap.db.pool_active_connections == 0 && snap.db.pool_pending_requests == 0;
-        let pool_acquire_p95_us = if pool_is_idle {
-            0
-        } else {
+        // Pool-acquire latency is a cumulative histogram. If the pool is not
+        // contended, historical spikes and lazy pool population should not keep
+        // health stuck in yellow/red.
+        let pool_acquire_p95_us = if pool_has_waiters {
             snap.db.pool_acquire_latency_us.p95
+        } else {
+            0
         };
 
         let wbq_depth_pct = pct(snap.storage.wbq_depth, snap.storage.wbq_capacity);
@@ -208,7 +216,11 @@ impl HealthSignals {
 
         Self {
             pool_acquire_p95_us,
-            pool_utilization_pct: snap.db.pool_utilization_pct,
+            pool_utilization_pct: if pool_has_waiters {
+                snap.db.pool_utilization_pct
+            } else {
+                0
+            },
             pool_over_80_for_s,
             wbq_depth_pct,
             wbq_queue_p95_us,
@@ -1133,6 +1145,34 @@ mod tests {
         let signals = HealthSignals::from_snapshot(&snap, now_us);
 
         assert_eq!(signals.pool_acquire_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn health_signals_ignore_lazy_pool_utilization_without_waiters() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.db.pool_acquire_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: 500_000,
+            min: 500_000,
+            max: 500_000,
+            p50: 500_000,
+            p95: 500_000,
+            p99: 500_000,
+        };
+        snap.db.pool_total_connections = 1;
+        snap.db.pool_active_connections = 1;
+        snap.db.pool_idle_connections = 0;
+        snap.db.pool_pending_requests = 0;
+        snap.db.pool_utilization_pct = 100;
+        snap.db.pool_over_80_since_us = now_us - 600_000_000;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+
+        assert_eq!(signals.pool_acquire_p95_us, 0);
+        assert_eq!(signals.pool_utilization_pct, 0);
+        assert_eq!(signals.pool_over_80_for_s, 0);
         assert_eq!(signals.classify(), HealthLevel::Green);
     }
 
