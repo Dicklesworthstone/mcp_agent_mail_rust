@@ -722,7 +722,7 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(&config.storage_root);
+    let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
     if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
         return semantic_readiness_response(
             "ok",

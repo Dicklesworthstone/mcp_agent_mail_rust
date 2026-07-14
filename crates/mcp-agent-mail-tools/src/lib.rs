@@ -65,6 +65,7 @@ pub mod tool_util {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -720,12 +721,49 @@ pub mod tool_util {
     static READ_ARCHIVE_INVENTORY_CACHE: LazyLock<Mutex<Option<ReadArchiveInventoryCacheEntry>>> =
         LazyLock::new(|| Mutex::new(None));
 
+    /// Avoid re-running the complete durability verdict for every polling read.
+    /// A new archive commit invalidates this cache; the TTL only bounds
+    /// detection of a live SQLite failure that has no archive write in between.
+    const READ_SOURCE_DECISION_CACHE_TTL: Duration = Duration::from_secs(30);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadSourceDecisionCacheKey {
+        database_url: String,
+        storage_root: PathBuf,
+        sqlite_path: PathBuf,
+        archive_head: Option<git2::Oid>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ReadSourceDecisionCacheEntry {
+        key: ReadSourceDecisionCacheKey,
+        checked_at: Instant,
+        use_archive_snapshot: bool,
+    }
+
+    static READ_SOURCE_DECISION_CACHE: LazyLock<Mutex<Option<ReadSourceDecisionCacheEntry>>> =
+        LazyLock::new(|| Mutex::new(None));
+
     fn read_archive_head(storage_root: &Path) -> Option<git2::Oid> {
         git2::Repository::open(storage_root)
             .ok()?
             .head()
             .ok()?
             .target()
+    }
+
+    fn cached_read_source_decision(
+        entry: Option<&ReadSourceDecisionCacheEntry>,
+        key: &ReadSourceDecisionCacheKey,
+        now: Instant,
+    ) -> Option<bool> {
+        entry.and_then(|entry| {
+            (entry.key == *key
+                && now
+                    .checked_duration_since(entry.checked_at)
+                    .is_some_and(|elapsed| elapsed < READ_SOURCE_DECISION_CACHE_TTL))
+            .then_some(entry.use_archive_snapshot)
+        })
     }
 
     pub(crate) fn read_archive_inventory(
@@ -757,6 +795,13 @@ pub mod tool_util {
     #[cfg(test)]
     fn reset_read_archive_inventory_cache() {
         *READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[cfg(test)]
+    fn reset_read_source_decision_cache() {
+        *READ_SOURCE_DECISION_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
@@ -832,7 +877,7 @@ pub mod tool_util {
         })
     }
 
-    fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
+    pub(crate) fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
         let archive = read_archive_inventory(storage_root);
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
@@ -845,7 +890,7 @@ pub mod tool_util {
             || sqlite_path.starts_with(storage_root)
     }
 
-    fn read_archive_is_ahead(
+    pub(crate) fn read_archive_is_ahead(
         storage_root: &Path,
         sqlite_path: &Path,
         conn: &mcp_agent_mail_db::DbConn,
@@ -911,7 +956,11 @@ pub mod tool_util {
     /// worse) according to a fast mailbox verdict. Returns `true` when read
     /// surfaces should fall back to archive snapshots instead of the
     /// potentially corrupt live file.
-    fn live_db_is_suspect(database_url: &str, storage_root: &Path, sqlite_path: &Path) -> bool {
+    pub(crate) fn live_db_is_suspect(
+        database_url: &str,
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> bool {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
             return false;
         }
@@ -949,6 +998,78 @@ pub mod tool_util {
         }
     }
 
+    pub(crate) fn should_use_archive_snapshot_for_read(
+        config: &Config,
+        resolved_path: &Path,
+        probe_context: &'static str,
+    ) -> bool {
+        let key = ReadSourceDecisionCacheKey {
+            database_url: config.database_url.clone(),
+            storage_root: config.storage_root.clone(),
+            sqlite_path: resolved_path.to_path_buf(),
+            archive_head: read_archive_head(&config.storage_root),
+        };
+        let now = Instant::now();
+        let mut cache = READ_SOURCE_DECISION_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(use_archive_snapshot) = cached_read_source_decision(cache.as_ref(), &key, now) {
+            return use_archive_snapshot;
+        }
+
+        let archive_has_state = archive_storage_root_is_authoritative_for_sqlite_path(
+            &config.storage_root,
+            resolved_path,
+        ) && read_archive_inventory_has_state(&config.storage_root);
+
+        let use_archive_snapshot = if !archive_has_state {
+            false
+        } else if !resolved_path.exists() {
+            true
+        } else if live_db_is_suspect(&config.database_url, &config.storage_root, resolved_path) {
+            true
+        } else {
+            match mcp_agent_mail_db::DbConn::open_file(resolved_path.to_string_lossy().as_ref()) {
+                Ok(conn) => {
+                    let conn = mcp_agent_mail_db::guard_db_conn(conn, probe_context);
+                    let archive_ahead =
+                        read_archive_is_ahead(&config.storage_root, resolved_path, &conn);
+                    drop(conn);
+                    match archive_ahead {
+                        Ok(true) => true,
+                        Err(error) if archive_has_state => {
+                            tracing::warn!(
+                                source = %resolved_path.display(),
+                                storage_root = %config.storage_root.display(),
+                                error = %error,
+                                "using archive-backed read snapshot because the live sqlite inventory probe failed"
+                            );
+                            true
+                        }
+                        Ok(false) | Err(_) => false,
+                    }
+                }
+                Err(error) if archive_has_state => {
+                    tracing::warn!(
+                        source = %resolved_path.display(),
+                        storage_root = %config.storage_root.display(),
+                        error = %error,
+                        "using archive-backed read snapshot because the live sqlite source could not be opened"
+                    );
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+
+        *cache = Some(ReadSourceDecisionCacheEntry {
+            key,
+            checked_at: now,
+            use_archive_snapshot,
+        });
+        use_archive_snapshot
+    }
+
     fn open_read_db_pool() -> Result<Option<ToolReadPool>, String> {
         let config = Config::from_env();
         if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
@@ -964,55 +1085,11 @@ pub mod tool_util {
         }
 
         let resolved_path = PathBuf::from(&sqlite_path);
-        let archive_has_state = archive_storage_root_is_authoritative_for_sqlite_path(
-            &config.storage_root,
+        let use_archive_snapshot = should_use_archive_snapshot_for_read(
+            &config,
             &resolved_path,
-        ) && read_archive_inventory_has_state(&config.storage_root);
-
-        // When the durability verdict says the live DB is suspect or worse,
-        // force archive-snapshot reads even if the archive isn't strictly
-        // "ahead" of the DB by row count.
-        let durability_forces_snapshot = archive_has_state
-            && live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-        let use_archive_snapshot = if durability_forces_snapshot {
-            true
-        } else {
-            match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-                Ok(conn) => {
-                    let conn = mcp_agent_mail_db::guard_db_conn(
-                        conn,
-                        "tool_util::open_read_db_pool archive-ahead probe",
-                    );
-                    let archive_ahead =
-                        read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                    drop(conn);
-                    match archive_ahead {
-                        Ok(true) => true,
-                        Err(error) if archive_has_state => {
-                            tracing::warn!(
-                                source = %resolved_path.display(),
-                                storage_root = %config.storage_root.display(),
-                                error = %error,
-                                "using archive-backed tool snapshot because the live sqlite inventory probe failed"
-                            );
-                            true
-                        }
-                        Ok(false) | Err(_) => false,
-                    }
-                }
-                Err(error) if archive_has_state => {
-                    tracing::warn!(
-                        source = %resolved_path.display(),
-                        storage_root = %config.storage_root.display(),
-                        error = %error,
-                        "using archive-backed tool snapshot because the live sqlite source could not be opened"
-                    );
-                    true
-                }
-                Err(_) => false,
-            }
-        };
+            "tool_util::open_read_db_pool archive-ahead probe",
+        );
 
         if !use_archive_snapshot {
             return Ok(None);
@@ -1718,6 +1795,55 @@ pub mod tool_util {
             assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
 
             reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn read_source_decision_cache_requires_matching_head_and_freshness() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_source_decision_cache();
+
+            let now = Instant::now();
+            let key = ReadSourceDecisionCacheKey {
+                database_url: "sqlite:///tmp/read-cache.sqlite3".to_string(),
+                storage_root: PathBuf::from("/tmp/read-cache-storage"),
+                sqlite_path: PathBuf::from("/tmp/read-cache.sqlite3"),
+                archive_head: None,
+            };
+            let entry = ReadSourceDecisionCacheEntry {
+                key: key.clone(),
+                checked_at: now,
+                use_archive_snapshot: false,
+            };
+
+            assert_eq!(
+                cached_read_source_decision(Some(&entry), &key, now),
+                Some(false)
+            );
+
+            let changed_head = ReadSourceDecisionCacheKey {
+                archive_head: Some(
+                    git2::Oid::from_str("0123456789012345678901234567890123456789")
+                        .expect("parse archive head"),
+                ),
+                ..key.clone()
+            };
+            assert_eq!(
+                cached_read_source_decision(Some(&entry), &changed_head, now),
+                None
+            );
+
+            let stale = ReadSourceDecisionCacheEntry {
+                checked_at: now
+                    .checked_sub(READ_SOURCE_DECISION_CACHE_TTL + Duration::from_secs(1))
+                    .expect("monotonic clock must be older than the decision cache TTL"),
+                ..entry
+            };
+            assert_eq!(cached_read_source_decision(Some(&stale), &key, now), None);
+
+            reset_read_source_decision_cache();
         }
 
         #[test]

@@ -99,137 +99,6 @@ fn is_missing_projects_table_error(message: &str) -> bool {
     lower.contains("no such table") && lower.contains("projects")
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ResourceReconcileInventory {
-    projects: usize,
-    agents: usize,
-    messages: usize,
-    max_message_id: i64,
-    project_identities: std::collections::BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
-}
-
-fn query_resource_db_inventory(
-    conn: &mcp_agent_mail_db::DbConn,
-) -> Result<ResourceReconcileInventory, String> {
-    let present = conn
-        .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-            &[],
-        )
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .filter_map(|row| row.get_named::<String>("name").ok())
-        .collect::<std::collections::BTreeSet<_>>();
-
-    let query_count = |sql: &str, alias: &str| -> Result<usize, String> {
-        let rows = conn.query_sync(sql, &[]).map_err(|err| err.to_string())?;
-        let Some(row) = rows.first() else {
-            return Err(format!(
-                "no rows returned from resource inventory query for {alias}"
-            ));
-        };
-        Ok(row
-            .get_named::<i64>(alias)
-            .ok()
-            .and_then(|count| usize::try_from(count).ok())
-            .unwrap_or(0))
-    };
-
-    let projects = if present.contains("projects") {
-        query_count(
-            "SELECT COUNT(*) AS project_count FROM projects",
-            "project_count",
-        )?
-    } else {
-        0
-    };
-    let agents = if present.contains("agents") {
-        query_count("SELECT COUNT(*) AS agent_count FROM agents", "agent_count")?
-    } else {
-        0
-    };
-    let (messages, max_message_id) = if present.contains("messages") {
-        let rows = conn
-            .query_sync(
-                "SELECT COUNT(*) AS message_count, COALESCE(MAX(id), 0) AS max_id FROM messages",
-                &[],
-            )
-            .map_err(|err| err.to_string())?;
-        let Some(row) = rows.first() else {
-            return Err("no rows returned from resource message inventory query".to_string());
-        };
-        (
-            row.get_named::<i64>("message_count")
-                .ok()
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(0),
-            row.get_named::<i64>("max_id").unwrap_or(0),
-        )
-    } else {
-        (0, 0)
-    };
-    let project_identities = if present.contains("projects") {
-        mcp_agent_mail_db::collect_db_project_identities(conn).map_err(|err| err.to_string())?
-    } else {
-        std::collections::BTreeSet::new()
-    };
-
-    Ok(ResourceReconcileInventory {
-        projects,
-        agents,
-        messages,
-        max_message_id,
-        project_identities,
-    })
-}
-
-fn resource_archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = crate::tool_util::read_archive_inventory(storage_root);
-    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
-}
-
-fn resource_archive_is_ahead(
-    storage_root: &Path,
-    sqlite_path: &Path,
-    conn: &mcp_agent_mail_db::DbConn,
-) -> Result<bool, String> {
-    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-        storage_root,
-        sqlite_path,
-    ) {
-        return Ok(false);
-    }
-
-    let archive = crate::tool_util::read_archive_inventory(storage_root);
-    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
-        return Ok(false);
-    }
-
-    let db_inventory = query_resource_db_inventory(conn)?;
-    let archive_message_count = archive.unique_message_ids;
-    let archive_max_id = archive.latest_message_id.unwrap_or(0);
-    let missing_archive_projects = mcp_agent_mail_db::archive_missing_project_identities(
-        &archive,
-        &db_inventory.project_identities,
-    );
-
-    let archive_metadata_ahead = mcp_agent_mail_db::pool::archive_metadata_advantage_is_decisive(
-        archive.projects,
-        archive.agents,
-        archive_message_count,
-        archive.latest_message_id,
-        db_inventory.projects,
-        db_inventory.agents,
-        db_inventory.messages,
-        db_inventory.max_message_id,
-        &missing_archive_projects,
-    );
-
-    Ok(archive_message_count > db_inventory.messages
-        || archive_max_id > db_inventory.max_message_id
-        || archive_metadata_ahead)
-}
-
 struct ResourceReadPool {
     pool: mcp_agent_mail_db::DbPool,
     _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
@@ -252,44 +121,6 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
-/// Check whether the live `SQLite` database is suspect for resource reads.
-///
-/// Delegates to the fast mailbox verdict. When `DurabilityState` is
-/// `DegradedReadOnly` (or worse), resource reads should fall back to
-/// archive-based data instead of the potentially corrupt live file.
-fn resource_live_db_is_suspect(
-    database_url: &str,
-    storage_root: &Path,
-    sqlite_path: &Path,
-) -> bool {
-    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-        storage_root,
-        sqlite_path,
-    ) {
-        return false;
-    }
-
-    let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
-        database_url,
-        storage_root,
-        &mcp_agent_mail_db::VerdictOptions::fast(),
-    );
-    let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
-    if mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
-        &verdict,
-        sqlite_path,
-    ) {
-        tracing::info!(
-            verdict_state = %verdict.state,
-            durability_state = %durability,
-            "live SQLite is suspect; resource reads will prefer archive snapshots"
-        );
-        true
-    } else {
-        false
-    }
-}
-
 fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
@@ -304,57 +135,11 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state = crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-        &config.storage_root,
+    let use_archive_snapshot = crate::tool_util::should_use_archive_snapshot_for_read(
+        &config,
         &resolved_path,
-    ) && resource_archive_inventory_has_state(&config.storage_root);
-
-    // When the durability verdict says the live DB is suspect or worse,
-    // force archive-snapshot reads even if the archive isn't strictly
-    // "ahead" of the DB by row count.
-    let durability_forces_snapshot = archive_has_state
-        && resource_live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-    let use_archive_snapshot = if !resolved_path.exists() {
-        archive_has_state
-    } else if durability_forces_snapshot {
-        true
-    } else {
-        match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-            Ok(conn) => {
-                let conn = mcp_agent_mail_db::guard_db_conn(
-                    conn,
-                    "resources::open_read_db_pool archive-ahead probe",
-                );
-                let archive_ahead =
-                    resource_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                drop(conn);
-                match archive_ahead {
-                    Ok(true) => true,
-                    Err(error) if archive_has_state => {
-                        tracing::warn!(
-                            source = %resolved_path.display(),
-                            storage_root = %config.storage_root.display(),
-                            error = %error,
-                            "using archive-backed resource snapshot because the live sqlite inventory probe failed"
-                        );
-                        true
-                    }
-                    Ok(false) | Err(_) => false,
-                }
-            }
-            Err(error) if archive_has_state => {
-                tracing::warn!(
-                    source = %resolved_path.display(),
-                    storage_root = %config.storage_root.display(),
-                    error = %error,
-                    "using archive-backed resource snapshot because the live sqlite source could not be opened"
-                );
-                true
-            }
-            Err(_) => false,
-        }
-    };
+        "resources::open_read_db_pool archive-ahead probe",
+    );
 
     if !use_archive_snapshot {
         return Ok(None);
@@ -436,7 +221,7 @@ fn resource_live_database_missing_without_archive_state() -> bool {
         crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
             &config.storage_root,
             &resolved_path,
-        ) && resource_archive_inventory_has_state(&config.storage_root);
+        ) && crate::tool_util::read_archive_inventory_has_state(&config.storage_root);
     !resolved_path.exists() && !archive_has_authoritative_state
 }
 
@@ -7345,8 +7130,12 @@ mod resource_shape_tests {
                 let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
                     .expect("open live db");
                 assert!(
-                    !resource_archive_is_ahead(&Config::from_env().storage_root, &db_path, &conn)
-                        .expect("resource archive ahead probe"),
+                    !crate::tool_util::read_archive_is_ahead(
+                        &Config::from_env().storage_root,
+                        &db_path,
+                        &conn,
+                    )
+                    .expect("resource archive ahead probe"),
                     "newer live message evidence should suppress metadata-only archive fallback"
                 );
                 drop(conn);
