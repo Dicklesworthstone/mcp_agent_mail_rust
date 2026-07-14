@@ -3343,8 +3343,8 @@ pub async fn fetch_inbox(
     // The write-back MUST target the live DB, not the archive snapshot,
     // because snapshot pools are read-only reconstructions. If the live DB
     // is degraded the write will fail gracefully (already best-effort).
-    if !messages.is_empty() {
-        let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+    let unread_message_ids = unread_message_ids(&messages);
+    if !unread_message_ids.is_empty() {
         let write_path = get_db_pool()
             .ok()
             .map(|live_pool| live_pool.sqlite_path().to_string());
@@ -3352,7 +3352,7 @@ pub async fn fetch_inbox(
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
                 agent_id,
-                &ids,
+                &unread_message_ids,
             ) {
                 Ok(Some(batch)) => {
                     apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
@@ -3366,7 +3366,7 @@ pub async fn fetch_inbox(
                 Err(e) => {
                     tracing::warn!(
                         agent_id = agent_id,
-                        count = ids.len(),
+                        count = unread_message_ids.len(),
                         error = %e,
                         "batch auto-mark-read on fetch_inbox failed"
                     );
@@ -3375,7 +3375,7 @@ pub async fn fetch_inbox(
         } else {
             tracing::warn!(
                 agent_id = agent_id,
-                count = ids.len(),
+                count = unread_message_ids.len(),
                 "skipping auto-mark-read because the live DB pool is unavailable (degraded mode)"
             );
         }
@@ -3404,6 +3404,14 @@ pub async fn fetch_inbox(
     phase.mark("json_serialization");
     emit_tail_latency_evidence(&phase.finish("ok"));
     Ok(response)
+}
+
+fn unread_message_ids(messages: &[InboxMessage]) -> Vec<i64> {
+    messages
+        .iter()
+        .filter(|message| message.read_ts.is_none())
+        .map(|message| message.id)
+        .collect()
 }
 
 fn apply_auto_read_timestamp(
@@ -5248,6 +5256,12 @@ mod tests {
                 body_md: None,
             },
         ];
+
+        assert_eq!(
+            unread_message_ids(&messages),
+            vec![1, 3],
+            "auto-read writes must target only messages that are still unread"
+        );
 
         let batch_read_ts = 1_770_354_000_000_000;
         apply_auto_read_timestamp(&mut messages, &[1, 2], batch_read_ts);
