@@ -1665,7 +1665,7 @@ pub mod tool_util {
             std::fs::write(
                 message_dir.join(format!("message-{id}.md")),
                 format!(
-                    "---json\\n{{\"id\":{id},\"from\":\"Alice\",\"to\":[],\"subject\":\"cached\"}}\\n---\\nbody\\n"
+                    "---json\n{{\"id\":{id},\"from\":\"Alice\",\"to\":[],\"subject\":\"cached\"}}\n---\nbody\n"
                 ),
             )
             .expect("write message");
