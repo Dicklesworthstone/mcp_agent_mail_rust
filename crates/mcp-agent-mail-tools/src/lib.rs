@@ -64,6 +64,7 @@ pub mod tool_util {
     use serde_json::{Map, Value, json};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -707,6 +708,59 @@ pub mod tool_util {
         project_identities: BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadArchiveInventoryCacheEntry {
+        storage_root: PathBuf,
+        head: git2::Oid,
+        inventory: mcp_agent_mail_db::ArchiveMessageInventory,
+    }
+
+    // Archive inventory scans parse every canonical message artifact. Reuse the
+    // result while the archive commit is unchanged; a new commit invalidates it.
+    static READ_ARCHIVE_INVENTORY_CACHE: LazyLock<Mutex<Option<ReadArchiveInventoryCacheEntry>>> =
+        LazyLock::new(|| Mutex::new(None));
+
+    fn read_archive_head(storage_root: &Path) -> Option<git2::Oid> {
+        git2::Repository::open(storage_root)
+            .ok()?
+            .head()
+            .ok()?
+            .target()
+    }
+
+    pub(crate) fn read_archive_inventory(
+        storage_root: &Path,
+    ) -> mcp_agent_mail_db::ArchiveMessageInventory {
+        let Some(head) = read_archive_head(storage_root) else {
+            return mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        };
+
+        let mut cache = READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.as_ref()
+            && entry.storage_root == storage_root
+            && entry.head == head
+        {
+            return entry.inventory.clone();
+        }
+
+        let inventory = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        *cache = Some(ReadArchiveInventoryCacheEntry {
+            storage_root: storage_root.to_path_buf(),
+            head,
+            inventory: inventory.clone(),
+        });
+        inventory
+    }
+
+    #[cfg(test)]
+    fn reset_read_archive_inventory_cache() {
+        *READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     fn query_read_db_inventory(
         conn: &mcp_agent_mail_db::DbConn,
     ) -> Result<ReadReconcileInventory, String> {
@@ -779,7 +833,7 @@ pub mod tool_util {
     }
 
     fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
-        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        let archive = read_archive_inventory(storage_root);
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
 
@@ -800,7 +854,7 @@ pub mod tool_util {
             return Ok(false);
         }
 
-        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        let archive = read_archive_inventory(storage_root);
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -1597,6 +1651,73 @@ pub mod tool_util {
                     );
                 },
             );
+        }
+
+        fn write_inventory_message(storage_root: &Path, id: i64) {
+            let project_dir = storage_root.join("projects").join("cache-project");
+            let message_dir = project_dir.join("messages").join("2026").join("07");
+            std::fs::create_dir_all(&message_dir).expect("create message directory");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"cache-project","human_key":"/cache-project"}"#,
+            )
+            .expect("write project metadata");
+            std::fs::write(
+                message_dir.join(format!("message-{id}.md")),
+                format!(
+                    "---json\\n{{\"id\":{id},\"from\":\"Alice\",\"to\":[],\"subject\":\"cached\"}}\\n---\\nbody\\n"
+                ),
+            )
+            .expect("write message");
+        }
+
+        fn commit_archive_tree(repo: &git2::Repository, message: &str) {
+            let mut index = repo.index().expect("open git index");
+            index
+                .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+                .expect("stage archive tree");
+            index.write().expect("write git index");
+            let tree_id = index.write_tree().expect("write git tree");
+            let tree = repo.find_tree(tree_id).expect("load git tree");
+            let signature =
+                git2::Signature::now("test", "test@example.com").expect("build git signature");
+            let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents = parent.iter().collect::<Vec<_>>();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents,
+            )
+            .expect("commit archive tree");
+        }
+
+        #[test]
+        fn read_archive_inventory_cache_refreshes_when_head_changes() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+
+            write_inventory_message(&storage_root, 1);
+            commit_archive_tree(&repo, "add first message");
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 1);
+            let first_head = read_archive_head(&storage_root).expect("first archive head");
+
+            write_inventory_message(&storage_root, 2);
+            commit_archive_tree(&repo, "add second message");
+            let second_head = read_archive_head(&storage_root).expect("second archive head");
+            assert_ne!(first_head, second_head);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+
+            reset_read_archive_inventory_cache();
         }
 
         #[test]
