@@ -2364,12 +2364,12 @@ fn open_sync_db_connection_with_busy_timeout(
         DbConn::open_file(&path)
     }
     .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
-    conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
-        .map_err(|err| {
-            std::io::Error::other(format!(
-                "configure sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
-            ))
-        })?;
+    if let Err(err) = conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};")) {
+        mcp_agent_mail_db::close_db_conn(conn, "sync database connection setup");
+        return Err(std::io::Error::other(format!(
+            "configure sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
+        )));
+    }
     Ok(conn)
 }
 
@@ -2384,11 +2384,12 @@ pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result
 
 pub(crate) fn open_health_probe_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     let conn = open_sync_db_connection_with_busy_timeout(path, HEALTH_SYNC_DB_BUSY_TIMEOUT_MS)?;
-    conn.execute_raw("PRAGMA query_only = ON;").map_err(|err| {
-        std::io::Error::other(format!(
+    if let Err(err) = conn.execute_raw("PRAGMA query_only = ON;") {
+        mcp_agent_mail_db::close_db_conn(conn, "health probe setup");
+        return Err(std::io::Error::other(format!(
             "configure sqlite query_only health probe on {path}: {err}"
-        ))
-    })?;
+        )));
+    }
     Ok(conn)
 }
 
@@ -14722,21 +14723,24 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
         None
     };
 
-    let conn = if is_memory {
-        DbConn::open_memory().map_err(|e| e.to_string())?
-    } else {
-        let sqlite_path = sqlite_path
-            .as_ref()
-            .ok_or_else(|| "cannot resolve sqlite path for readiness check".to_string())?;
-        if !sqlite_path.exists() {
-            return Err(format!(
-                "SQLite database is missing at {}; quick readiness refuses to initialize the mailbox",
-                sqlite_path.display()
-            ));
-        }
-        open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
-            .map_err(|e| e.to_string())?
-    };
+    let conn = mcp_agent_mail_db::guard_db_conn(
+        if is_memory {
+            DbConn::open_memory().map_err(|e| e.to_string())?
+        } else {
+            let sqlite_path = sqlite_path
+                .as_ref()
+                .ok_or_else(|| "cannot resolve sqlite path for readiness check".to_string())?;
+            if !sqlite_path.exists() {
+                return Err(format!(
+                    "SQLite database is missing at {}; quick readiness refuses to initialize the mailbox",
+                    sqlite_path.display()
+                ));
+            }
+            open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+                .map_err(|e| e.to_string())?
+        },
+        "quick readiness check connection",
+    );
 
     if let Err(e) = conn.query_sync("SELECT 1", &[]) {
         let error = e.to_string();
@@ -14769,21 +14773,24 @@ fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<
         None
     };
 
-    let conn = if is_memory {
-        DbConn::open_memory().map_err(|e| e.to_string())?
-    } else {
-        let sqlite_path = sqlite_path
-            .as_ref()
-            .ok_or_else(|| "cannot resolve sqlite path for readiness check".to_string())?;
-        if !sqlite_path.exists() {
-            return Err(format!(
-                "SQLite database is missing at {}; readiness refuses to initialize the mailbox",
-                sqlite_path.display()
-            ));
-        }
-        open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
-            .map_err(|e| e.to_string())?
-    };
+    let conn = mcp_agent_mail_db::guard_db_conn(
+        if is_memory {
+            DbConn::open_memory().map_err(|e| e.to_string())?
+        } else {
+            let sqlite_path = sqlite_path
+                .as_ref()
+                .ok_or_else(|| "cannot resolve sqlite path for readiness check".to_string())?;
+            if !sqlite_path.exists() {
+                return Err(format!(
+                    "SQLite database is missing at {}; readiness refuses to initialize the mailbox",
+                    sqlite_path.display()
+                ));
+            }
+            open_health_probe_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+                .map_err(|e| e.to_string())?
+        },
+        "readiness request connection",
+    );
 
     if let Err(e) = conn.query_sync("SELECT 1", &[]) {
         let error = e.to_string();
