@@ -10169,24 +10169,27 @@ where
     }
 
     let path_string = path.to_string_lossy().into_owned();
-    let conn = match mcp_agent_mail_db::DbConn::open_file(&path_string) {
-        Ok(conn) => conn,
-        Err(e) => {
-            let err_text = e.to_string();
-            if mcp_agent_mail_db::is_lock_error(&err_text) {
-                return Err(sqlite_doctor_busy_error(path, &err_text));
+    let conn = mcp_agent_mail_db::guard_db_conn(
+        match mcp_agent_mail_db::DbConn::open_file(&path_string) {
+            Ok(conn) => conn,
+            Err(e) => {
+                let err_text = e.to_string();
+                if mcp_agent_mail_db::is_lock_error(&err_text) {
+                    return Err(sqlite_doctor_busy_error(path, &err_text));
+                }
+                if is_sqlite_recovery_error_message(&err_text)
+                    || mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(&err_text)
+                {
+                    return Ok(false);
+                }
+                return Err(CliError::Other(format!(
+                    "cannot open sqlite file {} for health check: {e}",
+                    path.display()
+                )));
             }
-            if is_sqlite_recovery_error_message(&err_text)
-                || mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(&err_text)
-            {
-                return Ok(false);
-            }
-            return Err(CliError::Other(format!(
-                "cannot open sqlite file {} for health check: {e}",
-                path.display()
-            )));
-        }
-    };
+        },
+        "cli sqlite health probe",
+    );
 
     let is_healthy = sqlite_conn_is_healthy(&conn)?;
     drop(conn);
@@ -20980,7 +20983,7 @@ fn handle_doctor_check(
 }
 
 struct DoctorOpenContext {
-    conn: mcp_agent_mail_db::DbConn,
+    conn: mcp_agent_mail_db::DbConnGuard,
     opened_path: String,
 }
 
@@ -21001,8 +21004,11 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
     if path == ":memory:" {
-        let conn = mcp_agent_mail_db::DbConn::open_memory()
-            .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")))?;
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_memory()
+                .map_err(|e| CliError::Other(format!("cannot open in-memory database: {e}")))?,
+            "doctor database probe connection",
+        );
         return Ok(DoctorOpenContext {
             conn,
             opened_path: path,
@@ -21032,50 +21038,57 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
     }
 
     match mcp_agent_mail_db::DbConn::open_file(&candidate_path) {
-        Ok(conn) => match conn.query_sync("SELECT 1 AS one", &[]) {
-            Ok(_) => Ok(DoctorOpenContext {
-                conn,
-                opened_path: candidate_path,
-            }),
-            Err(probe_err) => {
-                let probe_err_text = probe_err.to_string();
-                if let Some(fallback_path) =
-                    sqlite_absolute_fallback_path(&candidate_path, &probe_err_text)
-                {
-                    let fallback_conn =
+        Ok(conn) => {
+            let conn = mcp_agent_mail_db::guard_db_conn(conn, "doctor database probe connection");
+            match conn.query_sync("SELECT 1 AS one", &[]) {
+                Ok(_) => Ok(DoctorOpenContext {
+                    conn,
+                    opened_path: candidate_path,
+                }),
+                Err(probe_err) => {
+                    let probe_err_text = probe_err.to_string();
+                    if let Some(fallback_path) =
+                        sqlite_absolute_fallback_path(&candidate_path, &probe_err_text)
+                    {
+                        let fallback_conn = mcp_agent_mail_db::guard_db_conn(
                         mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
                             CliError::Other(format!(
                                 "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
                             ))
-                        })?;
-                    fallback_conn
+                        })?,
+                        "doctor database fallback probe connection",
+                    );
+                        fallback_conn
                         .query_sync("SELECT 1 AS one", &[])
                         .map_err(|e| {
                             CliError::Other(format!(
                                 "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} probe failed: {e}"
                             ))
                     })?;
-                    return Ok(DoctorOpenContext {
-                        conn: fallback_conn,
-                        opened_path: fallback_path,
-                    });
+                        return Ok(DoctorOpenContext {
+                            conn: fallback_conn,
+                            opened_path: fallback_path,
+                        });
+                    }
+                    Err(CliError::Other(format!(
+                        "database probe failed at {candidate_path}: {probe_err}"
+                    )))
                 }
-                Err(CliError::Other(format!(
-                    "database probe failed at {candidate_path}: {probe_err}"
-                )))
             }
-        },
+        }
         Err(primary_err) => {
             let primary_err_text = primary_err.to_string();
             if let Some(fallback_path) =
                 sqlite_absolute_fallback_path(&candidate_path, &primary_err_text)
             {
-                let fallback_conn =
+                let fallback_conn = mcp_agent_mail_db::guard_db_conn(
                     mcp_agent_mail_db::DbConn::open_file(&fallback_path).map_err(|e| {
                         CliError::Other(format!(
                             "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
                         ))
-                    })?;
+                    })?,
+                    "doctor database fallback probe connection",
+                );
                 fallback_conn
                     .query_sync("SELECT 1 AS one", &[])
                     .map_err(|e| {
@@ -21096,7 +21109,7 @@ fn open_db_for_doctor_check_with_context(database_url: &str) -> CliResult<Doctor
 }
 
 fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::DbConn> {
-    open_db_for_doctor_check_with_context(database_url).map(|opened| opened.conn)
+    open_db_for_doctor_check_with_context(database_url).map(|opened| opened.conn.into_inner())
 }
 
 fn open_db_for_doctor_check_read_only_with_context(
