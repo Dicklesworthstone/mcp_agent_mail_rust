@@ -6878,6 +6878,11 @@ fn quarantined_sidecar_path(
 
 const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+// FrankenSQLite creates these namespace coordination files whenever it probes
+// a file-backed database. They are safe to remove only for a disposable staged
+// candidate, never for a live primary database.
+const FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
 fn sqlite_recovery_sidecar_label(suffix: &str) -> &'static str {
     match suffix {
         "-journal" => "rollback-journal",
@@ -6911,6 +6916,7 @@ fn sqlite_candidate_artifact_conflicts(candidate: &Path) -> bool {
     path_is_occupied(candidate)
         || SQLITE_RECOVERY_SIDECAR_SUFFIXES
             .iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
             .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix)))
 }
 
@@ -7053,12 +7059,19 @@ fn stage_backup_restore_candidate(
     Ok(restore_candidate)
 }
 
+fn remove_sqlite_candidate_sidecars(candidate: &Path) {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
+        let _ = std::fs::remove_file(sqlite_sidecar_path(candidate, suffix));
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
     let _ = std::fs::remove_file(candidate);
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let _ = std::fs::remove_file(sqlite_sidecar_path(candidate, suffix));
-    }
+    remove_sqlite_candidate_sidecars(candidate);
 }
 
 #[allow(clippy::result_large_err)]
@@ -7677,9 +7690,7 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
             backup_path.display()
         )));
     }
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let _ = std::fs::remove_file(sqlite_sidecar_path(&restore_candidate, suffix));
-    }
+    remove_sqlite_candidate_sidecars(&restore_candidate);
 
     let quarantined_db = sqlite_path_with_file_name_suffix(
         primary_path,
@@ -10154,6 +10165,9 @@ mod tests {
         let first_wal = sqlite_sidecar_path(&first, "-wal");
         let missing_target = dir.path().join("missing-wal-target");
         symlink(&missing_target, &first_wal).expect("create broken staged wal symlink");
+        let first_namespace_use = sqlite_sidecar_path(&first, "-fsqlite-ns-use");
+        std::fs::write(&first_namespace_use, b"stale namespace marker")
+            .expect("create stale staged namespace marker");
 
         let candidate = restore_candidate_path(&primary, timestamp);
         assert_eq!(

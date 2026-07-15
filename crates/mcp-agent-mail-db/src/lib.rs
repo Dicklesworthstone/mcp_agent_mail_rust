@@ -344,11 +344,14 @@ pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 pub type CanonicalDbConn = sqlmodel_sqlite::SqliteConnection;
 
 pub fn close_db_conn(conn: DbConn, context: &'static str) {
-    if let Err(error) = conn.close_sync() {
+    // Checkpoint scheduling is handled by the database maintenance path. These
+    // short-lived worker and probe connections must release their handles
+    // without contending for a final WAL checkpoint on every close.
+    if let Err(error) = conn.close_without_checkpoint_sync() {
         tracing::warn!(
             context,
             error = %error,
-            "failed to close FrankenSQLite connection explicitly"
+            "failed to close FrankenSQLite connection without final checkpoint"
         );
     }
 }
