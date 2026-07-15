@@ -155,6 +155,7 @@ pub fn record_snapshot_metadata(
     let bak = snapshot_bak_path(primary);
     let (row_counts, schema_version) =
         if let Ok(conn) = crate::DbConn::open_file(bak.display().to_string()) {
+            let conn = crate::guard_db_conn(conn, "snapshot metadata connection");
             (count_key_table_rows(&conn), read_schema_version(&conn))
         } else {
             (BTreeMap::new(), 0)

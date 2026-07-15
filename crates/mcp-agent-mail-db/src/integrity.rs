@@ -190,6 +190,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
             };
         }
     };
+    let conn = crate::guard_db_conn(conn, "inspect_mailbox_integrity connection");
 
     match run_check(&conn, kind) {
         Ok(check) => MailboxIntegrityVerdict {

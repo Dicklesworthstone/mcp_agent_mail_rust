@@ -745,6 +745,12 @@ pub async fn refresh_rollups(
     lookback_micros: i64,
 ) -> Outcome<RollupSummary, DbError> {
     if pool.sqlite_path() != ":memory:" {
+        match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
         return match crate::queries::open_canonical_atc_conn(pool, "refresh_rollups") {
             Ok(conn) => {
                 let result = refresh_rollups_with_conn(&conn, now_micros, lookback_micros);
@@ -1772,6 +1778,42 @@ mod tests {
             .into_result()
             .expect("initialize ATC sidecar schema for test pool");
         pool
+    }
+
+    #[test]
+    fn refresh_rollups_initializes_file_backed_atc_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("refresh_rollups_sidecar_init.db");
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create file-backed pool");
+        let atc_path = pool
+            .atc_sqlite_path()
+            .expect("file-backed ATC sidecar path");
+        assert!(
+            !std::path::Path::new(&atc_path).exists(),
+            "fresh pool should not need an ATC sidecar before the first ATC operation"
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let summary = runtime
+            .block_on(refresh_rollups(&cx, &pool, crate::now_micros(), 60_000_000))
+            .into_result()
+            .expect("first rollup refresh should initialize the ATC sidecar");
+        assert_eq!(summary.rows_scanned, 0);
+        assert!(
+            std::path::Path::new(&atc_path).is_file(),
+            "first rollup refresh should create the canonical ATC sidecar"
+        );
     }
 
     fn encode_outcome(spec: &TestExperienceSpec) -> Option<String> {
