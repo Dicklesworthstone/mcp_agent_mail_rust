@@ -191,17 +191,19 @@ impl HealthSignals {
             snap.storage.commit_pending_requests,
             snap.storage.commit_soft_cap,
         );
-        // Queue latency histograms are cumulative; ignore historical spikes
-        // once the queue has drained so old pressure does not pin health.
-        let wbq_queue_p95_us = if snap.storage.wbq_depth == 0 {
-            0
-        } else {
+        // Queue latency histograms are cumulative; use them only to escalate a
+        // currently material backlog. A single normal coalesced commit can be
+        // pending while it waits for its flush interval, so a historical slow
+        // sample must not pin flow-control health in yellow or red.
+        let wbq_queue_p95_us = if wbq_depth_pct >= yellow::WBQ_DEPTH_PCT {
             snap.storage.wbq_queue_latency_us.p95
-        };
-        let commit_queue_p95_us = if snap.storage.commit_pending_requests == 0 {
-            0
         } else {
+            0
+        };
+        let commit_queue_p95_us = if commit_depth_pct >= yellow::COMMIT_DEPTH_PCT {
             snap.storage.commit_queue_latency_us.p95
+        } else {
+            0
         };
         let (disk_pressure_level, disk_pressure_stale) = fresh_pressure_level(
             snap.system.disk_pressure_level,
@@ -1203,6 +1205,42 @@ mod tests {
 
         let signals = HealthSignals::from_snapshot(&snap, now_us);
 
+        assert_eq!(signals.wbq_queue_p95_us, 0);
+        assert_eq!(signals.commit_queue_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn health_signals_ignore_historical_queue_latency_below_material_backlog() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.wbq_depth = 1;
+        snap.storage.wbq_capacity = 8192;
+        snap.storage.wbq_queue_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: red::QUEUE_WAIT_P95_US,
+            min: red::QUEUE_WAIT_P95_US,
+            max: red::QUEUE_WAIT_P95_US,
+            p50: red::QUEUE_WAIT_P95_US,
+            p95: red::QUEUE_WAIT_P95_US,
+            p99: red::QUEUE_WAIT_P95_US,
+        };
+        snap.storage.commit_pending_requests = 1;
+        snap.storage.commit_soft_cap = 8192;
+        snap.storage.commit_queue_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: red::QUEUE_WAIT_P95_US,
+            min: red::QUEUE_WAIT_P95_US,
+            max: red::QUEUE_WAIT_P95_US,
+            p50: red::QUEUE_WAIT_P95_US,
+            p95: red::QUEUE_WAIT_P95_US,
+            p99: red::QUEUE_WAIT_P95_US,
+        };
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+
+        assert_eq!(signals.wbq_depth_pct, 0);
+        assert_eq!(signals.commit_depth_pct, 0);
         assert_eq!(signals.wbq_queue_p95_us, 0);
         assert_eq!(signals.commit_queue_p95_us, 0);
         assert_eq!(signals.classify(), HealthLevel::Green);
