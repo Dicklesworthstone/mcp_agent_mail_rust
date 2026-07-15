@@ -15172,18 +15172,21 @@ fn readiness_check_with_integrity(
         }
     };
 
-    if let Err(e) = conn.query_sync("SELECT 1", &[]) {
-        let error = e.to_string();
-        if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
-            return Err(format!(
-                "SQLite corruption detected during readiness check; automatic server-side recovery is disabled: {error}"
-            ));
+    let readiness_probe_result = (|| -> Result<_, String> {
+        if let Err(e) = conn.query_sync("SELECT 1", &[]) {
+            let error = e.to_string();
+            if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
+                return Err(format!(
+                    "SQLite corruption detected during readiness check; automatic server-side recovery is disabled: {error}"
+                ));
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
 
-    let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
-    drop(conn);
+        Ok(sqlite_startup_fingerprint(&conn, &config.database_url))
+    })();
+    mcp_agent_mail_db::close_db_conn(conn.detach(), "startup readiness connection");
+    let startup_integrity_fingerprint = readiness_probe_result?;
 
     let skip_startup_integrity =
         startup_integrity_fingerprint

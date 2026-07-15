@@ -824,7 +824,10 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
         return None;
     }
     // br-8ujfs.4.1 (D1): route through GitCmd.
+    // These probes only inspect history. Keep the in-process mutex, but do not
+    // create a flock sentinel in a workspace that may belong to another user.
     let output = mcp_agent_mail_core::git_cmd::GitCmd::new(workspace)
+        .skip_flock()
         .args(["rev-parse", "HEAD"])
         .run()
         .ok()?;
@@ -856,7 +859,10 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
     };
 
     // br-8ujfs.4.1 (D1): route through GitCmd.
+    // This is a read-only history lookup on an arbitrary project workspace.
+    // Avoid requiring write access to that workspace's Git metadata.
     let output = mcp_agent_mail_core::git_cmd::GitCmd::new(workspace)
+        .skip_flock()
         .args(["log", "-1", "--format=%ct", "--"])
         .arg(&pathspec)
         .run()
