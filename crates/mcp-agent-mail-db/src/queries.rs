@@ -1484,28 +1484,14 @@ async fn begin_concurrent_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcom
     }
 }
 
-/// Commit the current transaction and publish file-backed writes to fresh handles.
+/// Commit the current transaction.
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
-        Outcome::Ok(_) => {
-            if tracked.inner.path() != ":memory:" {
-                // FrankenSQLite can otherwise keep a successful COMMIT private
-                // to the pooled connection until a later close. The checkpoint
-                // gives post-commit probes and sibling processes the same view
-                // immediately after the write path returns.
-                if let Err(error) = tracked
-                    .inner
-                    .query_sync("PRAGMA wal_checkpoint(PASSIVE)", &[])
-                {
-                    tracing::warn!(
-                        db_path = %tracked.inner.path(),
-                        error = %error,
-                        "post_commit_checkpoint_failed_after_successful_commit"
-                    );
-                }
-            }
-            Outcome::Ok(())
-        }
+        // Post-commit visibility is proven by the explicit fresh-handle
+        // durability probes at the write call sites. Checkpoints belong to the
+        // periodic maintenance worker: attempting one on every successful
+        // write adds lock contention without strengthening the commit itself.
+        Outcome::Ok(_) => Outcome::Ok(()),
         Outcome::Err(error) => Outcome::Err(error),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
@@ -1600,6 +1586,7 @@ async fn durability_probe_query(
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
         };
+        let probe_conn = crate::guard_db_conn(probe_conn, "durability_probe_query connection");
         if let Err(e) = probe_conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL) {
             return Outcome::Err(DbError::Sqlite(format!(
                 "durability probe connection init failed: {e}"
@@ -1607,7 +1594,7 @@ async fn durability_probe_query(
         }
         let probe_tracked = tracked(&probe_conn);
         let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
-        crate::close_db_conn(probe_conn, "durability_probe_query connection");
+        drop(probe_conn);
 
         match &out {
             Outcome::Err(e)

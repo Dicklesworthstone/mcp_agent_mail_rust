@@ -4080,7 +4080,10 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         )));
     }
 
-    let conn = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?;
+    let conn = crate::guard_db_conn(
+        open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?,
+        "mailbox database inventory connection",
+    );
     let present = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -5559,6 +5562,7 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
             }
         }
     };
+    let conn = crate::guard_db_conn(conn, "sqlite primary read health probe");
 
     match sqlite_primary_check_is_ok_with_canonical_fallback(
         path,
