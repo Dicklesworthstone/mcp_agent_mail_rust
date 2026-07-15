@@ -1493,7 +1493,10 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                 // to the pooled connection until a later close. The checkpoint
                 // gives post-commit probes and sibling processes the same view
                 // immediately after the write path returns.
-                if let Err(error) = tracked.inner.execute_raw("PRAGMA wal_checkpoint(PASSIVE)") {
+                if let Err(error) = tracked
+                    .inner
+                    .query_sync("PRAGMA wal_checkpoint(PASSIVE)", &[])
+                {
                     tracing::warn!(
                         db_path = %tracked.inner.path(),
                         error = %error,
@@ -13684,6 +13687,20 @@ mod tests {
                 })
                 .count()
         }
+
+        fn message_count(&self, message: &str) -> usize {
+            self.events
+                .lock()
+                .expect("event capture lock poisoned")
+                .iter()
+                .filter(|event| {
+                    event
+                        .fields
+                        .iter()
+                        .any(|(name, value)| name == "message" && value.contains(message))
+                })
+                .count()
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -21134,65 +21151,70 @@ mod tests {
 
         let thread_count = 8usize;
         let messages_per_thread = 8usize;
+        let capture = EventCapture::default();
+        let dispatch = tracing::Dispatch::new(capture.clone());
         let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
         let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
         let handles: Vec<_> = (0..thread_count)
             .map(|thread_idx| {
                 let pool = pool.clone();
+                let dispatch = dispatch.clone();
                 let start_barrier = std::sync::Arc::clone(&start_barrier);
                 let failures = std::sync::Arc::clone(&failures);
                 std::thread::spawn(move || {
-                    let rt = RuntimeBuilder::current_thread()
-                        .build()
-                        .expect("build thread runtime");
-                    start_barrier.wait();
-                    for message_idx in 0..messages_per_thread {
-                        let cx = Cx::for_testing();
-                        let subject = format!("writer-{thread_idx}-message-{message_idx}");
-                        let body = format!("body-{thread_idx}-{message_idx}");
-                        match rt.block_on(async {
-                            create_message_with_recipients(
-                                &cx,
-                                &pool,
-                                project_id,
-                                sender_id,
-                                &subject,
-                                &body,
-                                Some("THREAD-CONCURRENT-DURABILITY"),
-                                "normal",
-                                false,
-                                "[]",
-                                &[(recipient_id, "to")],
-                            )
-                            .await
-                        }) {
-                            Outcome::Ok(row) => {
-                                assert!(row.id.is_some(), "created message must include id");
-                            }
-                            Outcome::Err(error) => {
-                                failures
-                                    .lock()
-                                    .expect("failures mutex")
-                                    .push(format!(
-                                        "thread {thread_idx} message {message_idx}: {error:?}"
-                                    ));
-                                break;
-                            }
-                            Outcome::Cancelled(reason) => {
-                                failures
-                                    .lock()
-                                    .expect("failures mutex")
-                                    .push(format!(
-                                        "thread {thread_idx} message {message_idx}: cancelled {reason:?}"
-                                    ));
-                                break;
-                            }
-                            Outcome::Panicked(payload) => {
-                                panic!("thread {thread_idx} message {message_idx} panicked: {payload}");
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let rt = RuntimeBuilder::current_thread()
+                            .build()
+                            .expect("build thread runtime");
+                        start_barrier.wait();
+                        for message_idx in 0..messages_per_thread {
+                            let cx = Cx::for_testing();
+                            let subject = format!("writer-{thread_idx}-message-{message_idx}");
+                            let body = format!("body-{thread_idx}-{message_idx}");
+                            match rt.block_on(async {
+                                create_message_with_recipients(
+                                    &cx,
+                                    &pool,
+                                    project_id,
+                                    sender_id,
+                                    &subject,
+                                    &body,
+                                    Some("THREAD-CONCURRENT-DURABILITY"),
+                                    "normal",
+                                    false,
+                                    "[]",
+                                    &[(recipient_id, "to")],
+                                )
+                                .await
+                            }) {
+                                Outcome::Ok(row) => {
+                                    assert!(row.id.is_some(), "created message must include id");
+                                }
+                                Outcome::Err(error) => {
+                                    failures
+                                        .lock()
+                                        .expect("failures mutex")
+                                        .push(format!(
+                                            "thread {thread_idx} message {message_idx}: {error:?}"
+                                        ));
+                                    break;
+                                }
+                                Outcome::Cancelled(reason) => {
+                                    failures
+                                        .lock()
+                                        .expect("failures mutex")
+                                        .push(format!(
+                                            "thread {thread_idx} message {message_idx}: cancelled {reason:?}"
+                                        ));
+                                    break;
+                                }
+                                Outcome::Panicked(payload) => {
+                                    panic!("thread {thread_idx} message {message_idx} panicked: {payload}");
+                                }
                             }
                         }
-                    }
+                    });
                 })
             })
             .collect();
@@ -21208,6 +21230,12 @@ mod tests {
             failures.join("\n")
         );
         drop(failures);
+
+        assert_eq!(
+            capture.message_count("post_commit_checkpoint_failed_after_successful_commit"),
+            0,
+            "concurrent writers should not emit post-commit checkpoint warnings"
+        );
 
         rt.block_on(async {
             let rows = durability_probe_query(
