@@ -6326,8 +6326,14 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_holder_pids_via_proc(_path: &Path) -> Vec<u32> {
-    Vec::new()
+fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
+    // macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
+    // with the activity-lock file open as a conservative holder candidate;
+    // the caller filters these PIDs through `pid_is_agent_mail`.  This is
+    // intentionally fail-closed: misclassifying an open-but-not-locked Agent
+    // Mail process as live only defers repair, while missing the real holder
+    // can authorize repair/reconstruct against an active database (GH#195).
+    pids_holding_file_via_lsof(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -6375,8 +6381,42 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pids_holding_file_via_proc(_path: &Path) -> Vec<u32> {
-    Vec::new()
+fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
+    pids_holding_file_via_lsof(path)
+}
+
+/// Enumerate PIDs with `path` open on platforms without Linux `/proc`.
+///
+/// `lsof` is part of the base macOS installation and is already the
+/// repository's established fallback in `mcp-agent-mail-server` startup
+/// diagnostics.  Passing `--` prevents a path beginning with `-` from being
+/// interpreted as an option.  Any probe failure returns no evidence; callers
+/// remain read-only and can combine this with other liveness signals.
+#[cfg(not(target_os = "linux"))]
+fn pids_holding_file_via_lsof(path: &Path) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("lsof")
+        .args(["-t", "-w", "--"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() && output.stdout.is_empty() {
+        return Vec::new();
+    }
+    parse_pid_lines(&output.stdout)
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_pid_lines(stdout: &[u8]) -> Vec<u32> {
+    String::from_utf8_lossy(stdout)
+        .split_whitespace()
+        .filter_map(|value| value.parse::<u32>().ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn executable_name_has_agent_mail_signature(name: &str) -> bool {
@@ -6457,9 +6497,32 @@ fn pid_command_line(pid: u32) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join(" "))
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_ps_output_value(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(not(target_os = "linux"))]
-fn pid_command_line(_pid: u32) -> Option<String> {
-    None
+fn ps_output_value(pid: u32, column: &str) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", column])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_output_value(&output.stdout)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_command_line(pid: u32) -> Option<String> {
+    ps_output_value(pid, "command=")
 }
 
 #[cfg(target_os = "linux")]
@@ -6468,8 +6531,8 @@ fn pid_executable_path(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pid_executable_path(_pid: u32) -> Option<PathBuf> {
-    None
+fn pid_executable_path(pid: u32) -> Option<PathBuf> {
+    ps_output_value(pid, "comm=").map(PathBuf::from)
 }
 
 fn pid_executable_deleted(pid: u32) -> bool {
@@ -6713,13 +6776,15 @@ pub fn inspect_mailbox_ownership(
     }
 }
 
-/// Cheap probe for a deleted/replaced executable that owns the mailbox locks.
+/// Cheap Linux probe for a deleted/replaced executable that owns the mailbox
+/// locks.
 ///
 /// Avoids the expensive `/proc/*/fd` database-file walk performed by full
-/// [`inspect_mailbox_ownership`]: reads only the advisory lock holders (via
-/// `/proc/locks`) and checks whether any Agent Mail holder runs a deleted
-/// executable. Suitable for the request-path health probe (GH#166), where the
-/// full ownership walk is intentionally skipped on the healthy fast path.
+/// [`inspect_mailbox_ownership`]: reads only `/proc/locks` and checks whether
+/// any Agent Mail holder's `/proc/<pid>/exe` target is deleted. Suitable for
+/// the request-path health probe (GH#166), where the full ownership walk is
+/// intentionally skipped on the healthy fast path.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn mailbox_owner_executable_deleted(primary_path: &Path, storage_root: &Path) -> bool {
     let storage_lock_path = mailbox_activity_lock_path_for_storage_root(storage_root);
@@ -6728,6 +6793,18 @@ pub fn mailbox_owner_executable_deleted(primary_path: &Path, storage_root: &Path
         .into_iter()
         .chain(lock_holder_pids_via_proc(&sqlite_lock_path))
         .any(|pid| pid_is_agent_mail(pid) && pid_executable_deleted(pid))
+}
+
+/// Non-Linux platforms do not expose Linux's deleted `/proc/<pid>/exe` marker.
+///
+/// Keep the request-path health probe allocation- and subprocess-free rather
+/// than running `lsof` twice for a condition that `ps` cannot establish.
+/// Explicit doctor/ownership diagnostics still perform conservative `lsof`
+/// discovery through [`inspect_mailbox_ownership`].
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn mailbox_owner_executable_deleted(_primary_path: &Path, _storage_root: &Path) -> bool {
+    false
 }
 
 /// A truly foreign process holding the mailbox `storage.sqlite3` open — neither
@@ -6748,12 +6825,13 @@ pub struct ForeignDbFileHolder {
 /// Enumerate every PID holding the mailbox `storage.sqlite3` file open that is
 /// **not** this process and **not** a recognizable Agent Mail process (br-epoqj).
 ///
-/// [`inspect_mailbox_ownership`] filters its `/proc/*/fd` scan through
+/// [`inspect_mailbox_ownership`] filters its database-file holder scan through
 /// `pid_is_agent_mail()` before the holder reaches the process-owner model, so a
 /// truly foreign writer is invisible to the pure `coresident_db_writer` detector.
 /// This unfiltered companion surfaces those holders for a low-confidence,
-/// detect-only doctor finding — doctor never kills a foreign process. Returns an
-/// empty list on platforms without `/proc` (the underlying scan is Linux-only).
+/// detect-only doctor finding — doctor never kills a foreign process. Holder
+/// discovery uses `/proc/*/fd` on Linux and conservative `lsof` evidence on
+/// macOS/BSD; unsupported or failed probes return an empty list.
 #[must_use]
 pub fn foreign_db_file_holders(primary_path: &Path) -> Vec<ForeignDbFileHolder> {
     let self_pid = std::process::id();
@@ -13315,6 +13393,19 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn non_linux_process_probe_parsers_are_bounded_and_deterministic() {
+        assert_eq!(
+            parse_pid_lines(b"77547\nnot-a-pid\n42\n77547\n"),
+            vec![42, 77_547]
+        );
+        assert_eq!(
+            parse_ps_output_value(b"\n  am serve-http --port 8765  \n"),
+            Some("am serve-http --port 8765".to_string())
+        );
+        assert_eq!(parse_ps_output_value(b"\n \t\n"), None);
     }
 
     #[test]

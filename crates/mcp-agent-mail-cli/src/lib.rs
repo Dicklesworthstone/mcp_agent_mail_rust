@@ -9797,8 +9797,11 @@ fn pids_holding_path(path: &Path) -> Vec<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pids_holding_path(_path: &Path) -> Vec<u32> {
-    Vec::new()
+fn pids_holding_path(path: &Path) -> Vec<u32> {
+    // macOS/BSD have no `/proc/<pid>/fd`; reuse the server's established
+    // `lsof` fallback so doctor reports the same real-file evidence as
+    // startup diagnostics (GH#195).
+    mcp_agent_mail_server::startup_checks::pids_holding_file(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -9823,8 +9826,8 @@ fn process_holds_path(pid: u32, path: &Path) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_holds_path(_pid: u32, _path: &Path) -> bool {
-    false
+fn process_holds_path(pid: u32, path: &Path) -> bool {
+    pids_holding_path(path).contains(&pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -9878,8 +9881,8 @@ fn pid_command_line_for_doctor_locks(pid: u32) -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pid_command_line_for_doctor_locks(_pid: u32) -> Option<String> {
-    None
+fn pid_command_line_for_doctor_locks(pid: u32) -> Option<String> {
+    doctor_locks_ps_output_value(pid, "command=")
 }
 
 #[cfg(target_os = "linux")]
@@ -9888,8 +9891,31 @@ fn pid_executable_path_for_doctor_locks(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pid_executable_path_for_doctor_locks(_pid: u32) -> Option<PathBuf> {
-    None
+fn pid_executable_path_for_doctor_locks(pid: u32) -> Option<PathBuf> {
+    doctor_locks_ps_output_value(pid, "comm=").map(PathBuf::from)
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_doctor_locks_ps_output(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn doctor_locks_ps_output_value(pid: u32, column: &str) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", column])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_doctor_locks_ps_output(&output.stdout)
 }
 
 fn mailbox_activity_lock_cli_error(err: std::io::Error) -> CliError {
@@ -46602,6 +46628,15 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(!report.holds_database_file);
         assert!(!report.holds_wal_file);
         assert!(!report.holds_shm_file);
+    }
+
+    #[test]
+    fn doctor_locks_parses_non_linux_ps_output_without_headers() {
+        assert_eq!(
+            parse_doctor_locks_ps_output(b"\n am serve-http --port 8765 \n"),
+            Some("am serve-http --port 8765".to_string())
+        );
+        assert_eq!(parse_doctor_locks_ps_output(b"\n \t\n"), None);
     }
 
     #[cfg(target_os = "linux")]
