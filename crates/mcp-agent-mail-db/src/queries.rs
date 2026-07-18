@@ -10,8 +10,8 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AgentLinkRow, AgentRow, FileReservationRow, InboxStatsRow, MessageRecipientRow, MessageRow,
-    ProductRow, ProjectRow,
+    AgentLinkRow, AgentRow, AtcPopulationAgentRow, FileReservationRow, InboxStatsRow,
+    MessageRecipientRow, MessageRow, ProductRow, ProjectRow,
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
@@ -4786,6 +4786,63 @@ pub async fn list_agents(
     project_id: i64,
 ) -> Outcome<Vec<AgentRow>, DbError> {
     list_agents_bounded(cx, pool, project_id, None, None).await
+}
+
+/// Load the bounded, recent agent population needed by the ATC operator.
+///
+/// This deliberately performs one joined query for the entire mailbox. The
+/// previous `list_projects` + `list_agents(project_id)` loop created N+1 async
+/// query/runtime boundaries on every periodic ATC refresh; on a mailbox with
+/// hundreds of projects that dominated the operator tick and caused sustained
+/// allocator churn (GH#190).
+pub async fn list_atc_population_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    min_last_active_ts: i64,
+    limit: usize,
+) -> Outcome<Vec<AtcPopulationAgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql = "SELECT p.id, p.human_key, a.name, a.program, a.last_active_ts \
+               FROM agents AS a \
+               JOIN projects AS p ON p.id = a.project_id \
+               WHERE a.last_active_ts <= 0 OR a.last_active_ts >= ? \
+               ORDER BY a.last_active_ts DESC, a.id DESC \
+               LIMIT ?";
+    let params = [Value::BigInt(min_last_active_ts), Value::BigInt(limit)];
+
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let get_string = |row: &SqlRow, index: usize| {
+                row.get(index)
+                    .and_then(|value| match value {
+                        Value::Text(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            Outcome::Ok(
+                rows.iter()
+                    .map(|row| AtcPopulationAgentRow {
+                        project_id: row.get(0).and_then(value_as_i64).unwrap_or_default(),
+                        project_key: get_string(row, 1),
+                        name: get_string(row, 2),
+                        program: get_string(row, 3),
+                        last_active_ts: row.get(4).and_then(value_as_i64).unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 /// List a project's agents with an optional activity floor and result cap
@@ -17421,6 +17478,68 @@ mod tests {
             assert_eq!(
                 recent_capped.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                 vec!["Newest", "Newer"]
+            );
+        });
+    }
+
+    #[test]
+    fn atc_population_snapshot_joins_projects_and_bounds_recent_agents() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("atc_population_snapshot.db");
+
+        rt.block_on(async {
+            let first = ensure_project(&cx, &pool, "/tmp/atc-population-a")
+                .await
+                .into_result()
+                .expect("ensure first project");
+            let second = ensure_project(&cx, &pool, "/tmp/atc-population-b")
+                .await
+                .into_result()
+                .expect("ensure second project");
+            let first_id = first.id.expect("first project id");
+            let second_id = second.id.expect("second project id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES \
+                 ({first_id}, 'Old',     'codex-cli',  'gpt-5', '', 1, 100, 'auto', 'auto'), \
+                 ({first_id}, 'RecentA', 'codex-cli',  'gpt-5', '', 1, 500, 'auto', 'auto'), \
+                 ({second_id}, 'RecentB','claude-code','opus',  '', 1, 300, 'auto', 'auto'), \
+                 ({second_id}, 'Unknown','claude-code','opus',  '', 1,   0, 'auto', 'auto')"
+            ))
+            .expect("insert population agents");
+            drop(conn);
+
+            let recent = list_atc_population_snapshot(&cx, &pool, 200, 10)
+                .await
+                .into_result()
+                .expect("load recent population");
+            assert_eq!(
+                recent.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+                vec!["RecentA", "RecentB", "Unknown"]
+            );
+            assert_eq!(recent[0].project_id, first_id);
+            assert_eq!(recent[0].project_key, "/tmp/atc-population-a");
+            assert_eq!(recent[1].project_id, second_id);
+            assert_eq!(recent[1].program, "claude-code");
+            assert_eq!(recent[2].last_active_ts, 0);
+
+            let capped = list_atc_population_snapshot(&cx, &pool, 200, 2)
+                .await
+                .into_result()
+                .expect("load capped population");
+            assert_eq!(
+                capped.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
+                vec!["RecentA", "RecentB"]
             );
         });
     }

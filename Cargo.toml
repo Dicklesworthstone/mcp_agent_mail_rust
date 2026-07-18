@@ -35,14 +35,14 @@ fastmcp-protocol = "0.3.1"
 
 asupersync = { version = "0.3.6", features = ["tls-webpki-roots"] }
 
-sqlmodel = "0.2.2"
-sqlmodel-core = "0.2.2"
-sqlmodel-query = "0.2.2"
-sqlmodel-schema = "0.2.2"
-sqlmodel-session = "0.2.2"
-sqlmodel-pool = "0.2.2"
-sqlmodel-frankensqlite = "0.2.2"
-sqlmodel-sqlite = "0.2.2"
+sqlmodel = "0.3.0"
+sqlmodel-core = "0.3.0"
+sqlmodel-query = "0.3.0"
+sqlmodel-schema = "0.3.0"
+sqlmodel-session = "0.3.0"
+sqlmodel-pool = "0.3.0"
+sqlmodel-frankensqlite = "0.3.0"
+sqlmodel-sqlite = "0.3.0"
 
 ftui = "0.5.0"
 ftui-runtime = { version = "0.5.0" }
@@ -162,11 +162,11 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Keep asupersync unified with the sibling checkouts. FrankenSQLite and
-# FrankenSearch reference asupersync via the absolute `/dp/asupersync`
+# Keep asupersync unified with the sibling checkouts. FrankenSearch
+# references asupersync via the absolute `/dp/asupersync`
 # path (fleet-wide symlink to the canonical checkout); we MUST use the
 # identical path string here or cargo treats `../asupersync` and
-# `/dp/asupersync` as two distinct 0.3.5 packages and refuses the lock
+# `/dp/asupersync` as two distinct packages and refuses the lock
 # ("package collision in the lockfile"). Single path string => single
 # Cx/Outcome universe.
 asupersync = { path = "/dp/asupersync" }
@@ -190,31 +190,6 @@ fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
 
 beads_rust = { path = "../beads_rust" }
 franken-agent-detection = { path = "../franken_agent_detection" }
-# sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
-sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
-sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-macros = { path = "../sqlmodel_rust/crates/sqlmodel-macros" }
-sqlmodel-query = { path = "../sqlmodel_rust/crates/sqlmodel-query" }
-sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
-sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
-sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
-sqlmodel-frankensqlite = { path = "../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
-sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
-fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-fsqlite-core = { path = "../frankensqlite/crates/fsqlite-core" }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-fsqlite-error = { path = "../frankensqlite/crates/fsqlite-error" }
-fsqlite-observability = { path = "../frankensqlite/crates/fsqlite-observability" }
-fsqlite-vfs = { path = "../frankensqlite/crates/fsqlite-vfs" }
-fsqlite-wal = { path = "../frankensqlite/crates/fsqlite-wal" }
-fsqlite-pager = { path = "../frankensqlite/crates/fsqlite-pager" }
-fsqlite-mvcc = { path = "../frankensqlite/crates/fsqlite-mvcc" }
-fsqlite-btree = { path = "../frankensqlite/crates/fsqlite-btree" }
-fsqlite-ast = { path = "../frankensqlite/crates/fsqlite-ast" }
-fsqlite-parser = { path = "../frankensqlite/crates/fsqlite-parser" }
-fsqlite-planner = { path = "../frankensqlite/crates/fsqlite-planner" }
-fsqlite-vdbe = { path = "../frankensqlite/crates/fsqlite-vdbe" }
-fsqlite-func = { path = "../frankensqlite/crates/fsqlite-func" }
 # ftui patches keep the repo on the latest local /dp frankentui APIs.
 ftui = { path = "../frankentui/crates/ftui" }
 ftui-core = { path = "../frankentui/crates/ftui-core" }

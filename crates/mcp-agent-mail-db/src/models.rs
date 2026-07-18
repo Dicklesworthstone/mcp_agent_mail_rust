@@ -151,6 +151,21 @@ pub struct AgentRow {
     pub registration_token: Option<String>,
 }
 
+/// Compact agent projection used to hydrate the in-process ATC population.
+///
+/// Keeping this projection separate from [`AgentRow`] avoids materializing
+/// model, task, policy, and registration-token fields on the daemon's periodic
+/// population refresh. The accompanying query joins projects once, so callers
+/// do not need a project query followed by one agent query per project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtcPopulationAgentRow {
+    pub project_id: i64,
+    pub project_key: String,
+    pub name: String,
+    pub program: String,
+    pub last_active_ts: i64,
+}
+
 impl Default for AgentRow {
     fn default() -> Self {
         let now = now_micros();
