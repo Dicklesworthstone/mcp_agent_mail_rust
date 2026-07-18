@@ -909,6 +909,12 @@ pub struct HealthCheckResponse {
     pub http_host: String,
     pub http_port: u16,
     pub database_url: String,
+    /// Effective archive/storage root owned by this serving process.
+    ///
+    /// This is intentionally top-level (rather than only under the optional
+    /// disk sample) so diagnostic clients can always bind their database and
+    /// archive probes to the mailbox the daemon is actually serving.
+    pub storage_root: String,
     pub semantic_readiness: SemanticReadinessResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_utilization: Option<PoolUtilizationResponse>,
@@ -1189,6 +1195,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         http_host: config.http_host.clone(),
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
+        storage_root: config.storage_root.display().to_string(),
         semantic_readiness,
         pool_utilization: pool.as_ref().map(|_| PoolUtilizationResponse {
             active: metrics.db.pool_active_connections,
@@ -2611,6 +2618,7 @@ mod tests {
             http_host: "0.0.0.0".into(),
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
+            storage_root: "/data".into(),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
@@ -2630,6 +2638,7 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["semantic_readiness"]["status"], "ok");
         assert_eq!(json["http_port"], 8765);
+        assert_eq!(json["storage_root"], "/data");
         assert_eq!(json["verdicts"]["db_health"]["status"], "green");
     }
 
@@ -3087,6 +3096,7 @@ mod tests {
             http_host: "localhost".into(),
             http_port: 8765,
             database_url: "sqlite:///:memory:".into(),
+            storage_root: "/tmp/agent-mail-test".into(),
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),

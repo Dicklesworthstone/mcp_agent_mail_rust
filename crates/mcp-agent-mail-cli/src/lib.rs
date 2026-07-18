@@ -21018,13 +21018,21 @@ fn handle_doctor_check(
 ) -> CliResult<()> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
-    handle_doctor_check_with(
-        &cfg.database_url,
-        &config.storage_root,
+    let target = doctor_live_mailbox_target(&cfg.database_url, &config.storage_root, &config);
+    let binding = target.daemon.as_ref().map(|_| {
+        (
+            target.process_config_differs,
+            target.binding_detail(&cfg.database_url, &config.storage_root),
+        )
+    });
+    handle_doctor_check_with_target(
+        &target.database_url,
+        &target.storage_root,
         project,
         verbose,
         format,
         json,
+        binding,
     )
 }
 
@@ -23392,6 +23400,78 @@ enum DoctorProbeResult {
     Fail(String),
 }
 
+#[derive(Debug, Clone)]
+struct DoctorJsonRpcHealthProbe {
+    result: DoctorProbeResult,
+    payload: Option<serde_json::Value>,
+    endpoint: Option<String>,
+}
+
+impl DoctorJsonRpcHealthProbe {
+    fn without_payload(result: DoctorProbeResult) -> Self {
+        Self {
+            result,
+            payload: None,
+            endpoint: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorDaemonMailboxTarget {
+    database_url: String,
+    storage_root: PathBuf,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorMailboxTarget {
+    database_url: String,
+    storage_root: PathBuf,
+    daemon: Option<DoctorDaemonMailboxTarget>,
+    process_config_differs: bool,
+}
+
+impl DoctorMailboxTarget {
+    fn process_config(database_url: &str, storage_root: &Path) -> Self {
+        Self {
+            database_url: database_url.to_string(),
+            storage_root: storage_root.to_path_buf(),
+            daemon: None,
+            process_config_differs: false,
+        }
+    }
+
+    fn binding_detail(&self, process_database_url: &str, process_storage_root: &Path) -> String {
+        let Some(daemon) = self.daemon.as_ref() else {
+            return format!(
+                "No live daemon mailbox identity was available; probing process configuration: database_url={}, storage_root={}",
+                process_database_url,
+                process_storage_root.display()
+            );
+        };
+        let endpoint = daemon
+            .endpoint
+            .as_deref()
+            .unwrap_or("local JSON-RPC endpoint");
+        if self.process_config_differs {
+            format!(
+                "Doctor process configuration differs from the live daemon; bound probes to daemon at {endpoint}: daemon database_url={}, daemon storage_root={} (process database_url={}, process storage_root={})",
+                daemon.database_url,
+                daemon.storage_root.display(),
+                process_database_url,
+                process_storage_root.display()
+            )
+        } else {
+            format!(
+                "Doctor probes are bound to the live daemon mailbox at {endpoint}: database_url={}, storage_root={}",
+                daemon.database_url,
+                daemon.storage_root.display()
+            )
+        }
+    }
+}
+
 impl DoctorProbeResult {
     fn ok(detail: impl Into<String>) -> Self {
         Self::Ok(detail.into())
@@ -24751,12 +24831,127 @@ fn summarize_agent_mail_process_samples(samples: &[DoctorProcessSample]) -> Stri
         .join(", ")
 }
 
+fn doctor_normalized_path_for_comparison(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+fn doctor_database_urls_equivalent(left: &str, right: &str) -> bool {
+    let left_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(left);
+    let right_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(right);
+    if left_memory || right_memory {
+        return left_memory && right_memory;
+    }
+
+    let sqlite_path = |database_url: &str| {
+        let config = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
+        config
+            .sqlite_path()
+            .ok()
+            .map(PathBuf::from)
+            .map(|path| doctor_normalized_path_for_comparison(&path))
+    };
+
+    match (sqlite_path(left), sqlite_path(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn doctor_daemon_mailbox_target_from_health(
+    payload: &serde_json::Value,
+    endpoint: Option<String>,
+) -> Option<DoctorDaemonMailboxTarget> {
+    let database_url = payload
+        .get("database_url")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    let storage_root = payload
+        .get("storage_root")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("disk")
+                .and_then(|disk| disk.get("storage_root"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())?;
+    let storage_root = PathBuf::from(storage_root);
+    if !storage_root.is_absolute() {
+        return None;
+    }
+    let database_config = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    if database_config.sqlite_path().is_err()
+        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url)
+    {
+        return None;
+    }
+
+    Some(DoctorDaemonMailboxTarget {
+        database_url: database_url.to_string(),
+        storage_root,
+        endpoint,
+    })
+}
+
+fn doctor_select_mailbox_target(
+    process_database_url: &str,
+    process_storage_root: &Path,
+    daemon: Option<DoctorDaemonMailboxTarget>,
+) -> DoctorMailboxTarget {
+    let Some(daemon) = daemon else {
+        return DoctorMailboxTarget::process_config(process_database_url, process_storage_root);
+    };
+    let process_config_differs =
+        !doctor_database_urls_equivalent(process_database_url, &daemon.database_url)
+            || doctor_normalized_path_for_comparison(process_storage_root)
+                != doctor_normalized_path_for_comparison(&daemon.storage_root);
+
+    DoctorMailboxTarget {
+        database_url: daemon.database_url.clone(),
+        storage_root: daemon.storage_root.clone(),
+        daemon: Some(daemon),
+        process_config_differs,
+    }
+}
+
+fn doctor_live_mailbox_target(
+    process_database_url: &str,
+    process_storage_root: &Path,
+    config: &Config,
+) -> DoctorMailboxTarget {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+
+    let port_status = check_port_status(&config.http_host, config.http_port);
+    if !matches!(port_status, PortStatus::AgentMailServer) {
+        return DoctorMailboxTarget::process_config(process_database_url, process_storage_root);
+    }
+    let probe = probe_local_jsonrpc_health(config, &port_status);
+    let daemon = probe.payload.as_ref().and_then(|payload| {
+        doctor_daemon_mailbox_target_from_health(payload, probe.endpoint.clone())
+    });
+    doctor_select_mailbox_target(process_database_url, process_storage_root, daemon)
+}
+
 fn collect_doctor_server_runtime_diagnostics(config: &Config) -> DoctorServerRuntimeDiagnostics {
     use mcp_agent_mail_server::startup_checks::check_port_status;
 
     let port_status = check_port_status(&config.http_host, config.http_port);
     let http_health = probe_local_http_health(config, &port_status);
-    let jsonrpc_health = probe_local_jsonrpc_health(config, &port_status);
+    let jsonrpc_health = probe_local_jsonrpc_health(config, &port_status).result;
     let listener_pids = resolved_doctor_sample_pids(&config.http_host, config.http_port);
     let (process_samples, process_error) = sample_agent_mail_process_cpu(&listener_pids);
 
@@ -24935,22 +25130,22 @@ fn probe_local_http_health(
 fn probe_local_jsonrpc_health(
     config: &Config,
     port_status: &mcp_agent_mail_server::startup_checks::PortStatus,
-) -> DoctorProbeResult {
+) -> DoctorJsonRpcHealthProbe {
     match port_status {
         mcp_agent_mail_server::startup_checks::PortStatus::Free => {
-            return DoctorProbeResult::warn(
+            return DoctorJsonRpcHealthProbe::without_payload(DoctorProbeResult::warn(
                 "Skipped JSON-RPC probe because no Agent Mail listener is present",
-            );
+            ));
         }
         mcp_agent_mail_server::startup_checks::PortStatus::OtherProcess { description } => {
-            return DoctorProbeResult::warn(format!(
+            return DoctorJsonRpcHealthProbe::without_payload(DoctorProbeResult::warn(format!(
                 "Skipped JSON-RPC probe because the port is owned by another process ({description})"
-            ));
+            )));
         }
         mcp_agent_mail_server::startup_checks::PortStatus::Error { message, .. } => {
-            return DoctorProbeResult::warn(format!(
+            return DoctorJsonRpcHealthProbe::without_payload(DoctorProbeResult::warn(format!(
                 "Skipped JSON-RPC probe because listener discovery failed: {message}"
-            ));
+            )));
         }
         mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer => {}
     }
@@ -24968,7 +25163,7 @@ fn probe_local_jsonrpc_health(
     });
 
     match context::run_async(async {
-        let mut last = None;
+        let mut last: Option<DoctorJsonRpcHealthProbe> = None;
         for url in &urls {
             let response =
                 post_jsonrpc_request(url, bearer, &request, DOCTOR_RUNTIME_JSONRPC_TIMEOUT_SECS)
@@ -24976,13 +25171,20 @@ fn probe_local_jsonrpc_health(
             match response {
                 Ok(payload) => {
                     if let Some(error_text) = parse_jsonrpc_error(&payload) {
-                        last = Some(("fail", error_text));
+                        last = Some(DoctorJsonRpcHealthProbe {
+                            result: DoctorProbeResult::fail(error_text),
+                            payload: None,
+                            endpoint: Some(url.clone()),
+                        });
                     } else {
                         let Some(result_payload) = payload.get("result").cloned() else {
-                            last = Some((
-                                "fail",
-                                "missing JSON-RPC result payload for health_check".to_string(),
-                            ));
+                            last = Some(DoctorJsonRpcHealthProbe {
+                                result: DoctorProbeResult::fail(
+                                    "missing JSON-RPC result payload for health_check",
+                                ),
+                                payload: None,
+                                endpoint: Some(url.clone()),
+                            });
                             continue;
                         };
 
@@ -24997,78 +25199,70 @@ fn probe_local_jsonrpc_health(
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("unknown");
 
-                                if status.eq_ignore_ascii_case("ok") {
-                                    if health_level.eq_ignore_ascii_case("critical") {
-                                        last = Some((
-                                            "warn",
-                                            format!(
-                                                "health_check reported status={status}, health_level={health_level}"
-                                            ),
-                                        ));
-                                    } else {
-                                        return Ok(url.clone());
-                                    }
+                                let detail = format!(
+                                    "health_check reported status={status}, health_level={health_level} via {url}"
+                                );
+                                let result = if status.eq_ignore_ascii_case("ok")
+                                    && !health_level.eq_ignore_ascii_case("critical")
+                                    && !health_level.eq_ignore_ascii_case("red")
+                                {
+                                    DoctorProbeResult::ok(format!(
+                                        "JSON-RPC health_check succeeded via {url}"
+                                    ))
+                                } else if status.eq_ignore_ascii_case("ok") {
+                                    DoctorProbeResult::warn(detail)
                                 } else {
-                                    last = Some((
-                                        "fail",
-                                        format!(
-                                            "health_check reported status={status}, health_level={health_level}"
-                                        ),
-                                    ));
+                                    DoctorProbeResult::fail(detail)
+                                };
+                                let probe = DoctorJsonRpcHealthProbe {
+                                    result,
+                                    payload: Some(parsed),
+                                    endpoint: Some(url.clone()),
+                                };
+                                if matches!(&probe.result, DoctorProbeResult::Ok(_)) {
+                                    return Ok(probe);
                                 }
+                                last = Some(probe);
                             }
                             None => {
-                                last = Some((
-                                    "fail",
-                                    "health_check returned empty or unparseable content"
-                                        .to_string(),
-                                ));
+                                last = Some(DoctorJsonRpcHealthProbe {
+                                    result: DoctorProbeResult::fail(
+                                        "health_check returned empty or unparseable content",
+                                    ),
+                                    payload: None,
+                                    endpoint: Some(url.clone()),
+                                });
                             }
                         }
                     }
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    if message.starts_with("authentication failed") {
-                        last = Some(("warn", message));
+                    let result = if message.starts_with("authentication failed") {
+                        DoctorProbeResult::warn(message)
                     } else {
-                        last = Some(("fail", message));
-                    }
+                        DoctorProbeResult::fail(message)
+                    };
+                    last = Some(DoctorJsonRpcHealthProbe {
+                        result,
+                        payload: None,
+                        endpoint: Some(url.clone()),
+                    });
                 }
             }
         }
 
-        let (severity, message) = last.unwrap_or_else(|| {
-            (
-                "fail",
-                "no candidate server URLs were available for JSON-RPC probing".to_string(),
-            )
-        });
-        Err(CliError::Other(format!("{severity}:{message}")))
+        Ok(last.unwrap_or_else(|| {
+            DoctorJsonRpcHealthProbe::without_payload(DoctorProbeResult::fail(
+                "no candidate server URLs were available for JSON-RPC probing",
+            ))
+        }))
     }) {
-        Ok(url) => DoctorProbeResult::ok(format!("JSON-RPC health_check succeeded via {url}")),
-        Err(CliError::Other(message)) => {
-            if let Some(detail) = message.strip_prefix("warn:") {
-                DoctorProbeResult::warn(format!(
-                    "JSON-RPC health_check was rejected: {}",
-                    truncate_doctor_command(detail)
-                ))
-            } else if let Some(detail) = message.strip_prefix("fail:") {
-                DoctorProbeResult::fail(format!(
-                    "JSON-RPC health_check transport failed: {}",
-                    truncate_doctor_command(detail)
-                ))
-            } else {
-                DoctorProbeResult::fail(format!(
-                    "JSON-RPC health_check failed: {}",
-                    truncate_doctor_command(&message)
-                ))
-            }
-        }
-        Err(error) => DoctorProbeResult::fail(format!(
+        Ok(probe) => probe,
+        Err(error) => DoctorJsonRpcHealthProbe::without_payload(DoctorProbeResult::fail(format!(
             "JSON-RPC health_check failed: {}",
             truncate_doctor_command(&error.to_string())
-        )),
+        ))),
     }
 }
 
@@ -27772,6 +27966,7 @@ pub(crate) fn runtime_identity_json(
     serde_json::Value::Object(obj)
 }
 
+#[cfg(test)]
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -27780,7 +27975,34 @@ fn handle_doctor_check_with(
     format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
+    handle_doctor_check_with_target(
+        database_url,
+        storage_root,
+        project,
+        verbose,
+        format,
+        json,
+        None,
+    )
+}
+
+fn handle_doctor_check_with_target(
+    database_url: &str,
+    storage_root: &Path,
+    project: Option<String>,
+    verbose: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    daemon_binding: Option<(bool, String)>,
+) -> CliResult<()> {
     let mut checks: Vec<serde_json::Value> = Vec::new();
+    if let Some((process_config_differs, detail)) = daemon_binding.as_ref() {
+        checks.push(serde_json::json!({
+            "check": "daemon_mailbox_binding",
+            "status": if *process_config_differs { "warn" } else { "ok" },
+            "detail": detail,
+        }));
+    }
     let mut db_file_sanity_failed = false;
     let env_config = Config::from_env();
     let database_probe_blocker_strategy = doctor_database_probe_blocker_read_only(database_url);
@@ -29450,6 +29672,15 @@ fn handle_doctor_check_with(
             env_config.http_port,
             None,
         ),
+        "daemon_mailbox_binding": daemon_binding.as_ref().map(|(differs, detail)| {
+            serde_json::json!({
+                "source": "live_health_check",
+                "process_config_differs": differs,
+                "detail": detail,
+                "effective_database_url": database_url,
+                "effective_storage_root": storage_root.display().to_string(),
+            })
+        }),
         "checks": checks,
         "diagnostic_payload": diagnostic_payload,
         "forensic_timeline": forensic_timeline,
@@ -29950,7 +30181,10 @@ fn handle_doctor_fix_orphan_refs(
 fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let storage_root = &config.storage_root;
+    let mailbox_target =
+        doctor_live_mailbox_target(&cfg.database_url, &config.storage_root, &config);
+    let database_url = mailbox_target.database_url.as_str();
+    let storage_root = mailbox_target.storage_root.as_path();
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -29960,6 +30194,16 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let mut fixed_count = 0u32;
     let mut failed_count = 0u32;
     let mut skipped_count = 0u32;
+
+    if mailbox_target.daemon.is_some() {
+        results.push(serde_json::json!({
+            "check": "daemon_mailbox_binding",
+            "action": if mailbox_target.process_config_differs { "bound" } else { "confirmed" },
+            "detail": mailbox_target.binding_detail(&cfg.database_url, &config.storage_root),
+            "effective_database_url": database_url,
+            "effective_storage_root": storage_root.display().to_string(),
+        }));
+    }
 
     let mode_label = if dry_run { "would fix" } else { "fixing" };
 
@@ -30363,7 +30607,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
     // Fix 6: Database reconstruction/repair for missing, corrupt, or logically inconsistent DBs.
     {
-        match doctor_database_fix_strategy(&cfg.database_url, storage_root) {
+        match doctor_database_fix_strategy(database_url, storage_root) {
             Ok(DoctorDatabaseFixStrategy::None(detail)) => {
                 results.push(serde_json::json!({
                     "check": "database_repair",
@@ -30386,7 +30630,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
                         handle_doctor_reconstruct_locked(
-                            &cfg.database_url,
+                            database_url,
                             storage_root,
                             false,
                             true,
@@ -30429,7 +30673,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
                         handle_doctor_repair_with_options(
-                            &cfg.database_url,
+                            database_url,
                             storage_root,
                             &backup_dir,
                             None,
@@ -30439,7 +30683,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                         )
                     }) {
                         Ok(()) => match verify_doctor_database_repair_cleared(
-                            &cfg.database_url,
+                            database_url,
                             storage_root,
                             &detail,
                         ) {
@@ -30582,7 +30826,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
     // Fix 8: WAL mode — enable if not already on.
     {
-        match open_db_for_doctor_check(&cfg.database_url) {
+        match open_db_for_doctor_check(database_url) {
             Ok(conn) => {
                 let wal_ok = conn
                     .query_sync("PRAGMA journal_mode", &[])
@@ -47370,6 +47614,81 @@ startup_timeout_sec = 42
         assert_eq!(
             doctor_server_fix_detail_summary(&diagnostics),
             "port ok; http ok; rpc failed; cpu high"
+        );
+    }
+
+    #[test]
+    fn doctor_mailbox_target_binds_to_live_daemon_on_root_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let process_root = dir.path().join("legacy-mailbox");
+        let daemon_root = dir.path().join("live-mailbox");
+        std::fs::create_dir_all(&process_root).unwrap();
+        std::fs::create_dir_all(&daemon_root).unwrap();
+        let process_database_url = format!(
+            "sqlite:///{}",
+            process_root.join("storage.sqlite3").display()
+        );
+        let daemon_database_url = format!(
+            "sqlite:///{}",
+            daemon_root.join("storage.sqlite3").display()
+        );
+        let payload = serde_json::json!({
+            "status": "error",
+            "health_level": "red",
+            "database_url": daemon_database_url,
+            "storage_root": daemon_root,
+        });
+        let daemon = doctor_daemon_mailbox_target_from_health(
+            &payload,
+            Some("http://127.0.0.1:8765/mcp/".to_string()),
+        )
+        .expect("daemon target");
+        let selected =
+            doctor_select_mailbox_target(&process_database_url, &process_root, Some(daemon));
+
+        assert!(selected.process_config_differs);
+        assert_eq!(selected.database_url, daemon_database_url);
+        assert_eq!(selected.storage_root, daemon_root);
+        assert!(
+            selected
+                .binding_detail(&process_database_url, &process_root)
+                .contains("bound probes to daemon")
+        );
+    }
+
+    #[test]
+    fn doctor_daemon_mailbox_target_accepts_legacy_disk_storage_root_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite:///{}", dir.path().join("mail.db").display());
+        let payload = serde_json::json!({
+            "database_url": database_url,
+            "disk": { "storage_root": dir.path() },
+        });
+
+        let target = doctor_daemon_mailbox_target_from_health(&payload, None)
+            .expect("disk.storage_root fallback");
+        assert_eq!(target.database_url, database_url);
+        assert_eq!(target.storage_root, dir.path());
+    }
+
+    #[test]
+    fn doctor_daemon_mailbox_target_rejects_relative_or_incomplete_identity() {
+        assert!(
+            doctor_daemon_mailbox_target_from_health(
+                &serde_json::json!({
+                    "database_url": "sqlite:///tmp/mail.db",
+                    "storage_root": "relative/mailbox",
+                }),
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            doctor_daemon_mailbox_target_from_health(
+                &serde_json::json!({ "storage_root": "/tmp/mailbox" }),
+                None,
+            )
+            .is_none()
         );
     }
 
