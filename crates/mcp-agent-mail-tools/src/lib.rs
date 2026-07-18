@@ -2496,6 +2496,10 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("list_contacts", clusters::CONTACT),
     ("set_contact_policy", clusters::CONTACT),
     // File reservations
+    (
+        "check_file_reservation_conflicts",
+        clusters::FILE_RESERVATIONS,
+    ),
     ("file_reservation_paths", clusters::FILE_RESERVATIONS),
     ("release_file_reservations", clusters::FILE_RESERVATIONS),
     ("renew_file_reservations", clusters::FILE_RESERVATIONS),
@@ -2551,6 +2555,10 @@ mod tests {
         );
         assert_eq!(tool_cluster("send_message"), Some(clusters::MESSAGING));
         assert_eq!(tool_cluster("request_contact"), Some(clusters::CONTACT));
+        assert_eq!(
+            tool_cluster("check_file_reservation_conflicts"),
+            Some(clusters::FILE_RESERVATIONS)
+        );
         assert_eq!(
             tool_cluster("file_reservation_paths"),
             Some(clusters::FILE_RESERVATIONS)

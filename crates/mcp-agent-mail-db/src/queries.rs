@@ -9230,6 +9230,168 @@ fn reservation_descendant_prefix(norm: &str) -> Option<String> {
     }
 }
 
+/// One active exclusive reservation captured with its authoritative holder name.
+///
+/// `agent_name` remains optional so consumers can fail closed on referential
+/// drift instead of silently dropping an unresolvable holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationConflictSnapshotRow {
+    pub id: i64,
+    pub agent_name: Option<String>,
+    pub path_pattern: String,
+    pub expires_ts: i64,
+}
+
+/// Canonical, point-in-time input for a read-only reservation conflict check.
+#[derive(Debug, Clone)]
+pub struct ReservationConflictSnapshot {
+    pub project: ProjectRow,
+    pub captured_ts: i64,
+    pub reservations: Vec<ReservationConflictSnapshotRow>,
+}
+
+/// Capture active exclusive reservations and holder identities from one fresh
+/// database transaction without registration, cleanup, release, or archive IO.
+///
+/// The release ledger is read in the same snapshot and subtracted in Rust to
+/// retain canonical active-reservation semantics without FrankenSQLite's known
+/// O(N*M) anti-join behaviour on joined queries.
+pub async fn get_reservation_conflict_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project_key: &str,
+) -> Outcome<ReservationConflictSnapshot, DbError> {
+    run_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
+        let captured_ts = now_micros();
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
+
+        // A fresh WAL snapshot is mandatory for guard correctness. This opens
+        // a transaction but performs no data mutation.
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, slug, human_key, created_at FROM projects \
+                     WHERE human_key = ? OR slug = ? \
+                     ORDER BY CASE WHEN human_key = ? THEN 0 ELSE 1 END LIMIT 1",
+                    &[
+                        Value::Text(project_key.to_string()),
+                        Value::Text(project_key.to_string()),
+                        Value::Text(project_key.to_string()),
+                    ],
+                )
+                .await,
+            )
+        );
+        let Some(project_row) = project_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Project", project_key));
+        };
+        let project = match decode_project_row(project_row) {
+            Ok(project) => project,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        let project_id = project.id.unwrap_or(0);
+        if project_id <= 0 {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "reservation conflict snapshot resolved invalid project id for {project_key}"
+            )));
+        }
+
+        let candidate_predicate = active_reservation_candidate_predicate_for("fr");
+        let candidate_sql = format!(
+            "SELECT fr.id, a.name, fr.path_pattern, fr.expires_ts \
+             FROM file_reservations fr \
+             LEFT JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
+             WHERE fr.project_id = ? AND fr.\"exclusive\" = 1 \
+               AND {candidate_predicate} AND fr.expires_ts > ? ORDER BY fr.id"
+        );
+        let candidate_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    &candidate_sql,
+                    &[Value::BigInt(project_id), Value::BigInt(captured_ts)],
+                )
+                .await,
+            )
+        );
+        let released_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, RELEASED_RESERVATION_IDS_SQL, &[]).await)
+        );
+        let released_ids: HashSet<i64> = released_rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(value_as_i64))
+            .collect();
+
+        let mut reservations = Vec::with_capacity(candidate_rows.len());
+        for row in &candidate_rows {
+            let Some(id) = row.get(0).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "missing reservation id in conflict snapshot".to_string(),
+                ));
+            };
+            if released_ids.contains(&id) {
+                continue;
+            }
+            let agent_name = row.get(1).and_then(|value| match value {
+                Value::Text(text) => Some(text.clone()),
+                _ => None,
+            });
+            let Some(path_pattern) = row.get(2).and_then(|value| match value {
+                Value::Text(text) => Some(text.clone()),
+                _ => None,
+            }) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "missing path_pattern for active reservation id={id}"
+                )));
+            };
+            let Some(expires_ts) = row.get(3).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "missing expires_ts for active reservation id={id}"
+                )));
+            };
+            reservations.push(ReservationConflictSnapshotRow {
+                id,
+                agent_name,
+                path_pattern,
+                expires_ts,
+            });
+        }
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(ReservationConflictSnapshot {
+            project,
+            captured_ts,
+            reservations,
+        })
+    })
+    .await
+}
+
 /// Create file reservations
 #[allow(clippy::too_many_arguments)]
 pub async fn create_file_reservations(
