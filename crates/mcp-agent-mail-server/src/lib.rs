@@ -160,24 +160,25 @@ use mcp_agent_mail_db::{
     DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
 };
 use mcp_agent_mail_tools::{
-    AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CleanupPaneIdentities,
-    ConfigEnvironmentQueryResource, ConfigEnvironmentResource, CreateAgentIdentity, EnsureProduct,
-    EnsureProject, FetchInbox, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
-    ForceReleaseFileReservation, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
-    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
-    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
-    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
-    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
-    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
-    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
-    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
-    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
-    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
-    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
-    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
+    AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
+    CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
+    CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox, FetchInboxProduct,
+    FileReservationPaths, FileReservationsResource, ForceReleaseFileReservation, HealthCheck,
+    IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
+    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
+    MailboxResource, MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource,
+    OutboxResource, ProductDetailsResource, ProductsLink, ProjectDetailsResource,
+    ProjectsListQueryResource, ProjectsListResource, RegisterAgent, ReleaseBuildSlot,
+    ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage, RequestContact,
+    ResolvePaneIdentity, RespondContact, SearchMessages, SearchMessagesProduct, SendMessage,
+    SetContactPolicy, SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource,
+    ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource,
+    ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
+    ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
+    ToolingMetricsQueryResource, ToolingMetricsResource, ToolingRecentResource,
+    ToolingSchemasQueryResource, ToolingSchemasResource, UninstallPrecommitGuard,
+    ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
+    ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -680,6 +681,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         "set_contact_policy",
         clusters::CONTACT,
         SetContactPolicy,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "check_file_reservation_conflicts",
+        clusters::FILE_RESERVATIONS,
+        CheckFileReservationConflicts,
     );
     let server = add_tool(
         server,

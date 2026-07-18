@@ -1511,6 +1511,15 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
     }
 }
 
+/// End a transaction that has only observed database state.
+///
+/// This intentionally bypasses [`commit_tx`]: that helper checkpoints the WAL
+/// after writes, while authoritative guard reads must not cause any durable
+/// database or WAL mutation of their own.
+async fn commit_read_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await).map(|_| ())
+}
+
 /// Rebuild indexes via `REINDEX`.
 ///
 /// Only needed for explicit repair/recovery paths (e.g. `am doctor repair`).
@@ -9285,6 +9294,271 @@ fn reservation_descendant_prefix(norm: &str) -> Option<String> {
     } else {
         Some(format!("{norm}/"))
     }
+}
+
+/// One authoritative active reservation used by the read-only conflict guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationConflictSnapshotRow {
+    pub id: i64,
+    pub agent_id: i64,
+    pub agent_name: Option<String>,
+    pub path_pattern: String,
+    pub expires_ts: i64,
+}
+
+/// A project, canonical caller identity, and reservation set observed in one
+/// fresh database transaction.
+#[derive(Debug, Clone)]
+pub struct ReservationConflictSnapshot {
+    pub project: ProjectRow,
+    pub caller_agent_id: i64,
+    pub captured_ts: i64,
+    pub reservations: Vec<ReservationConflictSnapshotRow>,
+    /// True when the active reservation set exceeded the SQL-level row cap.
+    pub overflow: bool,
+}
+
+/// Capture the canonical inputs for a reservation conflict decision without
+/// registering identities, healing archives, releasing leases, or otherwise
+/// changing mailbox state.
+///
+/// The active-row bound is part of the SQL query (`limit + 1`), rather than a
+/// check performed after an unbounded materialization. Holder names are loaded
+/// in bounded chunks inside the same transaction. Resolving the caller to its
+/// canonical lowest-ID case-insensitive identity in that transaction ensures
+/// self-reservation filtering is keyed to an existing row rather than trusted
+/// caller-supplied text.
+pub async fn get_reservation_conflict_snapshot(
+    cx: &Cx,
+    pool: &DbPool,
+    project_key: &str,
+    caller_name: &str,
+    max_reservations: usize,
+) -> Outcome<ReservationConflictSnapshot, DbError> {
+    if max_reservations == 0 {
+        return Outcome::Err(DbError::invalid(
+            "max_reservations",
+            "reservation conflict snapshot limit must be positive",
+        ));
+    }
+
+    run_with_mvcc_retry(cx, "get_reservation_conflict_snapshot", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let tracked = tracked(&*conn);
+
+        // BEGIN IMMEDIATE is the established fresh-snapshot path for reservation
+        // reads (GH#85/#86). The transaction performs no table writes and ends
+        // through commit_read_tx, which deliberately skips the write-path WAL
+        // checkpoint.
+        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        let captured_ts = now_micros();
+
+        let project_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id, slug, human_key, created_at FROM projects \
+                     WHERE human_key = ? OR slug = ? \
+                     ORDER BY CASE WHEN human_key = ? THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                    &[
+                        Value::Text(project_key.to_string()),
+                        Value::Text(project_key.to_string()),
+                        Value::Text(project_key.to_string()),
+                    ],
+                )
+                .await,
+            )
+        );
+        let Some(project_row) = project_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found("Project", project_key));
+        };
+        let project = match decode_project_row(project_row) {
+            Ok(project) => project,
+            Err(error) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+        let Some(project_id) = project.id.filter(|id| *id > 0) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(format!(
+                "reservation conflict snapshot resolved invalid project id for {project_key}"
+            )));
+        };
+
+        let caller_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT id FROM agents \
+                     WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                     ORDER BY id ASC LIMIT 1",
+                    &[
+                        Value::BigInt(project_id),
+                        Value::Text(caller_name.to_string()),
+                    ],
+                )
+                .await,
+            )
+        );
+        let Some(caller_row) = caller_rows.first() else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::not_found(
+                "Agent",
+                format!("{project_id}:{caller_name}"),
+            ));
+        };
+        let Some(caller_agent_id) = caller_row.get(0).and_then(value_as_i64) else {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(DbError::Internal(
+                "reservation conflict snapshot caller has no valid id".to_string(),
+            ));
+        };
+        let sql_limit = i64::try_from(max_reservations.saturating_add(1)).unwrap_or(i64::MAX);
+        let active_predicate = active_reservation_predicate_for("fr");
+        let reservation_sql = format!(
+            "SELECT fr.id, fr.agent_id, fr.path_pattern, fr.expires_ts \
+             FROM file_reservations AS fr \
+             WHERE fr.project_id = ? AND fr.\"exclusive\" = 1 \
+               AND {active_predicate} AND fr.expires_ts > ? \
+             ORDER BY fr.id ASC LIMIT ?"
+        );
+        let reservation_rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    &reservation_sql,
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(captured_ts),
+                        Value::BigInt(sql_limit),
+                    ],
+                )
+                .await,
+            )
+        );
+
+        if reservation_rows.len() > max_reservations {
+            try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+            return Outcome::Ok(ReservationConflictSnapshot {
+                project,
+                caller_agent_id,
+                captured_ts,
+                reservations: Vec::new(),
+                overflow: true,
+            });
+        }
+
+        let mut undecoded = Vec::with_capacity(reservation_rows.len());
+        let mut holder_ids = Vec::with_capacity(reservation_rows.len());
+        for row in &reservation_rows {
+            let Some(id) = row.get(0).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "active reservation snapshot row has no valid id".to_string(),
+                ));
+            };
+            let Some(agent_id) = row.get(1).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid agent id"
+                )));
+            };
+            let Some(path_pattern) = row.get(2).and_then(|value| match value {
+                Value::Text(path) => Some(path.clone()),
+                _ => None,
+            }) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid path pattern"
+                )));
+            };
+            let Some(expires_ts) = row.get(3).and_then(value_as_i64) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "active reservation {id} has no valid expiry"
+                )));
+            };
+            undecoded.push((id, agent_id, path_pattern, expires_ts));
+            holder_ids.push(agent_id);
+        }
+
+        holder_ids.sort_unstable();
+        holder_ids.dedup();
+        let mut holder_names = HashMap::with_capacity(holder_ids.len());
+        const HOLDER_QUERY_CHUNK: usize = 256;
+        for chunk in holder_ids.chunks(HOLDER_QUERY_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let holder_sql = format!(
+                "SELECT id, name FROM agents WHERE project_id = ? \
+                 AND id IN ({placeholders}) ORDER BY id ASC"
+            );
+            let mut params = Vec::with_capacity(chunk.len().saturating_add(1));
+            params.push(Value::BigInt(project_id));
+            params.extend(chunk.iter().copied().map(Value::BigInt));
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &holder_sql, &params).await)
+            );
+            for row in &rows {
+                let Some(agent_id) = row.get(0).and_then(value_as_i64) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(
+                        "reservation holder row has no valid id".to_string(),
+                    ));
+                };
+                let Some(name) = row.get(1).and_then(|value| match value {
+                    Value::Text(name) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(DbError::Internal(format!(
+                        "reservation holder {agent_id} has no valid name"
+                    )));
+                };
+                holder_names.insert(agent_id, name);
+            }
+        }
+
+        let reservations = undecoded
+            .into_iter()
+            .map(
+                |(id, agent_id, path_pattern, expires_ts)| ReservationConflictSnapshotRow {
+                    id,
+                    agent_id,
+                    agent_name: holder_names.get(&agent_id).cloned(),
+                    path_pattern,
+                    expires_ts,
+                },
+            )
+            .collect();
+
+        try_in_tx!(cx, &tracked, commit_read_tx(cx, &tracked).await);
+        Outcome::Ok(ReservationConflictSnapshot {
+            project,
+            caller_agent_id,
+            captured_ts,
+            reservations,
+            overflow: false,
+        })
+    })
+    .await
 }
 
 /// Create file reservations

@@ -1,6 +1,7 @@
 //! File reservation cluster tools
 //!
 //! Tools for advisory file locking:
+//! - `check_file_reservation_conflicts`: Read-only authoritative conflict check
 //! - `file_reservation_paths`: Request file reservations
 //! - `release_file_reservations`: Release reservations
 //! - `renew_file_reservations`: Extend reservation TTL
@@ -89,6 +90,21 @@ pub struct ReservationResponse {
     pub conflicts: Vec<ReservationConflict>,
 }
 
+/// Result of an authoritative, side-effect-free reservation conflict check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReservationConflictCheckResponse {
+    pub conflict_free: bool,
+    pub conflicts: Vec<ReservationConflict>,
+    pub clear_paths: Vec<String>,
+    pub checked_paths: usize,
+    pub total_conflicting_reservations: usize,
+    pub output_truncated: bool,
+    pub project: String,
+    pub snapshot_ts: String,
+    pub authoritative_source: String,
+    pub read_only: bool,
+}
+
 /// Release result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseResult {
@@ -173,6 +189,79 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
         ));
     }
     None
+}
+
+const MAX_CONFLICT_CHECK_PATHS: usize = 200;
+const MAX_CONFLICT_CHECK_PATH_BYTES: usize = 4_096;
+const MAX_CONFLICT_CHECK_PAYLOAD_BYTES: usize = 65_536;
+const MAX_CONFLICT_CHECK_SNAPSHOT_ROWS: usize = 10_000;
+const MAX_CONFLICT_HOLDERS_PER_PATH: usize = 50;
+const MAX_CONFLICT_HOLDERS_TOTAL: usize = 1_000;
+
+fn validate_conflict_check_paths(paths: &[String]) -> McpResult<()> {
+    if paths.is_empty() {
+        return Err(legacy_tool_error(
+            "EMPTY_PATHS",
+            "paths list cannot be empty",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        ));
+    }
+    if paths.len() > MAX_CONFLICT_CHECK_PATHS {
+        return Err(legacy_tool_error(
+            "TOO_MANY_PATHS",
+            format!(
+                "Maximum {MAX_CONFLICT_CHECK_PATHS} paths per conflict check, got {}",
+                paths.len()
+            ),
+            true,
+            json!({
+                "fail_closed": true,
+                "count": paths.len(),
+                "max": MAX_CONFLICT_CHECK_PATHS,
+                "do_not_edit": paths,
+            }),
+        ));
+    }
+
+    let mut payload_bytes = 0_usize;
+    for path in paths {
+        payload_bytes = payload_bytes.saturating_add(path.len());
+        if path.len() > MAX_CONFLICT_CHECK_PATH_BYTES {
+            return Err(legacy_tool_error(
+                "PATH_TOO_LONG",
+                format!(
+                    "Path exceeds the {MAX_CONFLICT_CHECK_PATH_BYTES}-byte conflict-check limit"
+                ),
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+        if path.contains('\0') {
+            return Err(legacy_tool_error(
+                "INVALID_PATH",
+                "Path contains a NUL byte",
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+    }
+    if payload_bytes > MAX_CONFLICT_CHECK_PAYLOAD_BYTES {
+        return Err(legacy_tool_error(
+            "PAYLOAD_TOO_LARGE",
+            format!(
+                "Combined paths exceed the {MAX_CONFLICT_CHECK_PAYLOAD_BYTES}-byte conflict-check limit"
+            ),
+            true,
+            json!({
+                "fail_closed": true,
+                "payload_bytes": payload_bytes,
+                "max": MAX_CONFLICT_CHECK_PAYLOAD_BYTES,
+                "do_not_edit": paths,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 /// The single chokepoint every reservation mutation (acquire / renew / release /
@@ -1297,6 +1386,231 @@ fn acquire_outcome<T>(
         }
         other => db_outcome_to_mcp_result(other),
     }
+}
+
+/// Check requested paths against one authoritative reservation snapshot
+/// without registering identities, cleaning up leases, healing archives, or
+/// changing reservation state.
+#[tool(
+    description = "Check project-relative paths against authoritative active exclusive file reservations without mutating Agent Mail.\n\nThis is the guard-safe read API for pre-edit, pre-commit, and pre-push checks. It resolves the existing caller identity and active leases in one fresh database snapshot, ignores only reservations owned by that canonical caller ID, and reports exact, glob, and ancestor conflicts. Expired, released, and shared reservations do not block. Malformed request or stored patterns fail closed. The call never registers agents or projects, cleans up leases, releases reservations, heals archives, or writes mailbox state.\n\nParameters\n----------\nproject_key : str\n    Existing project human key or slug.\nagent_name : str\n    Existing caller identity. Case-insensitive lookup resolves the canonical lowest-ID identity.\npaths : list[str]\n    One to 200 project-relative paths or glob patterns.\n\nReturns\n-------\ndict\n    { conflict_free, conflicts, clear_paths, checked_paths, total_conflicting_reservations, output_truncated, project, snapshot_ts, authoritative_source, read_only }"
+)]
+pub async fn check_file_reservation_conflicts(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    paths: Vec<String>,
+) -> McpResult<String> {
+    validate_conflict_check_paths(&paths)?;
+
+    let project_key = project_key.trim();
+    if project_key.is_empty()
+        || project_key.len() > MAX_CONFLICT_CHECK_PATH_BYTES
+        || project_key.contains('\0')
+    {
+        return Err(legacy_tool_error(
+            "INVALID_PROJECT_KEY",
+            "project_key must be non-empty, NUL-free, and at most 4096 bytes",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        ));
+    }
+    let caller = agent_name.trim();
+    if caller.is_empty() || caller.len() > 256 || caller.contains('\0') {
+        return Err(legacy_tool_error(
+            "INVALID_AGENT_NAME",
+            "agent_name must be non-empty, NUL-free, and at most 256 bytes",
+            true,
+            json!({"fail_closed": true, "do_not_edit": paths}),
+        ));
+    }
+    let caller = mcp_agent_mail_core::models::normalize_agent_name(caller)
+        .unwrap_or_else(|| caller.to_string());
+
+    let pool = get_db_pool()?;
+    let snapshot = acquire_outcome(
+        mcp_agent_mail_db::queries::get_reservation_conflict_snapshot(
+            ctx.cx(),
+            &pool,
+            project_key,
+            &caller,
+            MAX_CONFLICT_CHECK_SNAPSHOT_ROWS,
+        )
+        .await,
+        &paths,
+        "check_file_reservation_conflicts",
+    )?;
+
+    if snapshot.overflow {
+        return Err(legacy_tool_error(
+            "RESERVATION_SNAPSHOT_TOO_LARGE",
+            format!(
+                "Active reservation snapshot exceeds the safe {MAX_CONFLICT_CHECK_SNAPSHOT_ROWS}-row bound"
+            ),
+            true,
+            json!({
+                "fail_closed": true,
+                "max": MAX_CONFLICT_CHECK_SNAPSHOT_ROWS,
+                "do_not_edit": paths,
+            }),
+        ));
+    }
+
+    let mut normalized_paths = Vec::with_capacity(paths.len());
+    let mut seen_paths = HashSet::with_capacity(paths.len());
+    for path in &paths {
+        let Some(normalized) = relativize_path(&snapshot.project.human_key, path) else {
+            return Err(legacy_tool_error(
+                "INVALID_PATH",
+                "Path is outside the project root or contains invalid traversal",
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        };
+        let compiled = CompiledPattern::cached(&normalized);
+        if normalized.is_empty()
+            || invalid_file_reservation_pattern(&normalized).is_some()
+            || !compiled.is_matchable()
+        {
+            return Err(legacy_tool_error(
+                "INVALID_PATH_PATTERN",
+                format!("Malformed conflict-check path pattern: {path:?}"),
+                true,
+                json!({"fail_closed": true, "do_not_edit": paths}),
+            ));
+        }
+        if seen_paths.insert(normalized.clone()) {
+            normalized_paths.push(normalized);
+        }
+    }
+
+    let mut holder_by_agent = HashMap::with_capacity(snapshot.reservations.len());
+    let mut indexed = Vec::with_capacity(snapshot.reservations.len());
+    for reservation in &snapshot.reservations {
+        if reservation.agent_id == snapshot.caller_agent_id {
+            continue;
+        }
+        let Some(holder) = reservation.agent_name.as_deref() else {
+            return Err(legacy_tool_error(
+                "UNRESOLVED_RESERVATION_HOLDER",
+                format!(
+                    "Active reservation {} has no authoritative holder identity",
+                    reservation.id
+                ),
+                false,
+                json!({
+                    "fail_closed": true,
+                    "reservation_id": reservation.id,
+                    "do_not_edit": paths,
+                }),
+            ));
+        };
+        let compiled = CompiledPattern::cached(&reservation.path_pattern);
+        if reservation.path_pattern.is_empty()
+            || reservation.path_pattern.len() > MAX_CONFLICT_CHECK_PATH_BYTES
+            || reservation.path_pattern.contains('\0')
+            || invalid_file_reservation_pattern(&reservation.path_pattern).is_some()
+            || !compiled.is_matchable()
+        {
+            return Err(legacy_tool_error(
+                "MALFORMED_ACTIVE_RESERVATION",
+                format!(
+                    "Active reservation {} contains a malformed path pattern; conflict status is unverifiable",
+                    reservation.id
+                ),
+                false,
+                json!({
+                    "fail_closed": true,
+                    "reservation_id": reservation.id,
+                    "do_not_edit": paths,
+                }),
+            ));
+        }
+
+        holder_by_agent.insert(reservation.agent_id, holder.to_string());
+        indexed.push((
+            reservation.path_pattern.clone(),
+            ReservationRef {
+                agent_id: reservation.agent_id,
+                path_pattern: reservation.path_pattern.clone(),
+                exclusive: true,
+                expires_ts: reservation.expires_ts,
+            },
+        ));
+    }
+
+    let index = ReservationIndex::build(indexed.into_iter());
+    let mut conflicts = Vec::new();
+    let mut clear_paths = Vec::new();
+    let mut refs = Vec::new();
+    let mut total_conflicting_reservations = 0_usize;
+    let mut emitted_holders = 0_usize;
+    let mut output_truncated = false;
+
+    for path in &normalized_paths {
+        let compiled = CompiledPattern::cached(path);
+        index.find_conflicts(compiled.as_ref(), &mut refs);
+        total_conflicting_reservations = total_conflicting_reservations.saturating_add(refs.len());
+        refs.sort_unstable_by(|left, right| {
+            left.path_pattern
+                .cmp(&right.path_pattern)
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+        refs.dedup_by(|left, right| {
+            left.agent_id == right.agent_id && left.path_pattern == right.path_pattern
+        });
+
+        if refs.is_empty() {
+            clear_paths.push(path.clone());
+            continue;
+        }
+
+        let remaining_total = MAX_CONFLICT_HOLDERS_TOTAL.saturating_sub(emitted_holders);
+        let emit_count = refs
+            .len()
+            .min(MAX_CONFLICT_HOLDERS_PER_PATH)
+            .min(remaining_total);
+        if emit_count < refs.len() {
+            output_truncated = true;
+        }
+        let holders = refs
+            .iter()
+            .take(emit_count)
+            .filter_map(|entry| {
+                holder_by_agent
+                    .get(&entry.agent_id)
+                    .map(|holder| ConflictHolder {
+                        agent: holder.clone(),
+                        path_pattern: entry.path_pattern.clone(),
+                        exclusive: true,
+                        expires_ts: micros_to_iso(entry.expires_ts),
+                    })
+            })
+            .collect::<Vec<_>>();
+        emitted_holders = emitted_holders.saturating_add(holders.len());
+        conflicts.push(ReservationConflict {
+            path: path.clone(),
+            holders,
+        });
+    }
+
+    let response = ReservationConflictCheckResponse {
+        conflict_free: conflicts.is_empty(),
+        conflicts,
+        clear_paths,
+        checked_paths: normalized_paths.len(),
+        total_conflicting_reservations,
+        output_truncated,
+        project: snapshot.project.human_key,
+        snapshot_ts: micros_to_iso(snapshot.captured_ts),
+        authoritative_source: "database_snapshot".to_string(),
+        read_only: true,
+    };
+    serde_json::to_string(&response).map_err(|error| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("failed to serialize reservation conflict response: {error}"),
+        )
+    })
 }
 
 /// Request advisory file reservations on project-relative paths/globs.
@@ -2862,6 +3176,373 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}) failed: {other:?}"),
         }
+    }
+
+    async fn create_test_reservation(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        agent_id: i64,
+        path: &str,
+        ttl_seconds: i64,
+        exclusive: bool,
+    ) -> mcp_agent_mail_db::FileReservationRow {
+        match queries::create_file_reservations(
+            cx,
+            pool,
+            project_id,
+            agent_id,
+            &[path],
+            ttl_seconds,
+            exclusive,
+            "conflict-check test",
+        )
+        .await
+        {
+            Outcome::Ok(mut rows) => rows.pop().expect("reservation row"),
+            other => panic!("create reservation {path:?} failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conflict_check_is_authoritative_read_only_and_filters_non_blocking_rows() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-golden-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let caller = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.expect("holder id");
+                let caller_id = caller.id.expect("caller id");
+
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "src/main.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "docs/**/*.md",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(&cx, &pool, project_id, holder_id, "config", 3_600, true)
+                    .await;
+                create_test_reservation(&cx, &pool, project_id, caller_id, "own/**", 3_600, true)
+                    .await;
+                create_test_reservation(&cx, &pool, project_id, holder_id, "expired/**", -1, true)
+                    .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "shared/**",
+                    3_600,
+                    false,
+                )
+                .await;
+                let released = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "released/**",
+                    3_600,
+                    true,
+                )
+                .await;
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[released.id.expect("released reservation id")]),
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
+                    other => panic!("release fixture failed: {other:?}"),
+                }
+
+                let before =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("before snapshot failed: {other:?}"),
+                    };
+                let ctx = McpContext::new(cx.clone(), 1);
+                let response: ReservationConflictCheckResponse = serde_json::from_str(
+                    &check_file_reservation_conflicts(
+                        &ctx,
+                        project_key,
+                        "bluelake".to_string(),
+                        vec![
+                            "src/main.rs".to_string(),
+                            "src/**".to_string(),
+                            "docs/guide/readme.md".to_string(),
+                            "config/app.toml".to_string(),
+                            "own/file.rs".to_string(),
+                            "expired/file.rs".to_string(),
+                            "released/file.rs".to_string(),
+                            "shared/file.rs".to_string(),
+                            "free/file.rs".to_string(),
+                        ],
+                    )
+                    .await
+                    .expect("conflict check"),
+                )
+                .expect("response json");
+
+                assert!(!response.conflict_free);
+                assert!(response.read_only);
+                assert_eq!(response.authoritative_source, "database_snapshot");
+                assert_eq!(response.checked_paths, 9);
+                let conflict_paths = response
+                    .conflicts
+                    .iter()
+                    .map(|conflict| conflict.path.as_str())
+                    .collect::<HashSet<_>>();
+                assert_eq!(
+                    conflict_paths,
+                    HashSet::from([
+                        "src/main.rs",
+                        "src/**",
+                        "docs/guide/readme.md",
+                        "config/app.toml",
+                    ])
+                );
+                assert!(response.conflicts.iter().all(|conflict| {
+                    conflict
+                        .holders
+                        .iter()
+                        .all(|holder| holder.agent == "GreenCastle" && holder.exclusive)
+                }));
+                assert_eq!(
+                    response.clear_paths,
+                    [
+                        "own/file.rs",
+                        "expired/file.rs",
+                        "released/file.rs",
+                        "shared/file.rs",
+                        "free/file.rs",
+                    ]
+                );
+
+                let after =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("after snapshot failed: {other:?}"),
+                    };
+                assert_eq!(
+                    before
+                        .iter()
+                        .map(|row| (row.id, row.released_ts, row.expires_ts))
+                        .collect::<Vec<_>>(),
+                    after
+                        .iter()
+                        .map(|row| (row.id, row.released_ts, row.expires_ts))
+                        .collect::<Vec<_>>(),
+                    "read-only conflict check must not change reservation state"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_check_rejects_an_unregistered_caller_spoof() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-spoof-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.expect("holder id"),
+                    "src/guard.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let error = check_file_reservation_conflicts(
+                    &ctx,
+                    project_key,
+                    "GhostAgent".to_string(),
+                    vec!["src/guard.rs".to_string()],
+                )
+                .await
+                .expect_err("unregistered caller must fail closed");
+                let data = error.data.expect("error data");
+                assert_eq!(
+                    data["error"]["data"]["reservation_acquire"]["fail_closed"],
+                    true
+                );
+                assert_eq!(
+                    data["error"]["data"]["reservation_acquire"]["do_not_edit"],
+                    serde_json::json!(["src/guard.rs"])
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_snapshot_is_fresh_and_enforces_its_sql_row_bound() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-fresh-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.expect("holder id");
+                let first = create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "src/first.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    "src/second.rs",
+                    3_600,
+                    true,
+                )
+                .await;
+
+                let bounded = match queries::get_reservation_conflict_snapshot(
+                    &cx,
+                    &pool,
+                    &project_key,
+                    "BlueLake",
+                    1,
+                )
+                .await
+                {
+                    Outcome::Ok(snapshot) => snapshot,
+                    other => panic!("bounded snapshot failed: {other:?}"),
+                };
+                assert!(bounded.overflow);
+                assert!(bounded.reservations.is_empty());
+
+                let primed = match queries::get_reservation_conflict_snapshot(
+                    &cx,
+                    &pool,
+                    &project_key,
+                    "BlueLake",
+                    10,
+                )
+                .await
+                {
+                    Outcome::Ok(snapshot) => snapshot,
+                    other => panic!("prime snapshot failed: {other:?}"),
+                };
+                assert_eq!(primed.reservations.len(), 2);
+                match queries::release_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    None,
+                    Some(&[first.id.expect("first reservation id")]),
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => assert_eq!(rows.len(), 1),
+                    other => panic!("release failed: {other:?}"),
+                }
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let response: ReservationConflictCheckResponse = serde_json::from_str(
+                    &check_file_reservation_conflicts(
+                        &ctx,
+                        project_key,
+                        "BlueLake".to_string(),
+                        vec!["src/first.rs".to_string()],
+                    )
+                    .await
+                    .expect("fresh conflict check"),
+                )
+                .expect("response json");
+                assert!(response.conflict_free);
+                assert_eq!(response.clear_paths, ["src/first.rs"]);
+            });
+        });
+    }
+
+    #[test]
+    fn conflict_check_fails_closed_on_malformed_request_or_stored_pattern() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/conflict-check-invalid-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                let malformed_request = check_file_reservation_conflicts(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["[broken".to_string()],
+                )
+                .await
+                .expect_err("malformed request must fail closed");
+                let malformed_request_data = malformed_request.data.expect("error data");
+                assert_eq!(malformed_request_data["error"]["data"]["fail_closed"], true);
+
+                create_test_reservation(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.expect("holder id"),
+                    "[broken",
+                    3_600,
+                    true,
+                )
+                .await;
+                let malformed_stored = check_file_reservation_conflicts(
+                    &ctx,
+                    project_key,
+                    "BlueLake".to_string(),
+                    vec!["src/main.rs".to_string()],
+                )
+                .await
+                .expect_err("malformed stored reservation must fail closed");
+                let malformed_stored_data = malformed_stored.data.expect("error data");
+                assert_eq!(malformed_stored_data["error"]["data"]["fail_closed"], true);
+                assert_eq!(
+                    malformed_stored_data["error"]["type"],
+                    "MALFORMED_ACTIVE_RESERVATION"
+                );
+            });
+        });
     }
 
     // -----------------------------------------------------------------------
