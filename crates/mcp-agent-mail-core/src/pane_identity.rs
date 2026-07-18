@@ -490,8 +490,13 @@ fn file_name_matches_live_pane(file_name: &OsStr, live_panes: &[String]) -> bool
 
 /// Compute a truncated SHA-1 hex hash of the project key.
 fn project_hash(project_key: &str) -> String {
+    let normalized_key = if Path::new(project_key).is_absolute() {
+        crate::identity::resolve_project_path(project_key)
+    } else {
+        PathBuf::from(project_key)
+    };
     let mut hasher = Sha1::new();
-    hasher.update(project_key.as_bytes());
+    hasher.update(normalized_key.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
     let hex = crate::identity::bytes_to_lower_hex(digest);
     hex.chars().take(PROJECT_HASH_LEN).collect()
@@ -893,6 +898,22 @@ mod tests {
         let a = project_hash("/data/projects/alpha");
         let b = project_hash("/data/projects/beta");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn project_hash_converges_case_variants_on_case_insensitive_filesystem() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stored = tmp.path().join("ProjectRepo");
+        std::fs::create_dir_all(&stored).expect("create mixed-case project path");
+        let variant = tmp.path().join("projectrepo");
+        if !variant.exists() {
+            return;
+        }
+
+        assert_eq!(
+            project_hash(&stored.to_string_lossy()),
+            project_hash(&variant.to_string_lossy())
+        );
     }
 
     // -- sanitize_pane_id ----------------------------------------------------

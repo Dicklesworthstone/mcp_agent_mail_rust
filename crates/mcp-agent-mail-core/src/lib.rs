@@ -147,7 +147,9 @@ pub use git_lock::{
     DEFAULT_FLOCK_TIMEOUT_SECS, GitRepoLocks, ReentrancyGuard, RepoFlock, admin_dir_for,
     canonicalize_repo, sentinel_path,
 };
-pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
+pub use identity::{
+    ProjectIdentity, compute_project_slug, resolve_project_identity, resolve_project_path, slugify,
+};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};
 pub use kpi::{
     AckPressureKpi, AnomalyAlert, AnomalyKind, AnomalySeverity, AnomalyThresholds, ContentionKpi,

@@ -373,9 +373,11 @@ fn canonical_absolute_path_string(value: &str) -> Option<String> {
     if !path.is_absolute() {
         return None;
     }
-    std::fs::canonicalize(path)
-        .ok()
-        .map(|path| path.to_string_lossy().to_string())
+    Some(
+        mcp_agent_mail_core::resolve_project_path(value)
+            .to_string_lossy()
+            .to_string(),
+    )
 }
 
 fn human_keys_equivalent(left: &str, right: &str) -> bool {
@@ -17831,6 +17833,50 @@ mod tests {
                     assert_eq!(ensured.slug, legacy_raw_slug);
                     assert_eq!(ensured.human_key, link_key);
                     assert_eq!(by_raw_link.id, legacy_row.id);
+                    assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn ensure_project_collapses_case_variants_when_filesystem_is_case_insensitive() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+                ("WORKTREES_ENABLED", "0"),
+                ("PROJECT_IDENTITY_MODE", "dir"),
+            ],
+            || {
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                let cx = asupersync::Cx::for_testing();
+                let (dir, pool) = create_file_pool_with_schema_for_test("case-variant-aliases");
+                let stored = dir.path().join("ProjectRepo");
+                std::fs::create_dir_all(&stored).expect("create mixed-case project path");
+                let variant = dir.path().join("projectrepo");
+
+                if !variant.exists() {
+                    return;
+                }
+
+                rt.block_on(async {
+                    let from_stored = ensure_project(&cx, &pool, &stored.to_string_lossy())
+                        .await
+                        .into_result()
+                        .expect("ensure stored spelling");
+                    let from_variant = ensure_project(&cx, &pool, &variant.to_string_lossy())
+                        .await
+                        .into_result()
+                        .expect("ensure case variant");
+
+                    assert_eq!(from_stored.id, from_variant.id);
+                    assert_eq!(from_stored.slug, from_variant.slug);
+                    assert_eq!(from_stored.human_key, from_variant.human_key);
+                    assert!(from_stored.human_key.ends_with("ProjectRepo"));
                     assert_eq!(count_projects_for_test(&cx, &pool).await, 1);
                 });
             },
