@@ -184,7 +184,7 @@ fn query_resource_db_inventory(
 }
 
 fn resource_archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    let archive = crate::tool_util::read_archive_inventory(storage_root);
     archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
 }
 
@@ -200,7 +200,7 @@ fn resource_archive_is_ahead(
         return Ok(false);
     }
 
-    let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+    let archive = crate::tool_util::read_archive_inventory(storage_root);
     if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
         return Ok(false);
     }

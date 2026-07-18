@@ -62,8 +62,9 @@ pub mod tool_util {
     use mcp_agent_mail_core::Config;
     use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, create_pool, get_or_create_pool};
     use serde_json::{Map, Value, json};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
     use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -707,6 +708,160 @@ pub mod tool_util {
         project_identities: BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadArchiveSignature {
+        storage_root: PathBuf,
+        head: git2::Oid,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadArchiveInventoryCacheEntry {
+        signature: ReadArchiveSignature,
+        inventory: mcp_agent_mail_db::ArchiveMessageInventory,
+    }
+
+    const READ_ARCHIVE_INVENTORY_CACHE_CAPACITY: usize = 8;
+
+    // Archive inventory scans parse every canonical message artifact. Cache a
+    // small number of clean, committed archive generations so independent
+    // mailbox roots do not evict one another on every read.
+    static READ_ARCHIVE_INVENTORY_CACHE: LazyLock<Mutex<VecDeque<ReadArchiveInventoryCacheEntry>>> =
+        LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+    #[cfg(test)]
+    static READ_ARCHIVE_INVENTORY_SCAN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn read_archive_head(repo: &git2::Repository) -> Option<git2::Oid> {
+        repo.head()
+            .ok()?
+            .peel_to_commit()
+            .ok()
+            .map(|commit| commit.id())
+    }
+
+    /// Return a cacheable archive signature only when `projects/` is fully
+    /// represented by one stable commit. Any worktree, index, ignored, or
+    /// untracked state bypasses the cache because archive writes are durable in
+    /// the worktree before the asynchronous Git coalescer advances `HEAD`.
+    fn clean_read_archive_signature(storage_root: &Path) -> Option<ReadArchiveSignature> {
+        let canonical_root = storage_root.canonicalize().ok()?;
+        let repo = git2::Repository::open(&canonical_root).ok()?;
+        let canonical_workdir = repo.workdir()?.canonicalize().ok()?;
+        if canonical_workdir != canonical_root {
+            return None;
+        }
+
+        let head_before = read_archive_head(&repo)?;
+        let mut status_options = git2::StatusOptions::new();
+        status_options
+            .show(git2::StatusShow::IndexAndWorkdir)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true)
+            .include_unmodified(false)
+            .exclude_submodules(false)
+            .pathspec("projects");
+        if !repo.statuses(Some(&mut status_options)).ok()?.is_empty() {
+            return None;
+        }
+        let head_after = read_archive_head(&repo)?;
+        if head_before != head_after {
+            return None;
+        }
+
+        Some(ReadArchiveSignature {
+            storage_root: canonical_root,
+            head: head_after,
+        })
+    }
+
+    fn scan_read_archive_inventory(
+        storage_root: &Path,
+    ) -> mcp_agent_mail_db::ArchiveMessageInventory {
+        #[cfg(test)]
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        mcp_agent_mail_db::scan_archive_message_inventory(storage_root)
+    }
+
+    fn cached_read_archive_inventory(
+        signature: &ReadArchiveSignature,
+    ) -> Option<mcp_agent_mail_db::ArchiveMessageInventory> {
+        let mut cache = READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = cache
+            .iter()
+            .position(|entry| entry.signature == *signature)?;
+        let entry = cache.remove(index)?;
+        let inventory = entry.inventory.clone();
+        cache.push_back(entry);
+        drop(cache);
+        Some(inventory)
+    }
+
+    fn cache_read_archive_inventory(
+        signature: ReadArchiveSignature,
+        inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
+    ) {
+        let mut cache = READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|entry| entry.signature.storage_root != signature.storage_root);
+        cache.push_back(ReadArchiveInventoryCacheEntry {
+            signature,
+            inventory: inventory.clone(),
+        });
+        while cache.len() > READ_ARCHIVE_INVENTORY_CACHE_CAPACITY {
+            cache.pop_front();
+        }
+        drop(cache);
+    }
+
+    pub(crate) fn read_archive_inventory(
+        storage_root: &Path,
+    ) -> mcp_agent_mail_db::ArchiveMessageInventory {
+        let Some(signature_before) = clean_read_archive_signature(storage_root) else {
+            return scan_read_archive_inventory(storage_root);
+        };
+        if let Some(inventory) = cached_read_archive_inventory(&signature_before) {
+            return inventory;
+        }
+
+        // Do not hold the cache mutex across filesystem I/O. Cache the result
+        // only when both HEAD and worktree cleanliness remain unchanged across
+        // the full scan; a concurrent writer otherwise gets the conservative
+        // uncached behavior on this and subsequent reads.
+        let inventory = scan_read_archive_inventory(storage_root);
+        if clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before) {
+            cache_read_archive_inventory(signature_before, &inventory);
+        }
+        inventory
+    }
+
+    #[cfg(test)]
+    fn reset_read_archive_inventory_cache() {
+        READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn read_archive_inventory_scan_count() -> usize {
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn read_archive_inventory_cache_len() -> usize {
+        READ_ARCHIVE_INVENTORY_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     fn query_read_db_inventory(
         conn: &mcp_agent_mail_db::DbConn,
     ) -> Result<ReadReconcileInventory, String> {
@@ -779,7 +934,7 @@ pub mod tool_util {
     }
 
     fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
-        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        let archive = read_archive_inventory(storage_root);
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
 
@@ -800,7 +955,7 @@ pub mod tool_util {
             return Ok(false);
         }
 
-        let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
+        let archive = read_archive_inventory(storage_root);
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -1452,6 +1607,177 @@ pub mod tool_util {
             );
 
             Config::reset_cached();
+        }
+
+        fn write_inventory_message(storage_root: &Path, file_id: i64, message_id: i64) {
+            let project_dir = storage_root.join("projects").join("cache-project");
+            let message_dir = project_dir.join("messages").join("2026").join("07");
+            std::fs::create_dir_all(&message_dir).expect("create message directory");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"cache-project","human_key":"/cache-project"}"#,
+            )
+            .expect("write project metadata");
+            std::fs::write(
+                message_dir.join(format!("2026-07-14T00-00-00Z__cached__{file_id}.md")),
+                format!(
+                    r#"---json
+{{
+  "id": {message_id},
+  "from": "Alice",
+  "to": [],
+  "subject": "Cached",
+  "importance": "normal",
+  "created_ts": "2026-07-14T00:00:00Z"
+}}
+---
+
+body
+"#
+                ),
+            )
+            .expect("write canonical message");
+        }
+
+        fn commit_archive_tree(repo: &git2::Repository, message: &str) {
+            let mut index = repo.index().expect("open git index");
+            index
+                .add_all(["projects"], git2::IndexAddOption::DEFAULT, None)
+                .expect("stage archive tree");
+            index.write().expect("write git index");
+            let tree_id = index.write_tree().expect("write git tree");
+            let tree = repo.find_tree(tree_id).expect("load git tree");
+            let signature =
+                git2::Signature::now("test", "test@example.com").expect("build git signature");
+            let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents = parent.iter().collect::<Vec<_>>();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents,
+            )
+            .expect("commit archive tree");
+        }
+
+        #[test]
+        fn read_archive_inventory_cache_never_hides_uncommitted_archive_state() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "add first message");
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(read_archive_inventory_scan_count(), 1);
+
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                1,
+                "a clean, unchanged HEAD should reuse the cached inventory"
+            );
+
+            write_inventory_message(&storage_root, 2, 2);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(read_archive_inventory_scan_count(), 2);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                3,
+                "a dirty worktree must never populate or reuse the cache"
+            );
+
+            commit_archive_tree(&repo, "add second message");
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(read_archive_inventory_scan_count(), 4);
+            assert_eq!(read_archive_inventory(&storage_root).unique_message_ids, 2);
+            assert_eq!(read_archive_inventory_scan_count(), 4);
+
+            write_inventory_message(&storage_root, 1, 9);
+            assert_eq!(
+                read_archive_inventory(&storage_root).latest_message_id,
+                Some(9)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                5,
+                "modifying a tracked archive artifact must bypass the cached HEAD"
+            );
+
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn read_archive_inventory_cache_is_bounded_and_scoped_by_canonical_root() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut roots = Vec::new();
+            for index in 0..=READ_ARCHIVE_INVENTORY_CACHE_CAPACITY {
+                let root = temp.path().join(format!("archive-{index}"));
+                let repo = git2::Repository::init(&root).expect("init archive");
+                let message_id = i64::try_from(index + 1).expect("small cache test index");
+                write_inventory_message(&root, message_id, message_id);
+                commit_archive_tree(&repo, "seed archive");
+                assert_eq!(
+                    read_archive_inventory(&root).latest_message_id,
+                    Some(message_id)
+                );
+                roots.push(root);
+            }
+
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY + 1
+            );
+            assert_eq!(
+                read_archive_inventory_cache_len(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY,
+                "the cache must evict its least-recently-used entry"
+            );
+
+            let newest_root = roots.last().expect("newest archive root");
+            assert_eq!(
+                read_archive_inventory(newest_root).latest_message_id,
+                Some(i64::try_from(roots.len()).expect("small cache test length"))
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY + 1,
+                "the newest independent root should remain cached"
+            );
+
+            let oldest_root = roots.first().expect("oldest archive root");
+            assert_eq!(
+                read_archive_inventory(oldest_root).latest_message_id,
+                Some(1)
+            );
+            assert_eq!(
+                read_archive_inventory_scan_count(),
+                READ_ARCHIVE_INVENTORY_CACHE_CAPACITY + 2,
+                "reading the evicted root must perform a fresh scan"
+            );
+
+            reset_read_archive_inventory_cache();
         }
 
         #[test]
