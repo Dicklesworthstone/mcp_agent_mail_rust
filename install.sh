@@ -68,7 +68,10 @@ VERBOSE_DUMP_LINES=20
 LOG_FILE="${LOG_FILE:-/tmp/am-install-$(date -u +%Y%m%dT%H%M%SZ)-$$.log}"
 LOG_INITIALIZED=0
 ERROR_TAIL_EMITTED=0
-ORIGINAL_ARGS=("$@")
+# `${1+"$@"}` (not bare `"$@"`) keeps this safe on bash 3.2 (stock macOS):
+# pre-4.4 bash treats an argument-less `"$@"` expansion as an unbound
+# variable under `set -u`, which would abort a plain `curl ... | bash` run.
+ORIGINAL_ARGS=(${1+"$@"})
 UNINSTALL_SUMMARY=()
 REMOTE_HTTP_PROBE_DETAIL=""
 
@@ -771,7 +774,12 @@ detect_python_alias() {
       fi
     done < <(grep -oE '^\s*(source|\.)\s+"?[^"#]+"?' "$rc" 2>/dev/null | sed -E 's/^\s*(source|\.)\s+//' | sed 's/#.*//' | sed 's/[[:space:]]*$//' || true)
   done
-  rc_files+=("${sourced_files[@]}")
+  # Bash 3.2 (the stock macOS shell) treats an empty array expansion as an
+  # unbound variable under `set -u`. Guard the expansion explicitly so the
+  # normal no-sourced-files path remains portable.
+  if ((${#sourced_files[@]} > 0)); then
+    rc_files+=("${sourced_files[@]}")
+  fi
 
   # Also directly check ACFS paths (common agent framework that defines am alias)
   local acfs_zshrc="$HOME/.acfs/zsh/acfs.zshrc"
@@ -1574,6 +1582,13 @@ displace_python_binary() {
   if [ "$PYTHON_CLONE_FOUND" -eq 1 ] && [ -n "${PYTHON_CLONE_PATH:-}" ]; then
     candidates+=("$PYTHON_CLONE_PATH/.venv/bin/am")
     candidates+=("$PYTHON_CLONE_PATH/venv/bin/am")
+  fi
+
+  # Empty-array expansion aborts under `set -u` on bash 3.2, and candidates
+  # is only populated when a legacy Python launcher was detected.
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    verbose "displace_python_binary:no_candidates"
+    return 0
   fi
 
   local bin_path
@@ -4430,13 +4445,16 @@ remove_update_cache_and_logs() {
   if [ -n "${HOME:-}" ]; then
     cache_candidates+=("${HOME}/.cache/mcp-agent-mail/update-check.json")
   fi
-  for cache_file in "${cache_candidates[@]}"; do
-    if [ -f "$cache_file" ]; then
-      rm -f "$cache_file"
-      record_uninstall_summary "Removed update cache ${cache_file}"
-      removed=$((removed + 1))
-    fi
-  done
+  # Guard: expanding an empty array aborts under `set -u` on bash 3.2.
+  if [ "${#cache_candidates[@]}" -gt 0 ]; then
+    for cache_file in "${cache_candidates[@]}"; do
+      if [ -f "$cache_file" ]; then
+        rm -f "$cache_file"
+        record_uninstall_summary "Removed update cache ${cache_file}"
+        removed=$((removed + 1))
+      fi
+    done
+  fi
 
   local log_count=0
   while IFS= read -r log_path; do
@@ -4511,8 +4529,13 @@ collect_uninstall_data_paths() {
 }
 
 purge_data_paths() {
+  # `mapfile` is a bash 4 builtin; the stock macOS shell is bash 3.2, so
+  # populate the array with a portable while-read loop instead.
   local -a purge_paths=()
-  mapfile -t purge_paths < <(collect_uninstall_data_paths)
+  local purge_candidate
+  while IFS= read -r purge_candidate; do
+    [ -n "$purge_candidate" ] && purge_paths+=("$purge_candidate")
+  done < <(collect_uninstall_data_paths)
 
   if [ "${#purge_paths[@]}" -eq 0 ]; then
     record_uninstall_summary "No storage/database paths were found to purge"
@@ -5444,7 +5467,9 @@ fi
 
 cleanup() {
   local rc=$?
-  [ -n "${TMP:-}" ] && remove_installer_tmp_dir "$TMP" || true
+  if [ -n "${TMP:-}" ]; then
+    remove_installer_tmp_dir "$TMP" || true
+  fi
   if [ "${LOCKED:-0}" -eq 1 ]; then
     remove_installer_lock_dir "${LOCK_DIR:-}" || true
   fi
