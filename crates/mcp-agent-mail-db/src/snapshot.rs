@@ -192,12 +192,13 @@ pub fn latest_verified_snapshot(primary: &Path) -> Option<VerifiedSnapshotMetada
 ///
 /// This is the fast, lossless recovery path: it copies the verified `.bak` into
 /// a staging file beside the primary, re-verifies it, removes any stale
-/// WAL/SHM/journal sidecars from the primary, then atomically renames the
-/// staging file over the primary. Returns the metadata of the snapshot used, or
-/// `Ok(None)` when there is no trustworthy snapshot to restore from (caller
-/// should fall back to the archive-derived rebuild).
+/// publishes it through the unified receipt-backed recovery boundary. Returns
+/// the metadata of the snapshot used, or `Ok(None)` when there is no trustworthy
+/// snapshot to restore from (caller should fall back to the archive-derived
+/// rebuild).
 pub fn restore_from_verified_snapshot(
     primary: &Path,
+    storage_root: &Path,
 ) -> DbResult<Option<VerifiedSnapshotMetadata>> {
     let Some(meta) = latest_verified_snapshot(primary) else {
         return Ok(None);
@@ -218,14 +219,33 @@ pub fn restore_from_verified_snapshot(
     }
 
     // Stage the snapshot beside the primary, then validate the staged copy.
-    let staged = {
-        let mut name = primary.file_name().map_or_else(
-            || std::ffi::OsString::from("storage.sqlite3"),
-            std::ffi::OsStr::to_os_string,
-        );
-        name.push(".snapshot-restore.tmp");
-        primary.with_file_name(name)
-    };
+    let staged = (0_u32..10_000)
+        .find_map(|suffix| {
+            let mut name = primary.file_name().map_or_else(
+                || std::ffi::OsString::from("storage.sqlite3"),
+                std::ffi::OsStr::to_os_string,
+            );
+            if suffix == 0 {
+                name.push(".snapshot-restore.tmp");
+            } else {
+                name.push(format!(".snapshot-restore-{suffix:04}.tmp"));
+            }
+            let candidate = primary.with_file_name(name);
+            let family_is_free = std::fs::symlink_metadata(&candidate).is_err()
+                && ["-journal", "-wal", "-shm"].into_iter().all(|suffix| {
+                    std::fs::symlink_metadata(crate::pool::sqlite_path_with_suffix(
+                        &candidate, suffix,
+                    ))
+                    .is_err()
+                });
+            family_is_free.then_some(candidate)
+        })
+        .ok_or_else(|| {
+            DbError::Sqlite(format!(
+                "snapshot restore: exhausted candidate names beside {}",
+                primary.display()
+            ))
+        })?;
     std::fs::copy(&bak, &staged).map_err(|e| {
         DbError::Sqlite(format!(
             "snapshot restore: copy {} -> {}: {e}",
@@ -234,20 +254,15 @@ pub fn restore_from_verified_snapshot(
         ))
     })?;
     if !matches!(crate::pool::sqlite_file_is_healthy(&staged), Ok(true)) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(DbError::Sqlite(
-            "snapshot restore: staged copy failed health check".to_string(),
-        ));
+        return Err(DbError::Sqlite(format!(
+            "snapshot restore: staged copy {} failed health check and was preserved for inspection",
+            staged.display()
+        )));
     }
 
-    // Remove the primary's live sidecars so a stale WAL cannot shadow the
-    // restored content once readers reopen.
-    remove_sqlite_sidecars(primary);
-
-    std::fs::rename(&staged, primary).map_err(|e| {
-        let _ = std::fs::remove_file(&staged);
+    crate::pool::promote_recovery_candidate(primary, &staged, storage_root).map_err(|error| {
         DbError::Sqlite(format!(
-            "snapshot restore: publish {} -> {}: {e}",
+            "snapshot restore: promote {} -> {}: {error}",
             staged.display(),
             primary.display()
         ))
@@ -263,21 +278,6 @@ pub fn restore_from_verified_snapshot(
         "recovered database from last-known-healthy verified snapshot"
     );
     Ok(Some(meta))
-}
-
-/// Best-effort removal of a SQLite file's `-wal`/`-shm`/`-journal` sidecars.
-fn remove_sqlite_sidecars(primary: &Path) {
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut name = match primary.file_name() {
-            Some(name) => name.to_os_string(),
-            None => continue,
-        };
-        name.push(suffix);
-        let sidecar = primary.with_file_name(name);
-        if sidecar.exists() {
-            let _ = std::fs::remove_file(&sidecar);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -384,11 +384,12 @@ mod tests {
 
         // Corrupt the primary: overwrite with garbage so it is no longer a DB.
         std::fs::write(&primary, b"this is not a sqlite database at all").unwrap();
-        // (also drop any sidecars to simulate a hard corruption)
-        remove_sqlite_sidecars(&primary);
+        // Deliberately leave any SQLite sidecars in place. The unified
+        // promotion boundary must quarantine the complete old generation;
+        // the snapshot caller must not need to pre-clean live artifacts.
 
         // Restore from the verified snapshot.
-        let used = restore_from_verified_snapshot(&primary)
+        let used = restore_from_verified_snapshot(&primary, dir.path())
             .expect("restore should succeed")
             .expect("a verified snapshot should have been used");
         assert_eq!(used.created_us, 42);
@@ -408,7 +409,7 @@ mod tests {
         make_db(&primary);
         // No snapshot recorded -> nothing to restore, caller falls back to archive.
         assert!(
-            restore_from_verified_snapshot(&primary)
+            restore_from_verified_snapshot(&primary, dir.path())
                 .expect("ok")
                 .is_none(),
             "no verified snapshot => Ok(None), not an error"

@@ -2094,10 +2094,14 @@ impl DbPoolStatsSampler {
 #[derive(Clone)]
 pub struct DbPool {
     pool: Arc<Pool<DbConn>>,
+    /// Process-unique generation shared by every wrapper of `pool`.
+    ///
+    /// Unlike a raw `Arc` address, this value cannot be reused after a pool is
+    /// dropped. Read/search cache scopes include it so a replacement pool for
+    /// the same on-disk path cannot inherit pre-recovery numeric identities.
+    cache_generation: u64,
     sqlite_path: String,
     storage_root: PathBuf,
-    cache_key: String,
-    init_gate_key: String,
     init_sql: Arc<String>,
     run_migrations: bool,
     skip_startup_init: bool,
@@ -2118,28 +2122,35 @@ pub struct DbPool {
 /// pool — get their own. Entries are pruned by `Weak` liveness on every
 /// resolve, so a pointer address reused by a *new* pool after the old one is
 /// dropped never inherits a stale high-water mark.
-/// Registry value: a weak handle to the shared pool (for liveness pruning)
-/// paired with that pool's message-id allocator.
-type MessageIdAllocatorEntry = (Weak<Pool<DbConn>>, Arc<crate::id_floor::MessageIdAllocator>);
+/// Registry value: a weak handle to the shared pool (for liveness pruning),
+/// that pool's message-id allocator, and its process-unique cache generation.
+type MessageIdAllocatorEntry = (
+    Weak<Pool<DbConn>>,
+    Arc<crate::id_floor::MessageIdAllocator>,
+    u64,
+);
 
 static MESSAGE_ID_ALLOCATORS: OnceLock<Mutex<HashMap<usize, MessageIdAllocatorEntry>>> =
     OnceLock::new();
+static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn shared_message_id_allocator(
     pool: &Arc<Pool<DbConn>>,
-) -> Arc<crate::id_floor::MessageIdAllocator> {
+) -> (Arc<crate::id_floor::MessageIdAllocator>, u64) {
     let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
     // Drop entries whose pool has been freed so a reused address cannot
     // resurrect a stale allocator.
-    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    guard.retain(|_, (weak, _, _)| weak.strong_count() > 0);
     let key = Arc::as_ptr(pool) as usize;
-    if let Some((_, allocator)) = guard.get(&key) {
-        return allocator.clone();
+    if let Some((_, allocator, generation)) = guard.get(&key) {
+        return (allocator.clone(), *generation);
     }
     let allocator = Arc::new(crate::id_floor::MessageIdAllocator::new());
-    guard.insert(key, (Arc::downgrade(pool), allocator.clone()));
-    allocator
+    let generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    guard.insert(key, (Arc::downgrade(pool), allocator.clone(), generation));
+    drop(guard);
+    (allocator, generation)
 }
 
 impl DbPool {
@@ -2150,28 +2161,18 @@ impl DbPool {
     ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
-        let cache_key = pool_cache_key_from_parts(
-            &sqlite_path,
-            &storage_root,
-            config.min_connections,
-            config.max_connections,
-            config.acquire_timeout_ms,
-            config.max_lifetime_ms,
-        );
-        let init_gate_key = sqlite_init_gate_key(&sqlite_path, &storage_root);
         let init_sql = Arc::new(schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
         ));
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
-        let message_id_allocator = shared_message_id_allocator(&pool);
+        let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
 
         Ok(Self {
             pool,
+            cache_generation,
             sqlite_path,
             storage_root,
-            cache_key,
-            init_gate_key,
             init_sql,
             run_migrations: config.run_migrations,
             skip_startup_init,
@@ -2187,15 +2188,6 @@ impl DbPool {
     fn new_with_options(config: &DbPoolConfig, skip_startup_init: bool) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
-        let cache_key = pool_cache_key_from_parts(
-            &sqlite_path,
-            &storage_root,
-            config.min_connections,
-            config.max_connections,
-            config.acquire_timeout_ms,
-            config.max_lifetime_ms,
-        );
-        let init_gate_key = sqlite_init_gate_key(&sqlite_path, &storage_root);
         let init_sql = Arc::new(schema::build_conn_pragmas(
             config.max_connections,
             config.cache_budget_kb,
@@ -2211,14 +2203,13 @@ impl DbPool {
             .test_on_return(false);
 
         let pool = Arc::new(Pool::new(pool_config));
-        let message_id_allocator = shared_message_id_allocator(&pool);
+        let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
 
         Ok(Self {
             pool,
+            cache_generation,
             sqlite_path,
             storage_root,
-            cache_key,
-            init_gate_key,
             init_sql,
             run_migrations: config.run_migrations,
             skip_startup_init,
@@ -2270,11 +2261,14 @@ impl DbPool {
 
     #[must_use]
     pub fn sqlite_identity_key(&self) -> String {
-        if self.sqlite_path == ":memory:" {
-            format!(":memory:@{:p}", Arc::as_ptr(&self.pool))
-        } else {
-            self.sqlite_path.clone()
-        }
+        // A recovery may replace the database file at this same path while
+        // assigning different numeric ids to stable project/agent identities.
+        // Namespace read/search caches by the concrete pool generation, not
+        // just by path, so a newly initialized pool can never observe rows
+        // cached before the replacement. Clones and separately constructed
+        // wrappers of the same underlying pool intentionally share one
+        // generation.
+        format!("{}@{}", self.sqlite_path, self.cache_generation)
     }
 
     pub fn sample_pool_stats_now(&self) {
@@ -2282,41 +2276,12 @@ impl DbPool {
     }
 
     fn retire_runtime_state_after_recovery(&self, trigger_error: &str) {
-        let cache =
-            POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
-        let cache_evicted = {
-            let mut guard = cache.write();
-            match guard.get(&self.cache_key) {
-                Some(cached) => match cached.upgrade() {
-                    Some(shared_pool) if Arc::ptr_eq(&shared_pool, &self.pool) => {
-                        guard.remove(&self.cache_key);
-                        true
-                    }
-                    None => {
-                        guard.remove(&self.cache_key);
-                        true
-                    }
-                    Some(_) => false,
-                },
-                None => false,
-            }
-        };
-
-        let gates = SQLITE_INIT_GATES
-            .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
-        let init_gate_cleared = gates.write().remove(&self.init_gate_key).is_some();
-
+        retire_cached_runtime_state_after_recovery(Path::new(&self.sqlite_path), trigger_error);
+        // The registry-wide retirement derives canonical scopes from cache
+        // keys. Also invalidate this exact wrapper scope so unusual relative
+        // path spellings cannot retain a stale identity row.
+        crate::cache::read_cache().invalidate_scope(&self.sqlite_identity_key());
         self.pool.close();
-
-        tracing::warn!(
-            path = %self.sqlite_path,
-            trigger = %trigger_error,
-            cache_key = %self.cache_key,
-            cache_evicted,
-            init_gate_key = %self.init_gate_key,
-            init_gate_cleared,
-            "retired cached sqlite pool after runtime recovery so the next checkout reinitializes against the repaired database"
-        );
     }
 
     /// Acquire a pooled connection, creating and initializing a new one if needed.
@@ -3095,6 +3060,16 @@ impl DbPool {
         };
 
         ensure_proactive_backup_source_is_safe(primary, &bak_path)?;
+        let source_bytes = std::fs::metadata(primary)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "proactive backup aborted: failed to stat source {}: {error}",
+                    primary.display()
+                ))
+            })?
+            .len();
+        ensure_recovery_disk_headroom(primary, source_bytes, "proactive backup")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
 
         // Checkpoint WAL so the backup is self-contained.
         if let Err(e) = self.wal_checkpoint() {
@@ -3486,6 +3461,87 @@ fn sqlite_identity_path_cache_insert(path: &str, normalized: &str) {
             normalized: normalized.to_string(),
             validated_at: Instant::now(),
         },
+    );
+}
+
+/// Retire every in-process handle and identity cache for a replaced SQLite
+/// generation, regardless of which pool configuration created it.
+///
+/// Manual doctor recovery, startup recovery, and runtime self-healing all
+/// converge here after the durable receipt commit. Matching by canonical path
+/// (rather than one `DbPool.cache_key`) is essential: several differently
+/// sized pools may point at the same file, and any surviving file descriptor
+/// could keep serving pre-recovery numeric ids.
+fn retire_cached_runtime_state_after_recovery(primary_path: &Path, trigger: &str) {
+    let identity = normalize_sqlite_identity_path(&primary_path.to_string_lossy());
+    let cache_prefix = format!("{identity}|");
+    let retired_pools = {
+        let cache =
+            POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+        let mut guard = cache.write();
+        let matching_keys = guard
+            .keys()
+            .filter(|key| key.starts_with(&cache_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut pools = Vec::new();
+        for key in &matching_keys {
+            if let Some(pool) = guard.remove(key).and_then(|weak| weak.upgrade())
+                && !pools
+                    .iter()
+                    .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &pool))
+            {
+                pools.push(pool);
+            }
+        }
+        pools
+    };
+
+    let retired_generations = {
+        let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
+        let guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        retired_pools
+            .iter()
+            .filter_map(|pool| {
+                let key = Arc::as_ptr(pool) as usize;
+                guard.get(&key).map(|(_, _, generation)| *generation)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for pool in &retired_pools {
+        pool.close();
+    }
+    for generation in &retired_generations {
+        crate::cache::read_cache().invalidate_scope(&format!("{identity}@{generation}"));
+    }
+
+    let gate_prefix = format!("{identity}|storage_root=");
+    let init_gates_cleared = {
+        let gates = SQLITE_INIT_GATES
+            .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
+        let mut guard = gates.write();
+        let before = guard.len();
+        guard.retain(|key, _| !key.starts_with(&gate_prefix));
+        before.saturating_sub(guard.len())
+    };
+
+    if let Some(cache) = RECENT_RECONSTRUCT_CACHE.get() {
+        let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.remove(primary_path);
+        guard.remove(Path::new(&identity));
+    }
+    crate::search_service::invalidate_search_cache(
+        crate::search_cache::InvalidationTrigger::IndexRebuild,
+    );
+
+    tracing::warn!(
+        path = %identity,
+        trigger,
+        retired_pools = retired_pools.len(),
+        retired_generations = retired_generations.len(),
+        init_gates_cleared,
+        "retired all cached SQLite generations after durable database promotion"
     );
 }
 
@@ -4250,7 +4306,11 @@ fn reconcile_archive_state_before_init(
         return Ok(false);
     }
 
-    let stats = reconstruct_sqlite_file_from_archive_without_salvage(primary_path, storage_root)?;
+    // Preserve DB-only coordination state (contacts, acknowledgements,
+    // reservation release metadata, product-bus rows, and read state) while
+    // replaying archive-ahead content. Archive-only replacement silently
+    // discarded those rows even though the current database was healthy.
+    let stats = reconstruct_sqlite_file_with_archive_salvage(primary_path, storage_root)?;
     tracing::warn!(
         path = %primary_path.display(),
         storage_root = %storage_root.display(),
@@ -5559,6 +5619,10 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
             }
         }
     };
+    // Recovery may rename the probed file immediately after this function
+    // returns. Close the FrankenSQLite connection synchronously on every early
+    // return so a delayed drop cannot recreate the just-quarantined live path.
+    let conn = crate::guard_db_conn(conn, "sqlite primary health probe");
 
     match sqlite_primary_check_is_ok_with_canonical_fallback(
         path,
@@ -5960,6 +6024,68 @@ fn is_real_directory(path: &Path) -> bool {
 
 fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+#[allow(clippy::result_large_err)]
+fn recovery_files_share_identity(first: &Path, second: &Path) -> Result<bool, SqlError> {
+    let first_metadata = std::fs::metadata(first).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to inspect recovery file identity for {}: {error}",
+            first.display()
+        ))
+    })?;
+    let second_metadata = std::fs::metadata(second).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to inspect recovery file identity for {}: {error}",
+            second.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(first_metadata.dev() == second_metadata.dev()
+            && first_metadata.ino() == second_metadata.ino())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        return match (
+            first_metadata.volume_serial_number(),
+            first_metadata.file_index(),
+            second_metadata.volume_serial_number(),
+            second_metadata.file_index(),
+        ) {
+            (Some(first_volume), Some(first_index), Some(second_volume), Some(second_index)) => {
+                Ok(first_volume == second_volume && first_index == second_index)
+            }
+            _ => Err(SqlError::Custom(format!(
+                "could not establish stable recovery file identities for {} and {}; refusing promotion",
+                first.display(),
+                second.display()
+            ))),
+        };
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let first_canonical = std::fs::canonicalize(first).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to canonicalize recovery path {}: {error}",
+                first.display()
+            ))
+        })?;
+        let second_canonical = std::fs::canonicalize(second).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to canonicalize recovery path {}: {error}",
+                second.display()
+            ))
+        })?;
+        Ok(first_canonical == second_canonical)
+    }
 }
 
 fn path_is_occupied(path: &Path) -> bool {
@@ -6955,6 +7081,48 @@ fn quarantined_sidecar_path(
 }
 
 const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+// FrankenSQLite creates these namespace coordination files while probing a
+// file-backed database. They belong to the disposable staged candidate, not
+// the live primary, and must participate in candidate collision detection and
+// cleanup just like SQLite's own sidecars.
+const FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
+
+fn recovery_required_free_bytes(expected_write_bytes: u64) -> u64 {
+    RECOVERY_DISK_RESERVE_BYTES.saturating_add(expected_write_bytes)
+}
+
+fn recovery_disk_headroom_is_sufficient(available: u64, expected_write_bytes: u64) -> bool {
+    available >= recovery_required_free_bytes(expected_write_bytes)
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_recovery_disk_headroom(
+    primary_path: &Path,
+    expected_write_bytes: u64,
+    operation: &str,
+) -> Result<(), SqlError> {
+    let probe_path = primary_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let available = mcp_agent_mail_core::disk::disk_free_bytes(probe_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "{operation} refused: unable to measure free space on {}: {error}",
+            probe_path.display()
+        ))
+    })?;
+    let required = recovery_required_free_bytes(expected_write_bytes);
+    if !recovery_disk_headroom_is_sufficient(available, expected_write_bytes) {
+        return Err(SqlError::Custom(format!(
+            "{operation} refused for {}: only {available} bytes are free on {}, but at least {required} bytes are required (including a {}-byte safety reserve)",
+            primary_path.display(),
+            probe_path.display(),
+            RECOVERY_DISK_RESERVE_BYTES
+        )));
+    }
+    Ok(())
+}
 
 fn sqlite_recovery_sidecar_label(suffix: &str) -> &'static str {
     match suffix {
@@ -6989,6 +7157,7 @@ fn sqlite_candidate_artifact_conflicts(candidate: &Path) -> bool {
     path_is_occupied(candidate)
         || SQLITE_RECOVERY_SIDECAR_SUFFIXES
             .iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
             .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix)))
 }
 
@@ -7134,7 +7303,10 @@ fn stage_backup_restore_candidate(
 #[allow(clippy::result_large_err)]
 fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
     let _ = std::fs::remove_file(candidate);
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
         let _ = std::fs::remove_file(sqlite_sidecar_path(candidate, suffix));
     }
 }
@@ -7202,7 +7374,392 @@ fn activate_reconstruction_candidate(
             candidate_path.display(),
             primary_path.display()
         ))
+    })?;
+    crate::forensics::sync_activated_recovery_database(primary_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "reconstructed sqlite candidate {} was renamed into {}, but its file/directory activation could not be made durable: {error}",
+            candidate_path.display(),
+            primary_path.display()
+        ))
     })
+}
+
+#[derive(Debug)]
+struct ReconstructionCandidateFailure {
+    error: SqlError,
+    finalized_receipt_committed: bool,
+}
+
+impl ReconstructionCandidateFailure {
+    fn before_receipt_commit(error: SqlError) -> Self {
+        Self {
+            error,
+            finalized_receipt_committed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for ReconstructionCandidateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+fn unique_recovery_quarantine_path(primary_path: &Path, timestamp: &str) -> PathBuf {
+    (0_u32..10_000)
+        .find_map(|suffix| {
+            let suffix = if suffix == 0 {
+                format!(".corrupt-{timestamp}")
+            } else {
+                format!(".corrupt-{timestamp}-{suffix:04}")
+            };
+            let fallback = if suffix.starts_with(".corrupt-") {
+                format!("storage.sqlite3{suffix}")
+            } else {
+                format!("storage.sqlite3.corrupt-{timestamp}")
+            };
+            let candidate = sqlite_path_with_file_name_suffix(primary_path, &suffix, &fallback);
+            let occupied = path_is_occupied(&candidate)
+                || SQLITE_RECOVERY_SIDECAR_SUFFIXES
+                    .iter()
+                    .any(|sidecar| path_is_occupied(&sqlite_sidecar_path(&candidate, sidecar)));
+            (!occupied).then_some(candidate)
+        })
+        .unwrap_or_else(|| {
+            sqlite_path_with_file_name_suffix(
+                primary_path,
+                &format!(".corrupt-{timestamp}-exhausted"),
+                &format!("storage.sqlite3.corrupt-{timestamp}-exhausted"),
+            )
+        })
+}
+
+fn sync_recovery_parent(path: &Path) -> Result<(), SqlError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = std::fs::File::open(parent).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to open recovery parent directory {} for durability sync: {error}",
+            parent.display()
+        ))
+    })?;
+    directory.sync_all().map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to sync recovery parent directory {}: {error}",
+            parent.display()
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_recovery_candidate_promotion(
+    primary_path: &Path,
+    candidate_path: &Path,
+    quarantined_source: Option<&Path>,
+    timestamp: &str,
+) -> Result<(), SqlError> {
+    if let Some(quarantined_source) = quarantined_source {
+        return restore_quarantined_primary(primary_path, quarantined_source, timestamp);
+    }
+
+    if path_is_occupied(primary_path) {
+        if path_is_occupied(candidate_path) {
+            return Err(SqlError::Custom(format!(
+                "cannot roll back promoted candidate {} because its staging path {} is occupied",
+                primary_path.display(),
+                candidate_path.display()
+            )));
+        }
+        std::fs::rename(primary_path, candidate_path).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to return promoted candidate {} to staging path {}: {error}",
+                primary_path.display(),
+                candidate_path.display()
+            ))
+        })?;
+    }
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        restore_quarantined_sidecar(primary_path, suffix, "corrupt", timestamp)?;
+    }
+    sync_recovery_parent(primary_path)
+}
+
+fn abort_prepared_recovery_after_safe_rollback(
+    prepared: &crate::forensics::PreparedRecoveryReceipt,
+    error: SqlError,
+) -> ReconstructionCandidateFailure {
+    match crate::forensics::abort_recovery_receipt(prepared) {
+        Ok(aborted_path) => {
+            tracing::warn!(
+                aborted_receipt = %aborted_path.display(),
+                error = %error,
+                "recovery candidate promotion rolled back; durably marked its receipt intent aborted"
+            );
+            ReconstructionCandidateFailure::before_receipt_commit(error)
+        }
+        Err(abort_error) => {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "{error}; rollback restored the previous database generation, but aborting its pending recovery receipt failed: {abort_error}; readiness remains fail-closed"
+            )))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_and_abort_recovery_promotion(
+    primary_path: &Path,
+    candidate_path: &Path,
+    quarantined_source: Option<&Path>,
+    timestamp: &str,
+    prepared: &crate::forensics::PreparedRecoveryReceipt,
+    error: SqlError,
+) -> ReconstructionCandidateFailure {
+    match rollback_recovery_candidate_promotion(
+        primary_path,
+        candidate_path,
+        quarantined_source,
+        timestamp,
+    ) {
+        Ok(()) => abort_prepared_recovery_after_safe_rollback(prepared, error),
+        Err(rollback_error) => {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "{error}; rollback also failed: {rollback_error}; leaving the pending receipt in place so readiness fails closed"
+            )))
+        }
+    }
+}
+
+/// Atomically replace a live mailbox SQLite generation with a fully built,
+/// healthy candidate.
+///
+/// This is the sole live-database promotion boundary. It owns continuity
+/// receipt preparation/finalization, source and sidecar quarantine, rollback,
+/// cache-generation retirement, and post-commit ATC sidecar initialization.
+/// Low-level reconstruction functions only build fresh candidates and must
+/// never replace a live path directly.
+#[allow(clippy::result_large_err)]
+pub fn promote_recovery_candidate(
+    primary_path: &Path,
+    candidate_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    match promote_recovery_candidate_with_finalizer(
+        primary_path,
+        candidate_path,
+        storage_root,
+        &timestamp,
+        crate::forensics::finalize_recovery_receipt,
+    ) {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.finalized_receipt_committed => {
+            tracing::error!(
+                primary = %primary_path.display(),
+                error = %failure.error,
+                "recovery promotion committed its durable receipt; treating the new generation as authoritative despite a post-commit auxiliary failure"
+            );
+            Ok(())
+        }
+        Err(failure) => Err(failure.error),
+    }
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
+fn promote_recovery_candidate_with_finalizer<F>(
+    primary_path: &Path,
+    candidate_path: &Path,
+    storage_root: &Path,
+    timestamp: &str,
+    finalize_receipt: F,
+) -> Result<(), ReconstructionCandidateFailure>
+where
+    F: Fn(
+        &crate::forensics::PreparedRecoveryReceipt,
+    ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
+{
+    crate::forensics::verify_recovery_receipt_state_for_promotion(storage_root, primary_path)
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    validate_sqlite_target_path(primary_path, "recovery promotion destination")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    validate_sqlite_target_path(candidate_path, "recovery promotion candidate")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    if primary_path == candidate_path {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} is the live destination itself; promotion requires a distinct fresh staging path",
+                candidate_path.display()
+            )),
+        ));
+    }
+    if !is_real_file(candidate_path) {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} is missing or is not a regular non-symlink file",
+                candidate_path.display()
+            )),
+        ));
+    }
+    if path_is_occupied(primary_path) && !is_real_file(primary_path) {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery destination {} is occupied by a non-regular file",
+                primary_path.display()
+            )),
+        ));
+    }
+    if !sqlite_file_is_healthy(candidate_path)
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?
+    {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} failed the pre-promotion health check",
+                candidate_path.display()
+            )),
+        ));
+    }
+    let candidate_bytes = std::fs::metadata(candidate_path)
+        .map_err(|error| {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "failed to stat recovery candidate {}: {error}",
+                candidate_path.display()
+            )))
+        })?
+        .len();
+    ensure_recovery_disk_headroom(
+        primary_path,
+        candidate_bytes,
+        "recovery candidate promotion",
+    )
+    .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+
+    let source_existed = is_real_file(primary_path);
+    if source_existed
+        && recovery_files_share_identity(primary_path, candidate_path)
+            .map_err(ReconstructionCandidateFailure::before_receipt_commit)?
+    {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery candidate {} aliases the live database {}; promotion requires a distinct file generation",
+                candidate_path.display(),
+                primary_path.display()
+            )),
+        ));
+    }
+    if !source_existed
+        && SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| sqlite_sidecar_path(primary_path, suffix))
+            .any(|sidecar| path_is_occupied(&sidecar))
+    {
+        return Err(ReconstructionCandidateFailure::before_receipt_commit(
+            SqlError::Custom(format!(
+                "recovery destination {} is missing while SQLite sidecars still exist; refusing promotion without an inspectable source generation",
+                primary_path.display()
+            )),
+        ));
+    }
+    let prepared = crate::forensics::prepare_recovery_receipt(
+        storage_root,
+        primary_path,
+        source_existed.then_some(primary_path),
+        candidate_path,
+    )
+    .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    if !sqlite_file_is_healthy(candidate_path)
+        .map_err(|error| abort_prepared_recovery_after_safe_rollback(&prepared, error))?
+    {
+        return Err(abort_prepared_recovery_after_safe_rollback(
+            &prepared,
+            SqlError::Custom(format!(
+                "recovery candidate {} became unhealthy after its durable intent was prepared",
+                candidate_path.display()
+            )),
+        ));
+    }
+
+    let quarantined_source =
+        source_existed.then(|| unique_recovery_quarantine_path(primary_path, timestamp));
+    if let Some(quarantined_source) = quarantined_source.as_ref()
+        && let Err(error) = std::fs::rename(primary_path, quarantined_source)
+    {
+        return Err(abort_prepared_recovery_after_safe_rollback(
+            &prepared,
+            SqlError::Custom(format!(
+                "failed to quarantine live database {} as {}: {error}",
+                primary_path.display(),
+                quarantined_source.display()
+            )),
+        ));
+    }
+    let quarantine_path = quarantined_source
+        .clone()
+        .unwrap_or_else(|| unique_recovery_quarantine_path(primary_path, timestamp));
+    if let Err(error) = quarantine_corrupt_sidecars_or_restore_primary(
+        primary_path,
+        &quarantine_path,
+        timestamp,
+        "recovery candidate promotion",
+    ) {
+        return Err(abort_prepared_recovery_after_safe_rollback(
+            &prepared, error,
+        ));
+    }
+
+    if let Err(error) = activate_reconstruction_candidate(candidate_path, primary_path) {
+        return Err(rollback_and_abort_recovery_promotion(
+            primary_path,
+            candidate_path,
+            quarantined_source.as_deref(),
+            timestamp,
+            &prepared,
+            error,
+        ));
+    }
+
+    if let Err(error) = finalize_receipt(&prepared) {
+        if !error.promotion_marker_committed() {
+            return Err(rollback_and_abort_recovery_promotion(
+                primary_path,
+                candidate_path,
+                quarantined_source.as_deref(),
+                timestamp,
+                &prepared,
+                SqlError::Custom(error.to_string()),
+            ));
+        }
+        retire_cached_runtime_state_after_recovery(
+            primary_path,
+            "receipt committed with post-rename verification failure",
+        );
+        let _ = crate::reconstruct::recreate_atc_sidecar_schema(primary_path);
+        return Err(ReconstructionCandidateFailure {
+            error: SqlError::Custom(format!(
+                "recovery candidate {} is live and its finalized receipt marker was committed, but post-rename receipt durability/verification failed: {error}; retaining the promoted generation",
+                primary_path.display()
+            )),
+            finalized_receipt_committed: true,
+        });
+    }
+
+    retire_cached_runtime_state_after_recovery(primary_path, "durable recovery promotion");
+    if let Err(error) = crate::reconstruct::recreate_atc_sidecar_schema(primary_path) {
+        return Err(ReconstructionCandidateFailure {
+            error: SqlError::Custom(format!(
+                "recovery candidate {} was durably promoted and receipted, but post-promotion ATC sidecar initialization failed: {error}",
+                primary_path.display()
+            )),
+            finalized_receipt_committed: true,
+        });
+    }
+    tracing::warn!(
+        primary = %primary_path.display(),
+        candidate = %candidate_path.display(),
+        quarantined = ?quarantined_source.as_ref().map(|path| path.display().to_string()),
+        "durably promoted recovery candidate through the unified receipt boundary"
+    );
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -7211,7 +7768,29 @@ fn reconstruct_archive_into_candidate(
     storage_root: &Path,
     salvage_db_path: Option<&Path>,
     timestamp: &str,
-) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure> {
+    reconstruct_archive_into_candidate_with_finalizer(
+        primary_path,
+        storage_root,
+        salvage_db_path,
+        timestamp,
+        crate::forensics::finalize_recovery_receipt,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn reconstruct_archive_into_candidate_with_finalizer<F>(
+    primary_path: &Path,
+    storage_root: &Path,
+    salvage_db_path: Option<&Path>,
+    timestamp: &str,
+    finalize_receipt: F,
+) -> Result<crate::reconstruct::ReconstructStats, ReconstructionCandidateFailure>
+where
+    F: Fn(
+        &crate::forensics::PreparedRecoveryReceipt,
+    ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
+{
     let candidate_path = reconstruction_candidate_path(primary_path, timestamp);
     let reconstruct_result = match salvage_db_path {
         Some(salvage_db_path) => crate::reconstruct::reconstruct_from_archive_with_salvage(
@@ -7224,19 +7803,34 @@ fn reconstruct_archive_into_candidate(
 
     match reconstruct_result {
         Ok(stats) => match sqlite_file_is_healthy(&candidate_path) {
-            Ok(true) => match activate_reconstruction_candidate(&candidate_path, primary_path) {
+            Ok(true) => match promote_recovery_candidate_with_finalizer(
+                primary_path,
+                &candidate_path,
+                storage_root,
+                timestamp,
+                finalize_receipt,
+            ) {
                 Ok(()) => Ok(stats),
-                Err(error) => {
-                    let _ = quarantine_reconstruction_candidate_path(
-                        &candidate_path,
-                        primary_path,
-                        "reconstruct-failed",
-                        timestamp,
-                    );
-                    Err(SqlError::Custom(format!(
-                        "archive reconstruction failed for {}: candidate activation failed: {error}",
-                        primary_path.display()
-                    )))
+                Err(failure) => {
+                    // Failed candidates are preserved under an explicit
+                    // quarantine name. A committed `.json` receipt is the point
+                    // of no return, so that live generation must remain.
+                    if !failure.finalized_receipt_committed {
+                        let _ = quarantine_reconstruction_candidate_path(
+                            &candidate_path,
+                            primary_path,
+                            "reconstruct-failed",
+                            timestamp,
+                        );
+                    }
+                    Err(ReconstructionCandidateFailure {
+                        error: SqlError::Custom(format!(
+                            "archive reconstruction failed for {}: candidate promotion failed: {}",
+                            primary_path.display(),
+                            failure.error
+                        )),
+                        finalized_receipt_committed: failure.finalized_receipt_committed,
+                    })
                 }
             },
             Ok(false) => {
@@ -7246,10 +7840,12 @@ fn reconstruct_archive_into_candidate(
                     "reconstruct-failed",
                     timestamp,
                 );
-                Err(SqlError::Custom(format!(
-                    "archive reconstruction produced an unhealthy sqlite candidate for {}",
-                    primary_path.display()
-                )))
+                Err(ReconstructionCandidateFailure::before_receipt_commit(
+                    SqlError::Custom(format!(
+                        "archive reconstruction produced an unhealthy sqlite candidate for {}",
+                        primary_path.display()
+                    )),
+                ))
             }
             Err(e) => {
                 let _ = quarantine_reconstruction_candidate_path(
@@ -7258,7 +7854,7 @@ fn reconstruct_archive_into_candidate(
                     "reconstruct-failed",
                     timestamp,
                 );
-                Err(e)
+                Err(ReconstructionCandidateFailure::before_receipt_commit(e))
             }
         },
         Err(e) => {
@@ -7268,10 +7864,12 @@ fn reconstruct_archive_into_candidate(
                 "reconstruct-failed",
                 timestamp,
             );
-            Err(SqlError::Custom(format!(
-                "archive reconstruction failed for {}: {e}",
-                primary_path.display()
-            )))
+            Err(ReconstructionCandidateFailure::before_receipt_commit(
+                SqlError::Custom(format!(
+                    "archive reconstruction failed for {}: {e}",
+                    primary_path.display()
+                )),
+            ))
         }
     }
 }
@@ -7310,11 +7908,28 @@ fn restore_quarantined_primary_with_sidecar_label(
     sidecar_label: &str,
     timestamp: &str,
 ) -> Result<(), SqlError> {
+    let restore_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    restore_quarantined_primary_with_sidecar_label_at(
+        primary_path,
+        quarantined_path,
+        sidecar_label,
+        timestamp,
+        &restore_timestamp,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn restore_quarantined_primary_with_sidecar_label_at(
+    primary_path: &Path,
+    quarantined_path: &Path,
+    sidecar_label: &str,
+    timestamp: &str,
+    restore_timestamp: &str,
+) -> Result<(), SqlError> {
     if path_is_occupied(primary_path) {
-        let restore_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
         quarantine_reconstructed_candidate(
             primary_path,
-            &restore_timestamp,
+            restore_timestamp,
             "archive-reconcile-restore",
         )
         .map_err(|e| {
@@ -7338,7 +7953,12 @@ fn restore_quarantined_primary_with_sidecar_label(
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         restore_quarantined_sidecar(primary_path, suffix, sidecar_label, timestamp)?;
     }
-    Ok(())
+    crate::forensics::sync_activated_recovery_database(primary_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "restored original database {} but could not make its file/directory activation durable: {error}",
+            primary_path.display()
+        ))
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -7486,7 +8106,26 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     capture_forensics: bool,
     salvage_existing: bool,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    crate::forensics::verify_recovery_receipt_state(storage_root, primary_path)?;
     refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
+    let source_bytes = if is_real_file(primary_path) {
+        std::fs::metadata(primary_path)
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "archive reconstruction refused: failed to stat source {}: {error}",
+                    primary_path.display()
+                ))
+            })?
+            .len()
+    } else {
+        0
+    };
+    let expected_write_bytes = if capture_forensics {
+        source_bytes.saturating_mul(2)
+    } else {
+        source_bytes
+    };
+    ensure_recovery_disk_headroom(primary_path, expected_write_bytes, "archive reconstruction")?;
     if capture_forensics {
         let _bundle_dir =
             capture_automatic_recovery_bundle(primary_path, storage_root, "reconstruct")?;
@@ -7500,7 +8139,8 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
             )));
         }
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-        return reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp);
+        return reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp)
+            .map_err(|failure| failure.error);
     }
 
     if let Err(err) = wal_checkpoint_truncate_path(primary_path) {
@@ -7512,38 +8152,13 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     }
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let quarantined = sqlite_path_with_file_name_suffix(
-        primary_path,
-        &format!(".archive-reconcile-{timestamp}"),
-        &format!("storage.sqlite3.archive-reconcile-{timestamp}"),
-    );
-
-    std::fs::rename(primary_path, &quarantined).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to quarantine database {} for archive reconciliation: {e}",
-            primary_path.display()
-        ))
-    })?;
-    quarantine_corrupt_sidecars_or_restore_primary(
-        primary_path,
-        &quarantined,
-        &timestamp,
-        "archive reconciliation",
-    )?;
-
-    let salvage_db_path = salvage_existing.then_some(quarantined.as_path());
-    match reconstruct_archive_into_candidate(
-        primary_path,
-        storage_root,
-        salvage_db_path,
-        &timestamp,
-    ) {
-        Ok(stats) => Ok(stats),
-        Err(e) => {
-            restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
-            Err(e)
-        }
-    }
+    // Build and validate from a read-only coherent snapshot while the source
+    // generation remains at the live path. The unified promotion API performs
+    // the only quarantine/activation/receipt transition after construction is
+    // complete, so no low-level builder ever sees or replaces a live target.
+    let salvage_db_path = salvage_existing.then_some(primary_path);
+    reconstruct_archive_into_candidate(primary_path, storage_root, salvage_db_path, &timestamp)
+        .map_err(|failure| failure.error)
 }
 
 /// Coalescing window for back-to-back archive-salvage reconstructions.
@@ -7675,17 +8290,6 @@ fn reconstruct_sqlite_file_with_archive_salvage_uncached(
 }
 
 #[allow(clippy::result_large_err)]
-fn reconstruct_sqlite_file_from_archive_without_salvage(
-    primary_path: &Path,
-    storage_root: &Path,
-) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
-    validate_archive_salvage_storage_root(primary_path, storage_root)?;
-    with_recovery_admission(primary_path, "archive reconstruction", || {
-        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true, false)
-    })
-}
-
-#[allow(clippy::result_large_err)]
 pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
@@ -7738,13 +8342,46 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
 }
 
 #[allow(clippy::result_large_err)]
-fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), SqlError> {
+fn restore_from_backup(
+    primary_path: &Path,
+    backup_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    restore_from_backup_with_finalizer(
+        primary_path,
+        backup_path,
+        storage_root,
+        crate::forensics::finalize_recovery_receipt,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn restore_from_backup_with_finalizer<F>(
+    primary_path: &Path,
+    backup_path: &Path,
+    storage_root: &Path,
+    finalize_receipt: F,
+) -> Result<(), SqlError>
+where
+    F: Fn(
+        &crate::forensics::PreparedRecoveryReceipt,
+    ) -> Result<(), crate::forensics::RecoveryReceiptFinalizeError>,
+{
     if !is_real_file(backup_path) {
         return Err(SqlError::Custom(format!(
             "refusing to restore sqlite backup from non-regular file {}",
             backup_path.display()
         )));
     }
+    let backup_bytes = std::fs::metadata(backup_path)
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "refusing to restore sqlite backup {}: failed to stat it: {error}",
+                backup_path.display()
+            ))
+        })?
+        .len();
+    ensure_recovery_disk_headroom(primary_path, backup_bytes, "sqlite backup restore")?;
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let restore_candidate = stage_backup_restore_candidate(backup_path, primary_path, &timestamp)?;
@@ -7755,107 +8392,65 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
             backup_path.display()
         )));
     }
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
         let _ = std::fs::remove_file(sqlite_sidecar_path(&restore_candidate, suffix));
     }
-
-    let quarantined_db = sqlite_path_with_file_name_suffix(
+    promote_recovery_candidate_with_finalizer(
         primary_path,
-        &format!(".corrupt-{timestamp}"),
-        &format!("storage.sqlite3.corrupt-{timestamp}"),
-    );
-
-    if path_is_occupied(primary_path) {
-        std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
-            SqlError::Custom(format!(
-                "failed to quarantine corrupted database {}: {e}",
-                primary_path.display()
-            ))
-        })?;
-    }
-
-    quarantine_corrupt_sidecars_or_restore_primary(
-        primary_path,
-        &quarantined_db,
+        &restore_candidate,
+        storage_root,
         &timestamp,
-        "backup restore",
-    )?;
-
-    if let Err(e) = std::fs::rename(&restore_candidate, primary_path) {
-        if let Err(restore_err) =
-            restore_quarantined_primary(primary_path, &quarantined_db, &timestamp)
-        {
-            return Err(SqlError::Custom(format!(
-                "failed to publish staged sqlite backup {} into {}: {e}; rollback of quarantined database also failed: {restore_err}",
-                backup_path.display(),
-                primary_path.display()
-            )));
-        }
-        return Err(SqlError::Custom(format!(
-            "failed to publish staged sqlite backup {} into {}: {e}",
-            backup_path.display(),
-            primary_path.display()
-        )));
-    }
+        finalize_receipt,
+    )
+    .map_err(|failure| failure.error)?;
 
     tracing::warn!(
         primary = %primary_path.display(),
         backup = %backup_path.display(),
-        quarantined = %quarantined_db.display(),
         "auto-restored sqlite database from backup after corruption detection"
     );
     Ok(())
 }
 
 #[allow(clippy::result_large_err)]
-fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
+fn reinitialize_without_backup(primary_path: &Path, storage_root: &Path) -> Result<(), SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let quarantined_db = sqlite_path_with_file_name_suffix(
-        primary_path,
-        &format!(".corrupt-{timestamp}"),
-        &format!("storage.sqlite3.corrupt-{timestamp}"),
-    );
-
-    if path_is_occupied(primary_path) {
-        std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
+    let candidate = reconstruction_candidate_path(primary_path, &format!("blank-{timestamp}"));
+    let conn = DbConn::open_file(candidate.to_string_lossy().as_ref()).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to create blank recovery candidate {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    conn.execute_raw(&schema::init_schema_sql_base())
+        .map_err(|error| {
             SqlError::Custom(format!(
-                "failed to quarantine corrupted database {}: {e}",
-                primary_path.display()
+                "failed to initialize schema in blank recovery candidate {}: {error}",
+                candidate.display()
             ))
         })?;
-    }
-
-    quarantine_corrupt_sidecars_or_restore_primary(
-        primary_path,
-        &quarantined_db,
-        &timestamp,
-        "scratch reinitialization",
-    )?;
-
-    let path_str = primary_path.to_string_lossy();
-    let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
-        Ok(conn) => conn,
-        Err(e) => {
-            if let Err(restore_err) =
-                restore_quarantined_primary(primary_path, &quarantined_db, &timestamp)
-            {
-                return Err(SqlError::Custom(format!(
-                    "failed to initialize fresh sqlite file {}: {e}; rollback of quarantined database also failed: {restore_err}",
-                    primary_path.display()
-                )));
-            }
-            return Err(SqlError::Custom(format!(
-                "failed to initialize fresh sqlite file {}: {e}",
-                primary_path.display()
-            )));
-        }
-    };
-    let _conn = crate::guard_db_conn(conn, "scratch sqlite reinit connection");
+    conn.execute_raw(&schema::schema_user_version_sql())
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to set schema version in blank recovery candidate {}: {error}",
+                candidate.display()
+            ))
+        })?;
+    drop(conn);
+    wal_checkpoint_truncate_path(&candidate).map_err(|error| {
+        SqlError::Custom(format!(
+            "failed to checkpoint blank recovery candidate {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    promote_recovery_candidate(primary_path, &candidate, storage_root)?;
 
     tracing::warn!(
         primary = %primary_path.display(),
-        quarantined = %quarantined_db.display(),
-        "no healthy sqlite backup found; initialized fresh database file from scratch"
+        "no healthy sqlite backup found; promoted a receipted blank database candidate"
     );
     Ok(())
 }
@@ -7875,6 +8470,8 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     validate_sqlite_target_path(primary_path, "sqlite recovery target")?;
+    let recovery_receipt_root = primary_path.parent().unwrap_or_else(|| Path::new("."));
+    crate::forensics::verify_recovery_receipt_state(recovery_receipt_root, primary_path)?;
     let exists = primary_path.exists();
     if exists {
         cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
@@ -7920,7 +8517,8 @@ fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError>
         capture_automatic_recovery_bundle(primary_path, fallback_storage_root, "repair")?;
 
     if let Some(backup_path) = find_healthy_backup(primary_path) {
-        restore_from_backup(primary_path, &backup_path)?;
+        crate::forensics::verify_recovery_receipt_state(fallback_storage_root, primary_path)?;
+        restore_from_backup(primary_path, &backup_path, fallback_storage_root)?;
         if sqlite_file_is_healthy(primary_path)? {
             return Ok(());
         }
@@ -7935,7 +8533,7 @@ fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError>
         return Ok(());
     }
 
-    reinitialize_without_backup(primary_path)?;
+    reinitialize_without_backup(primary_path, fallback_storage_root)?;
     if sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
@@ -7959,6 +8557,8 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     storage_root: &Path,
 ) -> Result<(), SqlError> {
     validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
+    validate_sqlite_target_path(storage_root, "archive storage root")?;
+    crate::forensics::verify_recovery_receipt_state(storage_root, primary_path)?;
     if !path_is_occupied(primary_path) && has_quarantined_primary_artifact(primary_path) {
         return Err(SqlError::Custom(format!(
             "database file {} is missing but quarantined recovery artifact(s) exist; refusing blank reinitialization without operator action",
@@ -8050,7 +8650,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     };
 
     if let Some(backup_path) = find_healthy_backup(primary_path) {
-        restore_from_backup(primary_path, &backup_path)?;
+        restore_from_backup(primary_path, &backup_path, storage_root)?;
         if sqlite_file_is_healthy(primary_path)? {
             let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
             return Ok(());
@@ -8131,22 +8731,25 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
     }
 
     if had_primary {
-        if let Some(quarantined) =
-            quarantine_reconstructed_candidate(primary_path, &timestamp, "reconstruct-failed")?
-        {
-            tracing::warn!(
-                primary = %primary_path.display(),
-                quarantined = %quarantined.display(),
-                "quarantined reconstructed database candidate after failed archive recovery"
-            );
+        // The archive-salvage helper atomically restores the exact original
+        // primary on every failed candidate build. Do not quarantine that
+        // restored source a second time here: doing so leaves the live path
+        // missing and turns the only directly inspectable source into a
+        // misleading `reconstruct-failed` artifact. Candidate evidence is
+        // already quarantined by `reconstruct_archive_into_candidate`.
+        if !path_is_occupied(primary_path) {
+            return Err(SqlError::Custom(format!(
+                "database file {} could not be restored after failed archive recovery; quarantined evidence was retained and blank reinitialization is refused",
+                primary_path.display()
+            )));
         }
         return Err(SqlError::Custom(format!(
-            "database file {} was quarantined for archive-aware recovery, but reconstruction did not produce a healthy database; refusing blank reinitialization to avoid data loss",
+            "database file {} was restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization to avoid data loss",
             primary_path.display()
         )));
     }
 
-    reinitialize_without_backup(primary_path)?;
+    reinitialize_without_backup(primary_path, storage_root)?;
     if sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
@@ -10158,7 +10761,7 @@ mod tests {
         write_marker_db(&primary, "live-db");
         std::fs::write(&backup, b"not-a-valid-sqlite-backup").unwrap();
 
-        let err = restore_from_backup(&primary, &backup)
+        let err = restore_from_backup(&primary, &backup, dir.path())
             .expect_err("invalid staged backup should fail closed");
         let err_text = err.to_string();
         assert!(
@@ -10170,12 +10773,15 @@ mod tests {
             Some("live-db"),
             "primary database should remain untouched when staged backup validation fails"
         );
+        let restoring_artifacts = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".restoring-"))
+            .collect::<Vec<_>>();
         assert!(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .flatten()
-                .all(|entry| !entry.file_name().to_string_lossy().contains(".restoring-")),
-            "staged restore artifacts should be cleaned up after failure"
+            restoring_artifacts.is_empty(),
+            "staged restore artifacts should be cleaned up after failure: {restoring_artifacts:?}"
         );
         assert!(
             std::fs::read_dir(dir.path())
@@ -10184,6 +10790,163 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-")),
             "primary should not be quarantined before the staged replacement is proven healthy"
         );
+    }
+
+    #[test]
+    fn backup_restore_keeps_promoted_generation_after_post_rename_receipt_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        write_marker_db(&primary, "old-live-generation");
+        write_marker_db(&backup, "promoted-backup-generation");
+
+        let error = restore_from_backup_with_finalizer(
+            &primary,
+            &backup,
+            dir.path(),
+            crate::forensics::finalize_recovery_receipt_with_injected_post_rename_failure,
+        )
+        .expect_err("injected post-rename receipt failure must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("finalized recovery marker was committed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("promoted-backup-generation"),
+            "finalized receipt must prevent rollback to the old primary"
+        );
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
+            .expect("promoted backup and finalized receipt remain consistent");
+    }
+
+    #[test]
+    fn backup_restore_rolls_back_and_aborts_intent_before_receipt_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        write_marker_db(&primary, "old-live-generation");
+        write_marker_db(&backup, "candidate-backup-generation");
+
+        let error = restore_from_backup_with_finalizer(
+            &primary,
+            &backup,
+            dir.path(),
+            crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure,
+        )
+        .expect_err("injected pre-commit receipt failure must roll back");
+        assert!(
+            error.to_string().contains("injected pre-rename failure"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("old-live-generation"),
+            "the exact source generation must be live again before admission is released"
+        );
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
+            .expect("durably aborted pre-commit intent must not wedge readiness");
+        let receipt_root = dir.path().join(".mcp-agent-mail-recovery-receipts");
+        assert!(
+            std::fs::read_dir(receipt_root)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .flat_map(|entry| std::fs::read_dir(entry.path()).unwrap().flatten())
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".receipt.aborted")),
+            "rollback must preserve an explicit aborted receipt artifact"
+        );
+    }
+
+    #[test]
+    fn recovery_promotion_can_recover_again_after_receipted_source_corrupts() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let first_candidate = dir.path().join("storage.sqlite3.first-candidate");
+        let second_candidate = dir.path().join("storage.sqlite3.second-candidate");
+        write_marker_db(&primary, "original-generation");
+        write_marker_db(&first_candidate, "first-recovered-generation");
+
+        promote_recovery_candidate(&primary, &first_candidate, dir.path())
+            .expect("first recovery promotion");
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
+            .expect("first recovery receipt should verify");
+
+        std::fs::write(&primary, b"NOT A SQLITE DATABASE")
+            .expect("corrupt previously receipted live generation");
+        write_marker_db(&second_candidate, "second-recovered-generation");
+        promote_recovery_candidate(&primary, &second_candidate, dir.path())
+            .expect("a verified receipt chain must not make later corruption unrecoverable");
+
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("second-recovered-generation")
+        );
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
+            .expect("second recovery receipt should verify");
+
+        let receipt_root = dir.path().join(".mcp-agent-mail-recovery-receipts");
+        let receipt_text = std::fs::read_dir(receipt_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .flat_map(|entry| std::fs::read_dir(entry.path()).unwrap().flatten())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<String>();
+        assert!(
+            receipt_text.contains("source_snapshot_failure_sha256"),
+            "the second receipt must disclose that source continuity was unreadable"
+        );
+    }
+
+    #[test]
+    fn recovery_promotion_rejects_hard_link_alias_of_live_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        write_marker_db(&primary, "live-generation");
+        std::fs::hard_link(&primary, &candidate).expect("hard-link candidate to live database");
+
+        let error = promote_recovery_candidate(&primary, &candidate, dir.path())
+            .expect_err("a hard-link alias must not be promoted as a distinct generation");
+        assert!(
+            error.to_string().contains("aliases the live database"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("live-generation")
+        );
+        assert!(
+            candidate.exists(),
+            "rejected candidate must remain inspectable"
+        );
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
+            .expect("rejection before receipt admission must not degrade readiness");
+    }
+
+    #[test]
+    fn recovery_disk_headroom_reserves_space_beyond_expected_copy_bytes() {
+        let copy_bytes = 512 * 1024 * 1024;
+        let required = recovery_required_free_bytes(copy_bytes);
+        assert_eq!(required, copy_bytes + RECOVERY_DISK_RESERVE_BYTES);
+        assert!(!recovery_disk_headroom_is_sufficient(
+            required.saturating_sub(1),
+            copy_bytes
+        ));
+        assert!(recovery_disk_headroom_is_sufficient(required, copy_bytes));
+        assert_eq!(recovery_required_free_bytes(u64::MAX), u64::MAX);
     }
 
     #[cfg(unix)]
@@ -10242,6 +11005,24 @@ mod tests {
     }
 
     #[test]
+    fn restore_candidate_path_avoids_fsqlite_namespace_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let timestamp = "20260505_010101_001";
+        let first = restore_candidate_path(&primary, timestamp);
+        let first_namespace_use = sqlite_sidecar_path(&first, "-fsqlite-ns-use");
+        std::fs::write(&first_namespace_use, b"stale namespace marker")
+            .expect("create staged namespace marker");
+
+        let candidate = restore_candidate_path(&primary, timestamp);
+        assert_eq!(
+            candidate.file_name().and_then(OsStr::to_str),
+            Some("storage.sqlite3.restoring-20260505_010101_001-01"),
+            "FrankenSQLite namespace artifacts must force a unique restore candidate"
+        );
+    }
+
+    #[test]
     fn restore_from_backup_quarantines_stale_journal_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -10252,7 +11033,7 @@ mod tests {
         write_marker_db(&backup, "backup-db");
         std::fs::write(&stale_journal, b"old journal").expect("write stale journal");
 
-        restore_from_backup(&primary, &backup).expect("restore from healthy backup");
+        restore_from_backup(&primary, &backup, dir.path()).expect("restore from healthy backup");
 
         assert_eq!(
             sqlite_marker_value(&primary).as_deref(),
@@ -11170,7 +11951,7 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
-            let has_pool_entry = guard.contains_key(&pool.cache_key);
+            let has_pool_entry = guard.contains_key(&pool_cache_key(&config));
             drop(guard);
             assert!(
                 has_pool_entry,
@@ -11181,7 +11962,10 @@ mod tests {
             let gates = SQLITE_INIT_GATES
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
             let guard = gates.read();
-            let has_init_gate = guard.contains_key(&pool.init_gate_key);
+            let has_init_gate = guard.contains_key(&sqlite_init_gate_key(
+                pool.sqlite_path(),
+                pool.storage_root(),
+            ));
             drop(guard);
             assert!(
                 has_init_gate,
@@ -11240,7 +12024,7 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
-            let has_pool_entry = guard.contains_key(&pool.cache_key);
+            let has_pool_entry = guard.contains_key(&pool_cache_key(&config));
             drop(guard);
             assert!(
                 !has_pool_entry,
@@ -11251,7 +12035,10 @@ mod tests {
             let gates = SQLITE_INIT_GATES
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
             let guard = gates.read();
-            let has_init_gate = guard.contains_key(&pool.init_gate_key);
+            let has_init_gate = guard.contains_key(&sqlite_init_gate_key(
+                pool.sqlite_path(),
+                pool.storage_root(),
+            ));
             drop(guard);
             assert!(
                 !has_init_gate,
@@ -11997,6 +12784,25 @@ mod tests {
         assert_eq!(pool.sqlite_identity_key(), clone.sqlite_identity_key());
     }
 
+    #[test]
+    fn sqlite_identity_key_changes_for_new_file_pool_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_url = format!("sqlite:///{}", dir.path().join("mailbox.db").display());
+        let config = DbPoolConfig {
+            database_url,
+            ..DbPoolConfig::default()
+        };
+        let first = DbPool::new(&config).expect("first pool generation");
+        let second = DbPool::new(&config).expect("second pool generation");
+
+        assert_eq!(first.sqlite_path(), second.sqlite_path());
+        assert_ne!(
+            first.sqlite_identity_key(),
+            second.sqlite_identity_key(),
+            "a replacement pool at the same path must not reuse stale identity cache rows"
+        );
+    }
+
     /// Verify `quarantine_sidecar` renames WAL/SHM files with corrupt- prefix.
     #[test]
     fn quarantine_sidecar_renames_files() {
@@ -12055,11 +12861,8 @@ mod tests {
         assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
     }
 
-    #[cfg(unix)]
     #[test]
     fn restore_quarantined_primary_fails_closed_when_live_candidate_quarantine_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("test.db");
         let wal = dir.path().join("test.db-wal");
@@ -12070,24 +12873,22 @@ mod tests {
         std::fs::write(&primary, b"candidate").expect("write candidate primary");
         std::fs::write(&wal, b"candidate wal").expect("write candidate wal");
         std::fs::write(&original, b"original").expect("write original db");
+        let restore_timestamp = "20260218_120001_000";
+        let blocked_quarantine = dir.path().join(format!(
+            "test.db.archive-reconcile-restore-{restore_timestamp}"
+        ));
+        std::fs::create_dir(&blocked_quarantine).expect("create quarantine collision directory");
+        std::fs::write(blocked_quarantine.join("occupied"), b"block replacement")
+            .expect("make quarantine collision non-empty");
 
-        let original_mode = std::fs::metadata(dir.path())
-            .expect("dir metadata")
-            .permissions()
-            .mode();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
-            .expect("make directory read-only");
-
-        let err = restore_quarantined_primary_with_sidecar_label(
+        let err = restore_quarantined_primary_with_sidecar_label_at(
             &primary,
             &original,
             "archive-reconcile",
             "20260218_120000_000",
+            restore_timestamp,
         )
         .expect_err("live candidate quarantine failure should stop restore");
-
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(original_mode))
-            .expect("restore directory permissions");
 
         let err_text = err.to_string();
         assert!(
@@ -12374,6 +13175,46 @@ mod tests {
     }
 
     #[test]
+    fn archive_candidate_keeps_promoted_generation_after_post_rename_receipt_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let project = storage_root.join("projects").join("receipt-project");
+        let agent = project.join("agents").join("BlueFox");
+        std::fs::create_dir_all(&agent).expect("create archive agent directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"receipt-project","human_key":"/srv/receipt-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent.join("profile.json"),
+            r#"{"agent_name":"BlueFox","program":"codex","model":"gpt-5","registered_ts":"2026-07-17T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+
+        let failure = reconstruct_archive_into_candidate_with_finalizer(
+            &primary,
+            &storage_root,
+            None,
+            "20260717_120000_000",
+            crate::forensics::finalize_recovery_receipt_with_injected_post_rename_failure,
+        )
+        .expect_err("injected post-rename receipt failure must surface");
+        assert!(failure.finalized_receipt_committed);
+        assert!(
+            primary.exists(),
+            "promoted archive candidate must stay live"
+        );
+        assert!(
+            sqlite_file_is_healthy(&primary).expect("health probe"),
+            "promoted archive candidate must remain healthy"
+        );
+        crate::forensics::verify_recovery_receipt_state(&storage_root, &primary)
+            .expect("promoted archive candidate and finalized receipt remain consistent");
+    }
+
+    #[test]
     fn quarantine_corrupt_sidecars_or_restore_primary_rolls_back_on_sidecar_failure() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("test.db");
@@ -12541,9 +13382,11 @@ mod tests {
         );
     }
 
-    /// Archive-aware recovery should reconstruct from archive when no backup exists.
+    /// Automatic recovery must not silently discard DB-only state when a
+    /// quarantined source cannot be salvaged. An operator can still choose the
+    /// explicit archive-only reconstruction API after reviewing the evidence.
     #[test]
-    fn archive_recovery_reconstructs_without_backup() {
+    fn archive_recovery_refuses_archive_only_without_readable_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -12567,23 +13410,20 @@ mod tests {
             "---json\n{\n  \"id\": 1,\n  \"subject\": \"Test\",\n  \"from_agent\": \"SwiftFox\",\n  \"importance\": \"normal\",\n  \"to\": [\"CalmLake\"],\n  \"cc\": [],\n  \"bcc\": [],\n  \"thread_id\": \"t1\",\n  \"in_reply_to\": null,\n  \"created_ts\": \"2026-01-15T10:05:00\"\n}\n---\n\nTest body\n",
         ).unwrap();
 
-        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("unreadable salvage must block automatic archive-only promotion");
 
         assert!(
-            sqlite_file_is_healthy(&primary).unwrap(),
-            "reconstructed DB should be healthy"
+            error.to_string().contains(
+                "restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization"
+            ),
+            "recovery should remain fail-closed: {error}"
         );
-
-        // Verify data was actually recovered from archive.
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        let rows = conn
-            .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
-            .unwrap();
-        let count = rows
-            .first()
-            .and_then(|r| r.get_named::<i64>("n").ok())
-            .unwrap_or(0);
-        assert!(count >= 1, "should have at least 1 message from archive");
+        assert_eq!(
+            std::fs::read(&primary).expect("read restored corrupt source"),
+            b"corrupted-data",
+            "failed automatic recovery must restore the quarantined source for operator review"
+        );
     }
 
     #[test]
@@ -12952,6 +13792,14 @@ mod tests {
         crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
             .expect("seed stale sqlite db from archive");
 
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at)
+             VALUES ('db-only-coordination', '/db-only-coordination', 1)",
+        )
+        .expect("seed DB-only coordination identity");
+        drop(conn);
+
         std::fs::write(
             msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
             "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
@@ -12973,6 +13821,20 @@ mod tests {
         let row = rows.first().unwrap();
         assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
         assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+        let db_only_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM projects
+                 WHERE slug = 'db-only-coordination'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            db_only_rows[0]
+                .get_named::<i64>("count")
+                .unwrap_or_default(),
+            1,
+            "archive-ahead reconciliation must salvage DB-only coordination identities"
+        );
     }
 
     #[test]
@@ -13141,14 +14003,25 @@ mod tests {
         let rows = conn
             .query_sync("SELECT slug, human_key FROM projects", &[])
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        let identities: std::collections::HashSet<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("slug").unwrap_or_default(),
+                    row.get_named::<String>("human_key").unwrap_or_default(),
+                )
+            })
+            .collect();
         assert_eq!(
-            rows[0].get_named::<String>("slug").unwrap_or_default(),
-            "archive-project"
-        );
-        assert_eq!(
-            rows[0].get_named::<String>("human_key").unwrap_or_default(),
-            "/archive-project"
+            identities,
+            std::collections::HashSet::from([
+                (
+                    "archive-project".to_string(),
+                    "/archive-project".to_string()
+                ),
+                ("wrong-project".to_string(), "/wrong-project".to_string()),
+            ]),
+            "archive reconciliation must add missing archive identity state without discarding a distinct DB-only identity"
         );
     }
 
@@ -13331,7 +14204,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_recovery_accepts_project_only_reconstruction_as_durable_state() {
+    fn archive_recovery_keeps_project_only_archive_degraded_without_readable_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -13345,17 +14218,19 @@ mod tests {
         .unwrap();
         std::fs::write(&primary, b"corrupted-data").unwrap();
 
-        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect("project-only archive state should survive fail-closed recovery");
-
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        let rows = conn
-            .query_sync(
-                "SELECT slug, human_key FROM projects WHERE slug = 'project-only'",
-                &[],
-            )
-            .unwrap();
-        assert_eq!(rows.len(), 1);
+        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("unreadable salvage must block project-only archive promotion");
+        assert!(
+            error.to_string().contains(
+                "restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization"
+            ),
+            "project-only archive recovery should remain fail-closed: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).expect("read restored corrupt source"),
+            b"corrupted-data",
+            "failed automatic recovery must restore the quarantined source for operator review"
+        );
     }
 
     #[test]
@@ -13551,12 +14426,13 @@ mod tests {
             .expect_err("symlinked storage roots must not be trusted for archive recovery");
         let err_text = err.to_string();
         assert!(
-            err_text.contains("refusing blank reinitialization to avoid data loss"),
+            err_text.contains("archive storage root") && err_text.contains("symlinked path"),
             "unexpected error: {err_text}"
         );
-        assert!(
-            !primary.exists(),
-            "fail-closed recovery should not leave behind a fresh empty database"
+        assert_eq!(
+            std::fs::read(&primary).expect("read untouched corrupt source"),
+            b"corrupted-data",
+            "storage-root validation must fail before mutating the live database"
         );
     }
 

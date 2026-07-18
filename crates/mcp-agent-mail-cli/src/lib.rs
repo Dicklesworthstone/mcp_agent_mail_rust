@@ -10830,7 +10830,6 @@ fn recover_sqlite_file_with_storage_root(
         return Ok(());
     }
 
-    let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let backup = find_healthy_sqlite_backup(path);
 
     // br-bvq1x.11.1 (K1): capture best-effort pre-recovery row counts from the
@@ -10842,7 +10841,7 @@ fn recover_sqlite_file_with_storage_root(
     // backup that passed a full integrity check and carries metadata — as the
     // fast, lossless recovery path before falling back to a generic backup or an
     // archive rebuild. The restore re-verifies the snapshot before trusting it.
-    match mcp_agent_mail_db::snapshot::restore_from_verified_snapshot(path) {
+    match mcp_agent_mail_db::snapshot::restore_from_verified_snapshot(path, &storage_root) {
         Ok(Some(meta)) => {
             reconcile_sqlite_file_with_archive(path, &storage_root)?;
             let salvage_after = count_salvage_rows(path);
@@ -10893,7 +10892,14 @@ fn recover_sqlite_file_with_storage_root(
         // Count the validated replacement BEFORE swapping it in.
         let salvage_after = count_salvage_rows(&temp_restore);
         let suspect_rows = detect_salvage_suspect_typed_rows(&temp_restore);
-        swap_validated_sqlite_artifact(path, &temp_restore, &timestamp)?;
+        mcp_agent_mail_db::promote_recovery_candidate(path, &temp_restore, &storage_root).map_err(
+            |error| {
+                CliError::Other(format!(
+                    "validated sqlite backup promotion failed for {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
         reconcile_sqlite_file_with_archive(path, &storage_root)?;
         emit_salvage_loss_report(
             "backup-restore",
@@ -10968,7 +10974,17 @@ fn recover_sqlite_file_with_storage_root(
                     // and report any loss vs the pre-recovery original.
                     let salvage_after = count_salvage_rows(&temp_reconstruct);
                     let suspect_rows = detect_salvage_suspect_typed_rows(&temp_reconstruct);
-                    swap_validated_sqlite_artifact(path, &temp_reconstruct, &timestamp)?;
+                    mcp_agent_mail_db::promote_recovery_candidate(
+                        path,
+                        &temp_reconstruct,
+                        &storage_root,
+                    )
+                    .map_err(|error| {
+                        CliError::Other(format!(
+                            "validated archive reconstruction promotion failed for {}: {error}",
+                            path.display()
+                        ))
+                    })?;
                     reconcile_sqlite_file_with_archive(path, &storage_root)?;
                     emit_salvage_loss_report(
                         "archive-reconstruct",
@@ -17977,7 +17993,14 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
         })?;
     }
 
-    swap_validated_sqlite_artifact(db_path, &staged_restore, &restore_ts)?;
+    let storage_root = resolve_mailbox_activity_storage_root(None);
+    mcp_agent_mail_db::promote_recovery_candidate(db_path, &staged_restore, &storage_root)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "validated sqlite backup promotion failed for {}: {error}",
+                db_path.display()
+            ))
+        })?;
 
     // Never restore rollback-journal/WAL/SHM sidecars from backup artifacts.
     // Sidecars can be stale/inconsistent relative to the copied main DB and
@@ -66285,7 +66308,10 @@ fn stage_archive_restore_storage_root(
         if rel.as_os_str().is_empty() {
             continue;
         }
-        if excluded_rel_paths.contains(rel) {
+        if excluded_rel_paths
+            .iter()
+            .any(|excluded| rel == excluded || rel.starts_with(excluded))
+        {
             continue;
         }
 
@@ -67046,18 +67072,44 @@ fn archive_restore_state(
     let database_existed = path_is_occupied(&database_path);
     let storage_root_existed = path_is_occupied(&storage_root);
     validate_archive_restore_targets(&database_path, &storage_root)?;
-    let (_staged_db_dir, staged_db_path) = stage_archive_restore_snapshot(
+    let (staged_db_dir, staged_db_path) = stage_archive_restore_snapshot(
         &mut archive,
         snapshot_entry_name,
         &database_path,
         &storage_root,
     )?;
-    let storage_excluded_paths = archive_restore_storage_excluded_relative_paths(
+    let mut storage_excluded_paths = archive_restore_storage_excluded_relative_paths(
         &storage_root,
         &database_path,
         archive_db_path,
         archive_storage_path,
     );
+    let receipt_authority_root = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".mcp-agent-mail-recovery-receipts");
+    let staged_receipt_authority = if db_embedded_in_storage_root {
+        if let Ok(relative) = receipt_authority_root.strip_prefix(&storage_root) {
+            storage_excluded_paths.insert(relative.to_path_buf());
+        }
+        if path_is_real_directory(&receipt_authority_root) {
+            let staged = staged_db_dir.path().join("current-recovery-receipts");
+            share_update_copy_dir_recursive(&receipt_authority_root, &staged)?;
+            Some(staged)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let staged_continuity_db = if db_embedded_in_storage_root && database_existed {
+        let staged = staged_db_dir.path().join("current-live-generation.sqlite3");
+        copy_sqlite_backup_consistently(&database_path, &staged)?;
+        Some(staged)
+    } else {
+        None
+    };
     let (_staged_storage_dir, staged_storage_root) =
         stage_archive_restore_storage_root(&mut archive, &storage_root, &storage_excluded_paths)?;
 
@@ -67078,28 +67130,30 @@ fn archive_restore_state(
             if let Some(parent) = database_path.parent() {
                 ensure_real_directory_tree(parent, "archive restore database parent")?;
             }
-            std::fs::rename(&staged_db_path, &database_path)?;
+            if let Some(staged_receipts) = staged_receipt_authority.as_ref() {
+                share_update_copy_dir_recursive(staged_receipts, &receipt_authority_root)?;
+            }
+            if let Some(staged_source) = staged_continuity_db.as_ref() {
+                std::fs::copy(staged_source, &database_path).map_err(|error| {
+                    CliError::Other(format!(
+                        "failed to restore the pre-archive database generation into {} for continuity verification: {error}",
+                        database_path.display()
+                    ))
+                })?;
+            }
+            mcp_agent_mail_db::promote_recovery_candidate(
+                &database_path,
+                &staged_db_path,
+                &storage_root,
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "failed to promote staged archive database {} into {}: {error}",
+                    staged_db_path.display(),
+                    database_path.display()
+                ))
+            })?;
         } else {
-            if database_existed {
-                let backup = next_backup_path(&database_path, &timestamp);
-                std::fs::rename(&database_path, &backup)?;
-                backup_entries.push(ArchiveRestoreBackupEntry {
-                    original: database_path.clone(),
-                    backup,
-                });
-            }
-            for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-                let sidecar_path =
-                    mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-                if path_is_occupied(&sidecar_path) {
-                    let backup = next_backup_path(&sidecar_path, &timestamp);
-                    std::fs::rename(&sidecar_path, &backup)?;
-                    backup_entries.push(ArchiveRestoreBackupEntry {
-                        original: sidecar_path,
-                        backup,
-                    });
-                }
-            }
             if storage_root_existed {
                 let backup = next_backup_path(&storage_root, &timestamp);
                 std::fs::rename(&storage_root, &backup)?;
@@ -67109,8 +67163,19 @@ fn archive_restore_state(
                 });
             }
 
-            std::fs::rename(&staged_db_path, &database_path)?;
             std::fs::rename(&staged_storage_root, &storage_root)?;
+            mcp_agent_mail_db::promote_recovery_candidate(
+                &database_path,
+                &staged_db_path,
+                &storage_root,
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "failed to promote staged archive database {} into {}: {error}",
+                    staged_db_path.display(),
+                    database_path.display()
+                ))
+            })?;
         }
 
         Ok(())
@@ -68388,6 +68453,7 @@ fn handle_doctor_reconstruct_locked_with_path(
     handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), dry_run, yes, json)
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct QuarantinedSqliteState {
     original_db: PathBuf,
@@ -68395,12 +68461,14 @@ struct QuarantinedSqliteState {
     sidecars: Vec<(PathBuf, PathBuf)>,
 }
 
+#[cfg(test)]
 fn quarantine_sidecar_path(quarantine_db: &Path, suffix: &str) -> PathBuf {
     let mut aux_os = quarantine_db.as_os_str().to_os_string();
     aux_os.push(suffix);
     PathBuf::from(aux_os)
 }
 
+#[cfg(test)]
 fn quarantine_sqlite_state(
     db_path: &Path,
     quarantine_db: &Path,
@@ -68431,6 +68499,7 @@ fn quarantine_sqlite_state(
     })
 }
 
+#[cfg(test)]
 fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult<()> {
     if path_is_occupied(&state.original_db) {
         preserve_rollback_replacement_artifact(&state.original_db, "rollback-replaced-db")?;
@@ -68447,6 +68516,7 @@ fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult
     Ok(())
 }
 
+#[cfg(test)]
 fn next_rollback_preserved_artifact_path(path: &Path, label: &str) -> PathBuf {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let mut candidate = path_with_file_name_suffix(
@@ -68466,6 +68536,7 @@ fn next_rollback_preserved_artifact_path(path: &Path, label: &str) -> PathBuf {
     candidate
 }
 
+#[cfg(test)]
 fn preserve_rollback_replacement_artifact(path: &Path, label: &str) -> CliResult<Option<PathBuf>> {
     if !path_is_occupied(path) {
         return Ok(None);
@@ -68488,6 +68559,7 @@ fn sqlite_artifact_conflicts(candidate: &Path) -> bool {
             .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix)))
 }
 
+#[cfg(test)]
 fn next_sqlite_quarantine_path(db_path: &Path, timestamp: &str) -> PathBuf {
     let mut quarantine = path_with_file_name_suffix(
         db_path,
@@ -68506,20 +68578,7 @@ fn next_sqlite_quarantine_path(db_path: &Path, timestamp: &str) -> PathBuf {
     quarantine
 }
 
-fn swap_validated_sqlite_artifact(
-    db_path: &Path,
-    temp_db_path: &Path,
-    timestamp: &str,
-) -> CliResult<()> {
-    swap_validated_sqlite_artifact_with(
-        db_path,
-        temp_db_path,
-        timestamp,
-        |src, dst| std::fs::rename(src, dst),
-        |src, dst| std::fs::rename(src, dst),
-    )
-}
-
+#[cfg(test)]
 fn swap_validated_sqlite_artifact_with<SwapF, MoveSidecarF>(
     db_path: &Path,
     temp_db_path: &Path,
@@ -68625,6 +68684,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn cleanup_replacement_sqlite_sidecars(
     sidecars: &[PathBuf],
     context: &str,
@@ -68635,6 +68695,7 @@ fn cleanup_replacement_sqlite_sidecars(
     Ok(())
 }
 
+#[cfg(test)]
 fn restore_swapped_replacement_sqlite_artifact_without_original(
     db_path: &Path,
     temp_db_path: &Path,
@@ -69231,7 +69292,6 @@ fn handle_doctor_reconstruct_with(
     // Build a temp path for reconstruction. The original DB is NOT touched
     // until the new DB is fully built and validated — this is the key safety
     // invariant (see issue #59).
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let temp_db_path = next_doctor_artifact_path(&db_path, "reconstruct", "sqlite3");
 
     ftui_runtime::ftui_println!(
@@ -69282,11 +69342,13 @@ fn handle_doctor_reconstruct_with(
         )));
     }
 
-    swap_validated_sqlite_artifact(&db_path, &temp_db_path, &timestamp).map_err(|err| {
-        CliError::Other(format!(
-            "reconstruction succeeded but final database swap failed: {err}"
-        ))
-    })?;
+    mcp_agent_mail_db::promote_recovery_candidate(&db_path, &temp_db_path, &storage_root).map_err(
+        |err| {
+            CliError::Other(format!(
+                "reconstruction succeeded but final database promotion failed: {err}"
+            ))
+        },
+    )?;
 
     // mcp_agent_mail#160: after the swap, advance the messages id
     // allocator to at least the archive's max id. Without this, the

@@ -35,8 +35,8 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
     pool.sqlite_identity_key()
 }
 
-static MESSAGE_WRITE_SERIALIZER: LazyLock<asupersync::sync::Mutex<()>> =
-    LazyLock::new(|| asupersync::sync::Mutex::new(()));
+static MESSAGE_WRITE_SERIALIZER: LazyLock<Arc<asupersync::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(asupersync::sync::Mutex::new(())));
 
 // =============================================================================
 // ATC Leader Lease types
@@ -5731,19 +5731,25 @@ pub async fn create_message_with_recipients(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
-    let _serializer_guard = match MESSAGE_WRITE_SERIALIZER.lock(cx).await {
-        Ok(guard) => guard,
-        Err(asupersync::sync::LockError::Cancelled) => {
-            return Outcome::Cancelled(CancelReason::user(
-                "create_message_with_recipients serializer lock cancelled",
-            ));
-        }
-        Err(error) => {
-            return Outcome::Err(DbError::Internal(format!(
-                "create_message_with_recipients serializer lock failed: {error}"
-            )));
-        }
-    };
+    // Use the owned guard because this critical section intentionally spans
+    // async database and archive I/O. The borrowed guard is deliberately
+    // thread-affine, which would make this public future non-Send.
+    let _serializer_guard =
+        match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(asupersync::sync::LockError::Cancelled) => {
+                return Outcome::Cancelled(CancelReason::user(
+                    "create_message_with_recipients serializer lock cancelled",
+                ));
+            }
+            Err(error) => {
+                return Outcome::Err(DbError::Internal(format!(
+                    "create_message_with_recipients serializer lock failed: {error}"
+                )));
+            }
+        };
     // De-duplicate resolved recipient ids before any insert. The
     // `message_recipients` primary key is `(message_id, agent_id)` — `kind` is
     // NOT part of it — so the same agent appearing twice in `recipients` (e.g.
@@ -8442,23 +8448,56 @@ pub async fn mark_all_messages_read_in_project(
             map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
         );
 
-        let count = rows.len();
-        if count > 0 {
-            // Mark unread messages as read without acknowledging them.
-            let sql = "UPDATE message_recipients \
-                       SET read_ts = ? \
-                       WHERE agent_id = ? AND read_ts IS NULL \
-                       AND message_id IN (SELECT id FROM messages WHERE project_id = ?)";
-            let params = [
-                Value::BigInt(now),
-                Value::BigInt(agent_id),
-                Value::BigInt(project_id),
-            ];
-            try_in_tx!(
+        let mut message_ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "unread inbox query returned a message without an integer id".to_string(),
+                ));
+            };
+            message_ids.push(message_id);
+        }
+
+        if !message_ids.is_empty() {
+            // Update the exact rows selected above. In addition to keeping the
+            // count truthful, bounded chunks avoid executor limits in large
+            // subquery-backed UPDATEs and keep the whole operation atomic.
+            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+                let ph = placeholders(chunk.len());
+                let sql = format!(
+                    "UPDATE message_recipients \
+                     SET read_ts = ? \
+                     WHERE agent_id = ? AND read_ts IS NULL \
+                     AND message_id IN ({ph})"
+                );
+                let mut params = Vec::with_capacity(2 + chunk.len());
+                params.push(Value::BigInt(now));
+                params.push(Value::BigInt(agent_id));
+                params.extend(chunk.iter().copied().map(Value::BigInt));
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+                );
+            }
+
+            // Do not report a successful bulk transition unless every row
+            // selected in this transaction is now read. A partial executor
+            // result must roll the entire transaction back rather than leave
+            // inbox state and the returned count out of sync.
+            let unread_after = try_in_tx!(
                 cx,
                 &tracked,
-                map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+                map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
             );
+            if !unread_after.is_empty() {
+                let remaining = unread_after.len();
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
+                )));
+            }
 
             // Rebuild inbox_stats from ground truth.
             try_in_tx!(
@@ -8473,7 +8512,8 @@ pub async fn mark_all_messages_read_in_project(
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
 
-        let count_i64 = i64::try_from(count).expect("message recipient count fits in i64");
+        let count_i64 =
+            i64::try_from(message_ids.len()).expect("message recipient count fits in i64");
         Outcome::Ok(count_i64)
     })
     .await
@@ -14055,6 +14095,73 @@ mod tests {
                 "pool b should persist its own project row instead of reusing pool a cache"
             );
         });
+    }
+
+    #[test]
+    fn ensure_project_does_not_reuse_ids_from_replaced_file_pool() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("replaced-mailbox.sqlite3");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let human_key = "/data/projects/reconstructed-identity";
+        let identity = mcp_agent_mail_core::resolve_project_identity(human_key);
+
+        let conn = crate::DbConn::open_file(&db_path_text).expect("open seed database");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize seed schema");
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (11, '{}', '{}', 1)",
+            identity.slug, identity.human_key
+        ))
+        .expect("insert original project identity");
+        drop(conn);
+
+        let config = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_text}"),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            run_migrations: false,
+            ..Default::default()
+        };
+        let old_pool =
+            DbPool::new_without_startup_init(&config).expect("create original pool generation");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let old_project = rt
+            .block_on(ensure_project(&cx, &old_pool, human_key))
+            .into_result()
+            .expect("cache original project");
+        assert_eq!(old_project.id, Some(11));
+        drop(old_pool);
+
+        let conn = crate::DbConn::open_file(&db_path_text).expect("open replacement database");
+        conn.execute_raw("DELETE FROM projects")
+            .expect("remove pre-reconstruction identities");
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (29, '{}', '{}', 2)",
+            identity.slug, identity.human_key
+        ))
+        .expect("insert remapped project identity");
+        drop(conn);
+
+        let new_pool =
+            DbPool::new_without_startup_init(&config).expect("create replacement pool generation");
+        let remapped_project = rt
+            .block_on(ensure_project(&cx, &new_pool, human_key))
+            .into_result()
+            .expect("resolve project from replacement database");
+        assert_eq!(
+            remapped_project.id,
+            Some(29),
+            "a replacement pool must resolve the stable identity from SQLite instead of returning the retired generation's cached numeric id"
+        );
     }
 
     #[test]
@@ -19739,7 +19846,7 @@ mod tests {
         );
         assert!(
             crate::cache::read_cache()
-                .get_agent_scoped(pool.sqlite_path(), 1, "BlueLake")
+                .get_agent_scoped(&pool.sqlite_identity_key(), 1, "BlueLake")
                 .is_none(),
             "cleanup must invalidate cached agent rows"
         );
@@ -21332,7 +21439,7 @@ mod tests {
             assert_eq!(fetched.attachments_policy, "inline");
 
             let cached = crate::read_cache()
-                .get_agent_scoped(pool.sqlite_path(), project_id, "BlueLake")
+                .get_agent_scoped(&pool.sqlite_identity_key(), project_id, "BlueLake")
                 .expect("cache entry should be refreshed");
             assert_eq!(cached.contact_policy, "closed");
             assert_eq!(cached.attachments_policy, "inline");

@@ -287,6 +287,7 @@ pub use pool::{
     is_sqlite_recovery_error_message,
     is_sqlite_snapshot_conflict_error_message,
     open_sqlite_file_with_recovery,
+    promote_recovery_candidate,
     reconstruct_sqlite_file_with_archive_salvage,
     record_canary_probe,
     recovery_admission,

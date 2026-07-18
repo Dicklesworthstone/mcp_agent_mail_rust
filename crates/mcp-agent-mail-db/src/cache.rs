@@ -940,6 +940,88 @@ impl ReadCache {
         }
     }
 
+    /// Invalidate every cached row and deferred touch for one database scope.
+    ///
+    /// Recovery can replace a SQLite file in place while assigning different
+    /// numeric ids to the same stable project and agent identities. Keeping
+    /// rows from the retired pool generation would then let a cache hit return
+    /// an id now owned by an unrelated project. This operation deliberately
+    /// over-invalidates the retired scope: a cache miss is safe, while a stale
+    /// identity hit can cross-link all subsequent writes.
+    pub fn invalidate_scope(&self, scope: &str) {
+        let scope_fp = scope_fingerprint(scope);
+
+        {
+            let mut cache = self.projects_by_slug.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .cloned()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.projects_by_human_key.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .cloned()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.agents_by_key.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _, _)| *entry_scope == scope_fp)
+                .cloned()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.agents_by_id.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .copied()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+        {
+            let mut cache = self.inbox_stats.write();
+            let keys: Vec<_> = cache
+                .keys()
+                .filter(|(entry_scope, _)| *entry_scope == scope_fp)
+                .copied()
+                .collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+        }
+
+        // Clear the optimistic flag before walking the shards. A concurrent
+        // enqueue after this store will restore it; any other scope left in a
+        // shard also restores it below.
+        self.has_pending.store(false, Ordering::Release);
+        let mut has_remaining = false;
+        for shard in &self.deferred_touch_shards {
+            let mut shard = shard.lock();
+            shard.retain(|(entry_scope, _), _| *entry_scope != scope_fp);
+            has_remaining |= !shard.is_empty();
+        }
+        if has_remaining {
+            self.has_pending.store(true, Ordering::Release);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Deferred touch queue
     // -------------------------------------------------------------------------
@@ -1422,6 +1504,84 @@ mod tests {
         assert_eq!(cache.get_agent_by_id(42).unwrap().name, "GreenHill");
         // Different ID must miss
         assert!(cache.get_agent_by_id(99).is_none());
+    }
+
+    #[test]
+    fn invalidate_scope_removes_only_retired_pool_generation() {
+        let cache = ReadCache::new();
+        let old_scope = "sqlite:///mailbox.sqlite3@old";
+        let new_scope = "sqlite:///mailbox.sqlite3@new";
+
+        let mut old_project = make_project("shared-project");
+        old_project.id = Some(11);
+        let mut new_project = make_project("shared-project");
+        new_project.id = Some(29);
+        cache.put_project_scoped(old_scope, &old_project);
+        cache.put_project_scoped(new_scope, &new_project);
+
+        let old_agent = make_agent_with_id("BlueLake", 11, 101);
+        let new_agent = make_agent_with_id("BlueLake", 29, 202);
+        cache.put_agent_scoped(old_scope, &old_agent);
+        cache.put_agent_scoped(new_scope, &new_agent);
+        cache.put_inbox_stats_scoped(
+            old_scope,
+            &InboxStatsRow {
+                agent_id: 101,
+                total_count: 1,
+                unread_count: 1,
+                ack_pending_count: 0,
+                last_message_ts: Some(1),
+            },
+        );
+        cache.put_inbox_stats_scoped(
+            new_scope,
+            &InboxStatsRow {
+                agent_id: 202,
+                total_count: 2,
+                unread_count: 2,
+                ack_pending_count: 1,
+                last_message_ts: Some(2),
+            },
+        );
+        cache.enqueue_touch_scoped(old_scope, 101, 1);
+        cache.enqueue_touch_scoped(new_scope, 202, 2);
+
+        cache.invalidate_scope(old_scope);
+
+        assert!(
+            cache
+                .get_project_scoped(old_scope, "shared-project")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_project_by_human_key_scoped(old_scope, "/data/shared-project")
+                .is_none()
+        );
+        assert!(cache.get_agent_scoped(old_scope, 11, "BlueLake").is_none());
+        assert!(cache.get_agent_by_id_scoped(old_scope, 101).is_none());
+        assert!(cache.get_inbox_stats_scoped(old_scope, 101).is_none());
+        assert!(cache.drain_touches_scoped(old_scope).is_empty());
+
+        assert_eq!(
+            cache
+                .get_project_scoped(new_scope, "shared-project")
+                .and_then(|project| project.id),
+            Some(29)
+        );
+        assert_eq!(
+            cache
+                .get_agent_scoped(new_scope, 29, "BlueLake")
+                .and_then(|agent| agent.id),
+            Some(202)
+        );
+        assert_eq!(
+            cache
+                .get_inbox_stats_scoped(new_scope, 202)
+                .map(|stats| stats.total_count),
+            Some(2)
+        );
+        assert_eq!(cache.drain_touches_scoped(new_scope).get(&202), Some(&2));
     }
 
     #[test]

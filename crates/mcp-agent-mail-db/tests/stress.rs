@@ -2119,15 +2119,15 @@ fn get_inbox_stats_opt(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
 }
 
 fn invalidate_cached_inbox_stats(pool: &DbPool, agent_id: i64) {
-    read_cache().invalidate_inbox_stats_scoped(pool.sqlite_path(), agent_id);
+    read_cache().invalidate_inbox_stats_scoped(&pool.sqlite_identity_key(), agent_id);
 }
 
 fn get_cached_inbox_stats(pool: &DbPool, agent_id: i64) -> Option<InboxStatsRow> {
-    read_cache().get_inbox_stats_scoped(pool.sqlite_path(), agent_id)
+    read_cache().get_inbox_stats_scoped(&pool.sqlite_identity_key(), agent_id)
 }
 
 fn put_cached_inbox_stats(pool: &DbPool, stats: &InboxStatsRow) {
-    read_cache().put_inbox_stats_scoped(pool.sqlite_path(), stats);
+    read_cache().put_inbox_stats_scoped(&pool.sqlite_identity_key(), stats);
 }
 
 fn get_inbox_stats(pool: &DbPool, agent_id: i64) -> InboxStatsRow {

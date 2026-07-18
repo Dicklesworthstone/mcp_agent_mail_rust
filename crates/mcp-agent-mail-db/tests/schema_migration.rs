@@ -635,6 +635,7 @@ fn reconstruct_from_archive_recreates_atc_v17_schema_surface() {
     let dir = tempfile::tempdir().expect("tempdir");
     let storage_root = dir.path().join("storage");
     let db_path = dir.path().join("reconstructed_v17.sqlite3");
+    let candidate_path = dir.path().join("reconstructed_v17.candidate.sqlite3");
     let agent_dir = storage_root
         .join("projects")
         .join("reconstructed-project")
@@ -657,14 +658,23 @@ fn reconstruct_from_archive_recreates_atc_v17_schema_surface() {
     )
     .expect("write profile");
 
-    mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
-        .expect("reconstruct database from archive");
+    mcp_agent_mail_db::reconstruct_from_archive(&candidate_path, &storage_root)
+        .expect("reconstruct fresh candidate from archive");
+
+    let sidecar_path = db_path.with_file_name("atc.sqlite3");
+    assert!(
+        !sidecar_path.exists(),
+        "fresh candidate construction must not initialize the fixed live ATC sidecar"
+    );
+    mcp_agent_mail_db::promote_recovery_candidate(&db_path, &candidate_path, &storage_root)
+        .expect("promote reconstructed candidate through the recovery receipt boundary");
 
     // ATC telemetry is isolated in the atc.sqlite3 sidecar (br-bvq1x.11.7), a
-    // sibling of the primary mailbox DB. Reconstruct rebuilds the ATC v17 schema
-    // surface in the SIDECAR, not the primary DB (the primary must stay free of
-    // atc_* tables — see `reconstruct_with_agent_profile`).
-    let sidecar_path = db_path.with_file_name("atc.sqlite3");
+    // sibling of the primary mailbox DB. Candidate construction never touches
+    // that fixed live path; the unified promotion boundary initializes the ATC
+    // v17 schema only after the new primary generation is durably receipted.
+    // The primary must stay free of atc_* tables (see
+    // `reconstruct_with_agent_profile`).
     let conn =
         SqliteConnection::open_file(sidecar_path.display().to_string()).expect("open atc sidecar");
     conn.execute_raw(PRAGMA_SETTINGS_SQL)
@@ -699,6 +709,9 @@ fn reconstruct_quarantines_unusable_atc_sidecar_instead_of_wedging_recovery() {
     let dir = tempfile::tempdir().expect("tempdir");
     let storage_root = dir.path().join("storage");
     let db_path = dir.path().join("reconstructed_quarantine.sqlite3");
+    let candidate_path = dir
+        .path()
+        .join("reconstructed_quarantine.candidate.sqlite3");
     let agent_dir = storage_root
         .join("projects")
         .join("quarantine-project")
@@ -721,12 +734,21 @@ fn reconstruct_quarantines_unusable_atc_sidecar_instead_of_wedging_recovery() {
     )
     .expect("write profile");
 
-    // Pre-plant a garbage sidecar where reconstruct will build atc.sqlite3.
+    // Pre-plant a garbage sidecar at the fixed live path. Fresh candidate
+    // construction must leave it byte-for-byte untouched; only the unified
+    // promotion boundary may quarantine and rebuild it after DB activation.
     let sidecar_path = db_path.with_file_name("atc.sqlite3");
     std::fs::write(&sidecar_path, b"this is not a sqlite database").expect("plant corrupt sidecar");
 
-    mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
-        .expect("reconstruct must succeed despite a corrupt ATC sidecar");
+    mcp_agent_mail_db::reconstruct_from_archive(&candidate_path, &storage_root)
+        .expect("reconstruct fresh candidate despite a corrupt live ATC sidecar");
+    assert_eq!(
+        std::fs::read(&sidecar_path).expect("read untouched corrupt sidecar"),
+        b"this is not a sqlite database",
+        "fresh candidate construction must not mutate the fixed live ATC sidecar"
+    );
+    mcp_agent_mail_db::promote_recovery_candidate(&db_path, &candidate_path, &storage_root)
+        .expect("promotion must succeed despite a corrupt ATC sidecar");
 
     // The unusable sidecar was quarantined by rename (never deleted)...
     let quarantined: Vec<_> = std::fs::read_dir(dir.path())
@@ -1272,11 +1294,11 @@ fn all_expected_indexes_exist() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Pool-based initialization matches direct migration
+// 7. Pool-based initialization matches the primary direct-migration schema
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pool_initialization_creates_same_schema_as_direct_migration() {
+fn pool_initialization_creates_same_primary_schema_as_direct_migration() {
     // Direct migration path.
     let (conn, _dir1) = open_temp_db();
     block_on({
@@ -1291,6 +1313,7 @@ fn pool_initialization_creates_same_schema_as_direct_migration() {
         .query_sync(
             "SELECT name FROM sqlite_master \
              WHERE type='table' AND name NOT LIKE 'sqlite_stat%' \
+             AND name NOT LIKE 'atc_%' \
              ORDER BY name",
             &[],
         )
@@ -1309,6 +1332,7 @@ fn pool_initialization_creates_same_schema_as_direct_migration() {
             .query_sync(
                 "SELECT name FROM sqlite_master \
                  WHERE type='table' AND name NOT LIKE 'sqlite_stat%' \
+                 AND name NOT LIKE 'atc_%' \
                  ORDER BY name",
                 &[],
             )
@@ -1317,9 +1341,26 @@ fn pool_initialization_creates_same_schema_as_direct_migration() {
             .filter_map(|r| r.get_named::<String>("name").ok())
             .collect();
 
+        let pool_atc_tables: Vec<String> = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type='table' AND name LIKE 'atc_%' \
+                 ORDER BY name",
+                &[],
+            )
+            .expect("query ATC tables (pool)")
+            .iter()
+            .filter_map(|r| r.get_named::<String>("name").ok())
+            .collect();
+
         assert_eq!(
             direct_tables, pool_tables,
-            "pool-created schema should match direct migration schema"
+            "pool-created primary schema should match direct migration schema"
+        );
+        assert!(
+            pool_atc_tables.is_empty(),
+            "pool startup must keep ATC telemetry out of the canonical mailbox database: \
+             {pool_atc_tables:?}"
         );
     });
 }
