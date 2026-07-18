@@ -18726,9 +18726,57 @@ fn validate_tar_archive_verbose_listing(listing: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_tar_xz_archive_paths(archive_path: &Path) -> Result<(), String> {
+/// Compression flavor of a tar release archive, keyed off the file name.
+///
+/// Modern `tar` auto-detects compression on extraction, but the listing
+/// pre-validation passes an explicit flag so behavior stays deterministic
+/// across tar implementations (GNU tar, bsdtar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TarCompression {
+    Xz,
+    Gz,
+}
+
+impl TarCompression {
+    fn from_file_name(name: &str) -> Option<Self> {
+        if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+            Some(Self::Xz)
+        } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            Some(Self::Gz)
+        } else {
+            None
+        }
+    }
+
+    fn list_args(self) -> [&'static str; 1] {
+        match self {
+            Self::Xz => ["tJf"],
+            Self::Gz => ["tzf"],
+        }
+    }
+
+    fn verbose_list_args(self) -> [&'static str; 1] {
+        match self {
+            Self::Xz => ["tvJf"],
+            Self::Gz => ["tvzf"],
+        }
+    }
+
+    fn extract_args(self) -> [&'static str; 1] {
+        match self {
+            Self::Xz => ["xJf"],
+            Self::Gz => ["xzf"],
+        }
+    }
+}
+
+fn validate_tar_archive_paths(
+    archive_path: &Path,
+    compression: TarCompression,
+) -> Result<(), String> {
     let path_output = std::process::Command::new("tar")
-        .args(["tJf", &archive_path.to_string_lossy()])
+        .args(compression.list_args())
+        .arg(archive_path)
         .output()
         .map_err(|e| format!("failed to list tar archive: {e}"))?;
     if !path_output.status.success() {
@@ -18745,7 +18793,8 @@ fn validate_tar_xz_archive_paths(archive_path: &Path) -> Result<(), String> {
     validate_tar_archive_listing(&path_listing)?;
 
     let verbose_output = std::process::Command::new("tar")
-        .args(["tvJf", &archive_path.to_string_lossy()])
+        .args(compression.verbose_list_args())
+        .arg(archive_path)
         .output()
         .map_err(|e| format!("failed to inspect tar archive: {e}"))?;
     if !verbose_output.status.success() {
@@ -18762,18 +18811,19 @@ fn validate_tar_xz_archive_paths(archive_path: &Path) -> Result<(), String> {
     validate_tar_archive_verbose_listing(&verbose_listing)
 }
 
-/// Extract binaries from a .tar.xz archive into a temporary directory.
-/// Returns the directory path containing extracted files.
-fn extract_tar_xz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
-    validate_tar_xz_archive_paths(archive_path)?;
+/// Extract binaries from a tar archive into a temporary directory.
+fn extract_tar_archive(
+    archive_path: &Path,
+    dest_dir: &Path,
+    compression: TarCompression,
+) -> Result<(), String> {
+    validate_tar_archive_paths(archive_path, compression)?;
 
     let status = std::process::Command::new("tar")
-        .args([
-            "xJf",
-            &archive_path.to_string_lossy(),
-            "-C",
-            &dest_dir.to_string_lossy(),
-        ])
+        .args(compression.extract_args())
+        .arg(archive_path)
+        .arg("-C")
+        .arg(dest_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .status()
@@ -18785,6 +18835,54 @@ fn extract_tar_xz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Locate the single nested archive member left behind by a release pipeline that
+/// double-wraps its assets (e.g. a `.tar.xz` whose only member is an inner
+/// `.tar.gz` holding the actual binaries — observed on dsr-built releases,
+/// GH#188). Scans the extraction root plus one directory level and fails
+/// closed if the wrapper is ambiguous instead of extracting arbitrary archives.
+fn find_nested_release_archive(dir: &Path) -> Result<Option<(PathBuf, TarCompression)>, String> {
+    let mut nested = Vec::new();
+    let mut push_candidate = |path: &Path| {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        if path.is_file()
+            && let Some(compression) = TarCompression::from_file_name(name)
+        {
+            nested.push((path.to_path_buf(), compression));
+        }
+    };
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("failed to inspect extracted release: {error}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("failed to inspect extracted release entry: {error}"))?;
+        let entry_path = entry.path();
+        if path_is_real_directory(&entry_path) {
+            let sub_entries = std::fs::read_dir(&entry_path).map_err(|error| {
+                format!(
+                    "failed to inspect extracted release directory {}: {error}",
+                    entry_path.display()
+                )
+            })?;
+            for sub_entry in sub_entries {
+                let sub_entry = sub_entry
+                    .map_err(|error| format!("failed to inspect nested release entry: {error}"))?;
+                push_candidate(&sub_entry.path());
+            }
+        } else {
+            push_candidate(&entry_path);
+        }
+    }
+    match nested.len() {
+        0 => Ok(None),
+        1 => Ok(nested.pop()),
+        count => Err(format!(
+            "release archive is ambiguous: found {count} nested tar archives"
+        )),
+    }
 }
 
 /// Extract binaries from a .zip archive (Windows).
@@ -18894,7 +18992,7 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
         }
         ftui_runtime::ftui_eprintln!("Checksum verified.");
 
-        extract_tar_xz(&archive_path, &tmp_dir)?;
+        extract_tar_archive(&archive_path, &tmp_dir, TarCompression::Xz)?;
         // Clean up the archive file
         let _ = std::fs::remove_file(&archive_path);
     } else if filename.ends_with(".zip") {
@@ -18922,6 +19020,27 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
     } else {
         ("am", "mcp-agent-mail")
     };
+
+    if filename.ends_with(".tar.xz")
+        && (find_binary_in_dir(&tmp_dir, am_name).is_none()
+            || find_binary_in_dir(&tmp_dir, server_name).is_none())
+    {
+        // Double-wrapped release asset: the outer archive held another
+        // archive instead of the binaries (GH#188). Only a single nested tar
+        // archive is accepted; ambiguity fails closed.
+        if let Some((nested_path, compression)) = find_nested_release_archive(&tmp_dir)? {
+            ftui_runtime::ftui_eprintln!(
+                "Archive is double-wrapped; extracting nested {}...",
+                nested_path.file_name().map_or_else(
+                    || nested_path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned()
+                )
+            );
+            extract_tar_archive(&nested_path, &tmp_dir, compression)
+                .map_err(|e| format!("nested archive extraction failed: {e}"))?;
+            let _ = std::fs::remove_file(&nested_path);
+        }
+    }
 
     let am_binary = find_binary_in_dir(&tmp_dir, am_name)
         .ok_or_else(|| format!("{am_name} not found in extracted archive"))?;
@@ -77023,7 +77142,7 @@ fn validate_tar_xz_archive_paths_accepts_dist_release_layout() {
     let archive = tmp.path().join("mcp-agent-mail-test.tar.xz");
     create_test_tar_xz(&staging, &archive, &["mcp-agent-mail", "am"]);
 
-    validate_tar_xz_archive_paths(&archive)
+    validate_tar_archive_paths(&archive, TarCompression::Xz)
         .expect("dist release tarball layout should pass archive preflight");
 }
 
@@ -77040,12 +77159,122 @@ fn validate_tar_xz_archive_paths_rejects_actual_symlink_member() {
     let archive = tmp.path().join("mcp-agent-mail-symlink.tar.xz");
     create_test_tar_xz(&staging, &archive, &["am"]);
 
-    let err = validate_tar_xz_archive_paths(&archive)
+    let err = validate_tar_archive_paths(&archive, TarCompression::Xz)
         .expect_err("archive preflight should reject real symlink members");
     assert!(
         err.contains("unsupported member type"),
         "unexpected validation error: {err}"
     );
+}
+
+#[test]
+fn tar_compression_from_file_name_maps_known_extensions() {
+    assert_eq!(
+        TarCompression::from_file_name("mcp-agent-mail-aarch64-apple-darwin.tar.xz"),
+        Some(TarCompression::Xz)
+    );
+    assert_eq!(
+        TarCompression::from_file_name("release.txz"),
+        Some(TarCompression::Xz)
+    );
+    assert_eq!(
+        TarCompression::from_file_name("mcp-agent-mail-aarch64-apple-darwin.tar.gz"),
+        Some(TarCompression::Gz)
+    );
+    assert_eq!(
+        TarCompression::from_file_name("release.tgz"),
+        Some(TarCompression::Gz)
+    );
+    assert_eq!(TarCompression::from_file_name("am"), None);
+    assert_eq!(TarCompression::from_file_name("release.zip"), None);
+    assert_eq!(TarCompression::from_file_name("notes.txt"), None);
+}
+
+/// GH#188 regression: a release asset whose `.tar.xz` wraps a single inner
+/// `.tar.gz` that actually holds the binaries. One extraction pass leaves
+/// only the inner archive behind; the nested-archive recovery must find it,
+/// extract it in place, and expose the binaries to `find_binary_in_dir`.
+#[cfg(unix)]
+#[test]
+fn nested_archive_recovery_unwraps_double_wrapped_release() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Inner .tar.gz holding the real binaries (what dsr-built releases ship).
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).expect("create staging dir");
+    std::fs::write(staging.join("am"), b"am-binary").expect("write am");
+    std::fs::write(staging.join("mcp-agent-mail"), b"server-binary").expect("write server");
+    let inner = tmp.path().join("wrap").join("inner");
+    std::fs::create_dir_all(&inner).expect("create inner staging");
+    let inner_archive = inner.join("mcp-agent-mail-test.tar.gz");
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&inner_archive)
+        .arg("-C")
+        .arg(&staging)
+        .args(["mcp-agent-mail", "am"])
+        .status()
+        .expect("tar should be available");
+    assert!(status.success(), "inner tar.gz creation failed");
+
+    // Outer .tar.xz whose only member is the inner .tar.gz.
+    let outer_archive = tmp.path().join("mcp-agent-mail-test.tar.xz");
+    create_test_tar_xz(&inner, &outer_archive, &["mcp-agent-mail-test.tar.gz"]);
+
+    // First extraction pass: only the inner archive appears.
+    let extract_dir = tmp.path().join("extract");
+    std::fs::create_dir_all(&extract_dir).expect("create extract dir");
+    extract_tar_archive(&outer_archive, &extract_dir, TarCompression::Xz)
+        .expect("outer extraction should succeed");
+    assert!(
+        find_binary_in_dir(&extract_dir, "am").is_none(),
+        "binaries must not be visible after a single extraction pass"
+    );
+
+    // Recovery: detect and unwrap the nested archive, then retry the lookup.
+    let (nested_path, compression) = find_nested_release_archive(&extract_dir)
+        .expect("nested archive scan")
+        .expect("one nested archive");
+    assert_eq!(compression, TarCompression::Gz);
+    extract_tar_archive(&nested_path, &extract_dir, compression)
+        .expect("nested extraction should succeed");
+    let _ = std::fs::remove_file(&nested_path);
+
+    let am = find_binary_in_dir(&extract_dir, "am").expect("am found after recovery");
+    let server = find_binary_in_dir(&extract_dir, "mcp-agent-mail")
+        .expect("mcp-agent-mail found after recovery");
+    assert_eq!(std::fs::read(am).expect("read am"), b"am-binary");
+    assert_eq!(
+        std::fs::read(server).expect("read server"),
+        b"server-binary"
+    );
+}
+
+/// Flat (correctly built) archives must not trigger the nested-archive scan.
+#[cfg(unix)]
+#[test]
+fn nested_archive_scan_is_empty_for_flat_release_layout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("am"), b"am").expect("write am");
+    std::fs::write(tmp.path().join("mcp-agent-mail"), b"server").expect("write server");
+    assert_eq!(
+        find_nested_release_archive(tmp.path()).expect("nested archive scan"),
+        None
+    );
+}
+
+/// Recovery accepts the known one-wrapper release shape only. Multiple nested
+/// archives are ambiguous and must fail before any of them is extracted.
+#[cfg(unix)]
+#[test]
+fn nested_archive_scan_rejects_ambiguous_wrappers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("first.tar.gz"), b"first").expect("write first archive");
+    std::fs::write(tmp.path().join("second.tgz"), b"second").expect("write second archive");
+
+    let error = find_nested_release_archive(tmp.path())
+        .expect_err("multiple nested archives must fail closed");
+    assert!(error.contains("ambiguous"), "unexpected error: {error}");
 }
 
 #[test]
