@@ -535,6 +535,8 @@ fn auto_repair_missing_refs(
         });
     }
 
+    let _application = crate::ArchiveApplicationGuard::start();
+
     let canonical = canonicalize_repo(&candidate.path)
         .ok_or_else(|| format!("canonicalize repo {}", candidate.path.display()))?;
     let _flock = RepoFlock::acquire(&canonical)

@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
+    get_read_db_pool, legacy_tool_error, resolve_project,
 };
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
@@ -1129,7 +1129,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let pool = if semantic_readiness.status == "fail" {
         None
     } else {
-        match get_db_pool() {
+        match get_authoritative_live_db_pool() {
             Ok(pool) => {
                 pool.sample_pool_stats_now();
                 Some(pool)
@@ -2027,7 +2027,7 @@ pub async fn whois(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
     let limit_raw = commit_limit.unwrap_or(5);
@@ -2160,7 +2160,7 @@ pub async fn resolve_pane_identity(
 
     let mut project_keys = vec![project_key.clone()];
     if !Path::new(&project_key).is_absolute()
-        && let Ok(pool) = get_read_db_pool()
+        && let Ok(pool) = get_read_db_pool(ctx.cx()).await
         && let Ok(project) = resolve_project(ctx, &pool, &project_key).await
         && project.human_key != project_key
     {
@@ -2263,7 +2263,7 @@ pub async fn list_agents(
     limit: Option<u32>,
     active_within_days: Option<u32>,
 ) -> McpResult<String> {
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -3499,6 +3499,51 @@ body
     }
 
     #[test]
+    fn hot_health_check_does_not_advance_read_snapshot_writer_epoch() {
+        let _snapshot_guard = crate::tool_util::READ_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _health_guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("hot-health-check.sqlite3");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        drop(conn);
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let _primed_pool = get_authoritative_live_db_pool()
+                    .expect("prime authoritative pool before measuring hot-path epoch");
+                let epoch_before = crate::tool_util::read_snapshot_db_write_epoch_for_test();
+
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                assert_eq!(value["semantic_readiness"]["status"], "ok");
+                assert_eq!(
+                    crate::tool_util::read_snapshot_db_write_epoch_for_test(),
+                    epoch_before,
+                    "a hot authoritative health read must not enter the durable writer epoch"
+                );
+                Config::reset_cached();
+            },
+        );
+    }
+
+    #[test]
     fn health_check_direct_sqlite_probe_uses_mailbox_runtime_engine() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("health-check-engine.sqlite3");
@@ -3540,6 +3585,8 @@ body
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
         drop(conn);
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("stabilize stale live database fixture");
 
         with_process_env_overrides_for_test(
             &[

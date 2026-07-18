@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_agent,
-    resolve_project,
+    invalidate_read_snapshots_for_archive, legacy_tool_error, parse_attachment_metadata_json,
+    parse_recipients_lists, resolve_agent, resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
@@ -42,6 +42,15 @@ fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
 }
 
 pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
+    let storage_root = match &op {
+        mcp_agent_mail_storage::WriteOp::MessageBundle { config, .. }
+        | mcp_agent_mail_storage::WriteOp::AgentProfile { config, .. }
+        | mcp_agent_mail_storage::WriteOp::FileReservation { config, .. }
+        | mcp_agent_mail_storage::WriteOp::NotificationSignal { config, .. }
+        | mcp_agent_mail_storage::WriteOp::ClearSignal { config, .. } => {
+            config.storage_root.clone()
+        }
+    };
     match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
         mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
         | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
@@ -54,6 +63,7 @@ pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, co
             }
         }
     }
+    invalidate_read_snapshots_for_archive(&storage_root);
 }
 
 /// Write a message bundle to the git archive (best-effort).
@@ -3154,7 +3164,7 @@ pub async fn fetch_inbox(
 
     // Use archive-aware read pool so that inbox reads fall back to archive
     // snapshots when the live SQLite is suspect (DegradedReadOnly).
-    let read_pool = get_read_db_pool()?;
+    let read_pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -3345,23 +3355,21 @@ pub async fn fetch_inbox(
     // is degraded the write will fail gracefully (already best-effort).
     if !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        let write_path = get_db_pool()
-            .ok()
-            .map(|live_pool| live_pool.sqlite_path().to_string());
-        if let Some(ref live_sqlite_path) = write_path {
+        if let Ok(live_pool) = get_db_pool() {
+            let live_sqlite_path = live_pool.sqlite_path().to_string();
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
-                live_sqlite_path,
+                &live_sqlite_path,
                 agent_id,
                 &ids,
             ) {
                 Ok(Some(batch)) => {
                     apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
                     mcp_agent_mail_db::read_cache()
-                        .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                        .invalidate_inbox_stats_scoped(&live_sqlite_path, agent_id);
                 }
                 Ok(None) => {
                     mcp_agent_mail_db::read_cache()
-                        .invalidate_inbox_stats_scoped(live_sqlite_path, agent_id);
+                        .invalidate_inbox_stats_scoped(&live_sqlite_path, agent_id);
                 }
                 Err(e) => {
                     tracing::warn!(

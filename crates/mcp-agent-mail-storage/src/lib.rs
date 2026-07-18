@@ -460,6 +460,92 @@ const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
+// Snapshot builders live in `mcp-agent-mail-tools`, but every archive mutation
+// funnels through this crate.  A process-wide admission epoch keeps that layer
+// from publishing a reconstruction across either a direct write or a WBQ drain
+// without introducing a storage -> tools dependency cycle.  The scope is
+// deliberately conservative: an unrelated mailbox write may restart a build,
+// but no build can miss the actual filesystem application window.
+static ARCHIVE_APPLICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+static ARCHIVE_APPLICATIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static ARCHIVE_APPLICATION_BARRIER: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+thread_local! {
+    static ARCHIVE_APPLICATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct ArchiveApplicationGuard {
+    barrier: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl ArchiveApplicationGuard {
+    pub(crate) fn start() -> Self {
+        let nested = ARCHIVE_APPLICATION_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current.saturating_add(1));
+            current > 0
+        });
+        let barrier = if nested {
+            None
+        } else {
+            Some(
+                ARCHIVE_APPLICATION_BARRIER
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        ARCHIVE_APPLICATIONS_ACTIVE.fetch_add(1, Ordering::AcqRel);
+        ARCHIVE_APPLICATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        Self { barrier }
+    }
+}
+
+impl Drop for ArchiveApplicationGuard {
+    fn drop(&mut self) {
+        ARCHIVE_APPLICATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        ARCHIVE_APPLICATIONS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        ARCHIVE_APPLICATION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        drop(self.barrier.take());
+    }
+}
+
+/// Serialize a snapshot publication check with every archive mutation.
+///
+/// The callback must stay non-blocking and must not initiate archive writes.
+pub fn with_archive_publication_barrier<T>(publish: impl FnOnce() -> T) -> T {
+    let _barrier = ARCHIVE_APPLICATION_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish()
+}
+
+fn archive_fs_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let _application = ArchiveApplicationGuard::start();
+    fs::write(path, contents)
+}
+
+fn archive_fs_remove_file(path: &Path) -> std::io::Result<()> {
+    let _application = ArchiveApplicationGuard::start();
+    fs::remove_file(path)
+}
+
+fn archive_fs_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    let _application = ArchiveApplicationGuard::start();
+    fs::rename(from, to)
+}
+
+/// Process-wide archive application epoch used by immutable read snapshots.
+#[must_use]
+pub fn archive_application_epoch() -> u64 {
+    ARCHIVE_APPLICATION_EPOCH.load(Ordering::Acquire)
+}
+
+/// Number of archive writes currently applying filesystem changes.
+#[must_use]
+pub fn archive_applications_active() -> usize {
+    ARCHIVE_APPLICATIONS_ACTIVE.load(Ordering::Acquire)
+}
+
 fn new_write_behind_queue() -> WriteBehindQueue {
     let op_depth = Arc::new(AtomicU64::new(0));
     let channel_capacity = Config::get().wbq_channel_capacity;
@@ -1442,6 +1528,7 @@ fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize 
 }
 
 fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    let _application = ArchiveApplicationGuard::start();
     debug_assert!(!envelopes.is_empty());
 
     let mut attempts = 0;
@@ -1507,6 +1594,7 @@ fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result
 }
 
 fn wbq_execute_op(op: &WriteOp) -> Result<()> {
+    let _application = ArchiveApplicationGuard::start();
     let mut attempts = 0;
     loop {
         match wbq_execute_op_inner(op) {
@@ -1763,7 +1851,7 @@ fn quarantine_startup_artifact_if_exists(
     }
 
     let quarantine = next_startup_quarantine_path(path, fallback_name);
-    match fs::rename(path, &quarantine) {
+    match archive_fs_rename(path, &quarantine) {
         Ok(()) => Some(quarantine),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -1871,11 +1959,14 @@ impl FileLock {
             }
 
             // Try to create and exclusively lock the file
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&self.path)?;
+            let file = {
+                let _application = ArchiveApplicationGuard::start();
+                fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&self.path)?
+            };
 
             match file.try_lock_exclusive() {
                 Ok(()) => {
@@ -1938,8 +2029,8 @@ impl FileLock {
 
         // Remove files BEFORE releasing flock to prevent race where another
         // process acquires the lock between flock release and file removal.
-        let _ = fs::remove_file(&self.metadata_path);
-        let _ = fs::remove_file(&self.path);
+        let _ = archive_fs_remove_file(&self.metadata_path);
+        let _ = archive_fs_remove_file(&self.path);
         // Now drop the file handle to release the OS-level flock
         self.lock_file = None;
         Ok(())
@@ -2051,13 +2142,13 @@ impl FileLock {
 
         // Try quarantining while lock is held (best race safety).
         let quarantine = next_startup_quarantine_path(&self.path, "archive-lock-artifact");
-        let quarantined = match fs::rename(&self.path, &quarantine) {
+        let quarantined = match archive_fs_rename(&self.path, &quarantine) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // Windows can require closing/unlocking first before renaming.
                 let _ = file.unlock();
                 drop(file);
-                fs::rename(&self.path, &quarantine).is_ok()
+                archive_fs_rename(&self.path, &quarantine).is_ok()
             }
             Err(_) => false,
         };
@@ -4587,7 +4678,7 @@ fn write_lock_owner(repo_root: &Path) {
         .as_secs();
     let start_ticks = process_start_ticks(pid).unwrap_or(0);
     let content = format!("{pid}\n{ts}\n{start_ticks}\n");
-    let _ = fs::write(&owner_path, content);
+    let _ = archive_fs_write(&owner_path, content);
 }
 
 /// Remove the `.git/index.lock.owner` file after a successful commit.
@@ -4595,7 +4686,7 @@ fn remove_lock_owner(repo_root: &Path) {
     let Some((_lock_path, owner_path)) = git_index_lock_paths_checked(repo_root) else {
         return;
     };
-    let _ = fs::remove_file(&owner_path);
+    let _ = archive_fs_remove_file(&owner_path);
 }
 
 /// Run a commit attempt while ensuring the owner sidecar is cleaned up.
@@ -4661,6 +4752,12 @@ pub fn clean_stale_git_index_lock(repo_root: &Path, max_age_seconds: f64) -> boo
     try_clean_stale_git_lock(repo_root, max_age_seconds)
 }
 
+fn remove_git_lock_pair(owner_path: &Path, lock_path: &Path) {
+    let _application = ArchiveApplicationGuard::start();
+    let _ = fs::remove_file(owner_path);
+    let _ = fs::remove_file(lock_path);
+}
+
 /// Try to clean up a stale `.git/index.lock` file with PID-aware safety.
 ///
 /// See [`clean_stale_git_index_lock`] for the supported cleanup semantics.
@@ -4695,8 +4792,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     tracing::info!(
                         "[git-lock] index.lock owner PID {pid} reused (start ticks mismatch), removing stale lock"
                     );
-                    let _ = fs::remove_file(&owner_path);
-                    let _ = fs::remove_file(&lock_path);
+                    remove_git_lock_pair(&owner_path, &lock_path);
                     return true;
                 }
 
@@ -4714,8 +4810,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                             "[git-lock] index.lock held by alive PID {pid} but start ticks unavailable, force clean (age > {:.1}s)",
                             max_age_seconds * 2.0
                         );
-                        let _ = fs::remove_file(&owner_path);
-                        let _ = fs::remove_file(&lock_path);
+                        remove_git_lock_pair(&owner_path, &lock_path);
                         return true;
                     }
 
@@ -4731,8 +4826,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     tracing::info!(
                         "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
                     );
-                    let _ = fs::remove_file(&owner_path);
-                    let _ = fs::remove_file(&lock_path);
+                    remove_git_lock_pair(&owner_path, &lock_path);
                     return true;
                 }
 
@@ -4743,8 +4837,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
             // Remove owner before lock so a racing cleaner cannot pair
             // stale owner metadata with a freshly acquired lock.
             tracing::info!("[git-lock] index.lock held by dead PID {pid}, removing stale lock");
-            let _ = fs::remove_file(&owner_path);
-            let _ = fs::remove_file(&lock_path);
+            remove_git_lock_pair(&owner_path, &lock_path);
             return true;
         }
     }
@@ -4756,8 +4849,7 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
         && age > max_age_seconds
     {
         tracing::info!("[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)");
-        let _ = fs::remove_file(&owner_path);
-        let _ = fs::remove_file(&lock_path);
+        remove_git_lock_pair(&owner_path, &lock_path);
         return true;
     }
     false
@@ -4785,6 +4877,7 @@ fn commit_paths_lockfree(
     if rel_paths.is_empty() {
         return Ok(());
     }
+    let _application = ArchiveApplicationGuard::start();
 
     let workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
@@ -5078,13 +5171,13 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             if f.try_lock_exclusive().is_ok() {
                 let quarantine = next_startup_quarantine_path(path, "archive-lock-artifact");
                 let mut quarantined = false;
-                match fs::rename(path, &quarantine) {
+                match archive_fs_rename(path, &quarantine) {
                     Ok(()) => quarantined = true,
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                         // Windows can require closing/unlocking first before renaming.
                         let _ = f.unlock();
                         drop(f);
-                        quarantined = fs::rename(path, &quarantine).is_ok();
+                        quarantined = archive_fs_rename(path, &quarantine).is_ok();
                     }
                     Err(_) => {}
                 }
@@ -5332,6 +5425,7 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
             ),
         ));
     }
+    let _application = ArchiveApplicationGuard::start();
     fs::create_dir_all(dir)?;
     {
         let mut cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -5569,6 +5663,7 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
     if repo_cache_contains(root) {
         return Ok(false);
     }
+    let _application = ArchiveApplicationGuard::start();
 
     let git_dir = root.join(".git");
     if git_dir.exists() {
@@ -6843,6 +6938,7 @@ fn update_thread_digest(
     // respect to other appenders. Even for larger payloads, combining
     // header + entry into one write avoids interleaving from concurrent
     // writers between the two calls.
+    let _application = ArchiveApplicationGuard::start();
     let (mut file, is_new) = match create_new_archive_append_file(&digest_path) {
         Ok(f) => (f, true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -7205,6 +7301,7 @@ pub fn store_attachment(
         "bytes_original": original_bytes.len(),
         "ext": original_ext,
     });
+    let _application = ArchiveApplicationGuard::start();
     let mut audit_file = open_or_create_archive_append_file(&audit_path)?;
     audit_file.write_all(audit_entry.to_string().as_bytes())?;
     audit_file.write_all(b"\n")?;
@@ -7858,6 +7955,7 @@ pub fn clear_notification_signal(
         return SignalClearOutcome::Missing;
     }
 
+    let _application = ArchiveApplicationGuard::start();
     match fs::remove_file(&signal_path) {
         Ok(()) => {
             signal_debounce().lock().remove(&signal_key);
@@ -9530,6 +9628,7 @@ fn commit_paths(
     if rel_paths.is_empty() {
         return Ok(());
     }
+    let _application = ArchiveApplicationGuard::start();
 
     let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
     let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
@@ -9597,6 +9696,7 @@ fn commit_paths(
 /// Only used as an overload escape hatch for the async commit coalescer when the
 /// spill path set grows too large to track precisely.
 fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
+    let _application = ArchiveApplicationGuard::start();
     // Ensure this is a non-bare repo with a workdir.
     let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
 
@@ -9883,6 +9983,7 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
+    let _application = ArchiveApplicationGuard::start();
 
     // Refuse to write through symlinks (prevents symlink escape attacks)
     if let Ok(meta) = fs::symlink_metadata(path) {
@@ -15079,6 +15180,22 @@ mod tests {
             project_slug: project_slug.to_string(),
             agent_name: "WbqTestAgent".to_string(),
         }
+    }
+
+    #[test]
+    fn archive_application_guard_brackets_active_count_and_epoch() {
+        let epoch_before = archive_application_epoch();
+        {
+            let _guard = ArchiveApplicationGuard::start();
+            assert!(archive_applications_active() >= 1);
+            assert!(archive_application_epoch() > epoch_before);
+            {
+                let _nested = ArchiveApplicationGuard::start();
+                assert!(archive_applications_active() >= 2);
+            }
+            assert!(archive_applications_active() >= 1);
+        }
+        assert!(archive_application_epoch() >= epoch_before + 4);
     }
 
     #[test]

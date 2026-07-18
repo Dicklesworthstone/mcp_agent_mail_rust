@@ -272,6 +272,7 @@ pub use pool::{
     classify_canary_outcome,
     create_pool,
     create_pool_without_startup_init,
+    create_query_only_pool,
     deferred_write_queue,
     ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive,
@@ -300,8 +301,9 @@ pub use reconstruct::{
     ProjectIdentityMismatch, ReconstructStats, archive_missing_project_identities,
     collect_db_message_ids, collect_db_project_identities, compute_archive_drift_report,
     mailbox_project_identity_matches_db, reconstruct_from_archive,
-    reconstruct_from_archive_with_salvage, scan_archive_message_ids,
-    scan_archive_message_inventory,
+    reconstruct_from_archive_cancellable, reconstruct_from_archive_with_salvage,
+    reconstruct_from_archive_with_salvage_cancellable, scan_archive_message_ids,
+    scan_archive_message_inventory, scan_archive_message_inventory_cancellable,
 };
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,

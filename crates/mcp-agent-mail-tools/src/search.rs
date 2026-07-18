@@ -922,7 +922,7 @@ pub async fn search_messages(
         &[("date_to", date_to), ("before", before), ("until", until)],
     )?;
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     phase.mark("scope_resolution");
@@ -1164,7 +1164,7 @@ pub async fn summarize_thread(
     let use_llm = llm_mode.unwrap_or(true);
     let msg_limit = parse_summarize_thread_limit(per_thread_limit)?;
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 

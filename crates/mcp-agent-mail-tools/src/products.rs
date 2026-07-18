@@ -560,7 +560,7 @@ pub async fn search_messages_product(
         return Err(worktrees_required());
     }
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
@@ -744,7 +744,7 @@ pub async fn fetch_inbox_product(
         return Err(worktrees_required());
     }
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
@@ -871,7 +871,7 @@ pub async fn summarize_thread_product(
         return Err(worktrees_required());
     }
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {

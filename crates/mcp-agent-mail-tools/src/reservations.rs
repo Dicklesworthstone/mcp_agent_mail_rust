@@ -32,8 +32,8 @@ use crate::resources::{
     reservation_project_workspace_path,
 };
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
-    resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
+    legacy_tool_error, resolve_agent, resolve_project,
 };
 
 const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -280,7 +280,16 @@ fn validate_conflict_check_paths(paths: &[String]) -> McpResult<()> {
 /// artifact (wrong holder until TTL), so active ops are dropped and healed by
 /// reconcile-on-read instead (the same convergence path as the disk-critical
 /// skip).
-fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
+pub(crate) fn dispatch_reservation_archive_write(
+    op: mcp_agent_mail_storage::WriteOp,
+    context: &str,
+) {
+    let storage_root = match &op {
+        mcp_agent_mail_storage::WriteOp::FileReservation { config, .. } => {
+            config.storage_root.clone()
+        }
+        _ => unreachable!("reservation archive dispatcher only accepts reservation writes"),
+    };
     // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
     // return because the pre-commit guard reads it directly; a stale artifact
     // yields the *wrong holder* (GH#112). The previous implementation enqueued
@@ -332,6 +341,7 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
             }
         }
     }
+    crate::tool_util::invalidate_read_snapshots_for_archive(&storage_root);
 }
 
 /// Is every record in this archive op a TERMINAL release artifact (`released_ts`
@@ -1426,7 +1436,7 @@ pub async fn check_file_reservation_conflicts(
     let caller = mcp_agent_mail_core::models::normalize_agent_name(caller)
         .unwrap_or_else(|| caller.to_string());
 
-    let pool = get_db_pool()?;
+    let pool = get_authoritative_live_db_pool()?;
     let snapshot = acquire_outcome(
         mcp_agent_mail_db::queries::get_reservation_conflict_snapshot(
             ctx.cx(),
@@ -3282,6 +3292,7 @@ mod tests {
                         Outcome::Ok(rows) => rows,
                         other => panic!("before snapshot failed: {other:?}"),
                     };
+                let write_epoch_before = crate::tool_util::read_snapshot_db_write_epoch_for_test();
                 let ctx = McpContext::new(cx.clone(), 1);
                 let response: ReservationConflictCheckResponse = serde_json::from_str(
                     &check_file_reservation_conflicts(
@@ -3304,6 +3315,12 @@ mod tests {
                     .expect("conflict check"),
                 )
                 .expect("response json");
+
+                assert_eq!(
+                    crate::tool_util::read_snapshot_db_write_epoch_for_test(),
+                    write_epoch_before,
+                    "a cached authoritative conflict read must not enter or advance the writer epoch"
+                );
 
                 assert!(!response.conflict_free);
                 assert!(response.read_only);

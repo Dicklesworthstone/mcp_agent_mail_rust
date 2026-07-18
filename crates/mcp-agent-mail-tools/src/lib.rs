@@ -60,11 +60,14 @@ pub mod tool_util {
     use fastmcp::McpErrorCode;
     use fastmcp::prelude::*;
     use mcp_agent_mail_core::Config;
-    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, create_pool, get_or_create_pool};
+    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, get_cached_pool, get_or_create_pool};
     use serde_json::{Map, Value, json};
+    use sha2::{Digest, Sha256};
     use std::collections::{BTreeSet, VecDeque};
+    use std::io::Read as _;
     use std::path::{Path, PathBuf};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -685,9 +688,131 @@ pub mod tool_util {
         }
     }
 
-    pub fn get_db_pool() -> McpResult<DbPool> {
+    pub(crate) fn get_live_db_pool() -> McpResult<DbPool> {
+        let mut cfg = DbPoolConfig::from_env();
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+            return get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()));
+        }
+        cfg.run_migrations = false;
+        cfg.warmup_connections = 0;
+        mcp_agent_mail_db::create_query_only_pool(&cfg)
+            .map_err(|e| McpError::internal_error(e.to_string()))
+    }
+
+    struct ReadSnapshotWriteGuard {
+        slot: Option<Arc<ReadSnapshotScopeSlot>>,
+        active: bool,
+    }
+
+    impl ReadSnapshotWriteGuard {
+        fn begin(storage_root: &Path, sqlite_path: Option<&Path>) -> Self {
+            let Some(sqlite_path) = sqlite_path else {
+                return Self {
+                    slot: None,
+                    active: false,
+                };
+            };
+            Self {
+                slot: begin_read_snapshot_write(storage_root, sqlite_path),
+                active: true,
+            }
+        }
+    }
+
+    impl Drop for ReadSnapshotWriteGuard {
+        fn drop(&mut self) {
+            if self.active {
+                end_read_snapshot_write(self.slot.as_deref());
+            }
+        }
+    }
+
+    /// A live pool lease for mutation paths. Dropping the lease advances the
+    /// mailbox read-snapshot epoch after the operation has finished, so an
+    /// in-flight reconstruction cannot publish across a durable write window.
+    pub struct WriteDbPool {
+        pool: DbPool,
+        _write_guard: ReadSnapshotWriteGuard,
+    }
+
+    impl std::ops::Deref for WriteDbPool {
+        type Target = DbPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.pool
+        }
+    }
+
+    pub fn get_db_pool() -> McpResult<WriteDbPool> {
         let cfg = DbPoolConfig::from_env();
-        get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()))
+        let sqlite_path =
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+                None
+            } else {
+                let resolved =
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                        .map_err(|error| {
+                            McpError::internal_error(format!(
+                                "resolve live SQLite writer path before pool bootstrap: {error}"
+                            ))
+                        })?;
+                Some(PathBuf::from(resolved.canonical_path))
+            };
+        let storage_root = cfg
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        // Enter the writer epoch before even constructing a cold pool: pool
+        // bootstrap can recover, migrate, checkpoint, or create the live DB.
+        // The guard closes the epoch on every early-return/error path.
+        let write_guard = ReadSnapshotWriteGuard::begin(&storage_root, sqlite_path.as_deref());
+        let pool = get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()))?;
+        Ok(WriteDbPool {
+            pool,
+            _write_guard: write_guard,
+        })
+    }
+
+    /// Return the authoritative live pool for a read-only transaction.
+    ///
+    /// Hot reads reuse the existing live pool without entering a writer epoch.
+    /// A cold pool bootstrap may recover, migrate, checkpoint, or create the
+    /// mailbox, so only that bootstrap window is bracketed as a write before the
+    /// plain pool is returned to the caller.
+    pub(crate) fn get_authoritative_live_db_pool() -> McpResult<DbPool> {
+        let cfg = DbPoolConfig::from_env();
+        if let Some(pool) = get_cached_pool(&cfg) {
+            return Ok(pool);
+        }
+
+        let sqlite_path =
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+                None
+            } else {
+                let resolved =
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                        .map_err(|error| {
+                            McpError::internal_error(format!(
+                                "resolve authoritative SQLite path before pool bootstrap: {error}"
+                            ))
+                        })?;
+                Some(PathBuf::from(resolved.canonical_path))
+            };
+        let storage_root = cfg
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        let bootstrap_guard = ReadSnapshotWriteGuard::begin(&storage_root, sqlite_path.as_deref());
+        let pool = get_or_create_pool(&cfg).map_err(|error| {
+            McpError::internal_error(format!("open authoritative live database pool: {error}"))
+        })?;
+        drop(bootstrap_guard);
+        Ok(pool)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_snapshot_db_write_epoch_for_test() -> u64 {
+        READ_SNAPSHOT_DB_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn read_pool_setup_error_to_mcp_error(message: String) -> McpError {
@@ -785,6 +910,16 @@ pub mod tool_util {
         mcp_agent_mail_db::scan_archive_message_inventory(storage_root)
     }
 
+    fn scan_read_archive_inventory_cancellable(
+        storage_root: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<mcp_agent_mail_db::ArchiveMessageInventory, ReadSnapshotAcquireError> {
+        #[cfg(test)]
+        READ_ARCHIVE_INVENTORY_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        mcp_agent_mail_db::scan_archive_message_inventory_cancellable(storage_root, cancelled)
+            .map_err(ReadSnapshotAcquireError::failed)
+    }
+
     fn cached_read_archive_inventory(
         signature: &ReadArchiveSignature,
     ) -> Option<mcp_agent_mail_db::ArchiveMessageInventory> {
@@ -840,8 +975,32 @@ pub mod tool_util {
         inventory
     }
 
+    fn read_archive_inventory_cancellable(
+        storage_root: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<mcp_agent_mail_db::ArchiveMessageInventory, ReadSnapshotAcquireError> {
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        let Some(signature_before) = clean_read_archive_signature(storage_root) else {
+            return scan_read_archive_inventory_cancellable(storage_root, cancelled);
+        };
+        if let Some(inventory) = cached_read_archive_inventory(&signature_before) {
+            return Ok(inventory);
+        }
+
+        let inventory = scan_read_archive_inventory_cancellable(storage_root, cancelled)?;
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        if clean_read_archive_signature(storage_root).as_ref() == Some(&signature_before) {
+            cache_read_archive_inventory(signature_before, &inventory);
+        }
+        Ok(inventory)
+    }
+
     #[cfg(test)]
-    fn reset_read_archive_inventory_cache() {
+    pub(crate) fn reset_read_archive_inventory_cache() {
         READ_ARCHIVE_INVENTORY_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -850,7 +1009,7 @@ pub mod tool_util {
     }
 
     #[cfg(test)]
-    fn read_archive_inventory_scan_count() -> usize {
+    pub(crate) fn read_archive_inventory_scan_count() -> usize {
         READ_ARCHIVE_INVENTORY_SCAN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -860,6 +1019,1848 @@ pub mod tool_util {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    const READ_SNAPSHOT_SCOPE_CAPACITY: usize = 8;
+    const READ_SNAPSHOT_WORKER_LIMIT: usize = 4;
+    // Internal writes explicitly invalidate their mailbox epoch. The TTL is a
+    // fallback for external writers; an expired decision is served stale while
+    // one background worker validates cheap metadata/epochs. A separately
+    // configurable audit interval forces the exact content key periodically.
+    const READ_SNAPSHOT_VALIDATION_TTL_DEFAULT: Duration = Duration::from_secs(1);
+    const READ_SNAPSHOT_EXACT_AUDIT_INTERVAL_DEFAULT: Duration = Duration::from_secs(30);
+    const READ_SNAPSHOT_WAIT_SLICE: Duration = Duration::from_millis(50);
+    const READ_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
+    const READ_SNAPSHOT_GENERATION_RETRIES: usize = 3;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadSnapshotScope {
+        storage_root: PathBuf,
+        sqlite_path: PathBuf,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadSnapshotKey {
+        archive_digest: [u8; 32],
+        live_db_digest: [u8; 32],
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReadSnapshotCheapKey {
+        archive_metadata_digest: [u8; 32],
+        live_db_metadata_digest: [u8; 32],
+        live_data_version: Option<i64>,
+        db_write_epoch: u64,
+        archive_application_epoch: u64,
+    }
+
+    pub(crate) struct SharedArchiveReadSnapshot {
+        pool: mcp_agent_mail_db::DbPool,
+        _snapshot_dir: mcp_agent_mail_db::pool::CanonicalSnapshotTempDir,
+    }
+
+    impl SharedArchiveReadSnapshot {
+        pub(crate) fn pool(&self) -> mcp_agent_mail_db::DbPool {
+            self.pool.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    enum ArchiveReadDecision {
+        Live,
+        Snapshot(Arc<SharedArchiveReadSnapshot>),
+    }
+
+    impl ArchiveReadDecision {
+        fn immutable_snapshot(&self) -> Option<Arc<SharedArchiveReadSnapshot>> {
+            match self {
+                Self::Live => None,
+                Self::Snapshot(snapshot) => Some(Arc::clone(snapshot)),
+            }
+        }
+    }
+
+    struct ReadSnapshotCacheEntry {
+        key: ReadSnapshotKey,
+        cheap_key: ReadSnapshotCheapKey,
+        decision: ArchiveReadDecision,
+        validated_at: Instant,
+        strong_validated_at: Instant,
+        invalidation_epoch: u64,
+    }
+
+    struct ReadSnapshotBuildOutput {
+        key: ReadSnapshotKey,
+        cheap_key: ReadSnapshotCheapKey,
+        decision: ArchiveReadDecision,
+        strong_validated_at: Instant,
+    }
+
+    #[derive(Debug)]
+    struct ReadSnapshotBuildCompletion {
+        result: Mutex<Option<Result<(), ReadSnapshotAcquireError>>>,
+    }
+
+    impl ReadSnapshotBuildCompletion {
+        fn pending() -> Self {
+            Self {
+                result: Mutex::new(None),
+            }
+        }
+
+        fn complete(&self, result: Result<(), ReadSnapshotAcquireError>) {
+            let mut completion = self
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if completion.is_none() {
+                *completion = Some(result);
+            }
+        }
+
+        fn result(&self) -> Option<Result<(), ReadSnapshotAcquireError>> {
+            self.result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ReadSnapshotBuild {
+        token: u64,
+        invalidation_epoch: u64,
+        db_write_epoch: u64,
+        archive_application_epoch: u64,
+        deadline: Instant,
+        completion: Arc<ReadSnapshotBuildCompletion>,
+    }
+
+    #[derive(Default)]
+    struct ReadSnapshotScopeState {
+        ready: Option<ReadSnapshotCacheEntry>,
+        building: Option<ReadSnapshotBuild>,
+        next_token: u64,
+        active_writers: usize,
+    }
+
+    struct ReadSnapshotScopeSlot {
+        scope: ReadSnapshotScope,
+        state: Mutex<ReadSnapshotScopeState>,
+        invalidation_epoch: std::sync::atomic::AtomicU64,
+        data_version_observer: Mutex<Option<mcp_agent_mail_db::DbConn>>,
+        notify: asupersync::sync::Notify,
+    }
+
+    impl ReadSnapshotScopeSlot {
+        fn new(scope: ReadSnapshotScope) -> Self {
+            Self {
+                scope,
+                state: Mutex::new(ReadSnapshotScopeState::default()),
+                invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
+                data_version_observer: Mutex::new(None),
+                notify: asupersync::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ReadSnapshotRegistry {
+        slots: VecDeque<Arc<ReadSnapshotScopeSlot>>,
+    }
+
+    static READ_SNAPSHOT_REGISTRY: LazyLock<Mutex<ReadSnapshotRegistry>> =
+        LazyLock::new(|| Mutex::new(ReadSnapshotRegistry::default()));
+    static READ_SNAPSHOT_BLOCKING_POOL: LazyLock<asupersync::runtime::BlockingPool> =
+        LazyLock::new(|| asupersync::runtime::BlockingPool::new(0, READ_SNAPSHOT_WORKER_LIMIT));
+    const READ_SNAPSHOT_PENDING_BUILD_LIMIT: usize = READ_SNAPSHOT_SCOPE_CAPACITY;
+    static READ_SNAPSHOT_PENDING_BUILDS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static READ_SNAPSHOT_DB_WRITES_ACTIVE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static READ_SNAPSHOT_DB_WRITE_EPOCH: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(test)]
+    pub(crate) static READ_SNAPSHOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(test)]
+    static READ_SNAPSHOT_RECONSTRUCTION_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(test)]
+    static READ_SNAPSHOT_RECONSTRUCTIONS_INFLIGHT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(test)]
+    static READ_SNAPSHOT_RECONSTRUCTIONS_MAX_INFLIGHT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(test)]
+    static READ_SNAPSHOT_GENERATION_SCAN_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(test)]
+    static READ_SNAPSHOT_GENERATION_SCANS_INFLIGHT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(test)]
+    static READ_SNAPSHOT_GENERATION_SCANS_MAX_INFLIGHT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(test)]
+    static READ_SNAPSHOT_TEST_DELAY_MILLIS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(test)]
+    type ReadSnapshotPreReconstructionTestHook = Box<dyn FnOnce() + Send + 'static>;
+
+    #[cfg(test)]
+    static READ_SNAPSHOT_PRE_RECONSTRUCTION_TEST_HOOK: LazyLock<
+        Mutex<Option<ReadSnapshotPreReconstructionTestHook>>,
+    > = LazyLock::new(|| Mutex::new(None));
+
+    #[cfg(test)]
+    #[derive(Default)]
+    struct ReadSnapshotPostValidationTestState {
+        armed: bool,
+        reached: bool,
+        release: bool,
+    }
+
+    #[cfg(test)]
+    static READ_SNAPSHOT_POST_VALIDATION_TEST_HOOK: LazyLock<(
+        Mutex<ReadSnapshotPostValidationTestState>,
+        std::sync::Condvar,
+    )> = LazyLock::new(|| {
+        (
+            Mutex::new(ReadSnapshotPostValidationTestState::default()),
+            std::sync::Condvar::new(),
+        )
+    });
+
+    #[cfg(test)]
+    fn read_snapshot_test_delay() {
+        let millis = READ_SNAPSHOT_TEST_DELAY_MILLIS.load(std::sync::atomic::Ordering::Acquire);
+        if millis > 0 {
+            std::thread::sleep(Duration::from_millis(millis));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_snapshot_test_delay(delay: Duration) {
+        READ_SNAPSHOT_TEST_DELAY_MILLIS.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    fn set_read_snapshot_pre_reconstruction_test_hook(hook: impl FnOnce() + Send + 'static) {
+        *READ_SNAPSHOT_PRE_RECONSTRUCTION_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_read_snapshot_pre_reconstruction_test_hook() {
+        let hook = READ_SNAPSHOT_PRE_RECONSTRUCTION_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_read_snapshot_pre_reconstruction_test_hook() {
+        *READ_SNAPSHOT_PRE_RECONSTRUCTION_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[cfg(test)]
+    fn arm_read_snapshot_post_validation_test_hook() {
+        let (state, _) = &*READ_SNAPSHOT_POST_VALIDATION_TEST_HOOK;
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            ReadSnapshotPostValidationTestState {
+                armed: true,
+                reached: false,
+                release: false,
+            };
+    }
+
+    #[cfg(test)]
+    fn wait_for_read_snapshot_post_validation_test_hook(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (state, notify) = &*READ_SNAPSHOT_POST_VALIDATION_TEST_HOOK;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.reached {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, timed_out) = notify
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if timed_out.timed_out() && !state.reached {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn release_read_snapshot_post_validation_test_hook() {
+        let (state, notify) = &*READ_SNAPSHOT_POST_VALIDATION_TEST_HOOK;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.release = true;
+        notify.notify_all();
+    }
+
+    #[cfg(test)]
+    fn reset_read_snapshot_post_validation_test_hook() {
+        let (state, notify) = &*READ_SNAPSHOT_POST_VALIDATION_TEST_HOOK;
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            ReadSnapshotPostValidationTestState::default();
+        notify.notify_all();
+    }
+
+    fn read_snapshot_test_pause_after_final_validation() {
+        #[cfg(test)]
+        {
+            let (state, notify) = &*READ_SNAPSHOT_POST_VALIDATION_TEST_HOOK;
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.armed {
+                return;
+            }
+            state.reached = true;
+            notify.notify_all();
+            while !state.release {
+                state = notify
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            *state = ReadSnapshotPostValidationTestState::default();
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum ReadSnapshotAcquireError {
+        Cancelled,
+        Busy(String),
+        TimedOut(String),
+        Failed(String),
+    }
+
+    impl ReadSnapshotAcquireError {
+        pub(crate) fn failed(error: impl std::fmt::Display) -> Self {
+            Self::Failed(error.to_string())
+        }
+    }
+
+    fn read_snapshot_duration_from_env(name: &str, default: Duration) -> Duration {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(default)
+    }
+
+    fn read_snapshot_validation_ttl() -> Duration {
+        read_snapshot_duration_from_env(
+            "MCP_AGENT_MAIL_READ_SNAPSHOT_VALIDATION_TTL_MS",
+            READ_SNAPSHOT_VALIDATION_TTL_DEFAULT,
+        )
+    }
+
+    fn read_snapshot_exact_audit_interval() -> Duration {
+        read_snapshot_duration_from_env(
+            "MCP_AGENT_MAIL_READ_SNAPSHOT_EXACT_AUDIT_INTERVAL_MS",
+            READ_SNAPSHOT_EXACT_AUDIT_INTERVAL_DEFAULT,
+        )
+    }
+
+    struct ReadSnapshotBuildPermit;
+
+    impl ReadSnapshotBuildPermit {
+        fn try_acquire() -> Option<Self> {
+            let mut pending =
+                READ_SNAPSHOT_PENDING_BUILDS.load(std::sync::atomic::Ordering::Acquire);
+            loop {
+                if pending >= READ_SNAPSHOT_PENDING_BUILD_LIMIT {
+                    return None;
+                }
+                match READ_SNAPSHOT_PENDING_BUILDS.compare_exchange_weak(
+                    pending,
+                    pending + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => return Some(Self),
+                    Err(observed) => pending = observed,
+                }
+            }
+        }
+    }
+
+    impl Drop for ReadSnapshotBuildPermit {
+        fn drop(&mut self) {
+            READ_SNAPSHOT_PENDING_BUILDS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    struct ReadSnapshotBuildGuard {
+        slot: Arc<ReadSnapshotScopeSlot>,
+        token: u64,
+        active: bool,
+    }
+
+    impl ReadSnapshotBuildGuard {
+        fn new(slot: Arc<ReadSnapshotScopeSlot>, token: u64) -> Self {
+            Self {
+                slot,
+                token,
+                active: true,
+            }
+        }
+
+        fn publish(
+            &mut self,
+            build: &ReadSnapshotBuild,
+            result: Result<ReadSnapshotBuildOutput, ReadSnapshotAcquireError>,
+        ) {
+            let mut retired = None;
+            mcp_agent_mail_storage::with_archive_publication_barrier(|| {
+                let mut state = self
+                    .slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state
+                    .building
+                    .as_ref()
+                    .is_some_and(|build| build.token == self.token)
+                {
+                    let completion = match result {
+                        Ok(output)
+                            if self
+                                .slot
+                                .invalidation_epoch
+                                .load(std::sync::atomic::Ordering::Acquire)
+                                == build.invalidation_epoch
+                                && state.active_writers == 0
+                                && READ_SNAPSHOT_DB_WRITES_ACTIVE
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                    == 0
+                                && READ_SNAPSHOT_DB_WRITE_EPOCH
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                    == build.db_write_epoch
+                                && mcp_agent_mail_storage::archive_applications_active() == 0
+                                && mcp_agent_mail_storage::archive_application_epoch()
+                                    == build.archive_application_epoch =>
+                        {
+                            retired = state.ready.replace(ReadSnapshotCacheEntry {
+                                key: output.key,
+                                cheap_key: output.cheap_key,
+                                decision: output.decision,
+                                validated_at: Instant::now(),
+                                strong_validated_at: output.strong_validated_at,
+                                invalidation_epoch: build.invalidation_epoch,
+                            });
+                            Ok(())
+                        }
+                        Ok(_) => Err(ReadSnapshotAcquireError::Busy(
+                            "archive read snapshot build was superseded by a durable write"
+                                .to_string(),
+                        )),
+                        Err(error) => Err(error),
+                    };
+                    build.completion.complete(completion);
+                    state.building = None;
+                }
+            });
+            self.active = false;
+            // A retired entry owns a pool and temporary directory. Drop it
+            // outside the state mutex so cleanup cannot block admission.
+            drop(retired);
+        }
+    }
+
+    impl Drop for ReadSnapshotBuildGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let mut state = self
+                .slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .building
+                .as_ref()
+                .is_some_and(|build| build.token == self.token)
+            {
+                let completion = Arc::clone(
+                    &state
+                        .building
+                        .as_ref()
+                        .expect("matching snapshot build must remain present")
+                        .completion,
+                );
+                state.building = None;
+                completion.complete(Err(ReadSnapshotAcquireError::Failed(
+                    "archive read snapshot blocking worker terminated without publishing"
+                        .to_string(),
+                )));
+            }
+            drop(state);
+            self.slot.notify.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    struct ReadSnapshotReconstructionGuard;
+
+    #[cfg(test)]
+    struct ReadSnapshotGenerationScanGuard;
+
+    #[cfg(test)]
+    impl ReadSnapshotReconstructionGuard {
+        fn start() -> Self {
+            use std::sync::atomic::Ordering;
+
+            READ_SNAPSHOT_RECONSTRUCTION_COUNT.fetch_add(1, Ordering::Relaxed);
+            let current = READ_SNAPSHOT_RECONSTRUCTIONS_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            READ_SNAPSHOT_RECONSTRUCTIONS_MAX_INFLIGHT.fetch_max(current, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ReadSnapshotReconstructionGuard {
+        fn drop(&mut self) {
+            READ_SNAPSHOT_RECONSTRUCTIONS_INFLIGHT
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(test)]
+    impl ReadSnapshotGenerationScanGuard {
+        fn start() -> Self {
+            use std::sync::atomic::Ordering;
+
+            READ_SNAPSHOT_GENERATION_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
+            let current =
+                READ_SNAPSHOT_GENERATION_SCANS_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            READ_SNAPSHOT_GENERATION_SCANS_MAX_INFLIGHT.fetch_max(current, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ReadSnapshotGenerationScanGuard {
+        fn drop(&mut self) {
+            READ_SNAPSHOT_GENERATION_SCANS_INFLIGHT
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn update_path_metadata_digest(
+        hasher: &mut Sha256,
+        path: &Path,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                hasher.update([1]);
+                hasher.update(metadata.len().to_le_bytes());
+                let file_type = metadata.file_type();
+                hasher.update([
+                    u8::from(file_type.is_file()),
+                    u8::from(file_type.is_dir()),
+                    u8::from(file_type.is_symlink()),
+                ]);
+                let modified = metadata
+                    .modified()
+                    .unwrap_or(UNIX_EPOCH)
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                hasher.update(modified.as_secs().to_le_bytes());
+                hasher.update(modified.subsec_nanos().to_le_bytes());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update([0]);
+            }
+            Err(error) => return Err(ReadSnapshotAcquireError::failed(error)),
+        }
+        Ok(())
+    }
+
+    fn update_path_shape_digest(
+        hasher: &mut Sha256,
+        path: &Path,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                hasher.update([1]);
+                hasher.update(metadata.len().to_le_bytes());
+                let file_type = metadata.file_type();
+                hasher.update([
+                    u8::from(file_type.is_file()),
+                    u8::from(file_type.is_dir()),
+                    u8::from(file_type.is_symlink()),
+                ]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update([0]);
+            }
+            Err(error) => return Err(ReadSnapshotAcquireError::failed(error)),
+        }
+        Ok(())
+    }
+
+    fn update_file_contents_digest(
+        hasher: &mut Sha256,
+        path: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(ReadSnapshotAcquireError::failed)?;
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(path).map_err(ReadSnapshotAcquireError::failed)?;
+            hasher.update(target.to_string_lossy().as_bytes());
+            return Ok(());
+        }
+        if !metadata.is_file() {
+            return Ok(());
+        }
+
+        let mut file = std::fs::File::open(path).map_err(ReadSnapshotAcquireError::failed)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if cancelled() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            let read = file
+                .read(&mut buffer)
+                .map_err(ReadSnapshotAcquireError::failed)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(())
+    }
+
+    fn collect_archive_tree_paths(
+        directory: &Path,
+        paths: &mut Vec<PathBuf>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ReadSnapshotAcquireError::failed(error)),
+        };
+        for entry in entries {
+            if cancelled() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            let entry = entry.map_err(ReadSnapshotAcquireError::failed)?;
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(ReadSnapshotAcquireError::failed)?;
+            paths.push(path.clone());
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                collect_archive_tree_paths(&path, paths, cancelled)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_archive_generation(
+        storage_root: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(PathBuf, [u8; 32]), ReadSnapshotAcquireError> {
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        let canonical_root = storage_root
+            .canonicalize()
+            .map_err(ReadSnapshotAcquireError::failed)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"agent-mail-read-snapshot-archive-v1");
+        hasher.update(canonical_root.to_string_lossy().as_bytes());
+
+        if let Ok(repo) = git2::Repository::open(&canonical_root)
+            && repo
+                .workdir()
+                .and_then(|workdir| workdir.canonicalize().ok())
+                .as_ref()
+                == Some(&canonical_root)
+        {
+            let head_before = read_archive_head(&repo);
+            hasher.update(b"git");
+            if let Some(head) = head_before {
+                hasher.update(head.as_bytes());
+            }
+
+            let mut status_options = git2::StatusOptions::new();
+            status_options
+                .show(git2::StatusShow::IndexAndWorkdir)
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .include_ignored(true)
+                .recurse_ignored_dirs(true)
+                .include_unmodified(false)
+                .exclude_submodules(false)
+                .pathspec("projects");
+            let statuses = repo
+                .statuses(Some(&mut status_options))
+                .map_err(ReadSnapshotAcquireError::failed)?;
+            if cancelled() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            let mut dirty_paths = Vec::new();
+            for entry in statuses.iter() {
+                let path = entry.path().map_err(|error| {
+                    ReadSnapshotAcquireError::Failed(format!(
+                        "archive Git status path is unavailable or non-UTF-8; refusing an inexact read-snapshot generation: {error}"
+                    ))
+                })?;
+                dirty_paths.push((path.to_string(), entry.status().bits()));
+            }
+            dirty_paths.sort();
+            let mut content_paths = BTreeSet::new();
+            for (relative, status) in &dirty_paths {
+                if cancelled() {
+                    return Err(ReadSnapshotAcquireError::Cancelled);
+                }
+                hasher.update(relative.as_bytes());
+                hasher.update(status.to_le_bytes());
+                let path = canonical_root.join(relative);
+                let newly_discovered = content_paths.insert(path.clone());
+                if newly_discovered && path.exists() {
+                    let metadata = std::fs::symlink_metadata(&path)
+                        .map_err(ReadSnapshotAcquireError::failed)?;
+                    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        let mut descendants = Vec::new();
+                        collect_archive_tree_paths(&path, &mut descendants, cancelled)?;
+                        content_paths.extend(descendants);
+                    }
+                }
+            }
+            for path in content_paths {
+                if cancelled() {
+                    return Err(ReadSnapshotAcquireError::Cancelled);
+                }
+                let relative = path.strip_prefix(&canonical_root).unwrap_or(path.as_path());
+                hasher.update(relative.to_string_lossy().as_bytes());
+                update_path_metadata_digest(&mut hasher, &path)?;
+                if path.exists() {
+                    update_file_contents_digest(&mut hasher, &path, cancelled)?;
+                }
+            }
+
+            if read_archive_head(&repo) != head_before {
+                return Err(ReadSnapshotAcquireError::Failed(
+                    "archive HEAD changed while computing the read-snapshot generation".to_string(),
+                ));
+            }
+            return Ok((canonical_root, hasher.finalize().into()));
+        }
+
+        hasher.update(b"tree");
+        let projects = canonical_root.join("projects");
+        let mut paths = Vec::new();
+        collect_archive_tree_paths(&projects, &mut paths, cancelled)?;
+        paths.sort();
+        for path in paths {
+            if cancelled() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            let relative = path.strip_prefix(&canonical_root).unwrap_or(path.as_path());
+            hasher.update(relative.to_string_lossy().as_bytes());
+            update_path_metadata_digest(&mut hasher, &path)?;
+            update_file_contents_digest(&mut hasher, &path, cancelled)?;
+        }
+        Ok((canonical_root, hasher.finalize().into()))
+    }
+
+    fn read_live_db_generation(
+        sqlite_path: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<[u8; 32], ReadSnapshotAcquireError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"agent-mail-read-snapshot-live-db-v3-content");
+        // The main database plus rollback/WAL journals are durable content.
+        // Do not hash `-shm`: read-lock bookkeeping changes there without a
+        // durable mailbox write and would make generation validation livelock.
+        for path in
+            std::iter::once(sqlite_path.to_path_buf()).chain(["-journal", "-wal"].into_iter().map(
+                |suffix| mcp_agent_mail_db::pool::sqlite_path_with_suffix(sqlite_path, suffix),
+            ))
+        {
+            if cancelled() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            hasher.update(path.to_string_lossy().as_bytes());
+            // Read-only FrankenSQLite probes can advance the main file's mtime
+            // without changing durable bytes. The exact generation is content
+            // addressed, so include path shape but exclude incidental mtimes.
+            update_path_shape_digest(&mut hasher, &path)?;
+            if path.exists() {
+                update_file_contents_digest(&mut hasher, &path, cancelled)?;
+            }
+        }
+        Ok(hasher.finalize().into())
+    }
+
+    fn read_snapshot_scope(
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> Result<ReadSnapshotScope, ReadSnapshotAcquireError> {
+        let storage_root = storage_root
+            .canonicalize()
+            .map_err(ReadSnapshotAcquireError::failed)?;
+        let sqlite_path = sqlite_path
+            .canonicalize()
+            .unwrap_or_else(|_| sqlite_path.to_path_buf());
+        Ok(ReadSnapshotScope {
+            storage_root,
+            sqlite_path,
+        })
+    }
+
+    fn read_snapshot_key(
+        scope: &ReadSnapshotScope,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ReadSnapshotKey, ReadSnapshotAcquireError> {
+        #[cfg(test)]
+        let _generation_scan_guard = ReadSnapshotGenerationScanGuard::start();
+
+        let (_, archive_digest) = read_archive_generation(&scope.storage_root, cancelled)?;
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        let live_db_digest = read_live_db_generation(&scope.sqlite_path, cancelled)?;
+        Ok(ReadSnapshotKey {
+            archive_digest,
+            live_db_digest,
+        })
+    }
+
+    fn open_read_only_snapshot_probe(
+        sqlite_path: &Path,
+        phase: &str,
+    ) -> Result<mcp_agent_mail_db::DbConn, String> {
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file_read_only(sqlite_path.to_string_lossy().as_ref())
+                .map_err(|error| {
+                    format!(
+                        "{phase}: open {} read-only without create: {error}",
+                        sqlite_path.display()
+                    )
+                })?;
+        conn.execute_raw("PRAGMA query_only = ON;")
+            .map_err(|error| format!("{phase}: enforce query-only connection: {error}"))?;
+        Ok(conn)
+    }
+
+    fn read_snapshot_live_data_version(slot: &ReadSnapshotScopeSlot) -> Option<i64> {
+        let mut observer = slot
+            .data_version_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observer.is_none() {
+            let conn = open_read_only_snapshot_probe(
+                &slot.scope.sqlite_path,
+                "read-snapshot data_version observer",
+            )
+            .ok()?;
+            *observer = Some(conn);
+        }
+        let value = observer
+            .as_ref()
+            .and_then(|conn| mcp_agent_mail_db::pool::sqlite_data_version(conn).ok());
+        if value.is_none() {
+            // Re-open on the next validation after an observer failure. The
+            // metadata and exact-audit paths remain conservative meanwhile.
+            *observer = None;
+        }
+        value
+    }
+
+    fn read_snapshot_cheap_key(
+        slot: &ReadSnapshotScopeSlot,
+    ) -> Result<ReadSnapshotCheapKey, ReadSnapshotAcquireError> {
+        // Establish the long-lived observer before capturing file metadata:
+        // opening a read-only FrankenSQLite connection may create sidecars or
+        // advance the main file's mtime even though durable content is stable.
+        let live_data_version = read_snapshot_live_data_version(slot);
+
+        let mut archive = Sha256::new();
+        archive.update(b"agent-mail-read-snapshot-archive-metadata-v2");
+        archive.update(slot.scope.storage_root.to_string_lossy().as_bytes());
+        // Pool setup can create and remove transient root-level bookkeeping;
+        // only the projects tree and Git metadata define archive generations.
+        update_path_shape_digest(&mut archive, &slot.scope.storage_root)?;
+        update_path_metadata_digest(&mut archive, &slot.scope.storage_root.join("projects"))?;
+        update_path_metadata_digest(&mut archive, &slot.scope.storage_root.join(".git/HEAD"))?;
+        update_path_metadata_digest(&mut archive, &slot.scope.storage_root.join(".git/index"))?;
+        if let Ok(repo) = git2::Repository::open(&slot.scope.storage_root)
+            && let Some(head) = read_archive_head(&repo)
+        {
+            archive.update(head.as_bytes());
+        }
+
+        let mut live = Sha256::new();
+        live.update(b"agent-mail-read-snapshot-live-db-metadata-v2");
+        live.update(slot.scope.sqlite_path.to_string_lossy().as_bytes());
+        update_path_shape_digest(&mut live, &slot.scope.sqlite_path)?;
+        for path in ["-journal", "-wal"].into_iter().map(|suffix| {
+            mcp_agent_mail_db::pool::sqlite_path_with_suffix(&slot.scope.sqlite_path, suffix)
+        }) {
+            live.update(path.to_string_lossy().as_bytes());
+            update_path_metadata_digest(&mut live, &path)?;
+        }
+
+        Ok(ReadSnapshotCheapKey {
+            archive_metadata_digest: archive.finalize().into(),
+            live_db_metadata_digest: live.finalize().into(),
+            live_data_version,
+            db_write_epoch: READ_SNAPSHOT_DB_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+            archive_application_epoch: mcp_agent_mail_storage::archive_application_epoch(),
+        })
+    }
+
+    pub(crate) fn read_snapshot_cancelled(cx: Option<&asupersync::Cx>) -> bool {
+        cx.is_some_and(asupersync::Cx::is_cancel_requested)
+    }
+
+    fn read_snapshot_key_with_budget(
+        scope: &ReadSnapshotScope,
+        cancelled: &dyn Fn() -> bool,
+        cx: Option<&asupersync::Cx>,
+        build_deadline: Instant,
+    ) -> Result<ReadSnapshotKey, ReadSnapshotAcquireError> {
+        let key = match read_snapshot_key(scope, cancelled) {
+            Ok(key) => key,
+            Err(_) if read_snapshot_cancelled(cx) => {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            Err(_) if Instant::now() >= build_deadline => {
+                return Err(ReadSnapshotAcquireError::TimedOut(format!(
+                    "archive read snapshot generation scan exceeded its {}s work budget",
+                    READ_SNAPSHOT_BUILD_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        if read_snapshot_cancelled(cx) {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        if Instant::now() >= build_deadline {
+            return Err(ReadSnapshotAcquireError::TimedOut(format!(
+                "archive read snapshot generation scan exceeded its {}s work budget",
+                READ_SNAPSHOT_BUILD_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(key)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReadSnapshotMode {
+        Canonical,
+        ForceSnapshot,
+    }
+
+    #[derive(Clone)]
+    struct ReadSnapshotBuildRequest {
+        database_url: String,
+        mode: ReadSnapshotMode,
+    }
+
+    fn read_snapshot_slot(
+        scope: ReadSnapshotScope,
+    ) -> Result<Arc<ReadSnapshotScopeSlot>, ReadSnapshotAcquireError> {
+        let mut registry = READ_SNAPSHOT_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = registry.slots.iter().position(|slot| slot.scope == scope) {
+            let slot = registry
+                .slots
+                .remove(index)
+                .expect("read snapshot slot index must remain valid");
+            registry.slots.push_back(Arc::clone(&slot));
+            return Ok(slot);
+        }
+
+        let retired = if registry.slots.len() >= READ_SNAPSHOT_SCOPE_CAPACITY {
+            let Some(index) = registry.slots.iter().position(|candidate| {
+                Arc::strong_count(candidate) == 1 && {
+                    let state = candidate
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.building.is_none() && state.active_writers == 0
+                }
+            }) else {
+                return Err(ReadSnapshotAcquireError::Busy(format!(
+                    "archive read snapshot scope registry is at its hard capacity of {READ_SNAPSHOT_SCOPE_CAPACITY} active mailboxes"
+                )));
+            };
+            registry.slots.remove(index)
+        } else {
+            None
+        };
+        let slot = Arc::new(ReadSnapshotScopeSlot::new(scope));
+        registry.slots.push_back(Arc::clone(&slot));
+        drop(registry);
+        // A retired entry can own a pool and temporary directory. Never run
+        // that cleanup while holding the global registry lock.
+        drop(retired);
+        Ok(slot)
+    }
+
+    fn begin_read_snapshot_write(
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> Option<Arc<ReadSnapshotScopeSlot>> {
+        READ_SNAPSHOT_DB_WRITES_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        READ_SNAPSHOT_DB_WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        let slot = read_snapshot_scope(storage_root, sqlite_path)
+            .ok()
+            .and_then(|scope| read_snapshot_slot(scope).ok());
+        if let Some(slot) = &slot {
+            let mut state = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active_writers = state.active_writers.saturating_add(1);
+            slot.invalidation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            drop(state);
+            slot.notify.notify_waiters();
+        }
+        slot
+    }
+
+    fn end_read_snapshot_write(slot: Option<&ReadSnapshotScopeSlot>) {
+        if let Some(slot) = slot {
+            let mut state = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.active_writers = state.active_writers.saturating_sub(1);
+            slot.invalidation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            drop(state);
+        }
+        READ_SNAPSHOT_DB_WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        READ_SNAPSHOT_DB_WRITES_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(slot) = slot {
+            slot.notify.notify_waiters();
+        }
+    }
+
+    fn invalidate_read_snapshot_slot(slot: &ReadSnapshotScopeSlot) {
+        slot.invalidation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        slot.notify.notify_waiters();
+    }
+
+    pub(crate) fn invalidate_read_snapshots_for_archive(storage_root: &Path) {
+        let canonical = storage_root
+            .canonicalize()
+            .unwrap_or_else(|_| storage_root.to_path_buf());
+        let slots = READ_SNAPSHOT_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slots
+            .iter()
+            .filter(|slot| slot.scope.storage_root == canonical)
+            .cloned()
+            .collect::<Vec<_>>();
+        for slot in slots {
+            invalidate_read_snapshot_slot(&slot);
+        }
+    }
+
+    fn build_read_snapshot(
+        scope: &ReadSnapshotScope,
+        inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Arc<SharedArchiveReadSnapshot>, ReadSnapshotAcquireError> {
+        #[cfg(test)]
+        let _reconstruction_guard = ReadSnapshotReconstructionGuard::start();
+
+        let snapshot_dir =
+            mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("agent-mail-read-snapshot-")
+                .map_err(ReadSnapshotAcquireError::failed)?;
+        let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
+        let stats = if scope.sqlite_path.exists() {
+            mcp_agent_mail_db::reconstruct_from_archive_with_salvage_cancellable(
+                &snapshot_db,
+                &scope.storage_root,
+                Some(scope.sqlite_path.as_path()),
+                cancelled,
+            )
+            .map_err(ReadSnapshotAcquireError::failed)?
+        } else {
+            mcp_agent_mail_db::reconstruct_from_archive_cancellable(
+                &snapshot_db,
+                &scope.storage_root,
+                cancelled,
+            )
+            .map_err(ReadSnapshotAcquireError::failed)?
+        };
+        if cancelled() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        validate_read_snapshot_completeness(inventory, &stats)?;
+        let pool = mcp_agent_mail_db::create_query_only_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
+            storage_root: Some(scope.storage_root.clone()),
+            ..Default::default()
+        })
+        .map_err(ReadSnapshotAcquireError::failed)?;
+        Ok(Arc::new(SharedArchiveReadSnapshot {
+            pool,
+            _snapshot_dir: snapshot_dir,
+        }))
+    }
+
+    fn validate_read_snapshot_inventory(
+        inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        if inventory.parse_errors > 0 {
+            return Err(ReadSnapshotAcquireError::Failed(format!(
+                "archive read snapshot inventory found {} canonical message file(s) that could not be parsed; refusing an incomplete read decision",
+                inventory.parse_errors
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_read_snapshot_completeness(
+        inventory: &mcp_agent_mail_db::ArchiveMessageInventory,
+        stats: &mcp_agent_mail_db::ReconstructStats,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        validate_read_snapshot_inventory(inventory)?;
+        if stats.parse_errors > 0 {
+            return Err(ReadSnapshotAcquireError::Failed(format!(
+                "archive read snapshot reconstruction skipped {} malformed or unreadable archive artifact(s); refusing partial publication",
+                stats.parse_errors
+            )));
+        }
+
+        let reconstructed_message_files = stats
+            .messages
+            .checked_add(stats.duplicate_canonical_message_files)
+            .ok_or_else(|| {
+                ReadSnapshotAcquireError::Failed(
+                    "archive read snapshot message completeness count overflowed".to_string(),
+                )
+            })?;
+        if stats.projects != inventory.projects
+            || stats.agents != inventory.agents
+            || reconstructed_message_files != inventory.canonical_message_files
+        {
+            return Err(ReadSnapshotAcquireError::Failed(format!(
+                "archive read snapshot reconstruction was incomplete: inventory projects={} agents={} canonical_message_files={}; reconstructed projects={} agents={} messages={} duplicate_canonical_message_files={} (salvaged projects={} agents={} messages={})",
+                inventory.projects,
+                inventory.agents,
+                inventory.canonical_message_files,
+                stats.projects,
+                stats.agents,
+                stats.messages,
+                stats.duplicate_canonical_message_files,
+                stats.salvaged_projects,
+                stats.salvaged_agents,
+                stats.salvaged_messages,
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_snapshot_stop_error(
+        slot: &ReadSnapshotScopeSlot,
+        build: &ReadSnapshotBuild,
+        cx: &asupersync::Cx,
+        deadline: Instant,
+        phase: &str,
+    ) -> Option<ReadSnapshotAcquireError> {
+        if cx.is_cancel_requested() {
+            return Some(ReadSnapshotAcquireError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Some(ReadSnapshotAcquireError::TimedOut(format!(
+                "archive read snapshot {phase} exceeded its {}s cold-bootstrap budget",
+                READ_SNAPSHOT_BUILD_TIMEOUT.as_secs()
+            )));
+        }
+        if slot
+            .invalidation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != build.invalidation_epoch
+            || slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active_writers
+                > 0
+            || READ_SNAPSHOT_DB_WRITES_ACTIVE.load(std::sync::atomic::Ordering::Acquire) > 0
+            || READ_SNAPSHOT_DB_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+                != build.db_write_epoch
+            || mcp_agent_mail_storage::archive_applications_active() > 0
+            || mcp_agent_mail_storage::archive_application_epoch()
+                != build.archive_application_epoch
+        {
+            return Some(ReadSnapshotAcquireError::Busy(
+                "archive read snapshot build was superseded by a durable write".to_string(),
+            ));
+        }
+        None
+    }
+
+    fn normalize_read_snapshot_build_error(
+        error: ReadSnapshotAcquireError,
+        slot: &ReadSnapshotScopeSlot,
+        build: &ReadSnapshotBuild,
+        cx: &asupersync::Cx,
+        deadline: Instant,
+        phase: &str,
+    ) -> ReadSnapshotAcquireError {
+        read_snapshot_stop_error(slot, build, cx, deadline, phase).unwrap_or(error)
+    }
+
+    fn run_read_snapshot_build(
+        slot: &ReadSnapshotScopeSlot,
+        request: &ReadSnapshotBuildRequest,
+        build: &ReadSnapshotBuild,
+        cx: &asupersync::Cx,
+    ) -> Result<ReadSnapshotBuildOutput, ReadSnapshotAcquireError> {
+        #[cfg(test)]
+        read_snapshot_test_delay();
+
+        let cancelled = || {
+            read_snapshot_stop_error(
+                slot,
+                build,
+                cx,
+                build.deadline,
+                "generation or reconstruction",
+            )
+            .is_some()
+        };
+        let mut archive_inventory = None;
+        for _ in 0..READ_SNAPSHOT_GENERATION_RETRIES {
+            if let Some(error) =
+                read_snapshot_stop_error(slot, build, cx, build.deadline, "generation")
+            {
+                return Err(error);
+            }
+            let cheap_key = read_snapshot_cheap_key(slot)?;
+            let cheap_cached = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .as_ref()
+                .filter(|entry| {
+                    entry.invalidation_epoch == build.invalidation_epoch
+                        && entry.cheap_key == cheap_key
+                        && Instant::now().duration_since(entry.strong_validated_at)
+                            < read_snapshot_exact_audit_interval()
+                })
+                .map(|entry| {
+                    (
+                        entry.key.clone(),
+                        entry.decision.clone(),
+                        entry.strong_validated_at,
+                    )
+                });
+            if let Some((key, decision, strong_validated_at)) = cheap_cached {
+                return Ok(ReadSnapshotBuildOutput {
+                    key,
+                    cheap_key,
+                    decision,
+                    strong_validated_at,
+                });
+            }
+
+            let key =
+                read_snapshot_key_with_budget(&slot.scope, &cancelled, Some(cx), build.deadline)
+                    .map_err(|error| {
+                        normalize_read_snapshot_build_error(
+                            error,
+                            slot,
+                            &build,
+                            cx,
+                            build.deadline,
+                            "generation",
+                        )
+                    })?;
+
+            let cached_decision = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .as_ref()
+                .filter(|entry| {
+                    entry.invalidation_epoch == build.invalidation_epoch && entry.key == key
+                })
+                .map(|entry| entry.decision.clone());
+            if let Some(decision) = cached_decision {
+                let cheap_after = read_snapshot_cheap_key(slot)?;
+                if cheap_after == cheap_key {
+                    read_snapshot_test_pause_after_final_validation();
+                    return Ok(ReadSnapshotBuildOutput {
+                        key,
+                        cheap_key: cheap_after,
+                        decision,
+                        strong_validated_at: Instant::now(),
+                    });
+                }
+                continue;
+            }
+
+            if archive_inventory
+                .as_ref()
+                .is_none_or(|(digest, _)| *digest != key.archive_digest)
+            {
+                archive_inventory = Some((
+                    key.archive_digest,
+                    read_archive_inventory_cancellable(&slot.scope.storage_root, &cancelled)
+                        .map_err(|error| {
+                            normalize_read_snapshot_build_error(
+                                error,
+                                slot,
+                                &build,
+                                cx,
+                                build.deadline,
+                                "archive inventory",
+                            )
+                        })?,
+                ));
+            }
+            let inventory = &archive_inventory
+                .as_ref()
+                .expect("archive inventory generation must be initialized")
+                .1;
+            validate_read_snapshot_inventory(inventory)?;
+            let snapshot_required = if request.mode == ReadSnapshotMode::ForceSnapshot {
+                true
+            } else {
+                let archive_has_state = read_archive_inventory_has_state(inventory);
+                match open_read_only_snapshot_probe(
+                    &slot.scope.sqlite_path,
+                    "read-snapshot archive-ahead probe",
+                ) {
+                    Ok(conn) => {
+                        if archive_has_state
+                            && live_db_is_suspect(
+                                &request.database_url,
+                                &slot.scope.storage_root,
+                                &slot.scope.sqlite_path,
+                            )
+                        {
+                            true
+                        } else {
+                            let conn = mcp_agent_mail_db::guard_db_conn(
+                                conn,
+                                "tool_util::run_read_snapshot_build archive-ahead probe",
+                            );
+                            let ahead = read_archive_is_ahead(
+                                &slot.scope.storage_root,
+                                &slot.scope.sqlite_path,
+                                &conn,
+                                inventory,
+                            );
+                            drop(conn);
+                            match ahead {
+                                Ok(ahead) => ahead,
+                                Err(error) if archive_has_state => {
+                                    tracing::warn!(
+                                        source = %slot.scope.sqlite_path.display(),
+                                        storage_root = %slot.scope.storage_root.display(),
+                                        error = %error,
+                                        "using archive snapshot because the live sqlite inventory probe failed"
+                                    );
+                                    true
+                                }
+                                Err(_) => false,
+                            }
+                        }
+                    }
+                    Err(error) if archive_has_state => {
+                        tracing::warn!(
+                            source = %slot.scope.sqlite_path.display(),
+                            storage_root = %slot.scope.storage_root.display(),
+                            error = %error,
+                            "using archive snapshot because the live sqlite source could not be opened"
+                        );
+                        true
+                    }
+                    Err(_) => false,
+                }
+            };
+
+            let decision = if snapshot_required {
+                #[cfg(test)]
+                run_read_snapshot_pre_reconstruction_test_hook();
+                ArchiveReadDecision::Snapshot(
+                    build_read_snapshot(&slot.scope, inventory, &cancelled).map_err(|error| {
+                        normalize_read_snapshot_build_error(
+                            error,
+                            slot,
+                            &build,
+                            cx,
+                            build.deadline,
+                            "reconstruction",
+                        )
+                    })?,
+                )
+            } else {
+                ArchiveReadDecision::Live
+            };
+
+            let after =
+                read_snapshot_key_with_budget(&slot.scope, &cancelled, Some(cx), build.deadline)
+                    .map_err(|error| {
+                        normalize_read_snapshot_build_error(
+                            error,
+                            slot,
+                            &build,
+                            cx,
+                            build.deadline,
+                            "post-build validation",
+                        )
+                    })?;
+            let cheap_after = read_snapshot_cheap_key(slot)?;
+            if after == key && cheap_after == cheap_key {
+                read_snapshot_test_pause_after_final_validation();
+                return Ok(ReadSnapshotBuildOutput {
+                    key,
+                    cheap_key: cheap_after,
+                    decision,
+                    strong_validated_at: Instant::now(),
+                });
+            }
+        }
+
+        Err(ReadSnapshotAcquireError::Busy(
+            "archive or live SQLite content changed repeatedly during read-snapshot reconstruction"
+                .to_string(),
+        ))
+    }
+
+    fn try_claim_read_snapshot_build(
+        slot: &ReadSnapshotScopeSlot,
+        deadline: Instant,
+    ) -> Result<Option<ReadSnapshotBuild>, ReadSnapshotAcquireError> {
+        let mut state = slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active_writers > 0
+            || READ_SNAPSHOT_DB_WRITES_ACTIVE.load(std::sync::atomic::Ordering::Acquire) > 0
+            || mcp_agent_mail_storage::archive_applications_active() > 0
+        {
+            return Err(ReadSnapshotAcquireError::Busy(
+                "archive read snapshot build is blocked while a durable writer is active"
+                    .to_string(),
+            ));
+        }
+        if state.building.is_some() {
+            return Ok(None);
+        }
+        state.next_token = state.next_token.wrapping_add(1).max(1);
+        let build = ReadSnapshotBuild {
+            token: state.next_token,
+            invalidation_epoch: slot
+                .invalidation_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            db_write_epoch: READ_SNAPSHOT_DB_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+            archive_application_epoch: mcp_agent_mail_storage::archive_application_epoch(),
+            deadline,
+            completion: Arc::new(ReadSnapshotBuildCompletion::pending()),
+        };
+        state.building = Some(build.clone());
+        Ok(Some(build))
+    }
+
+    fn fail_scheduled_read_snapshot_build(
+        slot: &ReadSnapshotScopeSlot,
+        build: &ReadSnapshotBuild,
+        error: ReadSnapshotAcquireError,
+    ) {
+        let mut state = slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .building
+            .as_ref()
+            .is_some_and(|active| active.token == build.token)
+        {
+            state.building = None;
+            build.completion.complete(Err(error));
+        }
+        drop(state);
+        slot.notify.notify_waiters();
+    }
+
+    fn schedule_read_snapshot_build(
+        slot: Arc<ReadSnapshotScopeSlot>,
+        request: ReadSnapshotBuildRequest,
+        build: &ReadSnapshotBuild,
+        cx: asupersync::Cx,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        let Some(pending_permit) = ReadSnapshotBuildPermit::try_acquire() else {
+            let error = ReadSnapshotAcquireError::Busy(format!(
+                "archive read snapshot build queue is at its hard pending limit of {READ_SNAPSHOT_PENDING_BUILD_LIMIT}"
+            ));
+            fail_scheduled_read_snapshot_build(&slot, build, error.clone());
+            return Err(error);
+        };
+        let worker_slot = Arc::clone(&slot);
+        let worker_build = build.clone();
+        let handle = READ_SNAPSHOT_BLOCKING_POOL.spawn(move || {
+            let mut guard =
+                ReadSnapshotBuildGuard::new(Arc::clone(&worker_slot), worker_build.token);
+            let result = run_read_snapshot_build(&worker_slot, &request, &worker_build, &cx);
+            guard.publish(&worker_build, result);
+            drop(pending_permit);
+            worker_slot.notify.notify_waiters();
+        });
+        if handle.is_cancelled() {
+            let error = ReadSnapshotAcquireError::Busy(
+                "archive read snapshot blocking pool is unavailable".to_string(),
+            );
+            fail_scheduled_read_snapshot_build(&slot, build, error.clone());
+            return Err(error);
+        }
+        drop(handle);
+        Ok(())
+    }
+
+    async fn wait_for_read_snapshot_build(
+        slot: &ReadSnapshotScopeSlot,
+        build: ReadSnapshotBuild,
+        cx: &asupersync::Cx,
+        caller_deadline: Instant,
+    ) -> Result<(), ReadSnapshotAcquireError> {
+        loop {
+            if cx.is_cancel_requested() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            if let Some(completion) = build.completion.result() {
+                return match completion {
+                    Ok(()) => Ok(()),
+                    Err(ReadSnapshotAcquireError::Cancelled) => Ok(()),
+                    Err(ReadSnapshotAcquireError::Busy(message))
+                        if message.contains("superseded by a durable write") =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+
+            let now = Instant::now();
+            let deadline = build.deadline.min(caller_deadline);
+            if now >= deadline {
+                return Err(ReadSnapshotAcquireError::TimedOut(format!(
+                    "archive read snapshot cold bootstrap exceeded its {}s budget",
+                    READ_SNAPSHOT_BUILD_TIMEOUT.as_secs()
+                )));
+            }
+            let wait_for = READ_SNAPSHOT_WAIT_SLICE.min(deadline - now);
+            let notified = Box::pin(slot.notify.notified());
+            let _ =
+                asupersync::time::timeout(asupersync::time::wall_now(), wait_for, notified).await;
+        }
+    }
+
+    async fn get_archive_read_decision(
+        storage_root: &Path,
+        sqlite_path: &Path,
+        database_url: &str,
+        cx: &asupersync::Cx,
+        mode: ReadSnapshotMode,
+    ) -> Result<ArchiveReadDecision, ReadSnapshotAcquireError> {
+        if cx.is_cancel_requested() {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
+        let slot = read_snapshot_slot(read_snapshot_scope(storage_root, sqlite_path)?)?;
+        let request = ReadSnapshotBuildRequest {
+            database_url: database_url.to_string(),
+            mode,
+        };
+        let cold_deadline = Instant::now() + READ_SNAPSHOT_BUILD_TIMEOUT;
+
+        loop {
+            if cx.is_cancel_requested() {
+                return Err(ReadSnapshotAcquireError::Cancelled);
+            }
+            let epoch = slot
+                .invalidation_epoch
+                .load(std::sync::atomic::Ordering::Acquire);
+            let (ready, active_build) = {
+                let state = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ready = state.ready.as_ref().and_then(|entry| {
+                    (entry.invalidation_epoch == epoch
+                        && state.active_writers == 0
+                        && READ_SNAPSHOT_DB_WRITES_ACTIVE
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            == 0
+                        && entry.cheap_key.db_write_epoch
+                            == READ_SNAPSHOT_DB_WRITE_EPOCH
+                                .load(std::sync::atomic::Ordering::Acquire)
+                        && mcp_agent_mail_storage::archive_applications_active() == 0
+                        && entry.cheap_key.archive_application_epoch
+                            == mcp_agent_mail_storage::archive_application_epoch())
+                    .then(|| {
+                        (
+                            entry.decision.clone(),
+                            Instant::now().duration_since(entry.validated_at)
+                                < read_snapshot_validation_ttl(),
+                        )
+                    })
+                });
+                (ready, state.building.clone())
+            };
+
+            if let Some((decision, true)) = ready {
+                return Ok(decision);
+            }
+            if let Some((decision, false)) = ready {
+                if active_build.is_none() {
+                    match try_claim_read_snapshot_build(&slot, cold_deadline) {
+                        Ok(Some(build)) => {
+                            if let Err(error) = schedule_read_snapshot_build(
+                                Arc::clone(&slot),
+                                request.clone(),
+                                &build,
+                                cx.clone(),
+                            ) {
+                                tracing::warn!(error = ?error, "snapshot stale-while-revalidate scheduling failed");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::debug!(
+                            error = ?error,
+                            "snapshot stale-while-revalidate deferred while admission is busy"
+                        ),
+                    }
+                }
+                return Ok(decision);
+            }
+
+            let build = match active_build {
+                Some(build) => build,
+                None => {
+                    let Some(build) = try_claim_read_snapshot_build(&slot, cold_deadline)? else {
+                        continue;
+                    };
+                    schedule_read_snapshot_build(
+                        Arc::clone(&slot),
+                        request.clone(),
+                        &build,
+                        cx.clone(),
+                    )?;
+                    build
+                }
+            };
+            wait_for_read_snapshot_build(&slot, build, cx, cold_deadline).await?;
+        }
+    }
+
+    pub(crate) async fn get_archive_read_snapshot_if(
+        storage_root: &Path,
+        sqlite_path: &Path,
+        database_url: &str,
+        cx: &asupersync::Cx,
+    ) -> Result<Option<Arc<SharedArchiveReadSnapshot>>, ReadSnapshotAcquireError> {
+        get_archive_read_decision(
+            storage_root,
+            sqlite_path,
+            database_url,
+            cx,
+            ReadSnapshotMode::Canonical,
+        )
+        .await
+        .map(|decision| decision.immutable_snapshot())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_or_build_archive_read_snapshot(
+        storage_root: &Path,
+        sqlite_path: &Path,
+        cx: &asupersync::Cx,
+    ) -> Result<Arc<SharedArchiveReadSnapshot>, ReadSnapshotAcquireError> {
+        get_archive_read_decision(
+            storage_root,
+            sqlite_path,
+            &mcp_agent_mail_core::disk::sqlite_url_from_path(sqlite_path),
+            cx,
+            ReadSnapshotMode::ForceSnapshot,
+        )
+        .await?
+        .immutable_snapshot()
+        .ok_or_else(|| {
+            ReadSnapshotAcquireError::Failed(
+                "archive snapshot was unexpectedly bypassed by an unconditional build".to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn read_snapshot_acquire_error_to_mcp_error(
+        error: ReadSnapshotAcquireError,
+    ) -> McpError {
+        match error {
+            ReadSnapshotAcquireError::Cancelled => McpError::request_cancelled(),
+            ReadSnapshotAcquireError::Busy(message) => {
+                db_error_to_mcp_error(DbError::ResourceBusy(message))
+            }
+            ReadSnapshotAcquireError::TimedOut(message) => legacy_tool_error(
+                "SNAPSHOT_TIMEOUT",
+                message,
+                true,
+                json!({"timeout_seconds": READ_SNAPSHOT_BUILD_TIMEOUT.as_secs()}),
+            ),
+            ReadSnapshotAcquireError::Failed(message) => {
+                read_pool_setup_error_to_mcp_error(message)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_read_snapshot_cache() {
+        use std::sync::atomic::Ordering;
+
+        let mut registry = READ_SNAPSHOT_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            registry.slots.iter().all(|slot| slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .building
+                .is_none()),
+            "cannot reset the read snapshot cache while a reconstruction is active"
+        );
+        assert_eq!(
+            READ_SNAPSHOT_DB_WRITES_ACTIVE.load(Ordering::SeqCst),
+            0,
+            "cannot reset the read snapshot cache while a write lease is active"
+        );
+        registry.slots.clear();
+        drop(registry);
+        READ_SNAPSHOT_RECONSTRUCTION_COUNT.store(0, Ordering::SeqCst);
+        READ_SNAPSHOT_RECONSTRUCTIONS_INFLIGHT.store(0, Ordering::SeqCst);
+        READ_SNAPSHOT_RECONSTRUCTIONS_MAX_INFLIGHT.store(0, Ordering::SeqCst);
+        READ_SNAPSHOT_GENERATION_SCAN_COUNT.store(0, Ordering::SeqCst);
+        READ_SNAPSHOT_GENERATION_SCANS_INFLIGHT.store(0, Ordering::SeqCst);
+        READ_SNAPSHOT_GENERATION_SCANS_MAX_INFLIGHT.store(0, Ordering::SeqCst);
+        READ_SNAPSHOT_TEST_DELAY_MILLIS.store(0, Ordering::Release);
+        reset_read_snapshot_pre_reconstruction_test_hook();
+        reset_read_snapshot_post_validation_test_hook();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_snapshot_cache_stats() -> (usize, bool, usize, usize, usize) {
+        use std::sync::atomic::Ordering;
+
+        let registry = READ_SNAPSHOT_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ready = 0;
+        let mut building = false;
+        for slot in &registry.slots {
+            let state = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ready += usize::from(state.ready.is_some());
+            building |= state.building.is_some();
+        }
+        (
+            ready,
+            building,
+            READ_SNAPSHOT_RECONSTRUCTION_COUNT.load(Ordering::SeqCst),
+            READ_SNAPSHOT_RECONSTRUCTIONS_INFLIGHT.load(Ordering::SeqCst),
+            READ_SNAPSHOT_RECONSTRUCTIONS_MAX_INFLIGHT.load(Ordering::SeqCst),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_snapshot_generation_scan_stats() -> (usize, usize, usize) {
+        use std::sync::atomic::Ordering;
+
+        (
+            READ_SNAPSHOT_GENERATION_SCAN_COUNT.load(Ordering::SeqCst),
+            READ_SNAPSHOT_GENERATION_SCANS_INFLIGHT.load(Ordering::SeqCst),
+            READ_SNAPSHOT_GENERATION_SCANS_MAX_INFLIGHT.load(Ordering::SeqCst),
+        )
+    }
+
+    #[cfg(test)]
+    fn expire_read_snapshot_validation() {
+        let registry = READ_SNAPSHOT_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired_at = Instant::now() - read_snapshot_validation_ttl();
+        for slot in &registry.slots {
+            if let Some(entry) = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .as_mut()
+            {
+                entry.validated_at = expired_at;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn expire_read_snapshot_exact_audit() {
+        let registry = READ_SNAPSHOT_REGISTRY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired_at = Instant::now() - read_snapshot_exact_audit_interval();
+        for slot in &registry.slots {
+            if let Some(entry) = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .as_mut()
+            {
+                entry.validated_at = Instant::now() - read_snapshot_validation_ttl();
+                entry.strong_validated_at = expired_at;
+            }
+        }
     }
 
     fn query_read_db_inventory(
@@ -933,8 +2934,9 @@ pub mod tool_util {
         })
     }
 
-    fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
-        let archive = read_archive_inventory(storage_root);
+    fn read_archive_inventory_has_state(
+        archive: &mcp_agent_mail_db::ArchiveMessageInventory,
+    ) -> bool {
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
 
@@ -950,12 +2952,12 @@ pub mod tool_util {
         storage_root: &Path,
         sqlite_path: &Path,
         conn: &mcp_agent_mail_db::DbConn,
+        archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> Result<bool, String> {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
             return Ok(false);
         }
 
-        let archive = read_archive_inventory(storage_root);
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -964,7 +2966,7 @@ pub mod tool_util {
         let archive_message_count = archive.unique_message_ids;
         let archive_max_id = archive.latest_message_id.unwrap_or(0);
         let missing_archive_projects = mcp_agent_mail_db::archive_missing_project_identities(
-            &archive,
+            archive,
             &db_inventory.project_identities,
         );
 
@@ -988,14 +2990,21 @@ pub mod tool_util {
 
     pub struct ToolReadPool {
         pool: mcp_agent_mail_db::DbPool,
-        _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
+        _snapshot: Option<Arc<SharedArchiveReadSnapshot>>,
     }
 
     impl ToolReadPool {
         const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
             Self {
                 pool,
-                _snapshot_dir: None,
+                _snapshot: None,
+            }
+        }
+
+        fn snapshot(snapshot: Arc<SharedArchiveReadSnapshot>) -> Self {
+            Self {
+                pool: snapshot.pool(),
+                _snapshot: Some(snapshot),
             }
         }
     }
@@ -1050,7 +3059,12 @@ pub mod tool_util {
         }
     }
 
-    fn open_read_db_pool() -> Result<Option<ToolReadPool>, String> {
+    async fn open_read_db_pool_with_cx(
+        cx: &asupersync::Cx,
+    ) -> Result<Option<ToolReadPool>, ReadSnapshotAcquireError> {
+        if read_snapshot_cancelled(Some(cx)) {
+            return Err(ReadSnapshotAcquireError::Cancelled);
+        }
         let config = Config::from_env();
         if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             return Ok(None);
@@ -1058,99 +3072,53 @@ pub mod tool_util {
 
         let sqlite_path =
             mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
-                .map_err(|err| err.to_string())?
+                .map_err(ReadSnapshotAcquireError::failed)?
                 .canonical_path;
         if sqlite_path == ":memory:" {
             return Ok(None);
         }
 
         let resolved_path = PathBuf::from(&sqlite_path);
-        let archive_has_state = archive_storage_root_is_authoritative_for_sqlite_path(
+        if !archive_storage_root_is_authoritative_for_sqlite_path(
             &config.storage_root,
             &resolved_path,
-        ) && read_archive_inventory_has_state(&config.storage_root);
-
-        // When the durability verdict says the live DB is suspect or worse,
-        // force archive-snapshot reads even if the archive isn't strictly
-        // "ahead" of the DB by row count.
-        let durability_forces_snapshot = archive_has_state
-            && live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-        let use_archive_snapshot = if durability_forces_snapshot {
-            true
-        } else {
-            match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-                Ok(conn) => {
-                    let conn = mcp_agent_mail_db::guard_db_conn(
-                        conn,
-                        "tool_util::open_read_db_pool archive-ahead probe",
-                    );
-                    let archive_ahead =
-                        read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                    drop(conn);
-                    match archive_ahead {
-                        Ok(true) => true,
-                        Err(error) if archive_has_state => {
-                            tracing::warn!(
-                                source = %resolved_path.display(),
-                                storage_root = %config.storage_root.display(),
-                                error = %error,
-                                "using archive-backed tool snapshot because the live sqlite inventory probe failed"
-                            );
-                            true
-                        }
-                        Ok(false) | Err(_) => false,
-                    }
-                }
-                Err(error) if archive_has_state => {
-                    tracing::warn!(
-                        source = %resolved_path.display(),
-                        storage_root = %config.storage_root.display(),
-                        error = %error,
-                        "using archive-backed tool snapshot because the live sqlite source could not be opened"
-                    );
-                    true
-                }
-                Err(_) => false,
-            }
-        };
-
-        if !use_archive_snapshot {
+        ) {
             return Ok(None);
         }
 
-        let snapshot_dir =
-            mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("agent-mail-tool-snapshot-")
-                .map_err(|err| err.to_string())?;
-        let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
-        if resolved_path.exists() {
-            mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-                &snapshot_db,
-                &config.storage_root,
-                Some(resolved_path.as_path()),
-            )
-            .map_err(|err| err.to_string())?;
-        } else {
-            mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
-                .map_err(|err| err.to_string())?;
-        }
-        let pool = create_pool(&mcp_agent_mail_db::DbPoolConfig {
-            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
-            storage_root: Some(config.storage_root),
-            ..Default::default()
-        })
-        .map_err(|err| err.to_string())?;
-        Ok(Some(ToolReadPool {
-            pool,
-            _snapshot_dir: Some(snapshot_dir),
-        }))
+        get_archive_read_snapshot_if(
+            &config.storage_root,
+            &resolved_path,
+            &config.database_url,
+            cx,
+        )
+        .await
+        .map(|snapshot| snapshot.map(ToolReadPool::snapshot))
     }
 
-    pub fn get_read_db_pool() -> McpResult<ToolReadPool> {
-        match open_read_db_pool() {
+    #[cfg(test)]
+    async fn open_read_db_pool() -> Result<Option<ToolReadPool>, ReadSnapshotAcquireError> {
+        open_read_db_pool_with_cx(&asupersync::Cx::for_testing()).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_tool_read_snapshot_pointer(
+        cx: &asupersync::Cx,
+    ) -> Result<Option<usize>, ReadSnapshotAcquireError> {
+        open_read_db_pool_with_cx(cx).await.map(|pool| {
+            pool.and_then(|pool| {
+                pool._snapshot
+                    .as_ref()
+                    .map(|snapshot| Arc::as_ptr(snapshot) as usize)
+            })
+        })
+    }
+
+    pub async fn get_read_db_pool(cx: &asupersync::Cx) -> McpResult<ToolReadPool> {
+        match open_read_db_pool_with_cx(cx).await {
             Ok(Some(pool)) => Ok(pool),
-            Ok(None) => get_db_pool().map(ToolReadPool::live),
-            Err(error) => Err(read_pool_setup_error_to_mcp_error(error)),
+            Ok(None) => get_live_db_pool().map(ToolReadPool::live),
+            Err(error) => Err(read_snapshot_acquire_error_to_mcp_error(error)),
         }
     }
 
@@ -1278,13 +3246,10 @@ pub mod tool_util {
             }
         }
 
-        // Check read cache first (slug lookups only; ensure_project always hits DB)
+        // Project lookup caching is owned by the query layer so the cache key is
+        // scoped to this pool's SQLite identity.  A process can serve live and
+        // reconstructed snapshot databases with the same project slug.
         let is_absolute = std::path::Path::new(raw_identifier).is_absolute();
-        if !is_absolute
-            && let Some(cached) = mcp_agent_mail_db::read_cache().get_project(raw_identifier)
-        {
-            return Ok(cached);
-        }
         let out = if is_absolute {
             mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, raw_identifier).await
         } else {
@@ -1292,11 +3257,7 @@ pub mod tool_util {
         };
 
         match db_outcome_to_mcp_result(out) {
-            Ok(project) => {
-                // Populate cache on miss
-                mcp_agent_mail_db::read_cache().put_project(&project);
-                Ok(project)
-            }
+            Ok(project) => Ok(project),
             Err(e) => {
                 // Only enhance NOT_FOUND errors with fuzzy suggestions
                 let is_not_found = e
@@ -1584,9 +3545,39 @@ pub mod tool_util {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::sync::{Mutex, OnceLock};
+        use std::sync::Mutex;
 
-        static READ_POOL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        fn run_async<F: std::future::Future>(future: F) -> F::Output {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build test runtime");
+            runtime.block_on(future)
+        }
+
+        fn wait_for_snapshot_pointer_change(
+            storage_root: &Path,
+            sqlite_path: &Path,
+            old_pointer: usize,
+        ) -> Arc<SharedArchiveReadSnapshot> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let cx = asupersync::Cx::for_testing();
+                let snapshot = run_async(get_or_build_archive_read_snapshot(
+                    storage_root,
+                    sqlite_path,
+                    &cx,
+                ))
+                .expect("refreshed archive snapshot");
+                if Arc::as_ptr(&snapshot) as usize != old_pointer {
+                    return snapshot;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "background snapshot refresh did not publish a replacement"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
 
         #[test]
         fn process_env_overrides_bypass_stale_dependency_config_cache() {
@@ -1607,6 +3598,187 @@ pub mod tool_util {
             );
 
             Config::reset_cached();
+        }
+
+        #[test]
+        fn resolve_project_scopes_cache_to_each_database_generation() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let live_path = temp.path().join("live.sqlite3");
+            let snapshot_path = temp.path().join("snapshot.sqlite3");
+            for (path, id, human_key) in [
+                (&live_path, 17_i64, "/live-generation"),
+                (&snapshot_path, 42_i64, "/snapshot-generation"),
+            ] {
+                let conn = mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+                    .expect("open split-brain fixture");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize split-brain fixture");
+                conn.query_sync(
+                    "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, 'same-project', ?, 0)",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(id),
+                        mcp_agent_mail_db::sqlmodel::Value::Text(human_key.to_string()),
+                    ],
+                )
+                .expect("seed split-brain project");
+            }
+            let make_pool = |path: &Path| {
+                mcp_agent_mail_db::create_query_only_pool(&mcp_agent_mail_db::DbPoolConfig {
+                    database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(path),
+                    storage_root: Some(temp.path().join("archive")),
+                    min_connections: 0,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                })
+                .expect("create split-brain query pool")
+            };
+            let live_pool = make_pool(&live_path);
+            let snapshot_pool = make_pool(&snapshot_path);
+            let cx = asupersync::Cx::for_testing();
+            let ctx = McpContext::new(cx, 1);
+
+            let (live, snapshot, live_again) = run_async(async {
+                let live = resolve_project(&ctx, &live_pool, "same-project")
+                    .await
+                    .expect("resolve live generation");
+                let snapshot = resolve_project(&ctx, &snapshot_pool, "same-project")
+                    .await
+                    .expect("resolve snapshot generation");
+                let live_again = resolve_project(&ctx, &live_pool, "same-project")
+                    .await
+                    .expect("resolve live generation again");
+                (live, snapshot, live_again)
+            });
+
+            assert_eq!(
+                (live.id, live.human_key.as_str()),
+                (Some(17), "/live-generation")
+            );
+            assert_eq!(
+                (snapshot.id, snapshot.human_key.as_str()),
+                (Some(42), "/snapshot-generation")
+            );
+            assert_eq!(
+                (live_again.id, live_again.human_key.as_str()),
+                (Some(17), "/live-generation"),
+                "snapshot cache population must not replace the live pool identity"
+            );
+        }
+
+        #[test]
+        fn snapshot_probes_are_read_only_from_the_first_open() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let absent = temp.path().join("absent.sqlite3");
+            assert!(
+                open_read_only_snapshot_probe(&absent, "absent probe").is_err(),
+                "absent probe must fail closed"
+            );
+            assert!(!absent.exists(), "absent probe must not create a database");
+
+            let valid = temp.path().join("valid.sqlite3");
+            let seed = mcp_agent_mail_db::DbConn::open_file(valid.to_string_lossy().as_ref())
+                .expect("open valid probe fixture");
+            seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize valid probe fixture");
+            drop(seed);
+            let probe = open_read_only_snapshot_probe(&valid, "valid probe")
+                .expect("open valid probe read-only");
+            let query_only = probe
+                .query_sync("PRAGMA query_only", &[])
+                .expect("read query-only pragma")[0]
+                .get_as::<i64>(0)
+                .expect("decode query-only pragma");
+            assert_eq!(query_only, 1);
+            assert!(
+                probe
+                    .query_sync(
+                        "INSERT INTO projects (slug, human_key, created_at) VALUES ('forbidden', '/forbidden', 0)",
+                        &[],
+                    )
+                    .is_err(),
+                "snapshot probe must reject writes"
+            );
+            drop(probe);
+
+            let raced = temp.path().join("raced-away.sqlite3");
+            let seed = mcp_agent_mail_db::DbConn::open_file(raced.to_string_lossy().as_ref())
+                .expect("open raced probe fixture");
+            seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize raced probe fixture");
+            drop(seed);
+            assert!(raced.is_file(), "race fixture must exist before unlink");
+            std::fs::remove_file(&raced).expect("unlink race fixture");
+            assert!(
+                open_read_only_snapshot_probe(&raced, "raced probe").is_err(),
+                "probe must fail if the source vanishes before its first open"
+            );
+            assert!(!raced.exists(), "raced probe must not recreate the source");
+        }
+
+        #[test]
+        fn file_read_fallback_is_query_only_and_never_bootstraps() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            std::fs::create_dir_all(&storage_root).expect("create read fallback archive");
+            let db_path = temp.path().join("read-fallback.sqlite3");
+            let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path);
+            let storage_root_text = storage_root.display().to_string();
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_root_text.as_str()),
+                ],
+                || {
+                    Config::reset_cached();
+                    let pool = get_live_db_pool().expect("construct absent read fallback");
+                    let cx = asupersync::Cx::for_testing();
+                    assert!(
+                        !matches!(run_async(pool.acquire(&cx)), Outcome::Ok(_)),
+                        "absent file read fallback must fail closed"
+                    );
+                    Config::reset_cached();
+                },
+            );
+            assert!(
+                !db_path.exists(),
+                "read fallback must not create the live DB"
+            );
+
+            let seed = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open read fallback fixture");
+            seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize read fallback fixture");
+            drop(seed);
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_root_text.as_str()),
+                ],
+                || {
+                    Config::reset_cached();
+                    let pool = get_live_db_pool().expect("construct valid read fallback");
+                    let cx = asupersync::Cx::for_testing();
+                    let conn = match run_async(pool.acquire(&cx)) {
+                        Outcome::Ok(conn) => conn,
+                        Outcome::Err(err) => panic!("valid read fallback acquire failed: {err}"),
+                        Outcome::Cancelled(_) => panic!("valid read fallback acquire cancelled"),
+                        Outcome::Panicked(panic) => {
+                            panic!("valid read fallback acquire panicked: {}", panic.message())
+                        }
+                    };
+                    assert!(
+                        conn.query_sync(
+                            "INSERT INTO projects (slug, human_key, created_at) VALUES ('forbidden', '/forbidden', 0)",
+                            &[],
+                        )
+                        .is_err(),
+                        "file read fallback must reject writes"
+                    );
+                    Config::reset_cached();
+                },
+            );
         }
 
         fn write_inventory_message(storage_root: &Path, file_id: i64, message_id: i64) {
@@ -1663,9 +3835,493 @@ body
         }
 
         #[test]
+        fn snapshot_completeness_rejects_reconstruction_traversal_loss() {
+            let inventory = mcp_agent_mail_db::ArchiveMessageInventory {
+                projects: 1,
+                agents: 1,
+                canonical_message_files: 1,
+                ..mcp_agent_mail_db::ArchiveMessageInventory::default()
+            };
+            let mut stats = mcp_agent_mail_db::ReconstructStats::default();
+            stats.projects = 1;
+
+            let error = validate_read_snapshot_completeness(&inventory, &stats)
+                .expect_err("a best-effort reconstruction traversal loss must fail publication");
+            assert!(
+                matches!(
+                    error,
+                    ReadSnapshotAcquireError::Failed(ref detail)
+                        if detail.contains("reconstruction was incomplete")
+                            && detail.contains("inventory projects=1 agents=1 canonical_message_files=1")
+                            && detail.contains("reconstructed projects=1 agents=0 messages=0")
+                ),
+                "unexpected reconstruction completeness error: {error:?}"
+            );
+        }
+
+        #[test]
+        fn snapshot_completeness_counts_duplicate_files_but_not_salvage_rows() {
+            let inventory = mcp_agent_mail_db::ArchiveMessageInventory {
+                projects: 1,
+                agents: 1,
+                canonical_message_files: 2,
+                ..mcp_agent_mail_db::ArchiveMessageInventory::default()
+            };
+            let mut stats = mcp_agent_mail_db::ReconstructStats::default();
+            stats.projects = 1;
+            stats.agents = 1;
+            stats.messages = 1;
+            stats.duplicate_canonical_message_files = 1;
+            stats.salvaged_projects = 9;
+            stats.salvaged_agents = 9;
+            stats.salvaged_messages = 9;
+
+            validate_read_snapshot_completeness(&inventory, &stats).expect(
+                "archive completeness is reconstructed messages plus duplicate canonical files; salvage is separate",
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn hostile_reconstruction_traversal_never_publishes_ready_snapshot() {
+            use std::os::unix::fs::PermissionsExt;
+
+            struct PermissionRestore {
+                path: PathBuf,
+                permissions: std::fs::Permissions,
+            }
+
+            impl Drop for PermissionRestore {
+                fn drop(&mut self) {
+                    let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+                }
+            }
+
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            let project_dir = storage_root.join("projects").join("stable-project");
+            let agents_dir = project_dir.join("agents");
+            let agent_dir = agents_dir.join("StableAgent");
+            std::fs::create_dir_all(&agent_dir).expect("create stable agent directory");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"stable-project","human_key":"/stable-project"}"#,
+            )
+            .expect("write stable project metadata");
+            std::fs::write(agent_dir.join("profile.json"), "{}").expect("write stable profile");
+            commit_archive_tree(&repo, "commit stable traversal fixture");
+
+            let permission_restore = PermissionRestore {
+                path: agents_dir.clone(),
+                permissions: std::fs::metadata(&agents_dir)
+                    .expect("inspect agent directory permissions")
+                    .permissions(),
+            };
+            set_read_snapshot_pre_reconstruction_test_hook({
+                let agents_dir = agents_dir.clone();
+                move || {
+                    std::fs::set_permissions(&agents_dir, std::fs::Permissions::from_mode(0))
+                        .expect("make reconstruction traversal hostile");
+                }
+            });
+
+            let sqlite_path = temp.path().join("missing-live.sqlite3");
+            let cx = asupersync::Cx::for_testing();
+            let error = match run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            )) {
+                Err(error) => error,
+                Ok(_) => panic!("a reconstruction traversal loss must fail the snapshot build"),
+            };
+            assert!(
+                matches!(
+                    error,
+                    ReadSnapshotAcquireError::Failed(ref detail)
+                        if detail.contains("reconstruction was incomplete")
+                            && detail.contains("inventory projects=1 agents=1")
+                            && detail.contains("reconstructed projects=1 agents=0")
+                ),
+                "unexpected hostile reconstruction error: {error:?}"
+            );
+            let (ready, building, reconstructions, inflight, _) = read_snapshot_cache_stats();
+            assert_eq!(ready, 0, "traversal loss must not publish ready state");
+            assert!(!building, "failed traversal must release its build slot");
+            assert_eq!(reconstructions, 1);
+            assert_eq!(inflight, 0);
+
+            drop(permission_restore);
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn malformed_stable_agent_profile_never_publishes_ready_snapshot() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            let project_dir = storage_root.join("projects").join("stable-project");
+            let agent_dir = project_dir.join("agents").join("BrokenAgent");
+            std::fs::create_dir_all(&agent_dir).expect("create malformed agent directory");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"stable-project","human_key":"/stable-project"}"#,
+            )
+            .expect("write stable project metadata");
+            std::fs::write(agent_dir.join("profile.json"), "{not-json")
+                .expect("write malformed stable profile");
+            commit_archive_tree(&repo, "commit malformed stable agent profile");
+
+            let sqlite_path = temp.path().join("missing-live.sqlite3");
+            let cx = asupersync::Cx::for_testing();
+            let error = match run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            )) {
+                Err(error) => error,
+                Ok(_) => panic!("malformed stable profile must fail the cold snapshot build"),
+            };
+            assert!(
+                matches!(
+                    error,
+                    ReadSnapshotAcquireError::Failed(ref detail)
+                        if detail.contains("reconstruction skipped 1 malformed or unreadable archive artifact")
+                ),
+                "unexpected malformed-profile snapshot error: {error:?}"
+            );
+            let (ready, building, reconstructions, inflight, _) = read_snapshot_cache_stats();
+            assert_eq!(
+                ready, 0,
+                "a failed reconstruction must not publish ready state"
+            );
+            assert!(
+                !building,
+                "failed reconstruction must release its build slot"
+            );
+            assert_eq!(reconstructions, 1);
+            assert_eq!(inflight, 0);
+
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum ArchivePublicationRaceMutation {
+            ProjectMetadata,
+            AgentProfile,
+            RawAttachment,
+            NotificationSignal,
+            AsyncCommit,
+            ColdPoolBootstrap,
+        }
+
+        impl ArchivePublicationRaceMutation {
+            fn label(self) -> &'static str {
+                match self {
+                    Self::ProjectMetadata => "project metadata",
+                    Self::AgentProfile => "agent profile",
+                    Self::RawAttachment => "raw attachment",
+                    Self::NotificationSignal => "notification signal",
+                    Self::AsyncCommit => "async commit",
+                    Self::ColdPoolBootstrap => "cold live-pool bootstrap",
+                }
+            }
+        }
+
+        struct PostValidationHookReleaseGuard {
+            active: bool,
+        }
+
+        impl PostValidationHookReleaseGuard {
+            fn new() -> Self {
+                Self { active: true }
+            }
+
+            fn release(&mut self) {
+                if self.active {
+                    release_read_snapshot_post_validation_test_hook();
+                    self.active = false;
+                }
+            }
+        }
+
+        impl Drop for PostValidationHookReleaseGuard {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        fn wait_for_read_snapshot_build_completion(label: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while read_snapshot_cache_stats().1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !read_snapshot_cache_stats().1,
+                "{label} snapshot builder did not finish after the race hook was released"
+            );
+        }
+
+        fn run_archive_publication_race_case(mutation: ArchivePublicationRaceMutation) {
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+            mcp_agent_mail_storage::flush_async_commits();
+
+            let temp = tempfile::tempdir().expect("race tempdir");
+            let storage_root = temp.path().join("archive");
+            let mut config = Config {
+                storage_root: storage_root.clone(),
+                ..Config::default()
+            };
+            config.notifications_enabled = true;
+            config.notifications_debounce_ms = 0;
+            config.notifications_signals_dir = temp.path().join("signals");
+
+            let archive = mcp_agent_mail_storage::ensure_archive(&config, "cache-project")
+                .expect("ensure race archive");
+            write_inventory_message(&storage_root, 1, 1);
+            let repo = git2::Repository::open(&storage_root).expect("open race archive repo");
+            commit_archive_tree(&repo, "seed publication race archive");
+
+            let async_path = archive.root.join("async-only.txt");
+            if matches!(mutation, ArchivePublicationRaceMutation::AsyncCommit) {
+                std::fs::write(&async_path, b"commit me after final validation\n")
+                    .expect("write async commit fixture");
+            }
+
+            let sqlite_path = temp.path().join("missing-live.sqlite3");
+            let cx = asupersync::Cx::for_testing();
+            let initial = run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            ))
+            .expect("initial race snapshot");
+            let initial_pointer = Arc::as_ptr(&initial) as usize;
+
+            expire_read_snapshot_exact_audit();
+            arm_read_snapshot_post_validation_test_hook();
+            let mut release_guard = PostValidationHookReleaseGuard::new();
+            let stale = run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            ))
+            .expect("serve stale snapshot while exact audit runs");
+            assert_eq!(
+                Arc::as_ptr(&stale) as usize,
+                initial_pointer,
+                "{} case must initially serve the existing snapshot",
+                mutation.label()
+            );
+            assert!(
+                wait_for_read_snapshot_post_validation_test_hook(Duration::from_secs(5)),
+                "{} exact audit did not pause after final validation",
+                mutation.label()
+            );
+            let build_completion = {
+                let scope =
+                    read_snapshot_scope(&storage_root, &sqlite_path).expect("paused race scope");
+                let slot = read_snapshot_slot(scope).expect("paused race slot");
+                let state = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::clone(
+                    &state
+                        .building
+                        .as_ref()
+                        .expect("paused exact audit must retain its build")
+                        .completion,
+                )
+            };
+
+            let archive_epoch_before = mcp_agent_mail_storage::archive_application_epoch();
+            let db_epoch_before =
+                READ_SNAPSHOT_DB_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+            let mut cold_pool = None;
+            match mutation {
+                ArchivePublicationRaceMutation::ProjectMetadata => {
+                    mcp_agent_mail_storage::write_project_metadata_with_config(
+                        &archive,
+                        &config,
+                        "/publication-race-metadata",
+                    )
+                    .expect("write project metadata during publication race");
+                }
+                ArchivePublicationRaceMutation::AgentProfile => {
+                    mcp_agent_mail_storage::write_agent_profile_with_config(
+                        &archive,
+                        &config,
+                        &json!({"name": "PublicationRaceAgent", "program": "test"}),
+                    )
+                    .expect("write agent profile during publication race");
+                }
+                ArchivePublicationRaceMutation::RawAttachment => {
+                    let source = temp.path().join("publication-race.bin");
+                    std::fs::write(&source, b"publication race attachment")
+                        .expect("write attachment source fixture");
+                    mcp_agent_mail_storage::store_raw_attachment(&archive, &source, 1024)
+                        .expect("store raw attachment during publication race");
+                }
+                ArchivePublicationRaceMutation::NotificationSignal => {
+                    assert_eq!(
+                        mcp_agent_mail_storage::emit_notification_signal(
+                            &config,
+                            "cache-project",
+                            "PublicationRaceAgent",
+                            None,
+                        ),
+                        mcp_agent_mail_storage::SignalEmitOutcome::Emitted,
+                        "emit signal during publication race"
+                    );
+                }
+                ArchivePublicationRaceMutation::AsyncCommit => {
+                    let head_before = repo
+                        .head()
+                        .expect("race HEAD before async commit")
+                        .target()
+                        .expect("race HEAD target before async commit");
+                    mcp_agent_mail_storage::enqueue_async_commit(
+                        &storage_root,
+                        &config,
+                        "test: async publication race",
+                        &["projects/cache-project/async-only.txt".to_string()],
+                    );
+                    mcp_agent_mail_storage::flush_async_commits();
+                    let head_after = repo
+                        .head()
+                        .expect("race HEAD after async commit")
+                        .target()
+                        .expect("race HEAD target after async commit");
+                    assert_ne!(
+                        head_before, head_after,
+                        "async coalescer must apply a real Git mutation during the pause"
+                    );
+                }
+                ArchivePublicationRaceMutation::ColdPoolBootstrap => {
+                    let database_url =
+                        mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+                    let storage_root_text = storage_root.display().to_string();
+                    let pool = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                        &[
+                            ("DATABASE_URL", database_url.as_str()),
+                            ("STORAGE_ROOT", storage_root_text.as_str()),
+                        ],
+                        || {
+                            Config::reset_cached();
+                            let pool = get_db_pool().expect("enter cold-pool writer epoch");
+                            let conn = match run_async(pool.acquire(&cx)) {
+                                Outcome::Ok(conn) => conn,
+                                Outcome::Err(err) => {
+                                    panic!("cold live-pool bootstrap failed: {err}")
+                                }
+                                Outcome::Cancelled(_) => {
+                                    panic!("cold live-pool bootstrap cancelled")
+                                }
+                                Outcome::Panicked(panic) => {
+                                    panic!("cold live-pool bootstrap panicked: {}", panic.message())
+                                }
+                            };
+                            drop(conn);
+                            Config::reset_cached();
+                            pool
+                        },
+                    );
+                    assert!(
+                        sqlite_path.is_file(),
+                        "cold pool must bootstrap the live DB"
+                    );
+                    cold_pool = Some(pool);
+                }
+            }
+            if matches!(mutation, ArchivePublicationRaceMutation::ColdPoolBootstrap) {
+                assert_ne!(
+                    db_epoch_before,
+                    READ_SNAPSHOT_DB_WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+                    "cold bootstrap must enter the writer epoch before pool construction"
+                );
+            } else {
+                assert_ne!(
+                    archive_epoch_before,
+                    mcp_agent_mail_storage::archive_application_epoch(),
+                    "{} must cross the guarded archive mutation boundary",
+                    mutation.label()
+                );
+            }
+
+            release_guard.release();
+            wait_for_read_snapshot_build_completion(mutation.label());
+
+            let scope = read_snapshot_scope(&storage_root, &sqlite_path).expect("race scope");
+            let slot = read_snapshot_slot(scope).expect("race slot");
+            let state = slot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready = state
+                .ready
+                .as_ref()
+                .and_then(|entry| entry.decision.immutable_snapshot())
+                .expect("existing snapshot remains ready after rejected publication");
+            assert_eq!(
+                Arc::as_ptr(&ready) as usize,
+                initial_pointer,
+                "{} mutation must prevent the validated candidate from replacing the ready snapshot",
+                mutation.label()
+            );
+            assert!(matches!(
+                build_completion.result(),
+                Some(Err(ReadSnapshotAcquireError::Busy(message)))
+                    if message.contains("superseded by a durable write")
+            ));
+            drop(state);
+            drop(ready);
+            drop(slot);
+            drop(cold_pool);
+
+            mcp_agent_mail_storage::flush_async_commits();
+            drop(stale);
+            drop(initial);
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn post_validation_archive_mutations_reject_snapshot_publication() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for mutation in [
+                ArchivePublicationRaceMutation::ProjectMetadata,
+                ArchivePublicationRaceMutation::AgentProfile,
+                ArchivePublicationRaceMutation::RawAttachment,
+                ArchivePublicationRaceMutation::NotificationSignal,
+                ArchivePublicationRaceMutation::AsyncCommit,
+                ArchivePublicationRaceMutation::ColdPoolBootstrap,
+            ] {
+                run_archive_publication_race_case(mutation);
+            }
+        }
+
+        #[test]
         fn read_archive_inventory_cache_never_hides_uncommitted_archive_state() {
-            let _guard = READ_POOL_TEST_LOCK
-                .get_or_init(|| Mutex::new(()))
+            let _guard = READ_SNAPSHOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             reset_read_archive_inventory_cache();
@@ -1724,8 +4380,7 @@ body
 
         #[test]
         fn read_archive_inventory_cache_is_bounded_and_scoped_by_canonical_root() {
-            let _guard = READ_POOL_TEST_LOCK
-                .get_or_init(|| Mutex::new(()))
+            let _guard = READ_SNAPSHOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             reset_read_archive_inventory_cache();
@@ -1778,6 +4433,846 @@ body
             );
 
             reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn snapshot_registry_and_pending_queue_enforce_hard_admission_caps() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+
+            let held = (0..READ_SNAPSHOT_SCOPE_CAPACITY)
+                .map(|index| {
+                    read_snapshot_slot(ReadSnapshotScope {
+                        storage_root: PathBuf::from(format!("/held/archive-{index}")),
+                        sqlite_path: PathBuf::from(format!("/held/mailbox-{index}.sqlite3")),
+                    })
+                    .expect("admit slot below hard capacity")
+                })
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                read_snapshot_slot(ReadSnapshotScope {
+                    storage_root: PathBuf::from("/held/archive-overflow"),
+                    sqlite_path: PathBuf::from("/held/mailbox-overflow.sqlite3"),
+                }),
+                Err(ReadSnapshotAcquireError::Busy(_))
+            ));
+            assert_eq!(
+                READ_SNAPSHOT_REGISTRY
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .slots
+                    .len(),
+                READ_SNAPSHOT_SCOPE_CAPACITY
+            );
+
+            let permits = (0..READ_SNAPSHOT_PENDING_BUILD_LIMIT)
+                .map(|_| ReadSnapshotBuildPermit::try_acquire().expect("pending permit"))
+                .collect::<Vec<_>>();
+            assert!(ReadSnapshotBuildPermit::try_acquire().is_none());
+            drop(permits);
+            drop(held);
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn archive_read_snapshot_singleflight_is_bounded_and_invalidates_dirty_generation() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+            reset_read_snapshot_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "seed archive");
+            let sqlite_path = temp.path().join("missing-live.sqlite3");
+
+            let cancelled_cx = asupersync::Cx::for_testing();
+            cancelled_cx.set_cancel_requested(true);
+            let cancelled = match run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cancelled_cx,
+            )) {
+                Err(error) => error,
+                Ok(_) => panic!("a cancelled request must not start reconstruction"),
+            };
+            assert!(matches!(cancelled, ReadSnapshotAcquireError::Cancelled));
+            assert_eq!(
+                read_snapshot_cache_stats(),
+                (0, false, 0, 0, 0),
+                "cancelled admission must leave no builder or cached generation"
+            );
+            assert_eq!(read_snapshot_generation_scan_stats(), (0, 0, 0));
+
+            let worker_count = 12;
+            let barrier = Arc::new(std::sync::Barrier::new(worker_count));
+            let pointers = Arc::new(Mutex::new(Vec::new()));
+            std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let barrier = Arc::clone(&barrier);
+                    let pointers = Arc::clone(&pointers);
+                    let storage_root = storage_root.clone();
+                    let sqlite_path = sqlite_path.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let cx = asupersync::Cx::for_testing();
+                        let snapshot = run_async(get_or_build_archive_read_snapshot(
+                            &storage_root,
+                            &sqlite_path,
+                            &cx,
+                        ))
+                        .expect("shared archive read snapshot");
+                        pointers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(Arc::as_ptr(&snapshot) as usize);
+                    });
+                }
+            });
+
+            let pointers = pointers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(pointers.len(), worker_count);
+            assert!(
+                pointers.windows(2).all(|pair| pair[0] == pair[1]),
+                "all concurrent readers must receive the same immutable snapshot"
+            );
+            let original_pointer = pointers[0];
+            drop(pointers);
+
+            let (ready, building, reconstructions, inflight, max_inflight) =
+                read_snapshot_cache_stats();
+            assert_eq!(ready, 1);
+            assert!(!building);
+            assert_eq!(reconstructions, 1);
+            assert_eq!(inflight, 0);
+            assert_eq!(
+                max_inflight, 1,
+                "single-flight must never run more than one reconstruction task"
+            );
+            assert_eq!(
+                read_snapshot_generation_scan_stats(),
+                (2, 0, 1),
+                "N concurrent cold reads require only before/after generation scans"
+            );
+
+            expire_read_snapshot_validation();
+            let validation_barrier = Arc::new(std::sync::Barrier::new(worker_count));
+            let validation_pointers = Arc::new(Mutex::new(Vec::new()));
+            std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let barrier = Arc::clone(&validation_barrier);
+                    let pointers = Arc::clone(&validation_pointers);
+                    let storage_root = storage_root.clone();
+                    let sqlite_path = sqlite_path.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let cx = asupersync::Cx::for_testing();
+                        let snapshot = run_async(get_or_build_archive_read_snapshot(
+                            &storage_root,
+                            &sqlite_path,
+                            &cx,
+                        ))
+                        .expect("coalesced snapshot validation");
+                        pointers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(Arc::as_ptr(&snapshot) as usize);
+                    });
+                }
+            });
+            let validation_pointers = validation_pointers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(validation_pointers.len(), worker_count);
+            assert!(
+                validation_pointers
+                    .iter()
+                    .all(|pointer| *pointer == original_pointer),
+                "a coalesced validation must reuse the exact immutable snapshot"
+            );
+            drop(validation_pointers);
+            let validation_deadline = Instant::now() + Duration::from_secs(5);
+            while read_snapshot_cache_stats().1 && Instant::now() < validation_deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !read_snapshot_cache_stats().1,
+                "validation worker did not finish"
+            );
+            assert_eq!(
+                read_snapshot_generation_scan_stats(),
+                (2, 0, 1),
+                "routine cache validation must use the cheap metadata and epoch signature"
+            );
+            assert_eq!(read_snapshot_cache_stats().2, 1);
+
+            write_inventory_message(&storage_root, 2, 2);
+            expire_read_snapshot_exact_audit();
+            let replacement =
+                wait_for_snapshot_pointer_change(&storage_root, &sqlite_path, original_pointer);
+            let replacement_pointer = Arc::as_ptr(&replacement) as usize;
+            assert_ne!(
+                replacement_pointer, original_pointer,
+                "a dirty archive generation must not reuse the committed snapshot"
+            );
+            let cx = asupersync::Cx::for_testing();
+            let replacement_again = run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            ))
+            .expect("reuse replacement snapshot");
+            assert_eq!(
+                Arc::as_ptr(&replacement_again) as usize,
+                replacement_pointer,
+                "the unchanged dirty generation should reuse its immutable snapshot"
+            );
+
+            write_inventory_message(&storage_root, 2, 3);
+            expire_read_snapshot_exact_audit();
+            let mutated =
+                wait_for_snapshot_pointer_change(&storage_root, &sqlite_path, replacement_pointer);
+            let mutated_pointer = Arc::as_ptr(&mutated) as usize;
+            assert_ne!(
+                mutated_pointer, replacement_pointer,
+                "an in-place dirty artifact mutation must invalidate the snapshot"
+            );
+            let mutated_again = run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            ))
+            .expect("reuse in-place mutation snapshot");
+            assert_eq!(
+                Arc::as_ptr(&mutated_again) as usize,
+                mutated_pointer,
+                "an unchanged in-place mutation generation should be reused"
+            );
+            drop(mutated_again);
+            drop(mutated);
+            drop(replacement_again);
+            drop(replacement);
+
+            let (ready, building, reconstructions, inflight, max_inflight) =
+                read_snapshot_cache_stats();
+            assert_eq!(ready, 1, "only the latest mailbox generation is retained");
+            assert!(!building);
+            assert_eq!(
+                reconstructions, 3,
+                "new and mutated dirty archive content must invalidate prior generations"
+            );
+            assert_eq!(inflight, 0);
+            assert_eq!(max_inflight, 1);
+            assert_eq!(
+                read_snapshot_generation_scan_stats(),
+                (6, 0, 1),
+                "cheap validation adds no strong scan and both invalidations stay single-flight"
+            );
+
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn real_tool_read_path_coalesces_inventory_generation_and_reconstruction() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_archive_inventory_cache();
+            reset_read_snapshot_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            git2::Repository::init(&storage_root).expect("init dirty archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            let db_path = temp.path().join("live.sqlite3");
+            let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                .expect("open live db");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize live schema");
+            drop(conn);
+
+            let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path);
+            let storage_root_text = storage_root.to_string_lossy().into_owned();
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_root_text.as_str()),
+                ],
+                || {
+                    Config::reset_cached();
+
+                    let cancelled_cx = asupersync::Cx::for_testing();
+                    cancelled_cx.set_cancel_requested(true);
+                    let cancelled = run_async(open_read_db_pool_with_cx(&cancelled_cx));
+                    assert!(matches!(
+                        cancelled,
+                        Err(ReadSnapshotAcquireError::Cancelled)
+                    ));
+                    assert_eq!(read_archive_inventory_scan_count(), 0);
+                    assert_eq!(read_snapshot_generation_scan_stats(), (0, 0, 0));
+                    assert_eq!(read_snapshot_cache_stats(), (0, false, 0, 0, 0));
+
+                    let worker_count = 12;
+                    let barrier = Arc::new(std::sync::Barrier::new(worker_count));
+                    let pointers = Arc::new(Mutex::new(Vec::new()));
+                    std::thread::scope(|scope| {
+                        for _ in 0..worker_count {
+                            let barrier = Arc::clone(&barrier);
+                            let pointers = Arc::clone(&pointers);
+                            scope.spawn(move || {
+                                let cx = asupersync::Cx::for_testing();
+                                barrier.wait();
+                                let pool = run_async(open_read_db_pool_with_cx(&cx))
+                                    .expect("real read path")
+                                    .expect("archive snapshot pool");
+                                let snapshot = pool
+                                    ._snapshot
+                                    .as_ref()
+                                    .expect("snapshot ownership must be retained");
+                                pointers
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(Arc::as_ptr(snapshot) as usize);
+                            });
+                        }
+                    });
+
+                    let pointers = pointers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    assert_eq!(pointers.len(), worker_count);
+                    assert!(pointers.windows(2).all(|pair| pair[0] == pair[1]));
+                    assert_eq!(
+                        read_archive_inventory_scan_count(),
+                        1,
+                        "the real tool predicate must reuse one inventory for state and drift"
+                    );
+                    assert_eq!(read_snapshot_generation_scan_stats(), (2, 0, 1));
+                    assert_eq!(read_snapshot_cache_stats(), (1, false, 1, 0, 1));
+                },
+            );
+
+            reset_read_snapshot_cache();
+            reset_read_archive_inventory_cache();
+        }
+
+        #[test]
+        fn expired_live_decision_serves_stale_while_cheap_validation_runs() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            git2::Repository::init(&storage_root).expect("init empty archive");
+            let sqlite_path = temp.path().join("mailbox.sqlite3");
+            let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.to_string_lossy().as_ref())
+                .expect("open live mailbox");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize live mailbox");
+            drop(conn);
+            let cx = asupersync::Cx::for_testing();
+            let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+            assert!(
+                run_async(get_archive_read_snapshot_if(
+                    &storage_root,
+                    &sqlite_path,
+                    &database_url,
+                    &cx,
+                ))
+                .expect("initial live decision")
+                .is_none()
+            );
+
+            expire_read_snapshot_validation();
+            set_read_snapshot_test_delay(Duration::from_millis(400));
+            let started = Instant::now();
+            assert!(
+                run_async(get_archive_read_snapshot_if(
+                    &storage_root,
+                    &sqlite_path,
+                    &database_url,
+                    &cx,
+                ))
+                .expect("stale live decision")
+                .is_none()
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "expired Live decisions must not wait for background validation"
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while read_snapshot_cache_stats().1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            set_read_snapshot_test_delay(Duration::ZERO);
+            assert!(!read_snapshot_cache_stats().1);
+            assert_eq!(read_snapshot_cache_stats().2, 0);
+            assert_eq!(read_snapshot_generation_scan_stats(), (2, 0, 1));
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn archive_read_snapshot_waiter_uses_leader_deadline_without_starting_second_builder() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "seed archive");
+            let sqlite_path = temp.path().join("missing-live.sqlite3");
+            let scope = read_snapshot_scope(&storage_root, &sqlite_path).expect("snapshot scope");
+
+            let slot = read_snapshot_slot(scope).expect("snapshot slot");
+            let simulated_build = ReadSnapshotBuild {
+                token: 7,
+                invalidation_epoch: 0,
+                db_write_epoch: READ_SNAPSHOT_DB_WRITE_EPOCH
+                    .load(std::sync::atomic::Ordering::Acquire),
+                archive_application_epoch: mcp_agent_mail_storage::archive_application_epoch(),
+                deadline: Instant::now(),
+                completion: Arc::new(ReadSnapshotBuildCompletion::pending()),
+            };
+            slot.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .building = Some(simulated_build.clone());
+
+            let cx = asupersync::Cx::for_testing();
+            let error = run_async(wait_for_read_snapshot_build(
+                &slot,
+                simulated_build.clone(),
+                &cx,
+                Instant::now(),
+            ))
+            .expect_err("expired leader deadline must time out");
+            assert!(matches!(
+                error,
+                ReadSnapshotAcquireError::TimedOut(ref message)
+                    if message.contains("cold bootstrap")
+            ));
+            assert_eq!(
+                read_snapshot_cache_stats(),
+                (0, true, 0, 0, 0),
+                "a timed-out waiter must not replace or clear the leader"
+            );
+            assert_eq!(
+                read_snapshot_generation_scan_stats(),
+                (0, 0, 0),
+                "a timed-out waiter must not start generation discovery"
+            );
+            slot.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .building = None;
+            assert_eq!(read_snapshot_cache_stats(), (0, false, 0, 0, 0));
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn archive_read_snapshot_waiter_retains_its_generation_completion() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            std::fs::create_dir_all(&storage_root).expect("create archive root");
+            let scope = read_snapshot_scope(&storage_root, &temp.path().join("live.sqlite3"))
+                .expect("snapshot scope");
+            let slot = read_snapshot_slot(scope).expect("snapshot slot");
+            let deadline = Instant::now() + Duration::from_secs(1);
+
+            let first = try_claim_read_snapshot_build(&slot, deadline)
+                .expect("claim first build")
+                .expect("first build");
+            {
+                let mut state = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.building = None;
+                first
+                    .completion
+                    .complete(Err(ReadSnapshotAcquireError::Failed(
+                        "first generation failed".to_string(),
+                    )));
+            }
+
+            let second = try_claim_read_snapshot_build(&slot, deadline)
+                .expect("claim second build")
+                .expect("second build");
+            {
+                let mut state = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.building = None;
+                second.completion.complete(Ok(()));
+            }
+
+            let third = try_claim_read_snapshot_build(&slot, deadline)
+                .expect("claim third build")
+                .expect("third build");
+            let cx = asupersync::Cx::for_testing();
+            let error = run_async(wait_for_read_snapshot_build(&slot, first, &cx, deadline))
+                .expect_err("first waiter must observe its own failed generation");
+            assert!(matches!(
+                error,
+                ReadSnapshotAcquireError::Failed(ref message)
+                    if message == "first generation failed"
+            ));
+            assert!(matches!(second.completion.result(), Some(Ok(()))));
+            assert_eq!(
+                slot.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .building
+                    .as_ref()
+                    .map(|build| build.token),
+                Some(third.token),
+                "waiting on generation one must not follow or disturb generation three"
+            );
+            fail_scheduled_read_snapshot_build(&slot, &third, ReadSnapshotAcquireError::Cancelled);
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn query_only_snapshot_pool_rejects_mutation_and_preserves_rows() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sqlite_path = temp.path().join("immutable.sqlite3");
+            let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.to_string_lossy().as_ref())
+                .expect("open snapshot fixture");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize snapshot fixture");
+            drop(conn);
+
+            let pool =
+                mcp_agent_mail_db::create_query_only_pool(&mcp_agent_mail_db::DbPoolConfig {
+                    database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path),
+                    storage_root: Some(temp.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .expect("query-only pool");
+            let cx = asupersync::Cx::for_testing();
+            let conn = match run_async(pool.acquire(&cx)) {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("query-only pool acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("query-only pool acquire cancelled"),
+                Outcome::Panicked(panic) => {
+                    panic!("query-only pool acquire panicked: {}", panic.message())
+                }
+            };
+            let mutation = conn.query_sync(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('leak', '/leak', 0)",
+                &[],
+            );
+            assert!(
+                mutation.is_err(),
+                "shared snapshot connections must reject every DML statement"
+            );
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS project_count FROM projects", &[])
+                .expect("snapshot remains readable");
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.get_named::<i64>("project_count").ok()),
+                Some(0),
+                "failed mutation must not leak into later reads of the shared pool"
+            );
+        }
+
+        #[test]
+        fn slow_cold_snapshot_build_does_not_block_current_thread_executor() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "seed archive");
+            let sqlite_path = temp.path().join("missing-live.sqlite3");
+            READ_SNAPSHOT_TEST_DELAY_MILLIS.store(250, std::sync::atomic::Ordering::Release);
+
+            let cx = asupersync::Cx::for_testing();
+            let started = Instant::now();
+            let _ = run_async(asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_millis(25),
+                Box::pin(get_or_build_archive_read_snapshot(
+                    &storage_root,
+                    &sqlite_path,
+                    &cx,
+                )),
+            ));
+            assert!(
+                started.elapsed() < Duration::from_millis(150),
+                "a slow reconstruction must run on the blocking pool so the executor timer can fire"
+            );
+            assert!(
+                read_snapshot_cache_stats().1,
+                "the detached blocking worker should still own the cold build"
+            );
+
+            let wait_deadline = Instant::now() + Duration::from_secs(3);
+            while read_snapshot_cache_stats().1 && Instant::now() < wait_deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !read_snapshot_cache_stats().1,
+                "blocking worker did not finish"
+            );
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn live_generation_hashes_same_size_main_and_wal_content() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sqlite_path = temp.path().join("mailbox.sqlite3");
+            let wal_path = mcp_agent_mail_db::pool::sqlite_path_with_suffix(&sqlite_path, "-wal");
+            std::fs::write(&sqlite_path, b"AAAA").expect("write main fixture");
+            std::fs::write(&wal_path, b"1111").expect("write wal fixture");
+            let first =
+                read_live_db_generation(&sqlite_path, &|| false).expect("first live generation");
+
+            std::fs::write(&sqlite_path, b"AAAA").expect("rewrite unchanged main fixture");
+            std::fs::write(&wal_path, b"1111").expect("rewrite unchanged wal fixture");
+            let metadata_only = read_live_db_generation(&sqlite_path, &|| false)
+                .expect("metadata-only live generation");
+            assert_eq!(
+                first, metadata_only,
+                "metadata-only rewrites must not change a content-addressed generation"
+            );
+
+            std::fs::write(&wal_path, b"2222").expect("same-size wal rewrite");
+            let wal_changed =
+                read_live_db_generation(&sqlite_path, &|| false).expect("wal-changed generation");
+            assert_ne!(first, wal_changed, "same-size WAL writes must invalidate");
+
+            std::fs::write(&sqlite_path, b"BBBB").expect("same-size main rewrite");
+            std::fs::remove_file(&wal_path).expect("checkpoint removes wal");
+            let checkpointed =
+                read_live_db_generation(&sqlite_path, &|| false).expect("checkpointed generation");
+            assert_ne!(
+                wal_changed, checkpointed,
+                "same-size main updates and WAL checkpoint transitions must invalidate"
+            );
+        }
+
+        #[test]
+        fn dropping_live_write_lease_immediately_invalidates_exact_scope() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            std::fs::create_dir_all(&storage_root).expect("create archive root");
+            let sqlite_path = temp.path().join("mailbox.sqlite3");
+            let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.to_string_lossy().as_ref())
+                .expect("open live fixture");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("initialize live fixture");
+            drop(conn);
+            let scope = read_snapshot_scope(&storage_root, &sqlite_path).expect("snapshot scope");
+            let slot = read_snapshot_slot(scope).expect("snapshot slot");
+            assert_eq!(
+                slot.invalidation_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            let pool = mcp_agent_mail_db::create_pool_without_startup_init(
+                &mcp_agent_mail_db::DbPoolConfig {
+                    database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path),
+                    storage_root: Some(storage_root.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("live write pool");
+            let simulated_build =
+                try_claim_read_snapshot_build(&slot, Instant::now() + Duration::from_secs(1))
+                    .expect("claim build before writer")
+                    .expect("new scope build");
+            let write_pool = WriteDbPool {
+                pool,
+                _write_guard: ReadSnapshotWriteGuard::begin(
+                    &storage_root,
+                    Some(sqlite_path.as_path()),
+                ),
+            };
+            assert_eq!(
+                slot.invalidation_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "write lease admission must invalidate before the first mutation"
+            );
+            assert_eq!(
+                slot.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_writers,
+                1
+            );
+            let nested_slot = begin_read_snapshot_write(&storage_root, &sqlite_path);
+            assert_eq!(
+                slot.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_writers,
+                2,
+                "nested write leases must keep the scope admitted until the final exit"
+            );
+            end_read_snapshot_write(nested_slot.as_deref());
+            assert_eq!(
+                slot.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_writers,
+                1,
+                "exiting one nested lease must not reopen snapshot admission"
+            );
+            let mut simulated_guard =
+                ReadSnapshotBuildGuard::new(Arc::clone(&slot), simulated_build.token);
+            simulated_guard.publish(
+                &simulated_build,
+                Ok(ReadSnapshotBuildOutput {
+                    key: ReadSnapshotKey {
+                        archive_digest: [0; 32],
+                        live_db_digest: [0; 32],
+                    },
+                    cheap_key: read_snapshot_cheap_key(&slot).expect("cheap key"),
+                    decision: ArchiveReadDecision::Live,
+                    strong_validated_at: Instant::now(),
+                }),
+            );
+            assert!(
+                slot.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ready
+                    .is_none(),
+                "a build claimed before writer admission must not publish during the write epoch"
+            );
+            assert!(matches!(
+                try_claim_read_snapshot_build(&slot, Instant::now() + Duration::from_secs(1)),
+                Err(ReadSnapshotAcquireError::Busy(_))
+            ));
+            let cx = asupersync::Cx::for_testing();
+            let conn = match run_async(write_pool.acquire(&cx)) {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("live write pool acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("live write pool acquire cancelled"),
+                Outcome::Panicked(panic) => {
+                    panic!("live write pool acquire panicked: {}", panic.message())
+                }
+            };
+            conn.query_sync(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('written', '/written', 0)",
+                &[],
+            )
+            .expect("durable live write");
+            drop(conn);
+            drop(write_pool);
+            assert_eq!(
+                slot.invalidation_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+                4,
+                "each nested writer entry and exit must advance the exact scope epoch"
+            );
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn expired_snapshot_detects_checkpointed_same_length_live_write() {
+            let _guard = READ_SNAPSHOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reset_read_snapshot_cache();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("archive");
+            let repo = git2::Repository::init(&storage_root).expect("init archive repo");
+            write_inventory_message(&storage_root, 1, 1);
+            commit_archive_tree(&repo, "seed archive");
+            let sqlite_path = temp.path().join("mailbox.sqlite3");
+            mcp_agent_mail_db::reconstruct_from_archive(&sqlite_path, &storage_root)
+                .expect("seed live mailbox");
+
+            let cx = asupersync::Cx::for_testing();
+            let first = run_async(get_or_build_archive_read_snapshot(
+                &storage_root,
+                &sqlite_path,
+                &cx,
+            ))
+            .expect("initial snapshot");
+            let first_pointer = Arc::as_ptr(&first) as usize;
+            let live = mcp_agent_mail_db::DbConn::open_file(sqlite_path.to_string_lossy().as_ref())
+                .expect("open live mailbox");
+            live.query_sync("UPDATE messages SET subject = 'Mutate' WHERE id = 1", &[])
+                .expect("same-length live update");
+            drop(live);
+            mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&sqlite_path)
+                .expect("checkpoint same-length write");
+
+            expire_read_snapshot_exact_audit();
+            let refreshed =
+                wait_for_snapshot_pointer_change(&storage_root, &sqlite_path, first_pointer);
+            let refreshed_pool = refreshed.pool();
+            let refreshed_conn = match run_async(refreshed_pool.acquire(&cx)) {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("refreshed snapshot acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("refreshed snapshot acquire cancelled"),
+                Outcome::Panicked(panic) => {
+                    panic!("refreshed snapshot acquire panicked: {}", panic.message())
+                }
+            };
+            let subject = refreshed_conn
+                .query_sync("SELECT subject FROM messages WHERE id = 1", &[])
+                .expect("query refreshed snapshot")[0]
+                .get_named::<String>("subject")
+                .expect("refreshed subject");
+            assert_eq!(subject, "Mutate");
+            drop(refreshed_conn);
+            drop(refreshed_pool);
+            drop(refreshed);
+            drop(first);
+            reset_read_snapshot_cache();
+        }
+
+        #[test]
+        fn snapshot_acquisition_errors_have_exact_retry_envelopes() {
+            let busy = read_snapshot_acquire_error_to_mcp_error(ReadSnapshotAcquireError::Busy(
+                "snapshot worker unavailable".to_string(),
+            ));
+            let busy_data = busy.data.expect("busy envelope");
+            assert_eq!(busy_data["error"]["type"], "RESOURCE_BUSY");
+            assert_eq!(busy_data["error"]["recoverable"], true);
+
+            let timeout = read_snapshot_acquire_error_to_mcp_error(
+                ReadSnapshotAcquireError::TimedOut("cold bootstrap timed out".to_string()),
+            );
+            let timeout_data = timeout.data.expect("timeout envelope");
+            assert_eq!(timeout_data["error"]["type"], "SNAPSHOT_TIMEOUT");
+            assert_eq!(timeout_data["error"]["recoverable"], true);
+            assert_eq!(
+                timeout_data["error"]["data"]["timeout_seconds"],
+                READ_SNAPSHOT_BUILD_TIMEOUT.as_secs()
+            );
         }
 
         #[test]
@@ -1867,8 +5362,7 @@ body
 
         #[test]
         fn open_read_db_pool_ignores_unrelated_default_archive_overlap() {
-            let _guard = READ_POOL_TEST_LOCK
-                .get_or_init(|| Mutex::new(()))
+            let _guard = READ_SNAPSHOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -1916,7 +5410,7 @@ body
                     .expect("insert overlapping project");
                     drop(conn);
 
-                    let pool = open_read_db_pool().expect("open read db pool");
+                    let pool = run_async(open_read_db_pool()).expect("open read db pool");
                     assert!(
                         pool.is_none(),
                         "default global archive should not force shared tool read snapshots for an external custom DB"
@@ -1936,8 +5430,7 @@ body
 
         #[test]
         fn db_error_to_mcp_error_corruption_mapping_is_pure_with_live_pool() {
-            let _guard = READ_POOL_TEST_LOCK
-                .get_or_init(|| Mutex::new(()))
+            let _guard = READ_SNAPSHOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
 
