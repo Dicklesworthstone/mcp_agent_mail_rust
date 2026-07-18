@@ -100,7 +100,7 @@ pub struct ReservationConflictCheckResponse {
     pub output_truncated: bool,
     pub project: String,
     pub snapshot_ts: String,
-    pub authoritative_source: &'static str,
+    pub authoritative_source: String,
     pub read_only: bool,
 }
 
@@ -1591,7 +1591,7 @@ pub async fn check_file_reservation_conflicts(
         output_truncated,
         project: snapshot.project.slug,
         snapshot_ts: micros_to_iso(snapshot.captured_ts),
-        authoritative_source: "database_snapshot",
+        authoritative_source: "database_snapshot".to_string(),
         read_only: true,
     };
     serde_json::to_string(&response).map_err(|error| {
