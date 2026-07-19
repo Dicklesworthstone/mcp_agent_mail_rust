@@ -87,12 +87,23 @@ pub fn snapshot_meta_path(primary: &Path) -> PathBuf {
 /// rather than failing the whole snapshot.
 #[must_use]
 pub fn count_key_table_rows(conn: &crate::DbConn) -> BTreeMap<String, i64> {
+    count_key_table_rows_with(|sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()))
+}
+
+fn count_key_table_rows_canonical(conn: &crate::CanonicalDbConn) -> BTreeMap<String, i64> {
+    count_key_table_rows_with(|sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()))
+}
+
+fn count_key_table_rows_with<F>(mut query: F) -> BTreeMap<String, i64>
+where
+    F: FnMut(&str) -> Result<Vec<sqlmodel_core::Row>, String>,
+{
     let mut counts = BTreeMap::new();
     for table in SNAPSHOT_ROW_COUNT_TABLES {
         // Table names are a fixed allowlist (never user input), so this format
         // cannot inject SQL.
         let sql = format!("SELECT COUNT(*) AS n FROM {table}");
-        if let Ok(rows) = conn.query_sync(&sql, &[])
+        if let Ok(rows) = query(&sql)
             && let Some(row) = rows.first()
             && let Ok(n) = row.get_named::<i64>("n")
         {
@@ -103,7 +114,7 @@ pub fn count_key_table_rows(conn: &crate::DbConn) -> BTreeMap<String, i64> {
 }
 
 /// Read the `PRAGMA user_version` for an open connection (0 on any error).
-fn read_schema_version(conn: &crate::DbConn) -> i64 {
+fn read_schema_version_canonical(conn: &crate::CanonicalDbConn) -> i64 {
     conn.query_sync("PRAGMA user_version", &[])
         .ok()
         .and_then(|rows| rows.into_iter().next())
@@ -154,8 +165,11 @@ pub fn record_snapshot_metadata(
 ) -> DbResult<VerifiedSnapshotMetadata> {
     let bak = snapshot_bak_path(primary);
     let (row_counts, schema_version) =
-        if let Ok(conn) = crate::DbConn::open_file(bak.display().to_string()) {
-            (count_key_table_rows(&conn), read_schema_version(&conn))
+        if let Ok(conn) = crate::CanonicalDbConn::open_file(bak.display().to_string()) {
+            (
+                count_key_table_rows_canonical(&conn),
+                read_schema_version_canonical(&conn),
+            )
         } else {
             (BTreeMap::new(), 0)
         };
@@ -253,7 +267,10 @@ pub fn restore_from_verified_snapshot(
             staged.display()
         ))
     })?;
-    if !matches!(crate::pool::sqlite_file_is_healthy(&staged), Ok(true)) {
+    if !matches!(
+        crate::pool::sqlite_recovery_candidate_is_healthy(&staged),
+        Ok(true)
+    ) {
         return Err(DbError::Sqlite(format!(
             "snapshot restore: staged copy {} failed health check and was preserved for inspection",
             staged.display()

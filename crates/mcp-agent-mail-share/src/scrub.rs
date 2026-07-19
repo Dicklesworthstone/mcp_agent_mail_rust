@@ -461,6 +461,18 @@ pub fn scrub_snapshot(
                 scrub_secrets_in_text_column(&conn, RedactTextColumn::AgentTaskDescription)?;
             secrets_replaced +=
                 scrub_secrets_in_text_column(&conn, RedactTextColumn::SiblingSuggestionRationale)?;
+            if column_exists(&conn, "agents", "registration_token")? {
+                // Registration tokens are credentials by definition. Sharing
+                // presets must remove them even when their encoding does not
+                // match a generic secret detector; the full-fidelity archive
+                // preset keeps them so disaster recovery remains lossless.
+                secrets_replaced += exec_count(
+                    &conn,
+                    "UPDATE agents SET registration_token = NULL \
+                     WHERE registration_token IS NOT NULL",
+                    &[],
+                )?;
+            }
         }
 
         // Generate a stable salt for pseudonymization reproducibility (matches Python).
@@ -1153,6 +1165,37 @@ mod tests {
         assert_eq!(summary.secrets_replaced, 0);
         assert_eq!(summary.bodies_redacted, 0);
         assert_eq!(summary.attachments_cleared, 0);
+    }
+
+    #[test]
+    fn sharing_presets_remove_registration_tokens_but_archive_preserves_them() {
+        for (preset, expected_token) in [
+            (ScrubPreset::Standard, None),
+            (ScrubPreset::Strict, None),
+            (ScrubPreset::Archive, Some("registration-secret")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw("ALTER TABLE agents ADD COLUMN registration_token TEXT")
+                .unwrap();
+            conn.execute_raw(
+                "UPDATE agents SET registration_token = 'registration-secret' WHERE id = 1",
+            )
+            .unwrap();
+            drop(conn);
+
+            scrub_snapshot(&db, preset).unwrap();
+
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let rows = conn
+                .query_sync("SELECT registration_token FROM agents WHERE id = 1", &[])
+                .unwrap();
+            let token = rows[0]
+                .get_named::<Option<String>>("registration_token")
+                .unwrap();
+            assert_eq!(token.as_deref(), expected_token, "preset={preset:?}");
+        }
     }
 
     #[test]

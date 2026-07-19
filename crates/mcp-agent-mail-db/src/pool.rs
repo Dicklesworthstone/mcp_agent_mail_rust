@@ -3023,7 +3023,7 @@ impl DbPool {
                 if let Ok(modified) = metadata.modified()
                     && modified.elapsed().unwrap_or(max_age) < max_age
                 {
-                    match sqlite_file_is_healthy(&bak_path) {
+                    match sqlite_canonical_artifact_is_healthy(&bak_path) {
                         Ok(true) => return Ok(None),
                         Ok(false) => tracing::warn!(
                             backup = %bak_path.display(),
@@ -5546,6 +5546,65 @@ fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
     sqlite_canonical_incremental_check_is_ok(&conn)
 }
 
+/// Validate a database artifact without opening it through FrankenSQLite.
+///
+/// FrankenSQLite's namespace coordination files are intentionally persistent:
+/// opening a temporary pathname and then renaming that database leaves the
+/// namespace record attached to the old pathname. Recovery candidates are
+/// private, single-owner files that are renamed after validation, so all
+/// pre-promotion probes must use canonical SQLite only.
+#[allow(clippy::result_large_err)]
+fn sqlite_canonical_artifact_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    if !is_real_file(path) {
+        return Ok(false);
+    }
+    if SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().any(|suffix| {
+        std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix))
+            .is_ok_and(|metadata| !metadata.file_type().is_file())
+    }) {
+        return Ok(false);
+    }
+    normalize_recovery_candidate_probe_result(sqlite_file_is_healthy_canonical(path))
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_recovery_candidate_probe_result(
+    result: Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    match result {
+        Ok(healthy) => Ok(healthy),
+        Err(error) => {
+            let message = error.to_string();
+            if is_corruption_error_message(&message)
+                || is_sqlite_recovery_error_message(&message)
+                || is_sqlite_snapshot_conflict_error_message(&message)
+            {
+                Ok(false)
+            } else {
+                // Recovery candidates are private artifacts. Unlike a live
+                // primary compatibility probe, an unexpected lock/busy or I/O
+                // failure cannot be reclassified as healthy: promotion must
+                // fail closed unless canonical validation actually succeeds.
+                Err(error)
+            }
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn sqlite_recovery_candidate_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    if FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES
+        .iter()
+        .any(|suffix| path_is_occupied(&sqlite_sidecar_path(path, suffix)))
+    {
+        return Err(SqlError::Custom(format!(
+            "recovery candidate {} has FrankenSQLite namespace records; refusing to rename a generation that was opened through the live-runtime engine",
+            path.display()
+        )));
+    }
+    sqlite_canonical_artifact_is_healthy(path)
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_table_has_column(conn: &DbConn, table: &str, column: &str) -> Result<bool, SqlError> {
     let rows = conn.query_sync(&format!("PRAGMA table_info({table})"), &[])?;
@@ -5581,6 +5640,16 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 #[allow(clippy::result_large_err)]
 pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
     if !path.exists() {
+        return Ok(false);
+    }
+    // A directory, FIFO, device, or symlink in a SQLite sidecar slot cannot
+    // belong to a healthy live generation. Classify it as unhealthy before an
+    // engine open turns the obvious filesystem defect into an opaque I/O
+    // error. Recovery will preserve the artifact under quarantine.
+    if SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().any(|suffix| {
+        std::fs::symlink_metadata(sqlite_sidecar_path(path, suffix))
+            .is_ok_and(|metadata| !metadata.file_type().is_file())
+    }) {
         return Ok(false);
     }
     let path_str = path.to_string_lossy();
@@ -6175,30 +6244,16 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
 
 fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
     for candidate in sqlite_backup_candidates(primary_path) {
-        match sqlite_file_is_healthy(&candidate) {
+        match sqlite_canonical_artifact_is_healthy(&candidate) {
             Ok(true) => return Some(candidate),
-            Ok(false) => match sqlite_file_is_healthy_canonical(&candidate) {
-                Ok(true) => {
-                    tracing::warn!(
-                        candidate = %candidate.display(),
-                        "sqlite backup candidate failed primary health probe but passed canonical probe; accepting candidate"
-                    );
-                    return Some(candidate);
-                }
-                Ok(false) => tracing::warn!(
-                    candidate = %candidate.display(),
-                    "sqlite backup candidate failed health probes; skipping"
-                ),
-                Err(e) => tracing::warn!(
-                    candidate = %candidate.display(),
-                    error = %e,
-                    "sqlite backup candidate canonical probe failed; skipping"
-                ),
-            },
+            Ok(false) => tracing::warn!(
+                candidate = %candidate.display(),
+                "sqlite backup candidate failed canonical health probes; skipping"
+            ),
             Err(e) => tracing::warn!(
                 candidate = %candidate.display(),
                 error = %e,
-                "sqlite backup candidate unreadable; skipping"
+                "sqlite backup candidate canonical probe failed; skipping"
             ),
         }
     }
@@ -7081,10 +7136,10 @@ fn quarantined_sidecar_path(
 }
 
 const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
-// FrankenSQLite creates these namespace coordination files while probing a
-// file-backed database. They belong to the disposable staged candidate, not
-// the live primary, and must participate in candidate collision detection and
-// cleanup just like SQLite's own sidecars.
+// Legacy builds could leave FrankenSQLite namespace coordination files beside
+// a disposable candidate. They must block reuse of that pathname, but must
+// never be unlinked here: namespace records are persistent by design and only
+// FrankenSQLite's exclusive private-database cleanup protocol may remove them.
 const FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
 const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -7211,6 +7266,13 @@ fn sqlite_file_is_backup_safe(path: &Path) -> Result<bool, SqlError> {
     sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
 }
 
+fn sqlite_staged_backup_is_safe(path: &Path) -> Result<bool, SqlError> {
+    if !sqlite_recovery_candidate_is_healthy(path)? {
+        return Ok(false);
+    }
+    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
+}
+
 fn ensure_proactive_backup_source_is_safe(primary: &Path, backup_path: &Path) -> DbResult<()> {
     match sqlite_file_is_backup_safe(primary) {
         Ok(true) => Ok(()),
@@ -7228,7 +7290,7 @@ fn ensure_proactive_backup_source_is_safe(primary: &Path, backup_path: &Path) ->
 }
 
 fn validate_proactive_backup_stage(primary: &Path, staged_backup: &Path) -> DbResult<()> {
-    match sqlite_file_is_backup_safe(staged_backup) {
+    match sqlite_staged_backup_is_safe(staged_backup) {
         Ok(true) => {}
         Ok(false) => {
             return Err(DbError::Sqlite(format!(
@@ -7303,10 +7365,7 @@ fn stage_backup_restore_candidate(
 #[allow(clippy::result_large_err)]
 fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
     let _ = std::fs::remove_file(candidate);
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
-        .iter()
-        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
-    {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let _ = std::fs::remove_file(sqlite_sidecar_path(candidate, suffix));
     }
 }
@@ -7609,7 +7668,7 @@ where
             )),
         ));
     }
-    if !sqlite_file_is_healthy(candidate_path)
+    if !sqlite_recovery_candidate_is_healthy(candidate_path)
         .map_err(ReconstructionCandidateFailure::before_receipt_commit)?
     {
         return Err(ReconstructionCandidateFailure::before_receipt_commit(
@@ -7667,7 +7726,7 @@ where
         candidate_path,
     )
     .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
-    if !sqlite_file_is_healthy(candidate_path)
+    if !sqlite_recovery_candidate_is_healthy(candidate_path)
         .map_err(|error| abort_prepared_recovery_after_safe_rollback(&prepared, error))?
     {
         return Err(abort_prepared_recovery_after_safe_rollback(
@@ -7802,7 +7861,7 @@ where
     };
 
     match reconstruct_result {
-        Ok(stats) => match sqlite_file_is_healthy(&candidate_path) {
+        Ok(stats) => match sqlite_recovery_candidate_is_healthy(&candidate_path) {
             Ok(true) => match promote_recovery_candidate_with_finalizer(
                 primary_path,
                 &candidate_path,
@@ -8385,17 +8444,14 @@ where
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let restore_candidate = stage_backup_restore_candidate(backup_path, primary_path, &timestamp)?;
-    if !sqlite_file_is_healthy(&restore_candidate)? {
+    if !sqlite_recovery_candidate_is_healthy(&restore_candidate)? {
         cleanup_sqlite_candidate_artifact(&restore_candidate);
         return Err(SqlError::Custom(format!(
             "sqlite backup {} did not pass health checks after staging copy; original database is untouched",
             backup_path.display()
         )));
     }
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
-        .iter()
-        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
-    {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let _ = std::fs::remove_file(sqlite_sidecar_path(&restore_candidate, suffix));
     }
     promote_recovery_candidate_with_finalizer(
@@ -8419,12 +8475,14 @@ where
 fn reinitialize_without_backup(primary_path: &Path, storage_root: &Path) -> Result<(), SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let candidate = reconstruction_candidate_path(primary_path, &format!("blank-{timestamp}"));
-    let conn = DbConn::open_file(candidate.to_string_lossy().as_ref()).map_err(|error| {
-        SqlError::Custom(format!(
-            "failed to create blank recovery candidate {}: {error}",
-            candidate.display()
-        ))
-    })?;
+    let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref()).map_err(
+        |error| {
+            SqlError::Custom(format!(
+                "failed to create blank recovery candidate {}: {error}",
+                candidate.display()
+            ))
+        },
+    )?;
     conn.execute_raw(&schema::init_schema_sql_base())
         .map_err(|error| {
             SqlError::Custom(format!(
@@ -10554,6 +10612,18 @@ mod tests {
         checkpoint_and_remove_sqlite_sidecars(path);
     }
 
+    fn write_canonical_marker_db(path: &Path, value: &str) {
+        let path_str = path.to_string_lossy();
+        let conn =
+            crate::CanonicalDbConn::open_file(path_str.as_ref()).expect("open canonical marker db");
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
+            .expect("create canonical marker table");
+        conn.execute_raw(&format!("INSERT INTO marker(value) VALUES('{value}')"))
+            .expect("insert canonical marker value");
+        drop(conn);
+        checkpoint_and_remove_sqlite_sidecars(path);
+    }
+
     #[test]
     fn sqlite_backup_candidates_prefer_newer_timestamped_backup_over_stale_dot_bak() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10870,7 +10940,7 @@ mod tests {
         let first_candidate = dir.path().join("storage.sqlite3.first-candidate");
         let second_candidate = dir.path().join("storage.sqlite3.second-candidate");
         write_marker_db(&primary, "original-generation");
-        write_marker_db(&first_candidate, "first-recovered-generation");
+        write_canonical_marker_db(&first_candidate, "first-recovered-generation");
 
         promote_recovery_candidate(&primary, &first_candidate, dir.path())
             .expect("first recovery promotion");
@@ -10879,7 +10949,7 @@ mod tests {
 
         std::fs::write(&primary, b"NOT A SQLITE DATABASE")
             .expect("corrupt previously receipted live generation");
-        write_marker_db(&second_candidate, "second-recovered-generation");
+        write_canonical_marker_db(&second_candidate, "second-recovered-generation");
         promote_recovery_candidate(&primary, &second_candidate, dir.path())
             .expect("a verified receipt chain must not make later corruption unrecoverable");
 
@@ -10934,6 +11004,58 @@ mod tests {
         );
         crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
             .expect("rejection before receipt admission must not degrade readiness");
+    }
+
+    #[test]
+    fn recovery_candidate_probe_never_treats_lock_contention_as_healthy() {
+        let error = normalize_recovery_candidate_probe_result(Err(SqlError::Custom(
+            "database is locked".to_string(),
+        )))
+        .expect_err("a private recovery candidate must fail closed on lock contention");
+        assert!(
+            is_lock_error(&error.to_string()),
+            "unexpected error: {error}"
+        );
+
+        let corrupt = normalize_recovery_candidate_probe_result(Err(SqlError::Custom(
+            "database disk image is malformed".to_string(),
+        )))
+        .expect("recognized corruption should be a negative health verdict");
+        assert!(!corrupt);
+    }
+
+    #[test]
+    fn recovery_promotion_rejects_candidate_with_fsqlite_namespace_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.candidate");
+        let candidate_namespace = sqlite_sidecar_path(&candidate, "-fsqlite-ns-use");
+        write_marker_db(&primary, "live-generation");
+        write_canonical_marker_db(&candidate, "candidate-generation");
+        std::fs::write(&candidate_namespace, b"persistent namespace record")
+            .expect("seed candidate namespace record");
+
+        let error = promote_recovery_candidate(&primary, &candidate, dir.path())
+            .expect_err("a namespaced FrankenSQLite generation must not be renamed");
+        assert!(
+            error
+                .to_string()
+                .contains("FrankenSQLite namespace records"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("live-generation"),
+            "rejected candidate must not disturb the live generation"
+        );
+        assert!(
+            candidate.exists(),
+            "rejected candidate must remain inspectable"
+        );
+        assert!(
+            candidate_namespace.exists(),
+            "recovery must not unlink persistent namespace records"
+        );
     }
 
     #[test]

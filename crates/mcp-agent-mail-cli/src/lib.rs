@@ -8679,11 +8679,13 @@ const SQLITE_BASE_INIT_TABLES: [&str; 11] = [
     "inbox_stats",
 ];
 
-const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 12] = [
+const SQLITE_BASE_INIT_COLUMNS: [(&str, &str); 14] = [
     ("products", "product_uid"),
     ("product_project_links", "created_at"),
     ("agents", "attachments_policy"),
     ("agents", "contact_policy"),
+    ("agents", "reaper_exempt"),
+    ("agents", "registration_token"),
     ("messages", "attachments"),
     ("message_recipients", "kind"),
     ("message_recipients", "ack_ts"),
@@ -8727,6 +8729,48 @@ fn sqlite_conn_supports_required_reads(
     }
     for (table, column) in columns {
         if !sqlite_conn_has_column(conn, table, column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn sqlite_conn_has_column_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    table: &str,
+    column: &str,
+) -> CliResult<bool> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA table_info({table}) failed: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .any(|name| name == column))
+}
+
+fn sqlite_conn_has_table_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    table: &str,
+) -> CliResult<bool> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .map_err(|e| CliError::Other(format!("PRAGMA table_info({table}) failed: {e}")))?;
+    Ok(!rows.is_empty())
+}
+
+fn sqlite_conn_supports_required_reads_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    tables: &[&str],
+    columns: &[(&str, &str)],
+) -> CliResult<bool> {
+    for table in tables {
+        if !sqlite_conn_has_table_canonical(conn, table)? {
+            return Ok(false);
+        }
+    }
+    for (table, column) in columns {
+        if !sqlite_conn_has_column_canonical(conn, table, column)? {
             return Ok(false);
         }
     }
@@ -10164,6 +10208,25 @@ fn sqlite_file_is_healthy_canonical(path: &Path) -> CliResult<bool> {
     sqlite_conn_incremental_check_ok_canonical(&conn)
 }
 
+fn sqlite_recovery_candidate_is_healthy_canonical(path: &Path) -> CliResult<bool> {
+    if !path_is_real_file(path) {
+        return Ok(false);
+    }
+    match sqlite_file_is_healthy_canonical(path) {
+        Ok(healthy) => Ok(healthy),
+        Err(error) => {
+            let message = error.to_string();
+            if is_sqlite_recovery_error_message(&message)
+                || mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(&message)
+            {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn handle_sqlite_compatibility_probe_result(
     path: &Path,
     result: CliResult<bool>,
@@ -10196,7 +10259,7 @@ where
 
     let path_string = path.to_string_lossy().into_owned();
     let conn = match mcp_agent_mail_db::DbConn::open_file(&path_string) {
-        Ok(conn) => conn,
+        Ok(conn) => mcp_agent_mail_db::guard_db_conn(conn, "CLI sqlite health probe"),
         Err(e) => {
             let err_text = e.to_string();
             if mcp_agent_mail_db::is_lock_error(&err_text) {
@@ -10566,7 +10629,7 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
 
 fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
     for candidate in sqlite_backup_candidates(path) {
-        if let Ok(true) = sqlite_file_is_healthy(&candidate) {
+        if let Ok(true) = sqlite_recovery_candidate_is_healthy_canonical(&candidate) {
             return Some(candidate);
         }
     }
@@ -10882,7 +10945,7 @@ fn recover_sqlite_file_with_storage_root(
                 temp_restore.display()
             ))
         })?;
-        if !sqlite_file_is_healthy(&temp_restore)? {
+        if !sqlite_recovery_candidate_is_healthy_canonical(&temp_restore)? {
             cleanup_doctor_temp_sqlite_artifact(&temp_restore);
             return Err(CliError::Other(format!(
                 "sqlite backup {} did not pass health check after copy (original is untouched)",
@@ -10962,7 +11025,7 @@ fn recover_sqlite_file_with_storage_root(
                             ftui_runtime::ftui_eprintln!("Warning: {warning}");
                         }
                     }
-                    if !sqlite_file_is_healthy(&temp_reconstruct)? {
+                    if !sqlite_recovery_candidate_is_healthy_canonical(&temp_reconstruct)? {
                         cleanup_doctor_temp_sqlite_artifact(&temp_reconstruct);
                         return Err(CliError::Other(format!(
                             "reconstruction from archive completed, but health checks \
@@ -17765,7 +17828,7 @@ fn validate_staged_sqlite_backup(
     staged_backup: &Path,
     backup_path: &Path,
 ) -> CliResult<()> {
-    if !sqlite_file_is_healthy(staged_backup)? {
+    if !sqlite_recovery_candidate_is_healthy_canonical(staged_backup)? {
         return Err(CliError::Other(format!(
             "backup aborted: staged copy {} from {} failed health checks; backup {} was not created",
             staged_backup.display(),
@@ -17961,7 +18024,7 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
             staged_restore.display()
         ))
     })?;
-    if !sqlite_file_is_healthy(&staged_restore)? {
+    if !sqlite_recovery_candidate_is_healthy_canonical(&staged_restore)? {
         cleanup_doctor_temp_sqlite_artifact(&staged_restore);
         return Err(CliError::Other(format!(
             "backup {} did not pass health check after staging copy; live database is untouched",
@@ -42482,8 +42545,11 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     fn write_marker_db(path: &Path, marker: &str) {
-        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
-            .expect("open marker db");
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+                .expect("open marker db"),
+            "CLI marker fixture write",
+        );
         conn.execute_raw("CREATE TABLE IF NOT EXISTS marker(value TEXT)")
             .expect("create marker table");
         conn.execute_raw("DELETE FROM marker")
@@ -42499,8 +42565,11 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     fn read_marker_db(path: &Path) -> String {
-        let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
-            .expect("open marker db for read");
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+                .expect("open marker db for read"),
+            "CLI marker fixture read",
+        );
         let rows = conn
             .query_sync("SELECT value FROM marker LIMIT 1", &[])
             .expect("query marker");
@@ -42551,6 +42620,7 @@ http_headers = { Authorization = "Bearer secret" }
         }
 
         let quarantined_sidecar = |suffix: &str| {
+            let prefix = format!("storage.sqlite3{suffix}.corrupt-");
             std::fs::read_dir(dir.path())
                 .expect("read dir")
                 .flatten()
@@ -42558,9 +42628,7 @@ http_headers = { Authorization = "Bearer secret" }
                 .find(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with("storage.sqlite3.corrupt-") && name.ends_with(suffix)
-                        })
+                        .is_some_and(|name| name.starts_with(&prefix))
                 })
                 .expect("missing quarantined sqlite sidecar")
         };
@@ -42637,10 +42705,7 @@ http_headers = { Authorization = "Bearer secret" }
             .find(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("blocked-restore.sqlite3.corrupt-")
-                            && name.ends_with("-wal")
-                    })
+                    .is_some_and(|name| name.starts_with("blocked-restore.sqlite3-wal.corrupt-"))
             })
             .expect("quarantined wal directory");
         assert!(
@@ -43745,12 +43810,13 @@ http_headers = { Authorization = "Bearer secret" }
             );
         }
 
-        // Actual restore with --force should create backups and restore snapshot + storage.
+        // Actual restore with --force should preserve the prior state and
+        // restore the snapshot + storage.
         archive_restore_state(archive_arg, &restore_db, &restore_storage, true, false).unwrap();
 
-        let db_backup =
-            find_backup_entry(&restore_dir, "mailbox.sqlite3.backup-").expect("db backup created");
-        assert_eq!(std::fs::read(&db_backup).unwrap(), b"old-db");
+        let db_quarantine = find_backup_entry(&restore_dir, "mailbox.sqlite3.corrupt-")
+            .expect("prior database generation preserved");
+        assert_eq!(std::fs::read(&db_quarantine).unwrap(), b"old-db");
 
         let storage_backup = find_backup_entry(&restore_dir, "storage_repo.backup-")
             .expect("storage backup created");
@@ -43832,8 +43898,8 @@ http_headers = { Authorization = "Bearer secret" }
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
             "live broken WAL symlink should not remain after archive restore"
         );
-        let wal_backup = find_backup_entry(&restore_dir, "mailbox.sqlite3-wal.backup-")
-            .expect("broken WAL symlink should be backed up");
+        let wal_backup = find_backup_entry(&restore_dir, "mailbox.sqlite3-wal.corrupt-")
+            .expect("broken WAL symlink should be preserved");
         assert!(
             std::fs::symlink_metadata(&wal_backup)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink()),
@@ -66517,6 +66583,34 @@ fn next_backup_path(path: &Path, timestamp: &str) -> PathBuf {
     candidate
 }
 
+fn archive_restore_recovery_quarantine_entries(database_path: &Path) -> BTreeSet<PathBuf> {
+    let Some(parent) = database_path.parent() else {
+        return BTreeSet::new();
+    };
+    let Some(database_name) = database_path.file_name().and_then(OsStr::to_str) else {
+        return BTreeSet::new();
+    };
+    let mut prefixes = vec![format!("{database_name}.corrupt-")];
+    prefixes.extend(
+        SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .iter()
+            .map(|suffix| format!("{database_name}{suffix}.corrupt-")),
+    );
+
+    std::fs::read_dir(parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct ArchiveRestoreBackupEntry {
     original: PathBuf,
@@ -66676,10 +66770,10 @@ fn stage_archive_restore_snapshot(
 }
 
 fn archive_restore_snapshot_check_ok(
-    conn: &mcp_agent_mail_db::DbConn,
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
     kind: mcp_agent_mail_db::CheckKind,
 ) -> CliResult<bool> {
-    match sqlite_conn_check_ok(conn, kind) {
+    match sqlite_conn_check_ok_canonical(conn, kind) {
         Ok(ok) => Ok(ok),
         Err(error) => {
             let message = error.to_string();
@@ -66694,7 +66788,7 @@ fn archive_restore_snapshot_check_ok(
 
 fn archive_restore_snapshot_is_healthy(snapshot_path: &Path) -> CliResult<bool> {
     let path_string = snapshot_path.to_string_lossy().into_owned();
-    let conn = mcp_agent_mail_db::DbConn::open_file(&path_string).map_err(|e| {
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_string).map_err(|e| {
         CliError::Other(format!(
             "cannot open staged archive snapshot {}: {e}",
             snapshot_path.display()
@@ -66708,7 +66802,11 @@ fn archive_restore_snapshot_is_healthy(snapshot_path: &Path) -> CliResult<bool> 
         return Ok(false);
     }
 
-    sqlite_conn_supports_required_reads(&conn, &SQLITE_BASE_INIT_TABLES, &SQLITE_BASE_INIT_COLUMNS)
+    sqlite_conn_supports_required_reads_canonical(
+        &conn,
+        &SQLITE_BASE_INIT_TABLES,
+        &SQLITE_BASE_INIT_COLUMNS,
+    )
 }
 
 fn stage_archive_restore_storage_root(
@@ -67424,9 +67522,8 @@ fn archive_restore_state(
         archive_restore_db_embedded_in_storage_root(&database_path, &storage_root);
     if path_is_occupied(&database_path) && !db_embedded_in_storage_root {
         planned_ops.push(format!(
-            "backup {} -> {}",
-            database_path.display(),
-            next_backup_path(&database_path, &timestamp).display()
+            "preserve {} as a receipted recovery quarantine during promotion",
+            database_path.display()
         ));
     }
     if !db_embedded_in_storage_root {
@@ -67435,9 +67532,8 @@ fn archive_restore_state(
                 mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
             if path_is_occupied(&sidecar_path) {
                 planned_ops.push(format!(
-                    "backup {} -> {}",
-                    sidecar_path.display(),
-                    next_backup_path(&sidecar_path, &timestamp).display()
+                    "preserve {} as a recovery quarantine during promotion",
+                    sidecar_path.display()
                 ));
             }
         }
@@ -67509,6 +67605,7 @@ fn archive_restore_state(
 
     let database_existed = path_is_occupied(&database_path);
     let storage_root_existed = path_is_occupied(&storage_root);
+    let recovery_quarantines_before = archive_restore_recovery_quarantine_entries(&database_path);
     validate_archive_restore_targets(&database_path, &storage_root)?;
     let (staged_db_dir, staged_db_path) = stage_archive_restore_snapshot(
         &mut archive,
@@ -67543,7 +67640,22 @@ fn archive_restore_state(
     };
     let staged_continuity_db = if db_embedded_in_storage_root && database_existed {
         let staged = staged_db_dir.path().join("current-live-generation.sqlite3");
-        copy_sqlite_backup_consistently(&database_path, &staged)?;
+        if sqlite_recovery_candidate_is_healthy_canonical(&database_path)? {
+            copy_sqlite_backup_consistently(&database_path, &staged)?;
+        } else {
+            // The whole embedded storage root is already preserved by an
+            // atomic directory rename. Keep an exact byte-for-byte copy of an
+            // unreadable prior primary only so the unified promotion boundary
+            // can receipt and quarantine that generation after the new storage
+            // tree is staged. Do not reject archive restore merely because the
+            // generation being replaced is itself corrupt.
+            std::fs::copy(&database_path, &staged).map_err(|error| {
+                CliError::Other(format!(
+                    "failed to stage unreadable embedded database {} for continuity verification: {error}",
+                    database_path.display()
+                ))
+            })?;
+        }
         Some(staged)
     } else {
         None
@@ -67648,16 +67760,20 @@ fn archive_restore_state(
         .iter()
         .map(|entry| entry.backup.clone())
         .collect();
+    let recovery_quarantine_paths = archive_restore_recovery_quarantine_entries(&database_path)
+        .difference(&recovery_quarantines_before)
+        .cloned()
+        .collect::<Vec<_>>();
 
     ftui_runtime::ftui_println!("✓ Restore complete from {}.", archive_path.display());
-    if !backup_paths.is_empty() {
-        ftui_runtime::ftui_println!("Backups preserved at:");
-        for path in &backup_paths {
+    if !backup_paths.is_empty() || !recovery_quarantine_paths.is_empty() {
+        ftui_runtime::ftui_println!("Prior state preserved at:");
+        for path in backup_paths.iter().chain(&recovery_quarantine_paths) {
             ftui_runtime::ftui_println!("  - {}", path.display());
         }
     }
     ftui_runtime::ftui_println!(
-        "Database: {}\nStorage root: {}\nNeed to revert? Use the backups above or rerun with another archive.",
+        "Database: {}\nStorage root: {}\nNeed to revert? Use the preserved state above or rerun with another archive.",
         database_path.display(),
         storage_root.display()
     );
@@ -69771,7 +69887,7 @@ fn handle_doctor_reconstruct_with(
     };
 
     // Validate the reconstructed temp DB before swapping.
-    if !sqlite_file_is_healthy(&temp_db_path)? {
+    if !sqlite_recovery_candidate_is_healthy_canonical(&temp_db_path)? {
         cleanup_doctor_temp_sqlite_artifact(&temp_db_path);
         return Err(CliError::Other(format!(
             "reconstructed database at {} did not pass health checks; \

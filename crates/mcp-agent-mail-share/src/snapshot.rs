@@ -1,6 +1,6 @@
 //! Step 1: SQLite snapshot creation via SQL-level dump and restore.
 //!
-//! Creates an atomic, clean FrankenSQLite copy of the source database suitable for
+//! Creates an atomic, clean canonical SQLite copy of the source database suitable for
 //! offline manipulation (scoping, scrubbing, finalization with FTS5/VACUUM).
 //!
 //! Instead of a byte-level file copy we read schema + data through the runtime
@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 use sqlmodel_core::Value;
 
 use crate::ShareError;
@@ -17,8 +17,9 @@ use crate::ShareError;
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 #[cfg(test)]
-// Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
-type SqliteConnection = DbConn;
+// Export snapshots are canonical SQLite artifacts, so tests inspect them
+// through the same engine external consumers use.
+type SqliteConnection = CanonicalDbConn;
 
 /// Known tables produced by the `mcp-agent-mail-db` schema.
 ///
@@ -67,6 +68,8 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "last_active_ts",
             "attachments_policy",
             "contact_policy",
+            "reaper_exempt",
+            "registration_token",
         ],
     },
     KnownTable {
@@ -292,17 +295,23 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     // requested destination page_size before the first destination write.
     let dest_str = staged_dest.display().to_string();
     let requested_page_size = destination_page_size_bytes(destination_pragmas)?;
-    let dst_conn = if let Some(page_size) = requested_page_size {
-        DbConn::open_file_with_page_size(&dest_str, page_size).map_err(|e| ShareError::Sqlite {
-            message: format!(
-                "cannot create destination DB {dest_str} with page size {page_size}: {e}"
-            ),
-        })?
-    } else {
-        DbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
-            message: format!("cannot create destination DB {dest_str}: {e}"),
-        })?
-    };
+    // The source is the live FrankenSQLite database, but the destination is a
+    // disposable export image that will be renamed into place. Creating that
+    // image through FrankenSQLite would bind persistent namespace records to
+    // the staging pathname. Canonical SQLite has no pathname-bound namespace,
+    // so it is the correct writer for portable export artifacts.
+    let dst_conn = CanonicalDbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot create destination DB {dest_str}: {e}"),
+    })?;
+    if let Some(page_size) = requested_page_size {
+        dst_conn
+            .execute_raw(&format!("PRAGMA page_size = {page_size}"))
+            .map_err(|e| ShareError::Sqlite {
+                message: format!(
+                    "cannot configure destination DB {dest_str} with page size {page_size}: {e}"
+                ),
+            })?;
+    }
     for pragma in destination_pragmas {
         dst_conn
             .execute_raw(pragma)
@@ -392,7 +401,7 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
 }
 
 /// Transfer tables from a source snapshot to a fresh destination database.
-fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
+fn transfer_tables_frank(src: &DbConn, dst: &CanonicalDbConn) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
         create_dst_table(dst, table)?;
         let source_columns = source_columns_frank(src, table.name)?;
@@ -468,7 +477,7 @@ fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
 }
 
 /// Create a table in the destination database.
-fn create_dst_table(dst: &DbConn, table: &KnownTable) -> Result<(), ShareError> {
+fn create_dst_table(dst: &CanonicalDbConn, table: &KnownTable) -> Result<(), ShareError> {
     let col_defs: Vec<String> = table.columns.iter().map(|c| format!("\"{c}\"")).collect();
 
     let pk_suffix = primary_key_suffix(table.primary_key_columns);
@@ -575,6 +584,7 @@ fn available_columns<'a>(table: &'a KnownTable, source_columns: &HashSet<String>
 
 fn snapshot_default_value(table: &str, column: &str) -> Option<Value> {
     match (table, column) {
+        ("agents", "reaper_exempt") => Some(Value::BigInt(0)),
         ("messages", "recipients_json") => Some(Value::Text("{}".to_string())),
         _ => None,
     }
@@ -950,6 +960,51 @@ mod tests {
         let capabilities_json: String = rows[0].get_named("capabilities_json").unwrap();
         assert_eq!(tool_name, "send_message");
         assert_eq!(capabilities_json, "[\"attachments\"]");
+    }
+
+    #[test]
+    fn snapshot_preserves_agent_recovery_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("runtime.sqlite3");
+        let dest = dir.path().join("snapshot.sqlite3");
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY, \
+                project_id INTEGER NOT NULL, \
+                name TEXT NOT NULL, \
+                reaper_exempt INTEGER NOT NULL DEFAULT 0, \
+                registration_token TEXT\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents \
+             (id, project_id, name, reaper_exempt, registration_token) \
+             VALUES (7, 3, 'RecoveryAgent', 1, 'registration-secret')",
+        )
+        .unwrap();
+        drop(conn);
+
+        create_sqlite_snapshot(&source, &dest, false).unwrap();
+
+        let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
+        let rows = copy_conn
+            .query_sync(
+                "SELECT reaper_exempt, registration_token FROM agents WHERE id = 7",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("reaper_exempt").unwrap(), 1);
+        assert_eq!(
+            rows[0]
+                .get_named::<Option<String>>("registration_token")
+                .unwrap()
+                .as_deref(),
+            Some("registration-secret")
+        );
     }
 
     #[test]
