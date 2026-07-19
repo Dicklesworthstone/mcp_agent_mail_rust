@@ -66,6 +66,7 @@ extract_function() {
     extract_function select_linux_x86_64_gnu_artifact_if_available
     extract_function remove_installer_lock_dir
     extract_function check_network
+    extract_function persist_installer_copy
 } >"$extract"
 
 for required in set_artifact_url check_network select_linux_x86_64_gnu_artifact_if_available; do
@@ -82,6 +83,14 @@ set -euo pipefail
 url="${*: -1}"
 printf '%s\n' "$url" >>"${CURL_LOG:?}"
 case "$url" in
+    *installer-source.sh)
+        printf '%s\n' '#!/usr/bin/env bash' '#' '# mcp-agent-mail installer' 'echo persisted-installer'
+        exit 0
+        ;;
+    *invalid-installer.sh)
+        printf '%s\n' '<html>not an installer</html>'
+        exit 0
+        ;;
     *x86_64-unknown-linux-musl.tar.xz)
         exit "${MUSL_XZ_RC:-${MUSL_RC:-22}}"
         ;;
@@ -262,8 +271,66 @@ if [ -e "$lock_dir" ]; then
     exit 1
 fi
 
+# shellcheck disable=SC2016 # grep patterns intentionally match literal shell source.
 if grep -q 'rm -rf "${LOCK_DIR' "$INSTALL_SH" || grep -q 'rm -rf "$LOCK_DIR' "$INSTALL_SH"; then
     echo "FAIL: installer lock cleanup must not use rm -rf" >&2
+    exit 1
+fi
+
+step "scenario F: piped installer persistence is complete-or-untouched"
+piped_home="$tmp/piped-home"
+mkdir -p "$piped_home"
+{
+    printf '%s\n' \
+        'OFFLINE=0' \
+        'INSTALL_SCRIPT_URL=https://example.invalid/installer-source.sh' \
+        'verbose() { :; }'
+    extract_function persist_installer_copy
+    # shellcheck disable=SC2016 # generated script must expand this variable at runtime.
+    printf '%s\n' 'persist_installer_copy' 'printf "%s\n" "$SAVED_INSTALLER_PATH"'
+} | HOME="$piped_home" CURL_LOG="$tmp/scenario_f.curl.log" PATH="$tmp/bin:$PATH" \
+    bash >"$tmp/scenario_f.out"
+
+saved_installer="$piped_home/.local/share/mcp-agent-mail/install.sh"
+if [ ! -x "$saved_installer" ]; then
+    echo "FAIL: piped install did not persist an executable installer" >&2
+    exit 1
+fi
+if ! grep -q '^echo persisted-installer$' "$saved_installer"; then
+    echo "FAIL: persisted installer did not contain the complete fetched payload" >&2
+    exit 1
+fi
+if ! grep -Fxq "$saved_installer" "$tmp/scenario_f.out"; then
+    echo "FAIL: persisted installer path was not reported" >&2
+    exit 1
+fi
+
+printf '%s\n' 'known-good-installer' >"$saved_installer"
+{
+    printf '%s\n' \
+        'OFFLINE=0' \
+        'INSTALL_SCRIPT_URL=https://example.invalid/custom.tar.xz' \
+        'verbose() { :; }'
+    extract_function persist_installer_copy
+    printf '%s\n' 'persist_installer_copy'
+} | HOME="$piped_home" CURL_LOG="$tmp/scenario_f_failed.curl.log" CUSTOM_RC=22 \
+    PATH="$tmp/bin:$PATH" bash
+if [ "$(cat "$saved_installer")" != "known-good-installer" ]; then
+    echo "FAIL: failed installer fetch modified the existing saved copy" >&2
+    exit 1
+fi
+
+{
+    printf '%s\n' \
+        'OFFLINE=0' \
+        'INSTALL_SCRIPT_URL=https://example.invalid/invalid-installer.sh' \
+        'verbose() { :; }'
+    extract_function persist_installer_copy
+    printf '%s\n' 'persist_installer_copy'
+} | HOME="$piped_home" CURL_LOG="$tmp/scenario_f_invalid.curl.log" \
+    PATH="$tmp/bin:$PATH" bash
+if [ "$(cat "$saved_installer")" != "known-good-installer" ]; then
+    echo "FAIL: invalid successful response modified the existing saved copy" >&2
     exit 1
 fi
 

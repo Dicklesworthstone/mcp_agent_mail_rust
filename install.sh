@@ -6966,6 +6966,48 @@ if [ "$VERIFY" -eq 1 ]; then
   verify_installation
 fi
 
+# Persist a copy of this installer to disk so later `--uninstall` / re-run
+# invocations work even when this run was piped from curl (no ./install.sh on
+# disk). Best-effort: failure to persist must never fail the install.
+SAVED_INSTALLER_PATH=""
+persist_installer_copy() {
+  local target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/mcp-agent-mail"
+  local target="$target_dir/install.sh"
+  local staged_target="${target}.tmp.$$"
+  local source_path="${BASH_SOURCE[0]:-}"
+  local installer_payload=""
+  mkdir -p "$target_dir" 2>/dev/null || return 0
+  if [ -n "$source_path" ] && [ -f "$source_path" ] && [ "$source_path" != "$target" ]; then
+    cp "$source_path" "$staged_target" 2>/dev/null || return 0
+    chmod 0755 "$staged_target" 2>/dev/null || return 0
+    mv -f "$staged_target" "$target" 2>/dev/null || return 0
+  elif [ ! -f "$source_path" ]; then
+    # Piped install (`curl | bash`): the running script has no on-disk source,
+    # so fetch a copy from the canonical URL for later use. Buffer the response
+    # before touching the target so a truncated network transfer cannot leave a
+    # partial executable behind.
+    [ "$OFFLINE" -eq 1 ] && return 0
+    if ! installer_payload="$(curl -fsSL "$INSTALL_SCRIPT_URL" 2>/dev/null)"; then
+      return 0
+    fi
+    case "$installer_payload" in
+      '#!/usr/bin/env bash'*'# mcp-agent-mail installer'*) ;;
+      *) return 0 ;;
+    esac
+    if ! printf '%s\n' "$installer_payload" | bash -n >/dev/null 2>&1; then
+      return 0
+    fi
+    printf '%s\n' "$installer_payload" > "$staged_target" 2>/dev/null || return 0
+    chmod 0755 "$staged_target" 2>/dev/null || return 0
+    mv -f "$staged_target" "$target" 2>/dev/null || return 0
+  fi
+  [ -f "$target" ] || return 0
+  chmod 0755 "$target" 2>/dev/null || true
+  SAVED_INSTALLER_PATH="$target"
+  verbose "persist_installer_copy:saved path=${target}"
+}
+persist_installer_copy || true
+
 # Final summary
 echo ""
 if [ "$QUIET" -eq 0 ]; then
@@ -7000,9 +7042,9 @@ if [ "$QUIET" -eq 0 ]; then
 
   echo ""
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 245 --italic "Managed removal: ./install.sh --uninstall --dest $DEST"
+    gum style --foreground 245 --italic "Managed removal: ${SAVED_INSTALLER_PATH:-./install.sh} --uninstall --dest $DEST"
   else
-    echo -e "\033[0;90mManaged removal: ./install.sh --uninstall --dest $DEST\033[0m"
+    echo -e "\033[0;90mManaged removal: ${SAVED_INSTALLER_PATH:-./install.sh} --uninstall --dest $DEST\033[0m"
   fi
 fi
 
