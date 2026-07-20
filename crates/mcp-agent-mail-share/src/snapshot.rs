@@ -16,6 +16,20 @@ use crate::ShareError;
 
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum SnapshotDestinationProfile {
+    #[default]
+    Default,
+    PortableExport,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum SnapshotSourceProfile {
+    #[default]
+    Runtime,
+    CanonicalExport,
+}
+
 #[cfg(test)]
 // Export snapshots are canonical SQLite artifacts, so tests inspect them
 // through the same engine external consumers use.
@@ -208,14 +222,21 @@ pub fn create_sqlite_snapshot(
     destination: &Path,
     checkpoint: bool,
 ) -> Result<PathBuf, ShareError> {
-    rebuild_sqlite_snapshot_with_pragmas(source, destination, checkpoint, &[])
+    rebuild_sqlite_snapshot_with_profiles(
+        source,
+        destination,
+        checkpoint,
+        SnapshotSourceProfile::Runtime,
+        SnapshotDestinationProfile::Default,
+    )
 }
 
-pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
+pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
     source: &Path,
     destination: &Path,
     checkpoint: bool,
-    destination_pragmas: &[&str],
+    source_profile: SnapshotSourceProfile,
+    destination_profile: SnapshotDestinationProfile,
 ) -> Result<PathBuf, ShareError> {
     let source = crate::resolve_share_sqlite_path(source);
 
@@ -291,10 +312,9 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
 
     let source_str = source.display().to_string();
 
-    // Page size must be chosen before page 1 is initialized, so honor any
-    // requested destination page_size before the first destination write.
+    // Page size must be chosen before page 1 is initialized, so configure the
+    // closed export profile before the first destination write.
     let dest_str = staged_dest.display().to_string();
-    let requested_page_size = destination_page_size_bytes(destination_pragmas)?;
     // The source is the live FrankenSQLite database, but the destination is a
     // disposable export image that will be renamed into place. Creating that
     // image through FrankenSQLite would bind persistent namespace records to
@@ -303,29 +323,22 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     let dst_conn = CanonicalDbConn::open_file(&dest_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot create destination DB {dest_str}: {e}"),
     })?;
-    if let Some(page_size) = requested_page_size {
-        dst_conn
-            .execute_raw(&format!("PRAGMA page_size = {page_size}"))
-            .map_err(|e| ShareError::Sqlite {
-                message: format!(
-                    "cannot configure destination DB {dest_str} with page size {page_size}: {e}"
-                ),
-            })?;
-    }
-    for pragma in destination_pragmas {
-        dst_conn
-            .execute_raw(pragma)
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("failed to apply destination pragma {pragma:?}: {e}"),
-            })?;
-    }
+    configure_destination(&dst_conn, &dest_str, destination_profile)?;
 
-    let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
-        message: format!("cannot open source DB {source_str}: {e}"),
-    })?;
-    let transfer_result = transfer_tables_frank(&src, &dst_conn);
-    transfer_result?;
-    drop(src);
+    match source_profile {
+        SnapshotSourceProfile::Runtime => {
+            let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+                message: format!("cannot open runtime source DB {source_str}: {e}"),
+            })?;
+            transfer_tables(&src, &dst_conn)?;
+        }
+        SnapshotSourceProfile::CanonicalExport => {
+            let src = CanonicalDbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
+                message: format!("cannot open canonical export source DB {source_str}: {e}"),
+            })?;
+            transfer_tables(&src, &dst_conn)?;
+        }
+    }
     drop(dst_conn);
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&staged_dest).map_err(|e| {
         ShareError::Sqlite {
@@ -338,6 +351,30 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)
+}
+
+fn configure_destination(
+    conn: &CanonicalDbConn,
+    destination: &str,
+    profile: SnapshotDestinationProfile,
+) -> Result<(), ShareError> {
+    if !matches!(profile, SnapshotDestinationProfile::PortableExport) {
+        return Ok(());
+    }
+
+    conn.execute_raw("PRAGMA page_size = 1024")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure destination DB {destination} with page size 1024: {error}"
+            ),
+        })?;
+    conn.execute_raw("PRAGMA journal_mode='DELETE'")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure destination DB {destination} with DELETE journal mode: {error}"
+            ),
+        })?;
+    Ok(())
 }
 
 fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
@@ -400,11 +437,39 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+trait SnapshotSource {
+    fn query_snapshot(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error>;
+}
+
+impl SnapshotSource for DbConn {
+    fn query_snapshot(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+        self.query_sync(sql, params)
+    }
+}
+
+impl SnapshotSource for CanonicalDbConn {
+    fn query_snapshot(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+        self.query_sync(sql, params)
+    }
+}
+
 /// Transfer tables from a source snapshot to a fresh destination database.
-fn transfer_tables_frank(src: &DbConn, dst: &CanonicalDbConn) -> Result<(), ShareError> {
+fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
         create_dst_table(dst, table)?;
-        let source_columns = source_columns_frank(src, table.name)?;
+        let source_columns = source_columns(src, table.name)?;
         if source_columns.is_empty() {
             continue;
         }
@@ -436,11 +501,11 @@ fn transfer_tables_frank(src: &DbConn, dst: &CanonicalDbConn) -> Result<(), Shar
                     )
                 };
 
-            let rows = src
-                .query_sync(&select_sql, &params)
-                .map_err(|e| ShareError::Sqlite {
-                    message: format!("SELECT from {} failed: {e}", table.name),
-                })?;
+            let rows =
+                src.query_snapshot(&select_sql, &params)
+                    .map_err(|e| ShareError::Sqlite {
+                        message: format!("SELECT from {} failed: {e}", table.name),
+                    })?;
 
             if rows.is_empty() {
                 break;
@@ -503,27 +568,6 @@ fn build_insert(table: &str, columns: &[&str]) -> String {
     format!("INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
 }
 
-fn destination_page_size_bytes(destination_pragmas: &[&str]) -> Result<Option<u32>, ShareError> {
-    let mut requested = None;
-    for pragma in destination_pragmas {
-        let compact: String = pragma
-            .chars()
-            .filter(|ch| !ch.is_ascii_whitespace())
-            .collect();
-        let compact = compact.trim_end_matches(';').to_ascii_lowercase();
-        let Some(raw_value) = compact.strip_prefix("pragmapage_size=") else {
-            continue;
-        };
-        let page_size = raw_value
-            .parse::<u32>()
-            .map_err(|_| ShareError::Validation {
-                message: format!("invalid destination page_size pragma: {pragma}"),
-            })?;
-        requested = Some(page_size);
-    }
-    Ok(requested)
-}
-
 fn quoted_column_list(columns: &[&str]) -> String {
     columns
         .iter()
@@ -539,9 +583,9 @@ fn primary_key_suffix(primary_key_columns: &[&str]) -> String {
     format!(", PRIMARY KEY({})", quoted_column_list(primary_key_columns))
 }
 
-fn source_columns_frank(src: &DbConn, table: &str) -> Result<HashSet<String>, ShareError> {
+fn source_columns<S: SnapshotSource>(src: &S, table: &str) -> Result<HashSet<String>, ShareError> {
     let rows = src
-        .query_sync(&format!("PRAGMA table_info(\"{table}\")"), &[])
+        .query_snapshot(&format!("PRAGMA table_info(\"{table}\")"), &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("PRAGMA table_info({table}) failed: {e}"),
         })?;

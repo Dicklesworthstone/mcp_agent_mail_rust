@@ -205,8 +205,8 @@ pub fn latest_verified_snapshot(primary: &Path) -> Option<VerifiedSnapshotMetada
 /// exists and still passes a full integrity check.
 ///
 /// This is the fast, lossless recovery path: it copies the verified `.bak` into
-/// a staging file beside the primary, re-verifies it, removes any stale
-/// publishes it through the unified receipt-backed recovery boundary. Returns
+/// a staging file beside the primary, re-verifies it, then publishes it through
+/// the unified receipt-backed recovery boundary. Returns
 /// the metadata of the snapshot used, or `Ok(None)` when there is no trustworthy
 /// snapshot to restore from (caller should fall back to the archive-derived
 /// rebuild).
@@ -320,6 +320,34 @@ mod tests {
             .expect("checkpoint");
     }
 
+    fn make_restorable_mailbox_db(path: &Path) {
+        let conn = crate::DbConn::open_file(path.display().to_string()).expect("open db");
+        conn.execute_raw("PRAGMA journal_mode = WAL;").expect("wal");
+        conn.execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("mailbox schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'snapshot-project', '/snapshot-project', 1);
+             INSERT INTO agents
+                 (id, project_id, name, program, model, task_description,
+                  inception_ts, last_active_ts, attachments_policy, contact_policy,
+                  reaper_exempt, registration_token)
+                 VALUES
+                 (1, 1, 'BlueLake', 'codex-cli', 'test', '', 1, 1,
+                  'auto', 'auto', 0, NULL);
+             INSERT INTO messages
+                 (id, project_id, sender_id, subject, body_md, importance,
+                  ack_required, created_ts, recipients_json, attachments)
+                 VALUES
+                 (1, 1, 1, 'a', 'a', 'normal', 0, 1, '{}', '[]'),
+                 (2, 1, 1, 'b', 'b', 'normal', 0, 2, '{}', '[]'),
+                 (3, 1, 1, 'c', 'c', 'normal', 0, 3, '{}', '[]');",
+        )
+        .expect("seed mailbox");
+        conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint");
+    }
+
     #[test]
     fn snapshot_paths_are_siblings_of_primary() {
         let primary = Path::new("/tmp/mailbox/storage.sqlite3");
@@ -392,7 +420,7 @@ mod tests {
     fn restore_from_verified_snapshot_recovers_corrupt_primary() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
-        make_db(&primary);
+        make_restorable_mailbox_db(&primary);
 
         // Capture a verified snapshot (copy primary -> .bak, record metadata).
         std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();

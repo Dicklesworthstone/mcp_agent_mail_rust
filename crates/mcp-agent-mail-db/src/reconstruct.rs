@@ -6304,7 +6304,11 @@ body
             .execute_raw(
                 "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
                      (1, 'srv-team-shared', '/srv/team/shared', 1); \
-                 INSERT INTO agents (id, project_id, name) VALUES (7, 1, 'CanonicalAgent');",
+                 INSERT INTO agents \
+                     (id, project_id, name, program, model, task_description, \
+                      inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                     VALUES \
+                     (7, 1, 'CanonicalAgent', 'codex-cli', 'test', '', 1, 2, 'auto', 'auto');",
             )
             .unwrap();
         drop(salvage);
@@ -7327,7 +7331,9 @@ archive body
         salvage_conn
             .query_sync(
                 "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
-                 VALUES (2, 100, 10, 'DB-only', 'db body', 2)",
+                 VALUES
+                    (1, 100, 10, 'Archive copy', 'archive body', 1),
+                    (2, 100, 10, 'DB-only', 'db body', 2)",
                 &[],
             )
             .unwrap();
@@ -7352,6 +7358,56 @@ archive body
         assert_eq!(stats.salvaged_recipients, 2);
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let identity_rows = conn
+            .query_sync(
+                "SELECT p.id AS project_id, a.id AS agent_id
+                 FROM agents a
+                 JOIN projects p ON p.id = a.project_id
+                 WHERE p.human_key = '/test-project' AND a.name = 'Bob'",
+                &[],
+            )
+            .expect("query reconstructed recipient identity");
+        assert_eq!(identity_rows.len(), 1);
+        let reconstructed_project_id = identity_rows[0]
+            .get_named::<i64>("project_id")
+            .expect("project id");
+        let reconstructed_bob_id = identity_rows[0]
+            .get_named::<i64>("agent_id")
+            .expect("agent id");
+        assert_ne!(
+            reconstructed_bob_id, 11,
+            "the fixture must exercise numeric agent-id renumbering"
+        );
+        let runtime_conn = crate::DbConn::open_file(db_path.to_str().unwrap())
+            .expect("open reconstructed mailbox through the runtime engine");
+        let inbox = crate::sync::fetch_inbox_rows_from_conn(
+            &runtime_conn,
+            reconstructed_project_id,
+            reconstructed_bob_id,
+            false,
+            false,
+            false,
+            None,
+            25,
+        )
+        .expect("fetch inbox through the production query after reconstruction");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].message.subject, "Archive copy");
+        assert!(
+            crate::sync::fetch_inbox_rows_from_conn(
+                &runtime_conn,
+                reconstructed_project_id,
+                11,
+                false,
+                false,
+                false,
+                None,
+                25,
+            )
+            .expect("query stale source-local numeric id")
+            .is_empty(),
+            "delivery must follow the reconstructed stable identity, not the obsolete numeric id"
+        );
         let message_rows = conn
             .query_sync(
                 "SELECT id, subject, recipients_json FROM messages ORDER BY id",
@@ -7595,7 +7651,7 @@ archive body
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let rows = conn
             .query_sync(
-                "SELECT p.slug, a.name, fr.path_pattern, fr.exclusive, fr.reason,
+                "SELECT p.slug, a.id AS agent_id, a.name, fr.path_pattern, fr.exclusive, fr.reason,
                         fr.created_ts, fr.expires_ts,
                         COALESCE(rr.released_ts, fr.released_ts) AS effective_released_ts
                  FROM file_reservations fr
@@ -7609,6 +7665,11 @@ archive body
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "test-project");
         assert_eq!(rows[0].get_named::<String>("name").unwrap(), "Alice");
+        assert_ne!(
+            rows[0].get_named::<i64>("agent_id").unwrap(),
+            200,
+            "the fixture must prove reservation ownership survives numeric agent-id renumbering"
+        );
         assert_eq!(
             rows[0].get_named::<String>("path_pattern").unwrap(),
             "src/active/**"

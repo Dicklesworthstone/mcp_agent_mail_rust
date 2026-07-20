@@ -245,6 +245,7 @@
       "status": "warn"
     }
   ],
+  "daemon_mailbox_binding": null,
   "diagnostic_payload": {
     "artifacts": [
       {
@@ -288,7 +289,7 @@
       "generated_at": "<GENERATED_AT>",
       "schema_version": "0",
       "search_index_generation": {
-        "db_identity": "<TMP_ROOT>/mailbox.sqlite3",
+        "db_identity": "<TMP_ROOT>/mailbox.sqlite3@1",
         "index_dir": "<SEARCH_INDEX_ROOT>/<HASH>",
         "indexed_messages": 0,
         "last_backfill_at_micros": null,

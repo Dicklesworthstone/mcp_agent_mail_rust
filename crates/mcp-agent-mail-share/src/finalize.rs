@@ -700,17 +700,68 @@ fn prepare_rebuilt_snapshot_storage(
     let temp_dir = tempfile::Builder::new()
         .prefix("am-share-finalize-")
         .tempdir_in(parent)?;
+    let source_copy = temp_dir.path().join("mailbox.source.sqlite3");
+    stage_snapshot_source(&snapshot_path, &source_copy)?;
     let rebuilt_path = temp_dir.path().join("mailbox.sqlite3");
 
-    crate::snapshot::rebuild_sqlite_snapshot_with_pragmas(
-        &snapshot_path,
+    crate::snapshot::rebuild_sqlite_snapshot_with_profiles(
+        &source_copy,
         &rebuilt_path,
         false,
-        &["PRAGMA journal_mode='DELETE'", "PRAGMA page_size=1024"],
+        crate::snapshot::SnapshotSourceProfile::CanonicalExport,
+        crate::snapshot::SnapshotDestinationProfile::PortableExport,
     )?;
 
     let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
     Ok((temp_dir, rebuilt_path, backup_path))
+}
+
+fn stage_snapshot_source(snapshot_path: &Path, staged_path: &Path) -> Result<(), ShareError> {
+    std::fs::copy(snapshot_path, staged_path).map_err(|error| {
+        ShareError::Io(std::io::Error::other(format!(
+            "failed to stage SQLite snapshot {} at {}: {error}",
+            snapshot_path.display(),
+            staged_path.display()
+        )))
+    })?;
+
+    for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
+        let mut source_sidecar_os = snapshot_path.as_os_str().to_os_string();
+        source_sidecar_os.push(suffix);
+        let source_sidecar = std::path::PathBuf::from(source_sidecar_os);
+        match std::fs::symlink_metadata(&source_sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                let mut staged_sidecar_os = staged_path.as_os_str().to_os_string();
+                staged_sidecar_os.push(suffix);
+                let staged_sidecar = std::path::PathBuf::from(staged_sidecar_os);
+                std::fs::copy(&source_sidecar, &staged_sidecar).map_err(|error| {
+                    ShareError::Io(std::io::Error::other(format!(
+                        "failed to stage SQLite snapshot sidecar {} at {}: {error}",
+                        source_sidecar.display(),
+                        staged_sidecar.display()
+                    )))
+                })?;
+            }
+            // Never follow a sidecar symlink. A successful rebuild publishes a
+            // self-contained database and removes the stale link; a failed
+            // rebuild leaves the original snapshot and link untouched.
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "refusing to stage non-file SQLite snapshot sidecar {}",
+                    source_sidecar.display()
+                ))));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "failed to inspect SQLite snapshot sidecar {}: {error}",
+                    source_sidecar.display()
+                ))));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prepare_post_finalize_rollback_snapshot(
