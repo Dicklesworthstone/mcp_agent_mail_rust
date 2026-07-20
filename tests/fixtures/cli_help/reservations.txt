@@ -8,6 +8,6 @@ Options:
       --project <PROJECT>    Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
       --agent <AGENT>        Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
       --all                  Show reservations for all agents, not just the selected agent
-      --conflicts            Show only conflicting reservations
+      --conflicts            Add a `conflicting_active` projection; `all_active` stays authoritative
       --expiring <EXPIRING>  Warn about reservations expiring within N minutes
   -h, --help                 Print help
