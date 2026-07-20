@@ -35,27 +35,45 @@ export HTTP_PORT="${AM_E2E_UNUSED_PORT:-8799}"
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"reservation-read-parity","version":"1"}}}'
 
 stdio_session() {
-    local output="$1"
-    shift
-    local session_dir fifo server_pid writer_pid
+    local output="$1" expected_id="$2"
+    shift 2
+    local session_dir fifo server_pid writer_fd request response_seen
     session_dir="$(mktemp -d "${WORK}/stdio.XXXXXX")"
     fifo="${session_dir}/stdin"
     mkfifo "${fifo}"
     DATABASE_URL="${DATABASE_URL}" STORAGE_ROOT="${STORAGE_ROOT}" RUST_LOG=error \
         "${AM_BIN}" serve-stdio <"${fifo}" >"${output}" 2>"${output}.err" &
     server_pid=$!
-    sleep 0.3
-    {
-        printf '%s\n' "${INIT_REQ}"
-        local request
-        for request in "$@"; do
-            sleep 0.3
-            printf '%s\n' "${request}"
-        done
-        sleep 0.5
-    } >"${fifo}" &
-    writer_pid=$!
-    wait "${writer_pid}" 2>/dev/null || true
+    exec {writer_fd}>"${fifo}"
+    printf '%s\n' "${INIT_REQ}" >&"${writer_fd}"
+    for request in "$@"; do
+        printf '%s\n' "${request}" >&"${writer_fd}"
+    done
+    exec {writer_fd}>&-
+
+    response_seen=false
+    for _ in {1..200}; do
+        if jq -e --argjson id "${expected_id}" 'select(.id == $id)' "${output}" >/dev/null 2>&1; then
+            response_seen=true
+            break
+        fi
+        if ! kill -0 "${server_pid}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "${response_seen}" != true ]]; then
+        kill "${server_pid}" 2>/dev/null || true
+        wait "${server_pid}" 2>/dev/null || true
+        e2e_log "stdio response id ${expected_id} was not observed; stderr=$(head -c 320 "${output}.err")"
+        return 1
+    fi
+    for _ in {1..100}; do
+        if ! kill -0 "${server_pid}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.02
+    done
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
 }
@@ -83,7 +101,7 @@ json_assert() {
 }
 
 e2e_case_banner "MCP grant"
-stdio_session "${ART}/grant.jsonl" \
+stdio_session "${ART}/grant.jsonl" 12 \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_KEY}\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":\"${PROJECT_KEY}\",\"program\":\"e2e\",\"model\":\"test\",\"name\":\"GoldFox\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"GoldFox\",\"paths\":[\"src/alpha/**\"],\"ttl_seconds\":3600,\"exclusive\":true,\"reason\":\"read parity\"}}}"
@@ -114,7 +132,7 @@ done
 json_assert "conflict focus has a distinct empty projection" "${ART}/conflict_focus.json" \
     '(.conflicts == null or (.conflicts | length == 0)) and (.conflicting_active | length == 0)'
 json_assert "conflict focus explains no-overlap vs no-active" "${ART}/conflict_focus.json" \
-    '._alerts | any(.summary == "No overlapping active reservation pairs found" and (.action | contains("all_active")))'
+    '._alerts | any(.summary == "No overlapping active reservation pairs found" and .action == "`all_active` is the authoritative lease snapshot within the selected project/agent scope; use `am file_reservations conflicts <PROJECT> <PATHS>...` to check proposed edits.")'
 
 for view in active_path active_slug list_path list_slug; do
     if grep -Fq "GoldFox" "${ART}/${view}.txt" && grep -Fq "src/alpha/**" "${ART}/${view}.txt"; then
@@ -130,7 +148,7 @@ else
 fi
 
 e2e_case_banner "MCP release disappears from every read surface"
-stdio_session "${ART}/release.jsonl" \
+stdio_session "${ART}/release.jsonl" 20 \
     "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"GoldFox\",\"paths\":[\"src/alpha/**\"]}}}"
 printf '%s\n' "$(tool_result "${ART}/release.jsonl" 20)" >"${ART}/release.json"
 json_assert "MCP releases exactly one lease" "${ART}/release.json" '.released == 1'

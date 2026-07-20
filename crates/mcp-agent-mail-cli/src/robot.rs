@@ -14046,7 +14046,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     "info",
                     "No overlapping active reservation pairs found",
                     Some(
-                        "`all_active` is the authoritative lease snapshot; use `am file_reservations conflicts <project> <agent> --paths <path...>` to check proposed edits."
+                        "`all_active` is the authoritative lease snapshot within the selected project/agent scope; use `am file_reservations conflicts <PROJECT> <PATHS>...` to check proposed edits."
                             .to_string(),
                     ),
                 );
@@ -24007,19 +24007,42 @@ mod tests {
              (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
              VALUES
                 (?, 1, 1, 'src/*/foo.rs', 1, 'a', 0, ?, NULL),
-                (?, 1, 2, 'src/bar/*.rs', 1, 'b', 0, ?, NULL)",
+                (?, 1, 2, 'src/bar/*.rs', 1, 'b', 0, ?, NULL),
+                (?, 1, 3, 'docs/**', 1, 'unrelated', 0, ?, NULL)",
             &[
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
             ],
         )
         .expect("insert glob reservations");
 
-        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, false, Some(10))
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, true, Some(10))
             .expect("build reservations");
 
+        assert_eq!(data.all_active.len(), 3);
+        assert!(
+            data.all_active.iter().any(|entry| entry.path == "docs/**"),
+            "authoritative scoped snapshot should retain unrelated active leases"
+        );
+        assert_eq!(
+            data.conflicting_active
+                .as_ref()
+                .expect("conflict projection")
+                .len(),
+            2
+        );
+        assert!(
+            data.conflicting_active
+                .as_ref()
+                .expect("conflict projection")
+                .iter()
+                .all(|entry| entry.path != "docs/**"),
+            "conflict projection should exclude unrelated active leases"
+        );
         assert_eq!(data.conflicts.len(), 1);
         assert_eq!(data.conflicts[0].agent_a, "Alice");
         assert_eq!(data.conflicts[0].path_a, "src/*/foo.rs");
