@@ -118,6 +118,7 @@ e2e_case_banner "All read surfaces agree while the lease is active"
 amrun "${ART}/alias_path.json" reservations --project "${PROJECT_KEY}" --agent GoldFox --json
 amrun "${ART}/robot_slug.json" robot --project "${PROJECT_SLUG}" --agent GoldFox reservations --all --format json
 amrun "${ART}/conflict_focus.json" reservations --project "${PROJECT_KEY}" --agent GoldFox --conflicts --json
+amrun "${ART}/recovery_command.txt" file_reservations conflicts "${PROJECT_KEY}" "src/alpha/**"
 amrun "${ART}/active_path.txt" file_reservations active "${PROJECT_KEY}"
 amrun "${ART}/active_slug.txt" file_reservations active "${PROJECT_SLUG}"
 amrun "${ART}/list_path.txt" file_reservations list "${PROJECT_KEY}"
@@ -130,9 +131,16 @@ for view in alias_path robot_slug conflict_focus; do
         '.all_active | any(.path == "src/alpha/**" and .remaining_seconds > 0 and .remaining_seconds <= 3600)'
 done
 json_assert "conflict focus has a distinct empty projection" "${ART}/conflict_focus.json" \
-    '(.conflicts == null or (.conflicts | length == 0)) and (.conflicting_active | length == 0)'
+    'has("conflicting_active") and (.conflicting_active | type == "array" and length == 0) and (.conflicts == null or (.conflicts | type == "array" and length == 0))'
 json_assert "conflict focus explains no-overlap vs no-active" "${ART}/conflict_focus.json" \
     '._alerts | any(.summary == "No overlapping active reservation pairs found" and .action == "`all_active` is the authoritative lease snapshot within the selected project/agent scope; use `am file_reservations conflicts <PROJECT> <PATHS>...` to check proposed edits.")'
+if grep -Fq "1 conflict(s) found" "${ART}/recovery_command.txt.err" \
+    && grep -Fq "GoldFox" "${ART}/recovery_command.txt" \
+    && grep -Fq "src/alpha/**" "${ART}/recovery_command.txt"; then
+    e2e_pass "surfaced recovery command executes and finds the live lease"
+else
+    e2e_fail "surfaced recovery command did not find the live lease"
+fi
 
 for view in active_path active_slug list_path list_slug; do
     if grep -Fq "GoldFox" "${ART}/${view}.txt" && grep -Fq "src/alpha/**" "${ART}/${view}.txt"; then
@@ -157,10 +165,11 @@ amrun "${ART}/alias_after.json" reservations --project "${PROJECT_SLUG}" --agent
 amrun "${ART}/conflict_after.json" reservations --project "${PROJECT_KEY}" --agent GoldFox --conflicts --json
 amrun "${ART}/active_after.txt" file_reservations active "${PROJECT_SLUG}"
 amrun "${ART}/list_after.txt" file_reservations list "${PROJECT_KEY}"
-for view in alias_after conflict_after; do
-    json_assert "${view}: released lease absent" "${ART}/${view}.json" \
-        '.all_active | all(.agent != "GoldFox" or .path != "src/alpha/**")'
-done
+json_assert "alias_after: authoritative snapshot is explicitly empty" "${ART}/alias_after.json" \
+    'has("all_active") and (.all_active | type == "array" and length == 0)'
+json_assert "conflict_after: authoritative and conflict projections are explicitly empty" \
+    "${ART}/conflict_after.json" \
+    'has("all_active") and (.all_active | type == "array" and length == 0) and has("conflicting_active") and (.conflicting_active | type == "array" and length == 0)'
 for view in active_after list_after; do
     if grep -Fq "src/alpha/**" "${ART}/${view}.txt"; then
         e2e_fail "${view}: released lease still visible"
