@@ -12,6 +12,56 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.22](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.22) — 2026-07-19 **[Release]**
+
+### Recovery correctness and portable archives
+
+- Archive reconstruction now preserves project identities, agent recovery
+  fields, registration credentials, recipients, and migration continuity
+  across repeated recovery generations. Recovery candidates are validated with
+  canonical SQLite before promotion, and an unreadable prior generation plus
+  its sidecars is preserved under a receipted quarantine instead of being
+  mistaken for a disposable staging file (#186, #187, #191).
+- Export snapshot destinations are written and their FTS5 indexes finalized
+  with canonical SQLite on the disposable side of the pipeline. This prevents
+  FrankenSQLite's persistent pathname namespace from following a renamed
+  staging database, produces stock-SQLite-clean FTS5 artifacts, preserves
+  `reaper_exempt` and `registration_token` for full-fidelity archives, and
+  removes registration credentials from sharing presets.
+- Clean committed archive inventories are cached by Git generation, eliminating
+  repeated full-tree scans on archive-aware tool and resource reads while dirty
+  generations continue to bypass the cache (#192).
+
+### Runtime, identity, and operator safety
+
+- Non-MCP HTTP paths now run through a bounded blocking-dispatch pool, so a
+  `/mail` or 404 request cannot wedge the shared MCP listener. Startup WAL/SHM
+  forensic snapshots also have bounded retention (#184, #185).
+- Doctor adopts the live daemon's mailbox identity, diagnoses archive/DB parity
+  against the database actually being served, and detects live macOS file and
+  listener owners before authorizing mutation (#193, #195).
+- Filesystem case aliases collapse to one project identity on case-insensitive
+  filesystems, preventing split agents, orphaned reservations, and permanent
+  archive parity drift (#194).
+- ATC refreshes stream bounded population summaries instead of retaining an
+  ever-growing anonymous heap in a long-running daemon (#190).
+- A bounded, read-only `check_file_reservation_conflicts` tool now provides an
+  authoritative pre-edit conflict check with exact/glob/ancestor semantics,
+  fail-closed malformed-pattern handling, and no registration or cleanup side
+  effects. The implementation was independently mined from PR #196.
+
+### Installer and updater reliability
+
+- The installer supports stock macOS Bash 3.2 under `set -u`, persists a
+  complete installer copy for later managed uninstall after `curl | bash`, and
+  leaves any existing saved copy untouched if that persistence fetch fails
+  (#189).
+- `am update` recognizes and safely unwraps the nested release archives emitted
+  by older manual release tooling while retaining checksum and path-safety
+  validation (#188).
+
+---
+
 ## [v0.3.21](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.21) — 2026-07-10 **[Release]**
 
 ### Fixed: the TUI no longer degrades into a mostly blank screen

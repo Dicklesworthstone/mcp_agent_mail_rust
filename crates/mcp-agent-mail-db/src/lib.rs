@@ -272,6 +272,7 @@ pub use pool::{
     classify_canary_outcome,
     create_pool,
     create_pool_without_startup_init,
+    create_query_only_pool,
     deferred_write_queue,
     ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive,

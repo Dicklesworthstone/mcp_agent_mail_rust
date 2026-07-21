@@ -18,15 +18,19 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
     tool_util::{
-        db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool,
-        parse_attachment_metadata_json, parse_recipients_json_value,
+        db_error_to_mcp_error, db_outcome_to_mcp_result, parse_attachment_metadata_json,
+        parse_recipients_json_value,
     },
 };
+
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
     if let Some((base, query)) = input.split_once('?') {
@@ -99,6 +103,7 @@ fn is_missing_projects_table_error(message: &str) -> bool {
     lower.contains("no such table") && lower.contains("projects")
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResourceReconcileInventory {
     projects: usize,
@@ -108,6 +113,7 @@ struct ResourceReconcileInventory {
     project_identities: std::collections::BTreeSet<mcp_agent_mail_db::MailboxProjectIdentity>,
 }
 
+#[cfg(test)]
 fn query_resource_db_inventory(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Result<ResourceReconcileInventory, String> {
@@ -183,11 +189,7 @@ fn query_resource_db_inventory(
     })
 }
 
-fn resource_archive_inventory_has_state(storage_root: &Path) -> bool {
-    let archive = crate::tool_util::read_archive_inventory(storage_root);
-    archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
-}
-
+#[cfg(test)]
 fn resource_archive_is_ahead(
     storage_root: &Path,
     sqlite_path: &Path,
@@ -232,14 +234,21 @@ fn resource_archive_is_ahead(
 
 struct ResourceReadPool {
     pool: mcp_agent_mail_db::DbPool,
-    _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
+    _snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
 }
 
 impl ResourceReadPool {
     const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
         Self {
             pool,
-            _snapshot_dir: None,
+            _snapshot: None,
+        }
+    }
+
+    fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
+        Self {
+            pool: snapshot.pool(),
+            _snapshot: Some(snapshot),
         }
     }
 }
@@ -252,145 +261,45 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
-/// Check whether the live `SQLite` database is suspect for resource reads.
-///
-/// Delegates to the fast mailbox verdict. When `DurabilityState` is
-/// `DegradedReadOnly` (or worse), resource reads should fall back to
-/// archive-based data instead of the potentially corrupt live file.
-fn resource_live_db_is_suspect(
-    database_url: &str,
-    storage_root: &Path,
-    sqlite_path: &Path,
-) -> bool {
-    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
-        storage_root,
-        sqlite_path,
-    ) {
-        return false;
+async fn open_resource_read_pool(
+    cx: &asupersync::Cx,
+) -> Result<Option<ResourceReadPool>, crate::archive_read::AcquireError> {
+    if cx.is_cancel_requested() {
+        return Err(crate::archive_read::AcquireError::Cancelled);
     }
-
-    let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
-        database_url,
-        storage_root,
-        &mcp_agent_mail_db::VerdictOptions::fast(),
-    );
-    let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
-    if mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
-        &verdict,
-        sqlite_path,
-    ) {
-        tracing::info!(
-            verdict_state = %verdict.state,
-            durability_state = %durability,
-            "live SQLite is suspect; resource reads will prefer archive snapshots"
-        );
-        true
-    } else {
-        false
-    }
-}
-
-fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         return Ok(None);
     }
 
     let sqlite_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
-        .map_err(|err| err.to_string())?
+        .map_err(|error| crate::archive_read::AcquireError::Failed(error.to_string()))?
         .canonical_path;
     if sqlite_path == ":memory:" {
         return Ok(None);
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state = crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
         &config.storage_root,
         &resolved_path,
-    ) && resource_archive_inventory_has_state(&config.storage_root);
-
-    // When the durability verdict says the live DB is suspect or worse,
-    // force archive-snapshot reads even if the archive isn't strictly
-    // "ahead" of the DB by row count.
-    let durability_forces_snapshot = archive_has_state
-        && resource_live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-    let use_archive_snapshot = if !resolved_path.exists() {
-        archive_has_state
-    } else if durability_forces_snapshot {
-        true
-    } else {
-        match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-            Ok(conn) => {
-                let conn = mcp_agent_mail_db::guard_db_conn(
-                    conn,
-                    "resources::open_read_db_pool archive-ahead probe",
-                );
-                let archive_ahead =
-                    resource_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                drop(conn);
-                match archive_ahead {
-                    Ok(true) => true,
-                    Err(error) if archive_has_state => {
-                        tracing::warn!(
-                            source = %resolved_path.display(),
-                            storage_root = %config.storage_root.display(),
-                            error = %error,
-                            "using archive-backed resource snapshot because the live sqlite inventory probe failed"
-                        );
-                        true
-                    }
-                    Ok(false) | Err(_) => false,
-                }
-            }
-            Err(error) if archive_has_state => {
-                tracing::warn!(
-                    source = %resolved_path.display(),
-                    storage_root = %config.storage_root.display(),
-                    error = %error,
-                    "using archive-backed resource snapshot because the live sqlite source could not be opened"
-                );
-                true
-            }
-            Err(_) => false,
-        }
-    };
-
-    if !use_archive_snapshot {
+    ) {
         return Ok(None);
     }
-
-    let snapshot_dir =
-        mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("agent-mail-resource-snapshot-")
-            .map_err(|err| err.to_string())?;
-    let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
-    if resolved_path.exists() {
-        mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-            &snapshot_db,
-            &config.storage_root,
-            Some(resolved_path.as_path()),
-        )
-        .map_err(|err| err.to_string())?;
-    } else {
-        mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
-            .map_err(|err| err.to_string())?;
-    }
-    let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
-        database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
-        storage_root: Some(config.storage_root),
-        ..Default::default()
-    })
-    .map_err(|err| err.to_string())?;
-    Ok(Some(ResourceReadPool {
-        pool,
-        _snapshot_dir: Some(snapshot_dir),
-    }))
+    crate::archive_read::acquire_if_needed(
+        &config.storage_root,
+        &resolved_path,
+        &config.database_url,
+        cx,
+    )
+    .await
+    .map(|snapshot| snapshot.map(ResourceReadPool::snapshot))
 }
 
 fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
     let config = Config::from_env();
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
-        return get_db_pool().map(ResourceReadPool::live);
+        return crate::tool_util::get_live_read_db_pool().map(ResourceReadPool::live);
     }
 
     let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
@@ -416,7 +325,7 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
     pool_config.run_migrations = false;
     pool_config.warmup_connections = 0;
 
-    mcp_agent_mail_db::create_pool_without_startup_init(&pool_config)
+    mcp_agent_mail_db::create_query_only_pool(&pool_config)
         .map(ResourceReadPool::live)
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
@@ -432,19 +341,29 @@ fn resource_live_database_missing_without_archive_state() -> bool {
         return false;
     };
     let resolved_path = PathBuf::from(&resolved.canonical_path);
+    let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
     let archive_has_authoritative_state =
         crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
             &config.storage_root,
             &resolved_path,
-        ) && resource_archive_inventory_has_state(&config.storage_root);
+        ) && crate::tool_util::read_archive_inventory_has_state(&archive);
     !resolved_path.exists() && !archive_has_authoritative_state
 }
 
-fn get_resource_db_pool() -> McpResult<ResourceReadPool> {
-    match open_resource_read_pool() {
+async fn get_resource_db_pool(cx: &asupersync::Cx) -> McpResult<ResourceReadPool> {
+    match open_resource_read_pool(cx).await {
         Ok(Some(pool)) => Ok(pool),
         Ok(None) => open_live_resource_read_pool(),
-        Err(error) => Err(resource_sync_db_error_to_mcp_error(error)),
+        Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
+        Err(crate::archive_read::AcquireError::Busy(message)) => {
+            Err(db_error_to_mcp_error(DbError::ResourceBusy(message)))
+        }
+        Err(crate::archive_read::AcquireError::TimedOut(message)) => Err(db_error_to_mcp_error(
+            DbError::ResourceBusy(format!("archive snapshot timed out: {message}")),
+        )),
+        Err(crate::archive_read::AcquireError::Failed(message)) => {
+            Err(resource_sync_db_error_to_mcp_error(message))
+        }
     }
 }
 
@@ -836,7 +755,7 @@ pub struct AgentsListResponse {
 )]
 pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<String> {
     let (project_key, _query) = split_param_and_query(&project_key);
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
@@ -2172,7 +2091,7 @@ fn apply_projects_list_query_options(
     description = "List all projects known to the server in creation order.\n\nWhen to use\n-----------\n- Discover available projects when a user provides only an agent name.\n- Build UIs that let operators switch context between projects.\n\nReturns\n-------\nlist[dict]\n    Each: { id, slug, human_key, created_at }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"r2\",\"method\":\"resources/read\",\"params\":{\"uri\":\"resource://projects\"}}\n```"
 )]
 pub async fn projects_list(ctx: &McpContext) -> McpResult<String> {
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let rows =
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
 
@@ -2200,7 +2119,7 @@ pub async fn projects_list_query(ctx: &McpContext, query: String) -> McpResult<S
     let params = parse_query(&query);
     let query_opts = parse_projects_list_query_options(&params)?;
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let rows =
         db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
 
@@ -2250,7 +2169,7 @@ pub struct ProjectDetailResponse {
 )]
 pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug, _query) = split_param_and_query(&slug);
-    let pool = match get_resource_db_pool() {
+    let pool = match get_resource_db_pool(ctx.cx()).await {
         Ok(pool) => pool,
         Err(_) if resource_live_database_missing_without_archive_state() => {
             return Err(resource_project_not_found_error());
@@ -2329,7 +2248,7 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
     }
 
     let (key, _query) = split_param_and_query(&key);
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let product =
         match mcp_agent_mail_db::queries::get_product_by_key(ctx.cx(), &pool, key.trim()).await {
             Outcome::Ok(product) => product,
@@ -2410,7 +2329,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -2525,7 +2444,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -2663,7 +2582,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3275,7 +3194,7 @@ fn mailbox_full_messages(
     description = "List recent messages in an agent's mailbox with commit metadata fields. When archive commit data is unavailable, the `commit.summary` explicitly says so.\n\nReturns\n-------\ndict\n    { project, agent, count, messages: [{ id, subject, from, created_ts, importance, ack_required, kind, commit: {hexsha, summary} | null }] }"
 )]
 pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
     let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
     let messages = mailbox_simple_messages(
@@ -3302,7 +3221,7 @@ pub async fn mailbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     description = "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers when no archive commit data is resolved."
 )]
 pub async fn mailbox_with_commits(ctx: &McpContext, agent: String) -> McpResult<String> {
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
     let request = resolve_mailbox_resource_request(ctx, &pool, &agent).await?;
     let (inbox_rows, outbox_messages) = load_mailbox_messages(ctx, &pool, &request).await?;
     let messages = mailbox_full_messages(
@@ -3373,7 +3292,7 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3458,7 +3377,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3533,7 +3452,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3640,7 +3559,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -3733,7 +3652,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
         ));
     }
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
@@ -4501,7 +4420,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let (slug_str, query) = split_param_and_query(&slug);
     let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
 
-    let pool = get_resource_db_pool()?;
+    let pool = get_resource_db_pool(ctx.cx()).await?;
 
     let project = resolve_existing_resource_project(ctx, &pool, &slug_str).await?;
 
@@ -7390,7 +7309,9 @@ mod resource_shape_tests {
                     incremental_check.details
                 );
 
-                let pool = open_resource_read_pool().expect("open resource read pool");
+                let pool = open_resource_read_pool(&cx)
+                    .await
+                    .expect("open resource read pool");
                 assert!(
                     pool.is_none(),
                     "resource reads should stay on the live DB when only archive metadata is ahead"
@@ -7447,11 +7368,15 @@ mod resource_shape_tests {
                 .expect("insert overlapping project");
                 drop(conn);
 
-                let pool = open_resource_read_pool().expect("open resource read pool");
-                assert!(
-                    pool.is_none(),
-                    "default global archive should not force resource snapshots for an external custom DB"
-                );
+                run_async(|cx: Cx| async move {
+                    let pool = open_resource_read_pool(&cx)
+                        .await
+                        .expect("open resource read pool");
+                    assert!(
+                        pool.is_none(),
+                        "default global archive should not force resource snapshots for an external custom DB"
+                    );
+                });
             },
         );
     }

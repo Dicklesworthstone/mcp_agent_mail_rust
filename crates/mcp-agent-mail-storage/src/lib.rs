@@ -460,6 +460,72 @@ const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
+// Archive-backed read snapshots are built in a downstream crate, while the
+// physical filesystem mutations happen here (often later, on the write-behind
+// worker).  This fence exposes the real application window without creating a
+// storage -> tools dependency.  The mutex makes the final publication check
+// atomic with respect to writers; the epoch catches every completed window.
+static ARCHIVE_MUTATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+static ARCHIVE_MUTATIONS_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static ARCHIVE_PUBLICATION_FENCE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+thread_local! {
+    static ARCHIVE_MUTATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct ArchiveMutationGuard {
+    fence: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl ArchiveMutationGuard {
+    fn begin() -> Self {
+        let outermost = ARCHIVE_MUTATION_DEPTH.with(|depth| {
+            let outermost = depth.get() == 0;
+            depth.set(depth.get().saturating_add(1));
+            outermost
+        });
+        let fence = outermost.then(|| {
+            ARCHIVE_PUBLICATION_FENCE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        ARCHIVE_MUTATIONS_ACTIVE.fetch_add(1, Ordering::AcqRel);
+        ARCHIVE_MUTATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        Self { fence }
+    }
+}
+
+impl Drop for ArchiveMutationGuard {
+    fn drop(&mut self) {
+        ARCHIVE_MUTATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+        ARCHIVE_MUTATIONS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        ARCHIVE_MUTATION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        drop(self.fence.take());
+    }
+}
+
+/// Run a non-blocking snapshot publication check while physical archive
+/// mutations are excluded. The callback must not initiate an archive write.
+pub fn with_archive_snapshot_publication_fence<T>(publish: impl FnOnce() -> T) -> T {
+    let _fence = ARCHIVE_PUBLICATION_FENCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish()
+}
+
+/// Monotonic generation advanced on entry to and exit from every physical
+/// archive mutation window.
+#[must_use]
+pub fn archive_mutation_epoch() -> u64 {
+    ARCHIVE_MUTATION_EPOCH.load(Ordering::Acquire)
+}
+
+/// Number of physical archive mutation guards currently active.
+#[must_use]
+pub fn archive_mutations_active() -> usize {
+    ARCHIVE_MUTATIONS_ACTIVE.load(Ordering::Acquire)
+}
+
 fn new_write_behind_queue() -> WriteBehindQueue {
     let op_depth = Arc::new(AtomicU64::new(0));
     let channel_capacity = Config::get().wbq_channel_capacity;
@@ -1442,6 +1508,7 @@ fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize 
 }
 
 fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    let _mutation = ArchiveMutationGuard::begin();
     debug_assert!(!envelopes.is_empty());
 
     let mut attempts = 0;
@@ -1507,6 +1574,7 @@ fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result
 }
 
 fn wbq_execute_op(op: &WriteOp) -> Result<()> {
+    let _mutation = ArchiveMutationGuard::begin();
     let mut attempts = 0;
     loop {
         match wbq_execute_op_inner(op) {
@@ -4782,6 +4850,7 @@ fn commit_paths_lockfree(
     message: &str,
     rel_paths: &[&str],
 ) -> Result<()> {
+    let _mutation = ArchiveMutationGuard::begin();
     if rel_paths.is_empty() {
         return Ok(());
     }
@@ -5317,6 +5386,7 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 
 /// Create a directory (and parents) only if we haven't already created it.
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    let _mutation = ArchiveMutationGuard::begin();
     {
         let cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if cache.contains(dir) {
@@ -5566,6 +5636,7 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
+    let _mutation = ArchiveMutationGuard::begin();
     if repo_cache_contains(root) {
         return Ok(false);
     }
@@ -6803,6 +6874,7 @@ fn update_thread_digest(
     body_md: &str,
     canonical_rel: &str,
 ) -> Result<String> {
+    let _mutation = ArchiveMutationGuard::begin();
     let project_root = archive_project_root_checked(archive)?;
     let digest_dir = project_root.join("messages").join("threads");
     ensure_dir(&digest_dir)?;
@@ -7065,6 +7137,7 @@ pub fn store_attachment(
     file_path: &Path,
     embed_policy: EmbedPolicy,
 ) -> Result<StoredAttachment> {
+    let _mutation = ArchiveMutationGuard::begin();
     use base64::Engine;
     use image::GenericImageView;
 
@@ -7256,6 +7329,7 @@ pub fn store_raw_attachment(
     file_path: &Path,
     max_bytes: usize,
 ) -> Result<StoredAttachment> {
+    let _mutation = ArchiveMutationGuard::begin();
     let effective_limit = if max_bytes > 0 {
         max_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES)
     } else {
@@ -7814,6 +7888,7 @@ pub fn clear_notification_signal(
     project_slug: &str,
     agent_name: &str,
 ) -> SignalClearOutcome {
+    let _mutation = ArchiveMutationGuard::begin();
     if !config.notifications_enabled {
         return SignalClearOutcome::Disabled;
     }
@@ -9527,6 +9602,7 @@ fn commit_paths(
     message: &str,
     rel_paths: &[&str],
 ) -> Result<()> {
+    let _mutation = ArchiveMutationGuard::begin();
     if rel_paths.is_empty() {
         return Ok(());
     }
@@ -9597,6 +9673,7 @@ fn commit_paths(
 /// Only used as an overload escape hatch for the async commit coalescer when the
 /// spill path set grows too large to track precisely.
 fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
+    let _mutation = ArchiveMutationGuard::begin();
     // Ensure this is a non-bare repo with a workdir.
     let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
 
@@ -9880,6 +9957,8 @@ fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     use std::io::Write as _;
+
+    let _mutation = ArchiveMutationGuard::begin();
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
@@ -15079,6 +15158,22 @@ mod tests {
             project_slug: project_slug.to_string(),
             agent_name: "WbqTestAgent".to_string(),
         }
+    }
+
+    #[test]
+    fn archive_mutation_guard_brackets_epoch_and_active_window() {
+        let before = archive_mutation_epoch();
+        {
+            let _outer = ArchiveMutationGuard::begin();
+            assert!(archive_mutations_active() >= 1);
+            assert!(archive_mutation_epoch() > before);
+            {
+                let _nested = ArchiveMutationGuard::begin();
+                assert!(archive_mutations_active() >= 2);
+            }
+            assert!(archive_mutations_active() >= 1);
+        }
+        assert!(archive_mutation_epoch() >= before + 4);
     }
 
     #[test]

@@ -2105,12 +2105,19 @@ pub struct DbPool {
     init_sql: Arc<String>,
     run_migrations: bool,
     skip_startup_init: bool,
+    open_mode: DbPoolOpenMode,
     stats_sampler: Arc<DbPoolStatsSampler>,
     /// Shared, process-wide monotonic message-id allocator for this database
     /// (mcp_agent_mail#176). Resolved once at construction so all `DbPool`
     /// wrappers of the same underlying connection pool share one high-water
     /// mark; see [`shared_message_id_allocator`].
     message_id_allocator: Arc<crate::id_floor::MessageIdAllocator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbPoolOpenMode {
+    Recovering,
+    QueryOnlyStrict,
 }
 
 /// Registry of per-database message-id allocators, keyed by the shared
@@ -2154,6 +2161,18 @@ fn shared_message_id_allocator(
 }
 
 impl DbPool {
+    fn connection_init_sql(config: &DbPoolConfig, query_only: bool) -> Arc<String> {
+        let mut sql = String::new();
+        if query_only {
+            sql.push_str("PRAGMA query_only = ON;\n");
+        }
+        sql.push_str(&schema::build_conn_pragmas(
+            config.max_connections,
+            config.cache_budget_kb,
+        ));
+        Arc::new(sql)
+    }
+
     fn from_shared_pool_with_options(
         config: &DbPoolConfig,
         pool: Arc<Pool<DbConn>>,
@@ -2161,10 +2180,7 @@ impl DbPool {
     ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
-        let init_sql = Arc::new(schema::build_conn_pragmas(
-            config.max_connections,
-            config.cache_budget_kb,
-        ));
+        let init_sql = Self::connection_init_sql(config, false);
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
         let (message_id_allocator, cache_generation) = shared_message_id_allocator(&pool);
 
@@ -2176,6 +2192,7 @@ impl DbPool {
             init_sql,
             run_migrations: config.run_migrations,
             skip_startup_init,
+            open_mode: DbPoolOpenMode::Recovering,
             stats_sampler,
             message_id_allocator,
         })
@@ -2185,13 +2202,14 @@ impl DbPool {
         Self::from_shared_pool_with_options(config, pool, false)
     }
 
-    fn new_with_options(config: &DbPoolConfig, skip_startup_init: bool) -> DbResult<Self> {
+    fn new_with_options(
+        config: &DbPoolConfig,
+        skip_startup_init: bool,
+        query_only: bool,
+    ) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
         let storage_root = config.resolved_storage_root();
-        let init_sql = Arc::new(schema::build_conn_pragmas(
-            config.max_connections,
-            config.cache_budget_kb,
-        ));
+        let init_sql = Self::connection_init_sql(config, query_only);
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
         let pool_config = PoolConfig::new(config.max_connections)
@@ -2213,6 +2231,11 @@ impl DbPool {
             init_sql,
             run_migrations: config.run_migrations,
             skip_startup_init,
+            open_mode: if query_only {
+                DbPoolOpenMode::QueryOnlyStrict
+            } else {
+                DbPoolOpenMode::Recovering
+            },
             stats_sampler,
             message_id_allocator,
         })
@@ -2220,7 +2243,7 @@ impl DbPool {
 
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
-        Self::new_with_options(config, false)
+        Self::new_with_options(config, false, false)
     }
 
     /// Create a pool that skips one-time startup initialization on first acquire.
@@ -2228,7 +2251,18 @@ impl DbPool {
     /// Intended for read-only helper surfaces that open an already initialized
     /// mailbox under a live server and must avoid contending on startup repairs.
     pub fn new_without_startup_init(config: &DbPoolConfig) -> DbResult<Self> {
-        Self::new_with_options(config, true)
+        Self::new_with_options(config, true, false)
+    }
+
+    /// Create an uncached pool whose every connection opens an existing file
+    /// read-only and enforces SQLite's connection-local query-only guard.
+    ///
+    /// This constructor deliberately skips startup initialization and never
+    /// creates parent directories, repairs, migrates, reconciles, or replaces
+    /// its target. It is the only pool shape suitable for published archive
+    /// read snapshots.
+    pub fn new_query_only(config: &DbPoolConfig) -> DbResult<Self> {
+        Self::new_with_options(config, true, true)
     }
 
     #[must_use]
@@ -2292,6 +2326,7 @@ impl DbPool {
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
         let skip_startup_init = self.skip_startup_init;
+        let open_mode = self.open_mode;
         let cx2 = cx.clone();
 
         let start = Instant::now();
@@ -2308,6 +2343,7 @@ impl DbPool {
                 async move {
                     // Ensure parent directory exists for file-backed DBs.
                     if sqlite_path != ":memory:"
+                        && open_mode == DbPoolOpenMode::Recovering
                         && let Err(e) = ensure_sqlite_parent_dir_exists(&sqlite_path)
                     {
                         return Outcome::Err(e);
@@ -2360,6 +2396,11 @@ impl DbPool {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
                         }
+                    } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
+                        match DbConn::open_file_read_only(&sqlite_path) {
+                            Ok(c) => c,
+                            Err(e) => return Outcome::Err(e),
+                        }
                     } else {
                         match open_sqlite_file_with_recovery(&sqlite_path) {
                             Ok(c) => c,
@@ -2396,6 +2437,7 @@ impl DbPool {
                         "pool connection init pragmas",
                     ) {
                         if sqlite_path == ":memory:"
+                            || open_mode == DbPoolOpenMode::QueryOnlyStrict
                             || !is_sqlite_recovery_error_message(&first_init_err.to_string())
                         {
                             crate::close_db_conn(conn, "pool connection init failed (non-recoverable)");
@@ -8952,6 +8994,11 @@ pub fn create_pool_without_startup_init(config: &DbPoolConfig) -> DbResult<DbPoo
     DbPool::new_without_startup_init(config)
 }
 
+/// Create an uncached, strictly query-only pool for an immutable SQLite file.
+pub fn create_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
+    DbPool::new_query_only(config)
+}
+
 // ============================================================================
 // Synthetic canary namespace, metrics, and alert-isolation policy
 // (br-97gc6.5.2.6.5.4)
@@ -9802,6 +9849,102 @@ mod tests {
         assert!(table_names.contains(&"projects".to_string()));
         assert!(table_names.contains(&"agents".to_string()));
         assert!(table_names.contains(&"messages".to_string()));
+    }
+
+    #[test]
+    fn strict_query_only_pool_rejects_writes_without_changing_file_family() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("snapshot.sqlite3");
+        let seed = DbConn::open_file(db_path.to_string_lossy().into_owned()).expect("open seed db");
+        seed.execute_raw(&schema::init_schema_sql_base())
+            .expect("initialize seed schema");
+        drop(seed);
+        let family = |path: &Path| {
+            std::iter::once(path.to_path_buf())
+                .chain(["-journal", "-wal", "-shm"].into_iter().map(|suffix| {
+                    let mut value = path.as_os_str().to_os_string();
+                    value.push(suffix);
+                    PathBuf::from(value)
+                }))
+                .map(|path| (path.clone(), std::fs::read(path).ok()))
+                .collect::<Vec<_>>()
+        };
+        let before = family(&db_path);
+        let pool = DbPool::new_query_only(&DbPoolConfig {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+            storage_root: Some(directory.path().join("archive")),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct query-only pool");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let conn = runtime
+            .block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("acquire query-only connection");
+        let query_only = conn.query_sync("PRAGMA query_only", &[]).expect("pragma")[0]
+            .get_named::<i64>("query_only")
+            .expect("query_only value");
+        assert_eq!(query_only, 1);
+        assert!(
+            conn.execute_raw("CREATE TABLE forbidden(value INTEGER)")
+                .is_err()
+        );
+        drop(conn);
+        assert_eq!(family(&db_path), before);
+    }
+
+    #[test]
+    fn strict_query_only_pool_never_creates_or_recovers_its_target() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        for (name, initial) in [
+            ("absent.sqlite3", None),
+            ("corrupt.sqlite3", Some(b"not a sqlite database".as_slice())),
+        ] {
+            let db_path = directory.path().join(name);
+            if let Some(bytes) = initial {
+                std::fs::write(&db_path, bytes).expect("write corrupt candidate");
+            }
+            let before = std::fs::read_dir(directory.path())
+                .expect("read before")
+                .map(|entry| entry.expect("directory entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            let bytes_before = std::fs::read(&db_path).ok();
+            let pool = DbPool::new_query_only(&DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: Some(directory.path().join("archive")),
+                min_connections: 0,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("construct query-only pool");
+            assert!(matches!(
+                runtime.block_on(pool.acquire(&cx)),
+                asupersync::Outcome::Err(_)
+            ));
+            let after = std::fs::read_dir(directory.path())
+                .expect("read after")
+                .map(|entry| entry.expect("directory entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                after, before,
+                "strict open must create no sidecar or backup"
+            );
+            assert_eq!(std::fs::read(&db_path).ok(), bytes_before);
+        }
     }
 
     #[test]

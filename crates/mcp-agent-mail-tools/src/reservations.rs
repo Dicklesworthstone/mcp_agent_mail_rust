@@ -32,8 +32,8 @@ use crate::resources::{
     reservation_project_workspace_path,
 };
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
-    resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
+    legacy_tool_error, resolve_agent, resolve_project,
 };
 
 const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -1426,7 +1426,7 @@ pub async fn check_file_reservation_conflicts(
     let caller = mcp_agent_mail_core::models::normalize_agent_name(caller)
         .unwrap_or_else(|| caller.to_string());
 
-    let pool = get_db_pool()?;
+    let pool = get_authoritative_live_db_pool()?;
     let snapshot = acquire_outcome(
         mcp_agent_mail_db::queries::get_reservation_conflict_snapshot(
             ctx.cx(),

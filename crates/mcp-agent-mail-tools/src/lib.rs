@@ -23,6 +23,8 @@
     clippy::manual_ignore_case_cmp
 )]
 
+mod archive_read;
+
 pub mod build_slots;
 pub mod contacts;
 pub mod degraded_intents;
@@ -60,11 +62,11 @@ pub mod tool_util {
     use fastmcp::McpErrorCode;
     use fastmcp::prelude::*;
     use mcp_agent_mail_core::Config;
-    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, create_pool, get_or_create_pool};
+    use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, get_or_create_pool};
     use serde_json::{Map, Value, json};
     use std::collections::{BTreeSet, VecDeque};
     use std::path::{Path, PathBuf};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
 
     pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
     pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
@@ -685,9 +687,94 @@ pub mod tool_util {
         }
     }
 
-    pub fn get_db_pool() -> McpResult<DbPool> {
+    /// Live database lease for mutation paths. The guard brackets pool
+    /// bootstrap and the caller's entire operation, invalidating archive-read
+    /// decisions on both entry and exit.
+    pub struct WriteDbPool {
+        pool: DbPool,
+        _guard: crate::archive_read::WriteGuard,
+    }
+
+    impl std::ops::Deref for WriteDbPool {
+        type Target = DbPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.pool
+        }
+    }
+
+    pub fn get_db_pool() -> McpResult<WriteDbPool> {
         let cfg = DbPoolConfig::from_env();
-        get_or_create_pool(&cfg).map_err(|e| McpError::internal_error(e.to_string()))
+        let sqlite_path =
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+                None
+            } else {
+                Some(
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                        .map_err(|error| McpError::internal_error(error.to_string()))?
+                        .canonical_path,
+                )
+            };
+        let storage_root = cfg
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        let guard = crate::archive_read::WriteGuard::begin(
+            &storage_root,
+            sqlite_path.as_deref().map(Path::new),
+        );
+        let pool = get_or_create_pool(&cfg)
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        Ok(WriteDbPool {
+            pool,
+            _guard: guard,
+        })
+    }
+
+    /// Open the live mailbox for a read surface without migrations, recovery,
+    /// reconciliation, directory creation, or writer-generation changes.
+    pub(crate) fn get_live_read_db_pool() -> McpResult<DbPool> {
+        let mut cfg = DbPoolConfig::from_env();
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+            return get_or_create_pool(&cfg)
+                .map_err(|error| McpError::internal_error(error.to_string()));
+        }
+        cfg.run_migrations = false;
+        cfg.warmup_connections = 0;
+        mcp_agent_mail_db::create_query_only_pool(&cfg)
+            .map_err(|error| McpError::internal_error(error.to_string()))
+    }
+
+    /// Reuse a hot authoritative live pool for health reads without advancing
+    /// the writer generation. A genuinely cold bootstrap remains bracketed
+    /// because it may initialize, migrate, or recover the mailbox.
+    pub(crate) fn get_authoritative_live_db_pool() -> McpResult<DbPool> {
+        let cfg = DbPoolConfig::from_env();
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+            return Ok(pool);
+        }
+        let sqlite_path =
+            if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
+                None
+            } else {
+                Some(
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&cfg.database_url)
+                        .map_err(|error| McpError::internal_error(error.to_string()))?
+                        .canonical_path,
+                )
+            };
+        let storage_root = cfg
+            .storage_root
+            .clone()
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        let guard = crate::archive_read::WriteGuard::begin(
+            &storage_root,
+            sqlite_path.as_deref().map(Path::new),
+        );
+        let pool = get_or_create_pool(&cfg)
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        drop(guard);
+        Ok(pool)
     }
 
     fn read_pool_setup_error_to_mcp_error(message: String) -> McpError {
@@ -933,8 +1020,9 @@ pub mod tool_util {
         })
     }
 
-    fn read_archive_inventory_has_state(storage_root: &Path) -> bool {
-        let archive = read_archive_inventory(storage_root);
+    pub(crate) fn read_archive_inventory_has_state(
+        archive: &mcp_agent_mail_db::ArchiveMessageInventory,
+    ) -> bool {
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
 
@@ -946,16 +1034,16 @@ pub mod tool_util {
             || sqlite_path.starts_with(storage_root)
     }
 
-    fn read_archive_is_ahead(
+    pub(crate) fn read_archive_is_ahead(
         storage_root: &Path,
         sqlite_path: &Path,
         conn: &mcp_agent_mail_db::DbConn,
+        archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> Result<bool, String> {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
             return Ok(false);
         }
 
-        let archive = read_archive_inventory(storage_root);
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
         }
@@ -964,7 +1052,7 @@ pub mod tool_util {
         let archive_message_count = archive.unique_message_ids;
         let archive_max_id = archive.latest_message_id.unwrap_or(0);
         let missing_archive_projects = mcp_agent_mail_db::archive_missing_project_identities(
-            &archive,
+            archive,
             &db_inventory.project_identities,
         );
 
@@ -988,14 +1076,21 @@ pub mod tool_util {
 
     pub struct ToolReadPool {
         pool: mcp_agent_mail_db::DbPool,
-        _snapshot_dir: Option<mcp_agent_mail_db::pool::CanonicalSnapshotTempDir>,
+        _snapshot: Option<Arc<crate::archive_read::SharedSnapshot>>,
     }
 
     impl ToolReadPool {
         const fn live(pool: mcp_agent_mail_db::DbPool) -> Self {
             Self {
                 pool,
-                _snapshot_dir: None,
+                _snapshot: None,
+            }
+        }
+
+        fn snapshot(snapshot: Arc<crate::archive_read::SharedSnapshot>) -> Self {
+            Self {
+                pool: snapshot.pool(),
+                _snapshot: Some(snapshot),
             }
         }
     }
@@ -1012,7 +1107,11 @@ pub mod tool_util {
     /// worse) according to a fast mailbox verdict. Returns `true` when read
     /// surfaces should fall back to archive snapshots instead of the
     /// potentially corrupt live file.
-    fn live_db_is_suspect(database_url: &str, storage_root: &Path, sqlite_path: &Path) -> bool {
+    pub(crate) fn live_db_is_suspect(
+        database_url: &str,
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> bool {
         if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
             return false;
         }
@@ -1050,7 +1149,12 @@ pub mod tool_util {
         }
     }
 
-    fn open_read_db_pool() -> Result<Option<ToolReadPool>, String> {
+    async fn open_read_db_pool(
+        cx: &asupersync::Cx,
+    ) -> Result<Option<ToolReadPool>, crate::archive_read::AcquireError> {
+        if cx.is_cancel_requested() {
+            return Err(crate::archive_read::AcquireError::Cancelled);
+        }
         let config = Config::from_env();
         if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
             return Ok(None);
@@ -1058,99 +1162,46 @@ pub mod tool_util {
 
         let sqlite_path =
             mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
-                .map_err(|err| err.to_string())?
+                .map_err(|error| crate::archive_read::AcquireError::Failed(error.to_string()))?
                 .canonical_path;
         if sqlite_path == ":memory:" {
             return Ok(None);
         }
 
         let resolved_path = PathBuf::from(&sqlite_path);
-        let archive_has_state = archive_storage_root_is_authoritative_for_sqlite_path(
+        if !archive_storage_root_is_authoritative_for_sqlite_path(
             &config.storage_root,
             &resolved_path,
-        ) && read_archive_inventory_has_state(&config.storage_root);
-
-        // When the durability verdict says the live DB is suspect or worse,
-        // force archive-snapshot reads even if the archive isn't strictly
-        // "ahead" of the DB by row count.
-        let durability_forces_snapshot = archive_has_state
-            && live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
-
-        let use_archive_snapshot = if durability_forces_snapshot {
-            true
-        } else {
-            match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
-                Ok(conn) => {
-                    let conn = mcp_agent_mail_db::guard_db_conn(
-                        conn,
-                        "tool_util::open_read_db_pool archive-ahead probe",
-                    );
-                    let archive_ahead =
-                        read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
-                    drop(conn);
-                    match archive_ahead {
-                        Ok(true) => true,
-                        Err(error) if archive_has_state => {
-                            tracing::warn!(
-                                source = %resolved_path.display(),
-                                storage_root = %config.storage_root.display(),
-                                error = %error,
-                                "using archive-backed tool snapshot because the live sqlite inventory probe failed"
-                            );
-                            true
-                        }
-                        Ok(false) | Err(_) => false,
-                    }
-                }
-                Err(error) if archive_has_state => {
-                    tracing::warn!(
-                        source = %resolved_path.display(),
-                        storage_root = %config.storage_root.display(),
-                        error = %error,
-                        "using archive-backed tool snapshot because the live sqlite source could not be opened"
-                    );
-                    true
-                }
-                Err(_) => false,
-            }
-        };
-
-        if !use_archive_snapshot {
+        ) {
             return Ok(None);
         }
-
-        let snapshot_dir =
-            mcp_agent_mail_db::pool::CanonicalSnapshotTempDir::new("agent-mail-tool-snapshot-")
-                .map_err(|err| err.to_string())?;
-        let snapshot_db = snapshot_dir.path().join("mailbox.sqlite3");
-        if resolved_path.exists() {
-            mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
-                &snapshot_db,
-                &config.storage_root,
-                Some(resolved_path.as_path()),
-            )
-            .map_err(|err| err.to_string())?;
-        } else {
-            mcp_agent_mail_db::reconstruct_from_archive(&snapshot_db, &config.storage_root)
-                .map_err(|err| err.to_string())?;
-        }
-        let pool = create_pool(&mcp_agent_mail_db::DbPoolConfig {
-            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
-            storage_root: Some(config.storage_root),
-            ..Default::default()
-        })
-        .map_err(|err| err.to_string())?;
-        Ok(Some(ToolReadPool {
-            pool,
-            _snapshot_dir: Some(snapshot_dir),
-        }))
+        crate::archive_read::acquire_if_needed(
+            &config.storage_root,
+            &resolved_path,
+            &config.database_url,
+            cx,
+        )
+        .await
+        .map(|snapshot| snapshot.map(ToolReadPool::snapshot))
     }
 
-    pub fn get_read_db_pool() -> McpResult<ToolReadPool> {
-        match open_read_db_pool() {
+    pub async fn get_read_db_pool(cx: &asupersync::Cx) -> McpResult<ToolReadPool> {
+        match open_read_db_pool(cx).await {
             Ok(Some(pool)) => Ok(pool),
-            Ok(None) => get_db_pool().map(ToolReadPool::live),
-            Err(error) => Err(read_pool_setup_error_to_mcp_error(error)),
+            Ok(None) => get_live_read_db_pool().map(ToolReadPool::live),
+            Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
+            Err(crate::archive_read::AcquireError::Busy(message)) => {
+                Err(db_error_to_mcp_error(DbError::ResourceBusy(message)))
+            }
+            Err(crate::archive_read::AcquireError::TimedOut(message)) => Err(legacy_tool_error(
+                "SNAPSHOT_TIMEOUT",
+                message,
+                true,
+                json!({"timeout_seconds": 120}),
+            )),
+            Err(crate::archive_read::AcquireError::Failed(message)) => {
+                Err(read_pool_setup_error_to_mcp_error(message))
+            }
         }
     }
 
@@ -1588,6 +1639,18 @@ pub mod tool_util {
 
         static READ_POOL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+        fn run_async<F, Fut, T>(f: F) -> T
+        where
+            F: FnOnce(asupersync::Cx) -> Fut,
+            Fut: std::future::Future<Output = T>,
+        {
+            let cx = asupersync::Cx::for_testing();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build test runtime");
+            runtime.block_on(f(cx))
+        }
+
         #[test]
         fn process_env_overrides_bypass_stale_dependency_config_cache() {
             Config::reset_cached();
@@ -1916,11 +1979,13 @@ body
                     .expect("insert overlapping project");
                     drop(conn);
 
-                    let pool = open_read_db_pool().expect("open read db pool");
-                    assert!(
-                        pool.is_none(),
-                        "default global archive should not force shared tool read snapshots for an external custom DB"
-                    );
+                    run_async(|cx| async move {
+                        let pool = open_read_db_pool(&cx).await.expect("open read db pool");
+                        assert!(
+                            pool.is_none(),
+                            "default global archive should not force shared tool read snapshots for an external custom DB"
+                        );
+                    });
                 },
             );
         }

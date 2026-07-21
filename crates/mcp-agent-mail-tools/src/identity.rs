@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool, get_db_pool,
+    get_read_db_pool, legacy_tool_error, resolve_project,
 };
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
@@ -1129,7 +1129,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let pool = if semantic_readiness.status == "fail" {
         None
     } else {
-        match get_db_pool() {
+        match get_authoritative_live_db_pool() {
             Ok(pool) => {
                 pool.sample_pool_stats_now();
                 Some(pool)
@@ -2027,7 +2027,7 @@ pub async fn whois(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
 
     let include_commits = include_recent_commits.unwrap_or(true);
     let limit_raw = commit_limit.unwrap_or(5);
@@ -2160,7 +2160,7 @@ pub async fn resolve_pane_identity(
 
     let mut project_keys = vec![project_key.clone()];
     if !Path::new(&project_key).is_absolute()
-        && let Ok(pool) = get_read_db_pool()
+        && let Ok(pool) = get_read_db_pool(ctx.cx()).await
         && let Ok(project) = resolve_project(ctx, &pool, &project_key).await
         && project.human_key != project_key
     {
@@ -2263,7 +2263,7 @@ pub async fn list_agents(
     limit: Option<u32>,
     active_within_days: Option<u32>,
 ) -> McpResult<String> {
-    let pool = get_read_db_pool()?;
+    let pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -3495,6 +3495,71 @@ body
         assert!(
             !db_path.exists(),
             "health_check must not create a missing sqlite file"
+        );
+    }
+
+    #[test]
+    fn hot_health_check_does_not_advance_writer_epoch_or_touch_sqlite_family() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let db_path = temp.path().join("hot-health.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_value = storage_root.display().to_string();
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_value.as_str()),
+            ],
+            || {
+                Config::reset_cached();
+                let cx = Cx::for_testing();
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("test runtime");
+                let pool = get_db_pool().expect("bootstrap live pool");
+                let conn = match runtime.block_on(pool.acquire(&cx)) {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("bootstrap acquire failed: {error}"),
+                    Outcome::Cancelled(_) => panic!("bootstrap acquire was cancelled"),
+                    Outcome::Panicked(_) => panic!("bootstrap acquire panicked"),
+                };
+                drop(conn);
+                drop(pool);
+
+                let family = || {
+                    std::iter::once(db_path.clone())
+                        .chain(["-journal", "-wal", "-shm"].into_iter().map(|suffix| {
+                            let mut path = db_path.as_os_str().to_os_string();
+                            path.push(suffix);
+                            PathBuf::from(path)
+                        }))
+                        .map(|path| (path.clone(), std::fs::read(path).ok()))
+                        .collect::<Vec<_>>()
+                };
+                let before_family = family();
+                let before_epoch = crate::archive_read::writer_epoch_for_test();
+                let ctx = McpContext::new(cx, 1);
+                let response = health_check(&ctx).expect("hot health check");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("health response json");
+                assert_ne!(value["db_health"]["status"], "fail", "{value}");
+                assert_eq!(
+                    crate::archive_read::writer_epoch_for_test(),
+                    before_epoch,
+                    "hot health reads must not enter the durable-writer epoch"
+                );
+                assert_eq!(
+                    family(),
+                    before_family,
+                    "hot health reads must leave the SQLite file family byte-for-byte unchanged"
+                );
+            },
         );
     }
 

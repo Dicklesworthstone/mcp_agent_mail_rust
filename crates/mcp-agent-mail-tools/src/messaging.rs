@@ -3154,7 +3154,7 @@ pub async fn fetch_inbox(
 
     // Use archive-aware read pool so that inbox reads fall back to archive
     // snapshots when the live SQLite is suspect (DegradedReadOnly).
-    let read_pool = get_read_db_pool()?;
+    let read_pool = get_read_db_pool(ctx.cx()).await?;
     let project = resolve_project(ctx, &read_pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
