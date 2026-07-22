@@ -1618,7 +1618,7 @@ impl ConsoleCaps {
     #[allow(clippy::missing_const_for_fn)]
     pub fn from_capabilities(caps: &ftui::TerminalCapabilities) -> Self {
         Self {
-            true_color: caps.true_color,
+            true_color: caps.color_depth == ftui::ColorDepth::TrueColor,
             osc8_hyperlinks: caps.osc8_hyperlinks,
             mouse_sgr: caps.mouse_sgr,
             sync_output: caps.sync_output,
