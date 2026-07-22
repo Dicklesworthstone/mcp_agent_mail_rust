@@ -12,7 +12,7 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
-## [v0.3.22](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.22) — 2026-07-19 **[Release]**
+## [v0.3.22](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.22) — 2026-07-22 **[Release]**
 
 ### Recovery correctness and portable archives
 
@@ -59,6 +59,21 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 - `am update` recognizes and safely unwraps the nested release archives emitted
   by older manual release tooling while retaining checksum and path-safety
   validation (#188).
+
+### Migration robustness and build
+
+- A statistics-only `ANALYZE` migration whose target table is absent no longer
+  aborts `migrate_to_latest`. Previously, a database whose `atc_experiences`
+  table was missing (e.g. after a corrupt-page loss while the create/alter
+  migrations were already recorded applied) made `v16_analyze_atc_experiences`
+  hard-fail with "no such table", which wedged the whole server into DB-degraded
+  mode where every MCP write returned a generic "database error". The migration
+  runner now treats a missing-table `ANALYZE` as vacuously satisfied — it records
+  the migration and continues — since query-planner statistics change no schema
+  and no data (GH#185).
+- Build fix: `ConsoleCaps::from_capabilities` was updated for the current
+  `frankentui` API, whose `TerminalCapabilities` replaced the boolean
+  `true_color` field with a `color_depth: ColorDepth` enum.
 
 ---
 
