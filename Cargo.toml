@@ -206,3 +206,15 @@ ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
 rich_rust = { path = "../rich_rust" }
+
+# --- rch OOM mitigation (2026-07-23) ---------------------------------------
+# The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
+# 15-29GB rch workers, so rch fails the remote build and falls back to a LOCAL
+# compile on the trj orchestrator (load spikes + /data/tmp ENOSPC). These per-
+# package overrides cut per-rustc peak memory so it builds on the small workers
+# instead of flooding trj. Revert = delete this block.
+[profile.release.package."mcp-agent-mail-server"]
+codegen-units = 16
+
+[profile.dev.package."mcp-agent-mail-server"]
+debug = 1
