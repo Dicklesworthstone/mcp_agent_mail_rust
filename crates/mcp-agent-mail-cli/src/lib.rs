@@ -466,7 +466,7 @@ pub enum Commands {
         /// Show reservations for all agents, not just the selected agent.
         #[arg(long)]
         all: bool,
-        /// Show only conflicting reservations.
+        /// Add a `conflicting_active` projection; `all_active` stays authoritative.
         #[arg(long)]
         conflicts: bool,
         /// Warn about reservations expiring within N minutes.

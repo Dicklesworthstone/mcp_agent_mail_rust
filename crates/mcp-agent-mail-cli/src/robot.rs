@@ -2621,7 +2621,7 @@ pub enum RobotSubcommand {
         /// Show reservations for all agents, not just the selected agent.
         #[arg(long)]
         all: bool,
-        /// Show only conflicting reservations.
+        /// Add a `conflicting_active` projection; `all_active` stays authoritative.
         #[arg(long)]
         conflicts: bool,
         /// Warn about reservations expiring within N minutes.
@@ -7506,6 +7506,10 @@ struct ReservationsData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     my_reservations: Vec<ReservationEntry>,
     all_active: Vec<ReservationEntry>,
+    /// Conflict-only projection. `all_active` always remains the authoritative
+    /// active snapshot, including when `--conflicts` is selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflicting_active: Option<Vec<ReservationEntry>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conflicts: Vec<ReservationConflict>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -7899,13 +7903,15 @@ fn build_reservations(
             .flat_map(|c| vec![c.path_a.clone(), c.path_b.clone()])
             .collect();
         let filtered: Vec<_> = scoped_all_active
-            .into_iter()
+            .iter()
             .filter(|e| conflict_paths.contains(&e.path))
+            .cloned()
             .collect();
         return Ok((
             ReservationsData {
                 my_reservations: vec![],
-                all_active: filtered,
+                all_active: scoped_all_active,
+                conflicting_active: Some(filtered),
                 conflicts: scoped_conflicts,
                 expiring_soon: vec![],
                 playbooks: scoped_playbooks,
@@ -7925,6 +7931,7 @@ fn build_reservations(
             ReservationsData {
                 my_reservations: my_reservations.clone(),
                 all_active: scoped_all_active,
+                conflicting_active: None,
                 conflicts: scoped_conflicts,
                 expiring_soon: scoped_expiring_soon,
                 playbooks: scoped_playbooks,
@@ -7940,6 +7947,7 @@ fn build_reservations(
         ReservationsData {
             my_reservations,
             all_active,
+            conflicting_active: None,
             conflicts,
             expiring_soon,
             playbooks,
@@ -14033,6 +14041,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             )?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(scope.project_slug);
+            if conflicts && env.data.conflicts.is_empty() && !env.data.all_active.is_empty() {
+                env = env.with_alert(
+                    "info",
+                    "No overlapping active reservation pairs found",
+                    Some(
+                        "`all_active` is the authoritative lease snapshot within the selected project/agent scope; use `am file_reservations conflicts <PROJECT> <PATHS>...` to check proposed edits."
+                            .to_string(),
+                    ),
+                );
+            }
             for a in actions {
                 env = env.with_action(&a);
             }
@@ -17704,6 +17722,14 @@ mod tests {
                     granted_at: Some("55m ago".into()),
                 },
             ],
+            conflicting_active: Some(vec![ReservationEntry {
+                agent: Some("RedFox".into()),
+                path: "src/auth/jwt.rs".into(),
+                exclusive: true,
+                remaining_seconds: 300,
+                remaining: Some("5m \u{26a0}".into()),
+                granted_at: Some("55m ago".into()),
+            }]),
             conflicts: vec![ReservationConflict {
                 agent_a: "BlueLake".into(),
                 path_a: "src/auth/**".into(),
@@ -17746,6 +17772,7 @@ mod tests {
 
         let json = serde_json::to_value(&data).unwrap();
         assert_eq!(json["all_active"].as_array().unwrap().len(), 2);
+        assert_eq!(json["conflicting_active"].as_array().unwrap().len(), 1);
         assert_eq!(json["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(json["conflicts"][0]["agent_a"], "BlueLake");
         assert_eq!(json["expiring_soon"].as_array().unwrap().len(), 1);
@@ -23980,19 +24007,42 @@ mod tests {
              (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
              VALUES
                 (?, 1, 1, 'src/*/foo.rs', 1, 'a', 0, ?, NULL),
-                (?, 1, 2, 'src/bar/*.rs', 1, 'b', 0, ?, NULL)",
+                (?, 1, 2, 'src/bar/*.rs', 1, 'b', 0, ?, NULL),
+                (?, 1, 3, 'docs/**', 1, 'unrelated', 0, ?, NULL)",
             &[
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
             ],
         )
         .expect("insert glob reservations");
 
-        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, false, Some(10))
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, true, Some(10))
             .expect("build reservations");
 
+        assert_eq!(data.all_active.len(), 3);
+        assert!(
+            data.all_active.iter().any(|entry| entry.path == "docs/**"),
+            "authoritative scoped snapshot should retain unrelated active leases"
+        );
+        assert_eq!(
+            data.conflicting_active
+                .as_ref()
+                .expect("conflict projection")
+                .len(),
+            2
+        );
+        assert!(
+            data.conflicting_active
+                .as_ref()
+                .expect("conflict projection")
+                .iter()
+                .all(|entry| entry.path != "docs/**"),
+            "conflict projection should exclude unrelated active leases"
+        );
         assert_eq!(data.conflicts.len(), 1);
         assert_eq!(data.conflicts[0].agent_a, "Alice");
         assert_eq!(data.conflicts[0].path_a, "src/*/foo.rs");
