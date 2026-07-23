@@ -6139,22 +6139,22 @@ fn is_real_file(path: &Path) -> bool {
 
 #[allow(clippy::result_large_err)]
 fn recovery_files_share_identity(first: &Path, second: &Path) -> Result<bool, SqlError> {
-    let first_metadata = std::fs::metadata(first).map_err(|error| {
-        SqlError::Custom(format!(
-            "failed to inspect recovery file identity for {}: {error}",
-            first.display()
-        ))
-    })?;
-    let second_metadata = std::fs::metadata(second).map_err(|error| {
-        SqlError::Custom(format!(
-            "failed to inspect recovery file identity for {}: {error}",
-            second.display()
-        ))
-    })?;
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+
+        let first_metadata = std::fs::metadata(first).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to inspect recovery file identity for {}: {error}",
+                first.display()
+            ))
+        })?;
+        let second_metadata = std::fs::metadata(second).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to inspect recovery file identity for {}: {error}",
+                second.display()
+            ))
+        })?;
 
         Ok(first_metadata.dev() == second_metadata.dev()
             && first_metadata.ino() == second_metadata.ino())
@@ -6162,23 +6162,17 @@ fn recovery_files_share_identity(first: &Path, second: &Path) -> Result<bool, Sq
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-
-        return match (
-            first_metadata.volume_serial_number(),
-            first_metadata.file_index(),
-            second_metadata.volume_serial_number(),
-            second_metadata.file_index(),
-        ) {
-            (Some(first_volume), Some(first_index), Some(second_volume), Some(second_index)) => {
-                Ok(first_volume == second_volume && first_index == second_index)
-            }
-            _ => Err(SqlError::Custom(format!(
-                "could not establish stable recovery file identities for {} and {}; refusing promotion",
+        // std's volume_serial_number()/file_index() are still unstable
+        // (windows_by_handle), so stable builds cannot use them. same-file
+        // performs the equivalent GetFileInformationByHandle comparison on
+        // stable Rust and fails closed if either file cannot be opened.
+        same_file::is_same_file(first, second).map_err(|error| {
+            SqlError::Custom(format!(
+                "could not establish stable recovery file identities for {} and {}; refusing promotion: {error}",
                 first.display(),
                 second.display()
-            ))),
-        };
+            ))
+        })
     }
 
     #[cfg(not(any(unix, windows)))]
