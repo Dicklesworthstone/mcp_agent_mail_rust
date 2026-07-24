@@ -804,7 +804,15 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
         }
         let after = exact_generation(&slot.scope, build.deadline)?;
         let cheap_after = cheap_generation(&slot.scope, build.deadline)?;
-        if before == after && cheap_before == cheap_after {
+        // Only the exact (content) generation is compared across the probe
+        // window: the snapshot decision itself opens the live database, and a
+        // FrankenSQLite open can perturb file metadata without changing
+        // content (observed on macOS/APFS: every open bumps the db mtime and
+        // checkpoints the WAL when it can), so a metadata-based cheap
+        // comparison spanning the probes never converges. The published cheap
+        // baseline is taken after the probes, so the ready fast-path stays
+        // stable until a durable write actually lands.
+        if before == after {
             return Ok(BuildOutput {
                 generation: after,
                 cheap: cheap_after,
