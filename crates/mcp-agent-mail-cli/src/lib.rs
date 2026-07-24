@@ -4154,10 +4154,12 @@ fn systemd_unit_path() -> Option<PathBuf> {
 /// Uses `systemctl --user is-active` which returns "active" if the service
 /// is running. This checks actual runtime state, not just configuration.
 fn is_systemd_service_active() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME])
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME]);
+    for (key, value) in systemd_user_env_best_effort() {
+        cmd.env(key, value);
+    }
+    cmd.output().is_ok_and(|output| output.status.success())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4322,15 +4324,17 @@ struct SystemdRuntimeState {
 
 #[cfg(target_os = "linux")]
 fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
-    let output = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            SYSTEMD_UNIT_NAME,
-            "--property=ActiveState,SubState,Result,NRestarts,MainPID",
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args([
+        "--user",
+        "show",
+        SYSTEMD_UNIT_NAME,
+        "--property=ActiveState,SubState,Result,NRestarts,MainPID",
+    ]);
+    for (key, value) in systemd_user_env_best_effort() {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().ok()?;
     // `systemctl show` exits 0 even for an unknown unit (it returns
     // `ActiveState=inactive`), so don't bail on a non-zero status — just
     // parse whatever properties came back.
@@ -4619,16 +4623,14 @@ fn managed_service_display_name(kind: ManagedServiceKind) -> &'static str {
 
 fn stop_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
     match kind {
-        ManagedServiceKind::Systemd => run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]),
+        ManagedServiceKind::Systemd => run_systemctl_user(&["stop", SYSTEMD_UNIT_NAME]),
         ManagedServiceKind::Launchd => stop_launchd_service(),
     }
 }
 
 fn start_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
     match kind {
-        ManagedServiceKind::Systemd => {
-            run_cmd("systemctl", &["--user", "start", SYSTEMD_UNIT_NAME])
-        }
+        ManagedServiceKind::Systemd => run_systemctl_user(&["start", SYSTEMD_UNIT_NAME]),
         ManagedServiceKind::Launchd => start_launchd_service(),
     }
 }
@@ -36166,9 +36168,9 @@ fn service_install_systemd(
     // not-running service and picks up new unit content on an already-
     // running one, so it's correct for fresh and re-install alike. This
     // mirrors the launchd bootout+bootstrap pattern below.
-    run_cmd("systemctl", &["--user", "daemon-reload"])?;
-    run_cmd("systemctl", &["--user", "enable", SYSTEMD_UNIT_NAME])?;
-    run_cmd("systemctl", &["--user", "restart", SYSTEMD_UNIT_NAME])?;
+    run_systemctl_user(&["daemon-reload"])?;
+    run_systemctl_user(&["enable", SYSTEMD_UNIT_NAME])?;
+    run_systemctl_user(&["restart", SYSTEMD_UNIT_NAME])?;
 
     ftui_runtime::ftui_println!(
         "Service installed and started (systemd user unit: {})",
@@ -36346,8 +36348,8 @@ fn handle_service_uninstall() -> CliResult<()> {
 
 fn service_uninstall_systemd() -> CliResult<()> {
     // Stop and disable.
-    let _ = run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]);
-    let _ = run_cmd("systemctl", &["--user", "disable", SYSTEMD_UNIT_NAME]);
+    let _ = run_systemctl_user(&["stop", SYSTEMD_UNIT_NAME]);
+    let _ = run_systemctl_user(&["disable", SYSTEMD_UNIT_NAME]);
 
     let home = std::env::var("HOME").map_err(|_| CliError::Other("HOME not set".to_string()))?;
     let unit_path = PathBuf::from(&home)
@@ -36361,7 +36363,14 @@ fn service_uninstall_systemd() -> CliResult<()> {
         ftui_runtime::ftui_println!("Unit file not found (already removed?)");
     }
 
-    run_cmd("systemctl", &["--user", "daemon-reload"])?;
+    // The unit file is already gone; a failed reload (e.g. no user bus in a
+    // non-login shell) must not leave uninstall in a half-done error state.
+    if let Err(err) = run_systemctl_user(&["daemon-reload"]) {
+        ftui_runtime::ftui_println!(
+            "Note: could not reload systemd ({err}). The unit file was removed; \
+             systemd will drop the stale unit on its next daemon-reload."
+        );
+    }
     ftui_runtime::ftui_println!("Service uninstalled");
     Ok(())
 }
@@ -36470,9 +36479,12 @@ fn service_report_deleted_executable_owner() {
 
 fn service_status_systemd() -> CliResult<()> {
     // Show rich status via systemctl.
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "status", SYSTEMD_UNIT_NAME])
-        .output()?;
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["--user", "status", SYSTEMD_UNIT_NAME]);
+    for (key, value) in systemd_user_env_best_effort() {
+        cmd.env(key, value);
+    }
+    let output = cmd.output()?;
     let binding = systemd_service_configured_bind();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -36653,7 +36665,7 @@ fn handle_service_restart() -> CliResult<()> {
 
 fn service_restart_systemd() -> CliResult<()> {
     ftui_runtime::ftui_println!("Restarting {SERVICE_NAME} via systemd...");
-    run_cmd("systemctl", &["--user", "restart", SYSTEMD_UNIT_NAME])?;
+    run_systemctl_user(&["restart", SYSTEMD_UNIT_NAME])?;
     ftui_runtime::ftui_println!("Service restarted");
     Ok(())
 }
@@ -36726,6 +36738,112 @@ fn run_cmd(program: &str, args: &[&str]) -> CliResult<()> {
     Ok(())
 }
 
+/// Resolve the environment overrides needed to reach the per-user systemd bus.
+///
+/// `systemctl --user` connects to the session bus advertised by
+/// `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS`. Non-login shells — installer
+/// subshells, cron, CI, ssh sessions that bypass `pam_systemd` — leave both
+/// unset, so the command fails with "Failed to connect to user scope bus" and
+/// leaves a written-but-not-loaded unit (a silent partial install, #201).
+///
+/// This derives the standard `/run/user/$UID/bus` location and returns the
+/// overrides needed to inject it. Values already present in the ambient
+/// environment are inherited (never overwritten). When `require` is true and no
+/// user bus socket exists, an actionable error is returned instead of letting a
+/// raw systemd connection error bubble up. When `require` is false (read-only
+/// diagnostics), a missing bus yields an empty override set so the caller can
+/// degrade gracefully.
+fn systemd_user_env(require: bool) -> CliResult<Vec<(&'static str, String)>> {
+    let ambient_xdg = mcp_agent_mail_core::config::infra_env_value("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty());
+    let have_xdg = ambient_xdg.is_some();
+    let have_dbus = mcp_agent_mail_core::config::infra_env_value("DBUS_SESSION_BUS_ADDRESS")
+        .filter(|v| !v.is_empty())
+        .is_some();
+
+    // Ambient session env is complete: inherit it untouched.
+    if have_xdg && have_dbus {
+        return Ok(Vec::new());
+    }
+
+    let uid = current_uid()?;
+    let xdg = ambient_xdg.unwrap_or_else(|| format!("/run/user/{uid}"));
+    let bus_socket = std::path::Path::new(&xdg).join("bus");
+
+    if !bus_socket.exists() {
+        if !require {
+            return Ok(Vec::new());
+        }
+        return Err(CliError::Other(format!(
+            "cannot reach the systemd user bus (no socket at {}).\n\
+             This host has no active login session for the current user, which is \
+             normal under cron, CI, installer subshells, or a non-login shell.\n\
+             Fix options:\n  \
+             1. Enable a persistent user session (recommended for services):\n       \
+             sudo loginctl enable-linger $USER\n  \
+             2. Or export the session environment before retrying:\n       \
+             export XDG_RUNTIME_DIR=/run/user/$(id -u)\n       \
+             export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus",
+            bus_socket.display()
+        )));
+    }
+
+    let mut overrides = Vec::new();
+    if !have_xdg {
+        overrides.push(("XDG_RUNTIME_DIR", xdg.clone()));
+    }
+    if !have_dbus {
+        overrides.push((
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus_socket.display()),
+        ));
+    }
+    Ok(overrides)
+}
+
+/// Best-effort variant of [`systemd_user_env`] for read-only diagnostics: never
+/// errors, returning an empty override set when no user bus can be located.
+fn systemd_user_env_best_effort() -> Vec<(&'static str, String)> {
+    systemd_user_env(false).unwrap_or_default()
+}
+
+/// Run `systemctl --user <args>` with the user-bus environment injected so the
+/// command works from non-login shells (#201). Fails with actionable guidance
+/// when no user bus is reachable rather than emitting a raw systemd error and
+/// leaving an inconsistent partial state.
+fn run_systemctl_user(args: &[&str]) -> CliResult<()> {
+    let overrides = systemd_user_env(true)?;
+    let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
+    full.push("--user");
+    full.extend_from_slice(args);
+    run_cmd_with_env("systemctl", &full, &overrides)
+}
+
+/// Like [`run_cmd`] but applies the provided environment overrides to the child
+/// process via `Command::env` (never `std::env::set_var`, keeping this
+/// compatible with `forbid(unsafe_code)` on edition 2024).
+fn run_cmd_with_env(program: &str, args: &[&str], env: &[(&str, String)]) -> CliResult<()> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| CliError::Other(format!("failed to run {program}: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::Other(format!(
+            "{program} {} exited with code {}: {}",
+            args.join(" "),
+            output.status.code().unwrap_or(-1),
+            stderr.trim_end()
+        )));
+    }
+    Ok(())
+}
+
 /// Get the current user's UID (for launchd domain-target).
 fn current_uid() -> CliResult<u32> {
     // Use the `id -u` command to avoid a libc dependency and stay within forbid(unsafe_code).
@@ -36756,6 +36874,57 @@ mod tests {
     fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cmd_with_env_injects_child_environment() {
+        // The systemd user-bus fix (#201) relies on Command::env carrying
+        // XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS into the child. Verify the
+        // env-injection mechanism observes the override in the spawned process.
+        let ok = run_cmd_with_env(
+            "sh",
+            &["-c", "test \"$AM_TEST_INJECTED\" = present"],
+            &[("AM_TEST_INJECTED", "present".to_string())],
+        );
+        assert!(ok.is_ok(), "child must observe the injected env var: {ok:?}");
+
+        let missing = run_cmd_with_env(
+            "sh",
+            &["-c", "test \"$AM_TEST_INJECTED\" = present"],
+            &[],
+        );
+        assert!(
+            missing.is_err(),
+            "child without the override must not see the value"
+        );
+    }
+
+    #[test]
+    fn systemd_user_env_errors_actionably_when_bus_socket_absent() {
+        // A directory that exists but has no `bus` socket models a non-login
+        // shell with no active user session. `require=true` must surface an
+        // actionable message (loginctl enable-linger / export hints), and the
+        // best-effort variant must degrade to no overrides instead of erroring.
+        let tmp = std::env::temp_dir().join(format!("am-nobus-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("temp runtime dir");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("XDG_RUNTIME_DIR", tmp.to_str().unwrap()),
+                ("DBUS_SESSION_BUS_ADDRESS", ""),
+            ],
+            || {
+                let required = systemd_user_env(true);
+                assert!(required.is_err(), "missing bus socket must error when required");
+                let msg = format!("{required:?}");
+                assert!(msg.contains("enable-linger"), "message must be actionable: {msg}");
+                assert!(
+                    systemd_user_env_best_effort().is_empty(),
+                    "best-effort must degrade to no overrides"
+                );
+            },
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Extract the first top-level JSON value delimited by `open`/`close` from a

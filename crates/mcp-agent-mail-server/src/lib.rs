@@ -4695,32 +4695,72 @@ static READINESS_SEMANTIC_CACHE: std::sync::LazyLock<Mutex<ReadinessSemanticCach
 /// blocking worker handoff backs up behind a timeout.
 const MAX_CONCURRENT_DISPATCHES: u32 = 128;
 
-/// Atomic counter tracking in-flight blocking dispatches.
+/// Atomic counter tracking in-flight blocking dispatches (permits whose work
+/// is still within its timeout window and accounted as a live dispatch).
 static DISPATCH_INFLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// RAII guard that decrements `DISPATCH_INFLIGHT` on drop, ensuring the
-/// counter stays accurate even when the future is cancelled or panics.
-struct DispatchPermit;
+/// Atomic counter tracking *zombie* dispatches: blocking work that outlived its
+/// timeout and hard grace so its dispatch slot was force-released, but whose OS
+/// thread is still alive and burning CPU because the work below the dispatch
+/// layer (archive reconstruction, git revwalks) never observes cancellation.
+///
+/// Force-releasing the permit without accounting for the surviving thread is
+/// the core defect in #200: admission capacity is "restored" while the thread
+/// keeps running, so client retries admit fresh copies of the same
+/// uncancellable work without bound — a CPU storm. Admission therefore counts
+/// `DISPATCH_INFLIGHT + DISPATCH_ZOMBIES` against the cap, so a zombie continues
+/// to occupy capacity (providing backpressure against retries) until its thread
+/// actually exits and decrements this counter.
+static DISPATCH_ZOMBIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Current zombie dispatch count (surviving threads past hard grace).
+fn dispatch_zombie_count() -> u32 {
+    DISPATCH_ZOMBIES.load(Ordering::Relaxed)
+}
+
+/// RAII guard that decrements the appropriate dispatch counter on drop, ensuring
+/// accounting stays accurate even when the future is cancelled or panics.
+///
+/// A permit normally counts against `DISPATCH_INFLIGHT`. If hard grace elapses
+/// while the worker is still running, the permit is *zombified*: its accounting
+/// moves from `DISPATCH_INFLIGHT` to `DISPATCH_ZOMBIES` (see
+/// `run_cancellable_blocking_dispatch`), and this Drop then decrements
+/// `DISPATCH_ZOMBIES` when the thread finally exits.
+struct DispatchPermit {
+    zombified: Arc<AtomicBool>,
+}
 
 impl DispatchPermit {
     /// Try to acquire a dispatch slot.  Returns `None` when the server is at
-    /// capacity (`DISPATCH_INFLIGHT >= MAX_CONCURRENT_DISPATCHES`).
+    /// capacity, counting both live in-flight dispatches and surviving zombies
+    /// so uncancellable work that outlived its timeout still exerts backpressure
+    /// against retries (`DISPATCH_INFLIGHT + DISPATCH_ZOMBIES >= cap`).
     fn try_acquire() -> Option<Self> {
         // Relaxed ordering is fine: the counter is advisory and races between
         // concurrent fetch_add calls are harmless (off-by-one at most).
         let prev = DISPATCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
-        if prev >= MAX_CONCURRENT_DISPATCHES {
+        let zombies = DISPATCH_ZOMBIES.load(Ordering::Relaxed);
+        if prev.saturating_add(zombies) >= MAX_CONCURRENT_DISPATCHES {
             DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
             None
         } else {
-            Some(DispatchPermit)
+            Some(DispatchPermit {
+                zombified: Arc::new(AtomicBool::new(false)),
+            })
         }
     }
 }
 
 impl Drop for DispatchPermit {
     fn drop(&mut self) {
-        DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        if self.zombified.load(Ordering::Acquire) {
+            // The inflight slot was already released at hard grace; this thread
+            // was being accounted as a zombie. Release the zombie slot now that
+            // the uncancellable work has finally exited.
+            DISPATCH_ZOMBIES.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -4928,18 +4968,33 @@ where
                 .name("dispatch-hard-grace".into())
                 .spawn(move || {
                     std::thread::sleep(Duration::from_secs(grace_secs));
-                    if let Some(permit) = grace_permit
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take()
-                    {
-                        tracing::error!(
-                            method = %grace_method,
-                            grace_secs,
-                            "hard grace timeout: force-releasing dispatch permit for \
-                             zombie blocking work that ignored cancellation"
-                        );
-                        drop(permit);
+                    let guard = grace_permit.lock().unwrap_or_else(|e| e.into_inner());
+                    // If the worker already finished, its SharedPermitGuard took
+                    // and dropped the permit — nothing to reconcile.
+                    if let Some(permit) = guard.as_ref() {
+                        // The worker thread is still alive and ignoring
+                        // cancellation. Do NOT drop the permit here: dropping it
+                        // would restore admission capacity while the thread keeps
+                        // burning a core, letting retries multiply uncancellable
+                        // work without bound (#200). Instead, *transfer* the
+                        // accounting from the live-dispatch counter to the zombie
+                        // counter and leave the permit with the worker. The slot
+                        // stays occupied (inflight+zombie is unchanged) so retries
+                        // hit backpressure; when the thread finally exits, its
+                        // permit Drop clears the zombie slot.
+                        if !permit.zombified.swap(true, Ordering::AcqRel) {
+                            DISPATCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+                            let zombies = DISPATCH_ZOMBIES.fetch_add(1, Ordering::Relaxed) + 1;
+                            tracing::error!(
+                                method = %grace_method,
+                                grace_secs,
+                                zombies,
+                                "hard grace timeout: blocking work ignored cancellation; \
+                                 accounting it as a zombie so it keeps occupying admission \
+                                 capacity until the thread exits (prevents retry-amplified \
+                                 CPU storms)"
+                            );
+                        }
                     }
                 })
                 .ok();
@@ -10643,6 +10698,7 @@ impl HttpState {
             tracing::warn!(
                 path = %path,
                 inflight = MAX_CONCURRENT_DISPATCHES,
+                zombies = dispatch_zombie_count(),
                 "mail route admission control: too many concurrent requests, rejecting",
             );
             return self.error_response(
@@ -11353,6 +11409,7 @@ to skip auth for local requests.</p>
             tracing::warn!(
                 method = %method,
                 inflight = MAX_CONCURRENT_DISPATCHES,
+                zombies = dispatch_zombie_count(),
                 "dispatch admission control: too many concurrent requests, rejecting",
             );
             return id.map(|req_id| {
@@ -16494,14 +16551,21 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_hard_grace_force_releases_permit_when_closure_ignores_cancel() {
+    fn dispatch_hard_grace_accounts_zombie_against_admission_capacity() {
         with_serialized_dispatch_permits(|| {
             mcp_agent_mail_core::config::with_process_env_overrides_for_test(
                 &[("AM_DISPATCH_HARD_GRACE_SECS", "5")],
                 || {
                     let permit = DispatchPermit::try_acquire().expect("permit available");
-                    let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
-                    assert!(before >= 1);
+                    let inflight_before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+                    let zombies_before = DISPATCH_ZOMBIES.load(Ordering::Relaxed);
+                    assert!(inflight_before >= 1);
+
+                    // A stuck closure that ignores cancellation until explicitly
+                    // released, modelling reconstruct/revwalk work that never sees
+                    // the dispatch cancellation token.
+                    let release = Arc::new(AtomicBool::new(false));
+                    let release_worker = Arc::clone(&release);
 
                     let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
                         "test/zombie-closure".to_string(),
@@ -16510,32 +16574,62 @@ mod tests {
                         DispatchCancel::new(),
                         Arc::new(Mutex::new(Some(permit))),
                         move |_cancel| {
-                            // Deliberately ignore cancellation; simulate a stuck closure.
-                            std::thread::sleep(Duration::from_secs(10));
+                            while !release_worker.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
                             Ok(())
                         },
                     ));
 
                     assert!(result.is_err(), "dispatch timeout must return an error");
 
-                    // Permit should still be held immediately after timeout (grace not expired).
+                    // During the grace window the work is still accounted as a
+                    // live in-flight dispatch (permit not yet transferred).
                     assert_eq!(
                         DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-                        before,
-                        "permit must remain held during grace window"
+                        inflight_before,
+                        "permit must remain an in-flight slot during grace window"
                     );
 
-                    // Wait for the hard grace timeout (5s) + epsilon.
+                    // After hard grace, the still-running thread is reclassified
+                    // as a zombie: the in-flight slot is released BUT the zombie
+                    // counter rises by one, so total admission occupancy
+                    // (inflight + zombies) is unchanged — retries still hit the cap.
                     let wait_started = Instant::now();
-                    while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
-                        && wait_started.elapsed() < Duration::from_secs(7)
+                    while DISPATCH_ZOMBIES.load(Ordering::Relaxed) <= zombies_before
+                        && wait_started.elapsed() < Duration::from_secs(8)
                     {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     assert_eq!(
                         DISPATCH_INFLIGHT.load(Ordering::Relaxed),
-                        before - 1,
-                        "hard grace timeout must force-release the permit"
+                        inflight_before - 1,
+                        "hard grace must release the in-flight dispatch slot"
+                    );
+                    assert_eq!(
+                        DISPATCH_ZOMBIES.load(Ordering::Relaxed),
+                        zombies_before + 1,
+                        "the surviving thread must be accounted as a zombie, not vanish"
+                    );
+
+                    // When the uncancellable work finally exits, the zombie slot
+                    // is reclaimed — capacity is only restored once the CPU stops.
+                    release.store(true, Ordering::Release);
+                    let release_started = Instant::now();
+                    while DISPATCH_ZOMBIES.load(Ordering::Relaxed) > zombies_before
+                        && release_started.elapsed() < Duration::from_secs(5)
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert_eq!(
+                        DISPATCH_ZOMBIES.load(Ordering::Relaxed),
+                        zombies_before,
+                        "zombie slot must be reclaimed after the thread exits"
+                    );
+                    assert_eq!(
+                        DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                        inflight_before - 1,
+                        "in-flight count stays released after the zombie clears"
                     );
                 },
             );

@@ -8061,9 +8061,26 @@ pub fn get_recent_commits(
 
     let mut commits = Vec::new();
 
+    // Hard ceiling on how many commits we will examine when a path filter is
+    // present. Without it, a filter that matches fewer than `limit` commits
+    // (e.g. a freshly registered agent whose archive path barely appears in
+    // history) forces a walk over the *entire* archive history — the whois CPU
+    // bomb in #200. The per-commit check below is O(path-depth) tree lookups,
+    // so this budget bounds worst-case work to a small, quick scan while still
+    // finding recent matches for any active agent. Best-effort enrichment only;
+    // truncation just yields fewer "recent commits", never incorrect data.
+    let scan_budget = path_filter.map(|_| recent_commits_scan_budget());
+    let mut scanned: usize = 0;
+
     for oid_result in revwalk {
         if commits.len() >= limit {
             break;
+        }
+        if let Some(budget) = scan_budget {
+            if scanned >= budget {
+                break;
+            }
+            scanned += 1;
         }
         let oid = oid_result?;
         let commit = repo.find_commit(oid)?;
@@ -8100,48 +8117,53 @@ pub fn get_recent_commits(
     Ok(commits)
 }
 
+/// Default hard ceiling on commits examined by [`get_recent_commits`] when a
+/// path filter is present. Overridable via `AM_RECENT_COMMITS_SCAN_BUDGET`.
+const DEFAULT_RECENT_COMMITS_SCAN_BUDGET: usize = 20_000;
+
+fn recent_commits_scan_budget() -> usize {
+    mcp_agent_mail_core::config::env_value("AM_RECENT_COMMITS_SCAN_BUDGET")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_RECENT_COMMITS_SCAN_BUDGET)
+}
+
 /// Check if a commit touches files under a given path prefix.
-fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
+///
+/// Fast path (non-root commits): compare the object id of the tree/blob entry
+/// at `path_prefix` between this commit and its first parent. Anything that
+/// changes under a directory changes that directory's subtree oid, so an
+/// unchanged oid means nothing under the path was touched — an O(path-depth)
+/// check that loads only the trees along the path. The previous implementation
+/// ran a full, un-pathspec'd `diff_tree_to_tree` per commit, which loads every
+/// tree in the commit and was the dominant cost in the whois CPU storm (#200).
+fn commit_touches_path(_repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
     let filter = Path::new(path_prefix);
     let tree = match commit.tree() {
         Ok(t) => t,
         Err(_) => return false,
     };
 
-    // Check if any entry in the diff starts with path_prefix
+    // Root commit: no parent to diff against; inspect the tree directly.
     if commit.parent_count() == 0 {
-        // Root commit: check all entries
         return tree_contains_prefix(&tree, filter);
     }
 
-    if let Ok(parent) = commit.parent(0)
-        && let Ok(parent_tree) = parent.tree()
-        && let Ok(diff) = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
-    {
-        let mut found = false;
-        let _ = diff.foreach(
-            &mut |delta, _progress| {
-                let touches_new = delta
-                    .new_file()
-                    .path()
-                    .is_some_and(|path| repo_path_matches_filter(path, filter));
-                let touches_old = delta
-                    .old_file()
-                    .path()
-                    .is_some_and(|path| repo_path_matches_filter(path, filter));
-                if touches_new || touches_old {
-                    found = true;
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        );
-        return found;
-    }
+    let Ok(parent) = commit.parent(0) else {
+        return false;
+    };
+    let Ok(parent_tree) = parent.tree() else {
+        return false;
+    };
 
-    false
+    // `get_path` resolves the entry (blob or subtree) at the exact path,
+    // returning Err when absent. Presence-or-oid change ⇒ the path was touched.
+    // This matches the prior component-wise prefix semantics: a directory's
+    // subtree oid captures every descendant, and sibling names that merely
+    // share a textual prefix (`name` vs `name2`) resolve to distinct entries.
+    let current = tree.get_path(filter).ok().map(|entry| entry.id());
+    let parent = parent_tree.get_path(filter).ok().map(|entry| entry.id());
+    current != parent
 }
 
 /// Find the commit that introduced a specific file path.
@@ -17156,6 +17178,65 @@ mod tests {
 
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert!(head.tree().unwrap().get_path(Path::new(&rel)).is_err());
+    }
+
+    /// #200 (whois CPU bomb): `get_recent_commits` with a path filter must
+    /// select only commits that touch the path (fast subtree-oid check), and a
+    /// bounded scan budget must cap the walk so a filter matching few commits
+    /// cannot force a full-history traversal.
+    #[test]
+    fn get_recent_commits_path_filter_is_selective_and_budget_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "recent-commits-filter").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+
+        let commit_file = |rel_dir: &str, name: &str, body: &str, msg: &str| {
+            let file_path = archive.root.join(rel_dir).join(name);
+            fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            fs::write(&file_path, body).unwrap();
+            let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+            commit_paths(&repo, &config, msg, &[rel.as_str()]).unwrap();
+        };
+
+        // Oldest: the single commit touching AgentA. Then 5 AgentB commits on top.
+        commit_file("agents/AgentA", "profile.json", r#"{"a":1}"#, "touch AgentA");
+        for i in 0..5 {
+            commit_file(
+                "agents/AgentB",
+                "profile.json",
+                &format!(r#"{{"b":{i}}}"#),
+                &format!("touch AgentB {i}"),
+            );
+        }
+
+        // Default budget: the AgentA commit is found despite 5 newer AgentB commits.
+        let hits = get_recent_commits(&archive, 10, Some("agents/AgentA")).unwrap();
+        assert_eq!(hits.len(), 1, "exactly one commit touches AgentA");
+        assert_eq!(hits[0].summary, "touch AgentA");
+
+        // AgentB filter returns its commits and never the AgentA one.
+        let b_hits = get_recent_commits(&archive, 10, Some("agents/AgentB")).unwrap();
+        assert_eq!(b_hits.len(), 5, "all five AgentB commits match");
+        assert!(b_hits.iter().all(|c| c.summary.starts_with("touch AgentB")));
+
+        // A never-committed path yields nothing (and, crucially, returns).
+        let ghost = get_recent_commits(&archive, 10, Some("agents/Ghost")).unwrap();
+        assert!(ghost.is_empty(), "no commit touches a non-existent agent");
+
+        // Tight budget: only the 3 newest commits (all AgentB) are examined, so
+        // the older AgentA commit falls outside the scan window and is skipped —
+        // proving the budget bounds the walk instead of scanning all history.
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_RECENT_COMMITS_SCAN_BUDGET", "3")],
+            || {
+                let bounded = get_recent_commits(&archive, 10, Some("agents/AgentA")).unwrap();
+                assert!(
+                    bounded.is_empty(),
+                    "budget=3 must stop before reaching the older AgentA commit"
+                );
+            },
+        );
     }
 
     /// br-bvq1x.9.7 (ts2): an interrupted gc/repack can leave the branch tip

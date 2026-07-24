@@ -70,7 +70,6 @@ hybrid = [
     "tantivy-engine",
     "semantic",
     "frankensearch/lexical",
-    "frankensearch-fusion/lexical",
 ]
 
 [dev-dependencies]

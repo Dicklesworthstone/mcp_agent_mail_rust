@@ -81,7 +81,6 @@ hybrid = [
     "frankensearch-embed/hash",
     "frankensearch-embed/model2vec",
     "dep:frankensearch-fusion",
-    "frankensearch-fusion/lexical",
     "dep:frankensearch-index",
     "dep:half",
     "dep:wide",

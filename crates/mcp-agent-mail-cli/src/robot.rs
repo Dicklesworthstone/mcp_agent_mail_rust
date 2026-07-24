@@ -7506,6 +7506,13 @@ struct ReservationsData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     my_reservations: Vec<ReservationEntry>,
     all_active: Vec<ReservationEntry>,
+    /// Overlap-only projection of `all_active`: the subset of active leases that
+    /// actually participate in a conflict. Additive to `all_active` (which stays
+    /// the authoritative scoped snapshot on every read surface, including the
+    /// conflict-focused view) so conflict consumers can narrow to overlaps
+    /// without an operator mistaking "no overlaps" for "no active reservations".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    conflicting_active: Vec<ReservationEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     conflicts: Vec<ReservationConflict>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -7893,19 +7900,27 @@ fn build_reservations(
 
     // Apply filters
     if conflicts_only {
-        // Only keep entries involved in conflicts
+        // Compute the overlap-only projection, but keep `all_active` as the
+        // authoritative scoped snapshot. Previously the conflict-focused view
+        // *replaced* `all_active` with the overlap-only subset, so a live,
+        // non-overlapping reservation vanished from this one read surface while
+        // remaining visible in the normal/active/list/robot views — an operator
+        // could read "no overlaps" as "no active reservations" (#199). The
+        // narrower set is now surfaced additively as `conflicting_active`.
         let conflict_paths: std::collections::HashSet<String> = scoped_conflicts
             .iter()
             .flat_map(|c| vec![c.path_a.clone(), c.path_b.clone()])
             .collect();
-        let filtered: Vec<_> = scoped_all_active
-            .into_iter()
+        let conflicting_active: Vec<_> = scoped_all_active
+            .iter()
             .filter(|e| conflict_paths.contains(&e.path))
+            .cloned()
             .collect();
         return Ok((
             ReservationsData {
                 my_reservations: vec![],
-                all_active: filtered,
+                all_active: scoped_all_active,
+                conflicting_active,
                 conflicts: scoped_conflicts,
                 expiring_soon: vec![],
                 playbooks: scoped_playbooks,
@@ -7925,6 +7940,7 @@ fn build_reservations(
             ReservationsData {
                 my_reservations: my_reservations.clone(),
                 all_active: scoped_all_active,
+                conflicting_active: vec![],
                 conflicts: scoped_conflicts,
                 expiring_soon: scoped_expiring_soon,
                 playbooks: scoped_playbooks,
@@ -7940,6 +7956,7 @@ fn build_reservations(
         ReservationsData {
             my_reservations,
             all_active,
+            conflicting_active: vec![],
             conflicts,
             expiring_soon,
             playbooks,
@@ -17704,6 +17721,7 @@ mod tests {
                     granted_at: Some("55m ago".into()),
                 },
             ],
+            conflicting_active: vec![],
             conflicts: vec![ReservationConflict {
                 agent_a: "BlueLake".into(),
                 path_a: "src/auth/**".into(),
@@ -24129,6 +24147,62 @@ mod tests {
             "playbook should preserve orphaned holder identity: {:?}",
             data.playbooks[0]
         );
+    }
+
+    #[test]
+    fn build_reservations_conflicts_view_keeps_all_active_authoritative() {
+        // #199: the conflict-focused view must not drop non-overlapping active
+        // leases from `all_active`. It exposes the overlap-only subset via the
+        // additive `conflicting_active` field instead.
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let expires = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000);
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL),
+                (3, 1, 3, 'docs/**', 1, 'c', 0, ?, NULL)",
+            &[expires.clone(), expires.clone(), expires],
+        )
+        .expect("insert reservations");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, true, Some(10))
+            .expect("build reservations");
+
+        // The non-overlapping docs/** lease must remain visible in all_active.
+        assert_eq!(
+            data.all_active.len(),
+            3,
+            "conflict view must keep every active lease in all_active: {:?}",
+            data.all_active
+        );
+        assert!(
+            data.all_active.iter().any(|e| e.path == "docs/**"),
+            "non-overlapping lease must survive the conflict view: {:?}",
+            data.all_active
+        );
+
+        // conflicting_active is the overlap-only projection (the two auth paths).
+        assert_eq!(data.conflicting_active.len(), 2, "{:?}", data.conflicting_active);
+        assert!(
+            data.conflicting_active
+                .iter()
+                .all(|e| e.path.starts_with("src/auth")),
+            "conflicting_active must contain only overlapping leases: {:?}",
+            data.conflicting_active
+        );
+        assert!(
+            !data.conflicting_active.iter().any(|e| e.path == "docs/**"),
+            "docs/** does not overlap and must be excluded from conflicting_active"
+        );
+        assert_eq!(data.conflicts.len(), 1);
+
+        // Serialized shape: both fields present and distinct.
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["all_active"].as_array().unwrap().len(), 3);
+        assert_eq!(json["conflicting_active"].as_array().unwrap().len(), 2);
     }
 
     #[test]
