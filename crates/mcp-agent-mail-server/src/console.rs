@@ -4302,7 +4302,7 @@ mod tests {
     #[test]
     fn console_caps_from_capabilities_maps_fields() {
         let mut ftui_caps = ftui::TerminalCapabilities::basic();
-        ftui_caps.true_color = true;
+        ftui_caps.color_depth = ftui::ColorDepth::TrueColor;
         ftui_caps.osc8_hyperlinks = true;
         ftui_caps.mouse_sgr = false;
         ftui_caps.sync_output = true;
