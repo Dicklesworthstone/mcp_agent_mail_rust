@@ -25,6 +25,10 @@
 
 mod archive_read;
 
+/// Stack size for threads that may run the archive reconstruction/salvage
+/// path. Shared so every such thread is sized consistently (GH#202).
+pub use archive_read::worker_stack_size as archive_snapshot_worker_stack_size;
+
 pub mod build_slots;
 pub mod contacts;
 pub mod degraded_intents;

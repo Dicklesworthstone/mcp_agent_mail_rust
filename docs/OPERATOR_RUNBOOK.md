@@ -303,6 +303,23 @@ is used in hot paths.
 | `AM_HEALTH_SWEEP_INTERVAL_SEC`  | `900`   | Seconds between git ref-integrity sweep cycles |
 | `AM_HEALTH_SWEEP_BATCH`         | `5`     | Registered projects checked per sweep cycle |
 
+### Archive Read Snapshots
+
+Archive-backed reads build their snapshots on dedicated `am-archive-read`
+worker threads. These run the full reconstruction/salvage path, which is much
+deeper than Rust's 2 MiB default for spawned threads, so each worker is given
+an explicit 32 MiB stack. Leaving these at their defaults is correct for
+essentially all deployments.
+
+| Variable                                     | Default | Description                          |
+|----------------------------------------------|---------|--------------------------------------|
+| `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB`      | `32`    | Stack (MiB) per `am-archive-read` snapshot worker, clamped to 8..512. Raise only if a production-scale archive still overflows; a value below the floor is clamped up rather than honored. |
+| `MCP_AGENT_MAIL_READ_SNAPSHOT_EXACT_AUDIT_MS`| `1000`  | Interval between exact (content-hash) generation audits, capped at 30s |
+
+`RUST_MIN_STACK` is also honored: the worker stack is the larger of the
+configured value and `RUST_MIN_STACK`, so an existing environment-level
+workaround is never silently lowered by the built-in default.
+
 ### TUI
 
 | Variable               | Default   | Description                          |

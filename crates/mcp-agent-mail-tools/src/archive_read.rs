@@ -23,6 +23,26 @@ const WAIT_SLICE: Duration = Duration::from_millis(25);
 const EXACT_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
 const GENERATION_RETRIES: usize = 3;
 
+/// Stack reserved for each `am-archive-read` snapshot worker.
+///
+/// These workers run the full archive reconstruction/salvage path
+/// (`reconstruct_from_archive_with_salvage` -> FrankenSQLite schema replay and
+/// the salvage merge). On production-scale mailboxes that path is far deeper
+/// than Rust's 2 MiB default for spawned threads, so the worker aborted the
+/// whole process with "thread 'am-archive-read' has overflowed its stack"
+/// (GH#202: ~2.6k agents / ~18.3k messages). The main thread never hit this
+/// because it gets the process's 8 MiB rlimit stack instead.
+///
+/// Thread stacks are reserved as virtual address space and committed lazily on
+/// the platforms we ship, so the resident cost is only the pages actually
+/// touched. At `WORKER_LIMIT` (4) concurrent workers this reserves 128 MiB of
+/// address space, which is immaterial on 64-bit.
+const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+/// Lower bound for the operator override; below this GH#202 reproduces.
+const WORKER_STACK_SIZE_MIN: usize = 8 * 1024 * 1024;
+/// Upper bound for the operator override, to keep a typo from reserving TiBs.
+const WORKER_STACK_SIZE_MAX: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AcquireError {
     Cancelled,
@@ -804,7 +824,28 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
         }
         let after = exact_generation(&slot.scope, build.deadline)?;
         let cheap_after = cheap_generation(&slot.scope, build.deadline)?;
-        if before == after && cheap_before == cheap_after {
+        // GH#203: publish on exact-generation (content) stability alone.
+        //
+        // The snapshot decision above opens the live database, and a
+        // FrankenSQLite open can perturb file metadata without changing a byte
+        // of content — on macOS/APFS every open bumps the db mtime and
+        // checkpoint-truncates the WAL when it can take the lock. A cheap
+        // (metadata) comparison spanning those probes therefore never
+        // converges on macOS: every build returned Busy, `acquire_if_needed`
+        // re-claimed in a tight loop, and every DB-read tool call burned the
+        // full dispatch budget.
+        //
+        // Dropping the cheap half does not weaken the #198 contract. Writes
+        // are bracketed by `WriteGuard`, which advances both `WRITER_EPOCH`
+        // and the slot invalidation epoch on entry *and* exit, and publication
+        // is fenced on those epochs below — so a write that landed and
+        // reverted inside the probe window (the case content hashing alone
+        // cannot see) is still caught. `cheap_before` remains authoritative on
+        // the ready-shortcut arm above, where no probe runs between its two
+        // cheap reads. The published baseline is the post-probe `cheap_after`,
+        // so the ready fast-path — which opens nothing — stays stable until a
+        // durable write actually lands.
+        if before == after {
             return Ok(BuildOutput {
                 generation: after,
                 cheap: cheap_after,
@@ -954,6 +995,7 @@ fn spawn_build(slot: Arc<Slot>, database_url: String, build: &Build) -> Result<(
     let worker_slot = Arc::clone(&slot);
     std::thread::Builder::new()
         .name("am-archive-read".to_string())
+        .stack_size(worker_stack_size())
         .spawn(move || {
             let mut guard = WorkerBuildGuard::new(Arc::clone(&worker_slot), worker_build.clone());
             let result = run_build(&worker_slot, &database_url, &worker_build);
@@ -1002,6 +1044,53 @@ fn exact_audit_interval() -> Duration {
         .map(Duration::from_millis)
         .unwrap_or(EXACT_AUDIT_INTERVAL)
         .min(Duration::from_secs(30))
+}
+
+/// Stack size for archive-read snapshot workers, in bytes.
+///
+/// Defaults to [`WORKER_STACK_SIZE`] and is tunable via
+/// `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB` (megabytes), clamped to
+/// `[WORKER_STACK_SIZE_MIN, WORKER_STACK_SIZE_MAX]`.
+///
+/// `Builder::stack_size` takes precedence over `RUST_MIN_STACK` in std, so we
+/// fold `RUST_MIN_STACK` in explicitly: operators who already raised it as a
+/// GH#202 workaround keep that headroom instead of being silently lowered to
+/// our default.
+/// Stack size, in bytes, for any thread that may run the archive
+/// reconstruction/salvage path.
+///
+/// Exposed because `am-archive-read` is not the only such thread: the operator
+/// dashboard's refresh worker reaches the same
+/// `reconstruct_from_archive_with_salvage` path via
+/// `ObservabilitySyncDb::archive_snapshot`, and would abort the process the
+/// same way (GH#202) if left on the 2 MiB default.
+pub fn worker_stack_size() -> usize {
+    resolve_worker_stack_size(
+        read_usize_env("MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB"),
+        read_usize_env("RUST_MIN_STACK"),
+    )
+}
+
+fn read_usize_env(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// Pure resolution for [`worker_stack_size`], split out so the clamping and
+/// `RUST_MIN_STACK` precedence rules are testable without mutating process
+/// environment (this crate is `#![forbid(unsafe_code)]`, and `set_var` is
+/// `unsafe` in edition 2024).
+fn resolve_worker_stack_size(
+    configured_mb: Option<usize>,
+    rust_min_stack_bytes: Option<usize>,
+) -> usize {
+    let configured = configured_mb
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .unwrap_or(WORKER_STACK_SIZE)
+        .clamp(WORKER_STACK_SIZE_MIN, WORKER_STACK_SIZE_MAX);
+
+    configured.max(rust_min_stack_bytes.unwrap_or(0))
 }
 
 pub(crate) async fn acquire_if_needed(
@@ -1121,6 +1210,77 @@ mod tests {
     use std::sync::Barrier;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// GH#202: `am-archive-read` workers must not run on Rust's 2 MiB default
+    /// stack. Guards both the default and the operator override contract.
+    #[test]
+    fn archive_read_worker_stack_size_stays_above_the_default() {
+        // Default must clear the 2 MiB spawned-thread default that overflowed.
+        assert_eq!(resolve_worker_stack_size(None, None), WORKER_STACK_SIZE);
+        assert!(
+            WORKER_STACK_SIZE > 2 * 1024 * 1024,
+            "default worker stack must exceed the 2 MiB spawned-thread default"
+        );
+
+        // An override below the floor is clamped up, so GH#202 cannot be
+        // reintroduced by a stray small value.
+        assert_eq!(resolve_worker_stack_size(Some(1), None), WORKER_STACK_SIZE_MIN);
+
+        // An absurd override is clamped down rather than reserving TiBs, and an
+        // overflowing one falls back to the default instead of wrapping.
+        assert_eq!(
+            resolve_worker_stack_size(Some(999_999), None),
+            WORKER_STACK_SIZE_MAX
+        );
+        assert_eq!(
+            resolve_worker_stack_size(Some(usize::MAX), None),
+            WORKER_STACK_SIZE
+        );
+
+        // A sane override is honored verbatim.
+        assert_eq!(resolve_worker_stack_size(Some(64), None), 64 * 1024 * 1024);
+
+        // RUST_MIN_STACK headroom (the documented GH#202 workaround) is never
+        // silently lowered by our explicit stack_size...
+        assert_eq!(
+            resolve_worker_stack_size(None, Some(128 * 1024 * 1024)),
+            128 * 1024 * 1024
+        );
+
+        // ...but a smaller RUST_MIN_STACK never drags the default down.
+        assert_eq!(
+            resolve_worker_stack_size(None, Some(1024 * 1024)),
+            WORKER_STACK_SIZE
+        );
+    }
+
+    /// Proves the configured stack actually carries a frame depth that would
+    /// abort on the 2 MiB default, i.e. that `.stack_size()` is really applied.
+    #[test]
+    fn archive_read_worker_stack_survives_deep_frames() {
+        fn burn(depth: usize) -> usize {
+            // ~4 KiB of live stack per frame, opaque to the optimizer so the
+            // recursion cannot be turned into a loop or elided.
+            let mut frame = [0u8; 4096];
+            frame[0] = depth as u8;
+            frame[4095] = depth as u8;
+            std::hint::black_box(&frame);
+            if depth == 0 {
+                return 0;
+            }
+            burn(depth - 1) + usize::from(frame[0])
+        }
+
+        // 1024 frames x ~4 KiB is ~4 MiB of stack: comfortably over the 2 MiB
+        // default, comfortably under WORKER_STACK_SIZE_MIN.
+        let handle = std::thread::Builder::new()
+            .name("am-archive-read-stack-test".to_string())
+            .stack_size(worker_stack_size())
+            .spawn(|| burn(1024))
+            .expect("spawn archive-read stack probe");
+
+        handle.join().expect("archive-read stack probe must not overflow");
+    }
 
     fn write_archive_fixture(root: &Path) {
         let project = root.join("projects").join("single-flight-project");

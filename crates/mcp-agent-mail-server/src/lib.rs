@@ -8288,6 +8288,12 @@ impl StartupDashboard {
         let this = Arc::clone(self);
         let handle = std::thread::Builder::new()
             .name("mcp-agent-mail-dashboard".to_string())
+            // GH#202: `dashboard_open_connection` can fall back to
+            // `ObservabilitySyncDb::archive_snapshot`, which runs the same full
+            // reconstruction/salvage path that overflowed the 2 MiB spawned-thread
+            // default on a production-scale archive. Size this worker like the
+            // `am-archive-read` workers so the dashboard cannot abort the process.
+            .stack_size(mcp_agent_mail_tools::archive_snapshot_worker_stack_size())
             .spawn(move || {
                 let mut db_conn =
                     dashboard_open_connection(&this.database_url, Path::new(&this.storage_root));
