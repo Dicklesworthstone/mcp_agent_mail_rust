@@ -2413,15 +2413,34 @@ effective_free_bytes={free}"
         mcp_agent_mail_db::queries::get_message(ctx.cx(), &pool, message_id).await,
     )?;
     if original.project_id != project_id {
-        return Err(legacy_tool_error(
-            "NOT_FOUND",
-            format!("Message not found: {message_id}"),
-            true,
-            json!({
-                "entity": "Message",
-                "identifier": message_id,
-            }),
-        ));
+        // The message may hang off a forked row for the same project identity
+        // (case-variant or reassigned project ids: #186/#187/#194). Every other
+        // message surface scopes by agent/recipient rather than project-row
+        // equality, so compare project identity, not row id, before rejecting.
+        let owner_is_alias = match mcp_agent_mail_db::queries::get_project_by_id(
+            ctx.cx(),
+            &pool,
+            original.project_id,
+        )
+        .await
+        {
+            Outcome::Ok(owner) => {
+                owner.slug == project.slug
+                    || owner.human_key.eq_ignore_ascii_case(&project.human_key)
+            }
+            _ => false,
+        };
+        if !owner_is_alias {
+            return Err(legacy_tool_error(
+                "NOT_FOUND",
+                format!("Message not found: {message_id}"),
+                true,
+                json!({
+                    "entity": "Message",
+                    "identifier": message_id,
+                }),
+            ));
+        }
     }
 
     // Resolve importance: use override if provided, otherwise inherit from original.
