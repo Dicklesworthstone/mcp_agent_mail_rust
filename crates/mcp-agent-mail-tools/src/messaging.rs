@@ -12,7 +12,7 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::{
     Config, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
-    append_tail_latency_evidence_if_configured,
+    append_tail_latency_evidence_if_configured, compute_project_slug,
 };
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
@@ -2413,15 +2413,55 @@ effective_free_bytes={free}"
         mcp_agent_mail_db::queries::get_message(ctx.cx(), &pool, message_id).await,
     )?;
     if original.project_id != project_id {
-        return Err(legacy_tool_error(
-            "NOT_FOUND",
-            format!("Message not found: {message_id}"),
-            true,
-            json!({
-                "entity": "Message",
-                "identifier": message_id,
-            }),
-        ));
+        // GH#204: this is the only message surface that gates on raw project
+        // row equality; `fetch_inbox` / `mark_message_read` scope by agent id
+        // instead. A mailbox created before the #194 case-alias collapse can
+        // carry two project rows for one logical project (case-variant keys on
+        // a case-insensitive filesystem), so a message every other tool
+        // resolves would be reported here as a spurious NOT_FOUND. Accept the
+        // reply when the owning row is an alias of the requested project, and
+        // otherwise fail with an error that names the real owner instead of
+        // misdirecting debugging toward the message store.
+        let owner = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), &pool, original.project_id)
+                .await,
+        )
+        .ok();
+
+        let aliases_requested_project = owner.as_ref().is_some_and(|owner| {
+            owner.slug == project.slug
+                || compute_project_slug(&owner.human_key) == compute_project_slug(&project.human_key)
+        });
+
+        if !aliases_requested_project {
+            // Say *why* the lookup failed without disclosing the owning
+            // project. Message ids are globally sequential, so echoing the
+            // owner's human_key here would let any agent enumerate ids to map
+            // out projects it has no access to. Naming the failure mode is
+            // what saves the debugging time; naming the other project is not.
+            let detail = if owner.is_some() {
+                format!(
+                    "Message not found: {message_id} (the id exists but belongs to a different project; \
+                     it is not reachable from '{}'). If you expected it here, the project's identity \
+                     rows may have forked — check `am doctor` and the project key spelling.",
+                    project.human_key
+                )
+            } else {
+                format!("Message not found: {message_id}")
+            };
+            return Err(legacy_tool_error(
+                "NOT_FOUND",
+                detail,
+                true,
+                json!({
+                    "entity": "Message",
+                    "identifier": message_id,
+                    "requested_project_id": project_id,
+                    "requested_project_key": project.human_key.clone(),
+                    "belongs_to_other_project": owner.is_some(),
+                }),
+            ));
+        }
     }
 
     // Resolve importance: use override if provided, otherwise inherit from original.

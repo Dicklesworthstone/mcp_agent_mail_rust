@@ -305,6 +305,121 @@ fn test_reply_message_not_found() {
 }
 
 // -----------------------------------------------------------------------
+// GH#204: cross-project reply stays rejected, but names the real owner
+// -----------------------------------------------------------------------
+
+/// `reply_message` is the only message surface that gates on project row
+/// identity, which made a forked-identity mailbox surface as a bare
+/// "Message not found" that misdirected debugging toward the message store.
+///
+/// This locks in both halves of the fix: a reply aimed at a genuinely
+/// different project is still refused (the security property), and the error
+/// now identifies the owning project instead of implying the id is unknown.
+///
+/// Note the alias-*acceptance* half of GH#204 only arises on case-insensitive
+/// filesystems, where two case-variant keys denote one logical project. On a
+/// case-sensitive filesystem they are legitimately distinct projects, so it is
+/// not expressible here and is deliberately not asserted.
+#[test]
+fn test_reply_message_cross_project_reports_owning_project() {
+    run_serial_async(|cx| async move {
+        let suffix = unique_suffix();
+        let owning_key = format!("/tmp/msg_reply_owner-{suffix}");
+        let other_key = format!("/tmp/msg_reply_other-{suffix}");
+        let ctx = McpContext::new(cx.clone(), 1);
+
+        setup_project_and_agent(&ctx, &owning_key, "BlueLake").await;
+        setup_project_and_agent(&ctx, &owning_key, "RedPeak").await;
+        setup_project_and_agent(&ctx, &other_key, "GreenVale").await;
+
+        let result = send_message(
+            &ctx,
+            owning_key.clone(),
+            "BlueLake".to_string(),
+            vec!["RedPeak".to_string()],
+            "Owned subject".to_string(),
+            "Hello".to_string(),
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            None, // importance
+            None, // ack_required
+            None, // thread_id
+            None, // topic
+            None, // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
+        )
+        .await
+        .expect("send_message should succeed");
+
+        let parsed: Value = serde_json::from_str(&result).expect("valid JSON");
+        let msg_id = parsed["deliveries"][0]["payload"]["id"]
+            .as_i64()
+            .expect("message id");
+
+        // Replying from an unrelated project must still be refused.
+        let err = reply_message(
+            &ctx,
+            other_key.clone(),
+            msg_id,
+            "GreenVale".to_string(),
+            "Reply body".to_string(),
+            None, // to
+            None, // cc
+            None, // bcc
+            None, // subject_prefix
+            None, // importance
+            None, // ack_required
+            None, // attachment_paths
+            None, // convert_images
+            None, // sender_token
+        )
+        .await
+        .expect_err("cross-project reply must be refused");
+
+        let payload = error_object(&err);
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("NOT_FOUND"));
+        assert_eq!(
+            payload.get("recoverable").and_then(Value::as_bool),
+            Some(true),
+        );
+
+        // The diagnostic must say the id exists but is out of scope, rather
+        // than implying it does not exist at all...
+        let details = payload
+            .get("data")
+            .and_then(Value::as_object)
+            .expect("error should carry structured data");
+        assert_eq!(
+            details.get("requested_project_key").and_then(Value::as_str),
+            Some(other_key.as_str()),
+            "error should record which project was asked for"
+        );
+        assert_eq!(
+            details.get("belongs_to_other_project").and_then(Value::as_bool),
+            Some(true),
+            "error should distinguish 'wrong project' from 'no such message'"
+        );
+
+        // ...but it must NOT disclose the owning project. Message ids are
+        // globally sequential, so leaking the owner's key here would let any
+        // agent enumerate ids to map out projects it cannot access.
+        let rendered = serde_json::to_string(&payload).expect("serialize error payload");
+        assert!(
+            !rendered.contains(owning_key.as_str()),
+            "error payload must not disclose the owning project key: {rendered}"
+        );
+        assert!(
+            !err.message.contains(owning_key.as_str()),
+            "error message must not disclose the owning project key: {}",
+            err.message
+        );
+    });
+}
+
+// -----------------------------------------------------------------------
 // T11.4: Reply subject prefix (Re:) — idempotent, case-insensitive
 // -----------------------------------------------------------------------
 
