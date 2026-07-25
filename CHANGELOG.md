@@ -12,6 +12,86 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ---
 
+## [v0.3.23](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.23) — 2026-07-24 **[Release]**
+
+Reliability release. v0.3.22 aborted the daemon on Linux at production scale
+and made every DB read time out on macOS; both are fixed here. Upgrading is
+strongly recommended for anyone on v0.3.22.
+
+### Fixed
+
+- **Worker threads no longer run on Rust's 2 MiB default stack ([#202](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/202)).**
+  A stack overflow is not recoverable in Rust — the runtime aborts the process,
+  it cannot be caught, and every other thread's in-flight work dies with it.
+  `am-archive-read` ran the full archive reconstruction/salvage path on 2 MiB and
+  aborted the daemon on a production-scale mailbox (~2.6k agents / ~18.3k
+  messages), while the same code was fine driven from the main thread's 8 MiB
+  rlimit stack.
+
+  `am-archive-read` was not the only exposure: the operator dashboard's refresh
+  worker reaches the same path via `ObservabilitySyncDb::archive_snapshot` on a
+  1200 ms loop, so fixing only the reported thread would have left the daemon
+  abortable. Sizing is now uniform rather than rationed to threads that look
+  deep — a new `mcp_agent_mail_core::worker_stack` module holds one policy and
+  all 30 `thread::Builder` chains carry an explicit stack size. Thread stacks are
+  reserved address space committed lazily per page, so an untouched 32 MiB stack
+  costs ~0 resident memory.
+
+  Tunable via `MCP_AGENT_MAIL_WORKER_STACK_MB` (clamped 8..512; the legacy
+  `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB` is still honored). `RUST_MIN_STACK` is
+  folded in explicitly, since `Builder::stack_size` would otherwise override it
+  and silently lower operators who had already raised it as a workaround.
+
+- **Archive-read snapshots no longer self-invalidate on macOS ([#203](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/203)).**
+  `run_build` required both the exact (content) and cheap (metadata) generations
+  to agree across its snapshot-decision probes — but the probes themselves open
+  the live database, and a FrankenSQLite open bumps the file's mtime on
+  macOS/APFS without changing a byte. The gate could never converge: every build
+  returned `Busy`, `acquire_if_needed` re-claimed in a tight loop, and every
+  DB-read tool call burned the full 30 s dispatch budget.
+
+  Publication now gates on exact-generation stability alone. This does not weaken
+  the [#198](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/198)
+  contract: writes are bracketed by `WriteGuard`, which advances both
+  `WRITER_EPOCH` and the slot invalidation epoch on entry *and* exit, and
+  publication is fenced on those epochs — so a write that landed and reverted
+  inside the probe window is still caught.
+
+- **`reply_message` no longer reports live messages as missing ([#204](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/204)).**
+  It was the only message surface gating on raw project-row equality, so a
+  mailbox carrying forked identity rows resolved a message everywhere except
+  there. Project identity is now compared via `resolve_project_path` —
+  filesystem canonicalization, which collapses exactly the
+  [#194](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/194)
+  aliases and nothing else. Notably *not* slug comparison: `slugify` collapses
+  every non-alphanumeric run to one dash, so `/srv/app-one` and `/srv/app_one`
+  share a slug, and using it would have admitted replies across distinct
+  projects.
+
+  The rejection now states that the id exists but is out of scope, without
+  naming the owning project — message ids are globally sequential, so echoing
+  the owner's key would let any agent enumerate ids to map projects it cannot
+  access.
+
+### Changed
+
+- ftui 0.5 `TerminalCapabilities`: true-colour detection moved onto the
+  `ColorDepth` enum.
+- Dependency refresh across ~184 packages; asupersync 0.3.9.
+- `docs/OPERATOR_RUNBOOK.md` gains a **Worker Thread Stacks** section covering
+  the sizing policy, the tunables, and the `RUST_MIN_STACK` interaction.
+
+### Known issues
+
+- The 120 s archive-read `BUILD_TIMEOUT` still exceeds the 30 s dispatch
+  timeout, so a build legitimately taking 31–120 s will still time the caller
+  out and invite a retry (noted in
+  [#203](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/203)).
+- FrankenSQLite remains on the published 0.1.18 rather than the newer sibling
+  checkout: `main` there is mid-async-refactor and does not compile.
+
+---
+
 ## [v0.3.22](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.22) — 2026-07-22 **[Release]**
 
 ### Recovery correctness and portable archives
