@@ -4449,6 +4449,16 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     // Cleanup: release any expired (TTL) reservations and any stale reservations.
     //
     // Parity with Python: this resource is allowed to perform best-effort cleanup.
+    //
+    // The mutations must NOT run on the resource pool: since GH#198 that pool
+    // is query-only (or an immutable snapshot), and a release attempt there
+    // fails with "attempt to write a readonly database" — which, propagated,
+    // turned this read surface into an error (br-lwwq5 surfaced this once the
+    // gate starvation was fixed). Cleanup writes take the normal write-path
+    // lease instead; if the mailbox cannot take writes right now, best-effort
+    // means serving the listing without cleanup, not failing the read.
+    let write_pool = crate::tool_util::get_db_pool().ok();
+    let cleanup_pool = write_pool.as_deref();
     let mut released_ids: Vec<i64> = Vec::with_capacity(8);
 
     // We only need agents map + mail cache for stale evaluation.
@@ -4474,11 +4484,12 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts <= now).
     for row in all_rows.iter().filter(|r| r.expires_ts <= now_micros) {
+        let Some(write_db) = cleanup_pool else { break };
         let Some(id) = row.id else { continue };
         let updated = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::force_release_reservation(
                 ctx.cx(),
-                &pool,
+                write_db,
                 id,
                 Some(row.expires_ts),
             )
@@ -4492,6 +4503,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
     for row in all_rows.iter().filter(|r| r.expires_ts > now_micros) {
+        let Some(write_db) = cleanup_pool else { break };
         let Some(id) = row.id else { continue };
         let agent_last_active = agent_by_id
             .get(&row.agent_id)
@@ -4528,7 +4540,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             let updated = db_outcome_to_mcp_result(
                 mcp_agent_mail_db::queries::force_release_reservation(
                     ctx.cx(),
-                    &pool,
+                    write_db,
                     id,
                     Some(row.expires_ts),
                 )
@@ -4579,7 +4591,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         let updated = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::force_release_reservation(
                 ctx.cx(),
-                &pool,
+                write_db,
                 id,
                 Some(row.expires_ts),
             )
@@ -4591,6 +4603,9 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
         released_ids.push(id);
     }
+    // The cleanup mutations are done; release the write lease before the
+    // read-only artifact lookups and the final listing.
+    drop(write_pool);
 
     // Best-effort archive artifact writes for any releases.
     if !released_ids.is_empty() {
@@ -5161,6 +5176,19 @@ mod resource_shape_tests {
         serde_json::from_str(payload).expect("valid JSON")
     }
 
+    /// Seeding pool for tests: the plain live pool WITHOUT a `WriteGuard`
+    /// lease. `get_db_pool()` returns a `WriteDbPool` whose guard brackets
+    /// the holder's entire scope; keeping that lease alive across the read
+    /// assertions starves the archive-read gate's claim admission for the
+    /// full `BUILD_TIMEOUT` — 24 tests each burned the whole 120s deadline
+    /// (br-lwwq5). Production takes the lease per write operation and drops
+    /// it before reads; tests must do the same. The `.clone()` resolves via
+    /// `Deref<Target = DbPool>`, so the `WriteDbPool` temporary (and its
+    /// guard) drops at the end of this statement.
+    fn seed_pool() -> mcp_agent_mail_db::DbPool {
+        get_db_pool().expect("db pool").clone()
+    }
+
     struct PopulatedMailboxFixture {
         ctx: McpContext,
         project_ref: String,
@@ -5172,7 +5200,7 @@ mod resource_shape_tests {
     }
 
     async fn setup_populated_mailbox_fixture(cx: &Cx) -> PopulatedMailboxFixture {
-        let pool = get_db_pool().expect("db pool");
+        let pool = seed_pool();
         let project_key = format!("/tmp/resources-populated-{}", unique_suffix());
         let project = ensure_project(cx, &pool, &project_key).await;
         let project_id = project.id.unwrap_or(0);
@@ -5318,7 +5346,7 @@ mod resource_shape_tests {
     fn message_and_thread_resources_redact_bcc_recipients() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-bcc-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5437,7 +5465,7 @@ mod resource_shape_tests {
     fn empty_dataset_resources_return_expected_shapes() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-empty-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5653,7 +5681,7 @@ mod resource_shape_tests {
         with_serialized_resources(|| {
             run_async(|cx| async move {
                 let fixture = setup_populated_mailbox_fixture(&cx).await;
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let conn = match pool.acquire(&cx).await {
                     Outcome::Ok(c) => c,
                     Outcome::Err(err) => panic!("acquire failed: {err}"),
@@ -5700,7 +5728,7 @@ mod resource_shape_tests {
     fn resource_reads_do_not_create_projects_for_missing_absolute_paths() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let before = db_outcome_to_mcp_result(queries::list_projects(&cx, &pool).await)
                     .expect("projects before")
                     .len();
@@ -5725,7 +5753,7 @@ mod resource_shape_tests {
     fn inbox_and_outbox_reject_invalid_since_ts() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-invalid-since-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5762,7 +5790,7 @@ mod resource_shape_tests {
     fn urgent_unread_view_excludes_read_messages() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-urgent-read-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -5784,23 +5812,15 @@ mod resource_shape_tests {
                 let message_id = message.id.unwrap_or(0);
                 let recipient_id = recipient.id.unwrap_or(0);
 
-                let conn = match pool.acquire(&cx).await {
-                    Outcome::Ok(c) => c,
-                    Outcome::Err(err) => panic!("acquire failed: {err}"),
-                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
-                    Outcome::Panicked(_) => panic!("acquire panicked"),
-                };
-                conn.execute_sync(
-                    "UPDATE message_recipients SET read_ts = ? WHERE message_id = ? AND agent_id = ?",
-                    &[
-                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
-                            mcp_agent_mail_db::now_micros(),
-                        ),
-                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
-                        mcp_agent_mail_db::sqlmodel::Value::BigInt(recipient_id),
-                    ],
-                )
-                .expect("mark message read");
+                // Mark read through the product API, not raw SQL: the write
+                // path owns read-cache invalidation, and a bare UPDATE leaves
+                // a stale recipient row that the read pools then serve
+                // (surfaced when br-lwwq5's gate starvation was fixed and
+                // these reads started completing).
+                match queries::mark_message_read(&cx, &pool, recipient_id, message_id).await {
+                    Outcome::Ok(_) => {}
+                    other => panic!("mark message read failed: {other:?}"),
+                }
 
                 let ctx = McpContext::new(cx.clone(), 1);
                 let project_ref = project.human_key.clone();
@@ -6093,7 +6113,7 @@ mod resource_shape_tests {
     fn resources_preserve_attachment_metadata_objects() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-attachments-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6233,7 +6253,7 @@ mod resource_shape_tests {
     fn resources_surface_malformed_message_metadata() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-malformed-metadata-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6313,7 +6333,7 @@ mod resource_shape_tests {
     fn message_details_preserves_placeholder_when_sender_row_is_missing() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-orphaned-sender-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6374,7 +6394,7 @@ mod resource_shape_tests {
     fn agent_named_resources_use_case_insensitive_lookup() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-case-insensitive-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6495,7 +6515,7 @@ mod resource_shape_tests {
     fn project_scoped_resources_use_case_insensitive_project_slug_lookup() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-project-slug-case-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6670,7 +6690,7 @@ mod resource_shape_tests {
     fn thread_details_respects_include_bodies_toggle() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-thread-toggle-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6719,7 +6739,7 @@ mod resource_shape_tests {
     fn file_reservations_active_only_filters_released_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-reservations-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6809,7 +6829,7 @@ mod resource_shape_tests {
     fn file_reservations_missing_workspace_does_not_release_stale_rows() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-missing-workspace-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6885,7 +6905,7 @@ mod resource_shape_tests {
     fn file_reservations_release_orphaned_holder_rows_when_other_signals_are_stale() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-orphaned-holder-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -6982,7 +7002,7 @@ mod resource_shape_tests {
     fn product_details_accepts_orphaned_product_placeholder() {
         with_serialized_resources_env(&[("WORKTREES_ENABLED", "true")], || {
             run_async(|cx| async move {
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-orphaned-product-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
@@ -7041,7 +7061,7 @@ mod resource_shape_tests {
             run_async(|cx| async move {
                 mcp_agent_mail_storage::wbq_start();
 
-                let pool = get_db_pool().expect("db pool");
+                let pool = seed_pool();
                 let project_key = format!("/tmp/resources-release-artifacts-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);

@@ -879,6 +879,13 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
         } else {
             Decision::Live
         };
+        tracing::debug!(
+            decision = match &decision {
+                Decision::Live => "live",
+                Decision::Snapshot(_) => "snapshot",
+            },
+            "archive-read build decision"
+        );
         if let Some(error) = build_stopped(slot, build) {
             return Err(error);
         }
@@ -957,9 +964,24 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
                 });
                 Ok(())
             }
-            Ok(_) => Err(AcquireError::Busy(
-                "archive-read snapshot build was superseded before publication".to_string(),
-            )),
+            Ok(_) => {
+                tracing::debug!(
+                    deadline_ok = Instant::now() < build.deadline,
+                    invalidation_epoch = slot.invalidation_epoch.load(Ordering::Acquire),
+                    build_invalidation_epoch = build.invalidation_epoch,
+                    writer_epoch = WRITER_EPOCH.load(Ordering::Acquire),
+                    build_writer_epoch = build.writer_epoch,
+                    global_writers = WRITERS_ACTIVE.load(Ordering::Acquire),
+                    archive_mutations = mcp_agent_mail_storage::archive_mutations_active(),
+                    archive_epoch = mcp_agent_mail_storage::archive_mutation_epoch(),
+                    build_archive_epoch = build.archive_epoch,
+                    slot_writers = state.writers,
+                    "archive-read publication superseded"
+                );
+                Err(AcquireError::Busy(
+                    "archive-read snapshot build was superseded before publication".to_string(),
+                ))
+            }
             Err(error) => Err(error),
         };
         state.building = None;
@@ -984,6 +1006,12 @@ fn claim_build(slot: &Slot, deadline: Instant) -> Result<Option<Build>, AcquireE
         || WRITERS_ACTIVE.load(Ordering::Acquire) != 0
         || mcp_agent_mail_storage::archive_mutations_active() != 0
     {
+        tracing::debug!(
+            slot_writers = state.writers,
+            global_writers = WRITERS_ACTIVE.load(Ordering::Acquire),
+            archive_mutations = mcp_agent_mail_storage::archive_mutations_active(),
+            "archive-read claim refused: durable writer active"
+        );
         return Err(AcquireError::Busy(
             "archive-read snapshot admission is blocked by an active durable writer".to_string(),
         ));

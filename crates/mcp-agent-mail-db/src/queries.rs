@@ -1538,6 +1538,29 @@ async fn begin_immediate_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome
     map_sql_outcome(tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await).map(|_| ())
 }
 
+/// Begin a transaction that guarantees a fresh WAL snapshot for a read.
+///
+/// Writable pools keep Bug #85's `BEGIN IMMEDIATE`, which both re-pins the
+/// snapshot and serializes against an in-flight release. Query-only pools —
+/// every GH#198 read surface — cannot take a write lock ("attempt to write a
+/// readonly database" turned the file_reservations resource into a hard error,
+/// br-lwwq5), so fall back to an explicit deferred `BEGIN`: starting any new
+/// transaction re-pins the connection to the newest committed frame, which is
+/// all the freshness contract needs on a pool that can never write.
+async fn begin_fresh_snapshot_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+    match begin_immediate_tx(cx, tracked).await {
+        Outcome::Err(error)
+            if {
+                let message = error.to_string().to_ascii_lowercase();
+                message.contains("readonly database") || message.contains("query_only")
+            } =>
+        {
+            map_sql_outcome(tracked.execute(cx, "BEGIN", &[]).await).map(|_| ())
+        }
+        out => out,
+    }
+}
+
 /// Rollback the current transaction (best-effort, errors ignored).
 async fn rollback_tx(cx: &Cx, tracked: &TrackedConnection<'_>) {
     let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
@@ -9354,8 +9377,8 @@ pub async fn get_reservation_conflict_snapshot(
         // BEGIN IMMEDIATE is the established fresh-snapshot path for reservation
         // reads (GH#85/#86). The transaction performs no table writes and ends
         // through commit_read_tx, which deliberately skips the write-path WAL
-        // checkpoint.
-        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        // checkpoint. On query-only pools this degrades to a deferred BEGIN.
+        try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
         let captured_ts = now_micros();
 
         let project_rows = try_in_tx!(
@@ -9739,7 +9762,8 @@ async fn get_active_reservations_once(
     let tracked = tracked(&*conn);
 
     // Force a fresh WAL snapshot so we never read stale reservation state.
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    // On query-only pools this degrades to a deferred BEGIN.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     // GH#180: fetch candidate active rows with the cheap `released_ts` predicate
     // (no release-ledger join, no `NOT IN` subquery), then subtract the release
@@ -10397,8 +10421,10 @@ async fn list_file_reservations_once(
 
     // Force a fresh WAL snapshot for active-only reads to avoid stale
     // reservation state after a release (Bug #85) or concurrent grant.
+    // Falls back to a deferred BEGIN on query-only pools (GH#198 read
+    // surfaces), where BEGIN IMMEDIATE is a readonly-database error.
     if active_only {
-        try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+        try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
     }
 
     let (sql, params) = if active_only {
@@ -10630,7 +10656,8 @@ async fn list_unreleased_file_reservations_once(
     let tracked = tracked(&*conn);
 
     // Force a fresh WAL snapshot (same rationale as get_active_reservations).
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    // On query-only pools this degrades to a deferred BEGIN.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
 
     let sql = format!(
         "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, \
