@@ -56,6 +56,11 @@ pub const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 /// Floor for the operator override. Below this GH#202 reproduces.
 pub const WORKER_STACK_SIZE_MIN: usize = 8 * 1024 * 1024;
 
+/// The default must clear the 2 MiB spawned-thread stack that GH#202
+/// overflowed. Enforced at compile time so lowering [`WORKER_STACK_SIZE`] below
+/// the value that caused the abort fails the build rather than a test.
+const _: () = assert!(WORKER_STACK_SIZE > 2 * 1024 * 1024);
+
 /// Ceiling for the [`WORKER_STACK_ENV`] override, so a typo in that variable
 /// cannot reserve terabytes.
 ///
@@ -95,10 +100,11 @@ fn read_usize_env(key: &str) -> Option<usize> {
         .and_then(|value| value.trim().parse::<usize>().ok())
 }
 
-/// Pure resolution for [`worker_stack_size`], split out so the clamping and
-/// `RUST_MIN_STACK` precedence rules are testable without mutating process
-/// environment (several crates here are `#![forbid(unsafe_code)]`, and
-/// `set_var` is `unsafe` in edition 2024).
+/// Pure resolution for [`worker_stack_size`].
+///
+/// Split out so the clamping and `RUST_MIN_STACK` precedence rules are testable
+/// without mutating process environment (several crates here are
+/// `#![forbid(unsafe_code)]`, and `set_var` is `unsafe` in edition 2024).
 ///
 /// `Thread::stack_size` takes precedence over `RUST_MIN_STACK` in std, so
 /// `RUST_MIN_STACK` is folded in explicitly: an operator who already raised it
@@ -124,7 +130,6 @@ pub fn resolve_worker_stack_size(
 /// 2 MiB default. Existing sites call `.stack_size(worker_stack_size())`
 /// explicitly on their own builders — both routes resolve to the same policy,
 /// so either is correct; this one is simply harder to forget.
-#[must_use]
 pub fn worker_thread(name: impl Into<String>) -> std::thread::Builder {
     std::thread::Builder::new()
         .name(name.into())
@@ -138,10 +143,6 @@ mod tests {
     #[test]
     fn default_clears_the_2_mib_spawned_thread_default() {
         assert_eq!(resolve_worker_stack_size(None, None), WORKER_STACK_SIZE);
-        assert!(
-            WORKER_STACK_SIZE > 2 * 1024 * 1024,
-            "default must exceed the 2 MiB spawned-thread default that GH#202 overflowed"
-        );
     }
 
     #[test]
@@ -181,9 +182,12 @@ mod tests {
         // Spawning through the helper must survive a frame depth that would
         // abort on the 2 MiB default, i.e. the size is really applied.
         fn burn(depth: usize) -> usize {
+            // The marker only has to be non-zero and opaque; truncating `depth`
+            // would say nothing extra, so write a constant and keep the frame
+            // itself as the thing under test.
             let mut frame = [0u8; 4096];
-            frame[0] = depth as u8;
-            frame[4095] = depth as u8;
+            frame[0] = 1;
+            frame[4095] = 1;
             std::hint::black_box(&frame);
             if depth == 0 {
                 return 0;
