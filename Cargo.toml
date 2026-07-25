@@ -33,7 +33,7 @@ fastmcp-server = "0.3.1"
 fastmcp-transport = "0.3.1"
 fastmcp-protocol = "0.3.1"
 
-asupersync = { version = "0.3.6", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.3.9", features = ["tls-webpki-roots"] }
 
 sqlmodel = "0.3.0"
 sqlmodel-core = "0.3.0"
@@ -116,7 +116,7 @@ signal-hook = "0.4.4"
 # Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
 # those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
 # Downstream crates opt into the exact no-Tokio subfeatures they need.
-frankensearch = { version = "0.3.2", path = "../frankensearch/frankensearch", default-features = false }
+frankensearch = { version = "0.3.2", path = "../frankensearch/frankensearch", default-features = false, features = ["lexical-tantivy"] }
 frankensearch-core = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-core" }
 frankensearch-embed = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
 frankensearch-index = { version = "0.2.1", path = "../frankensearch/crates/frankensearch-index" }
