@@ -569,6 +569,7 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     let op_depth_worker = Arc::clone(&wbq.op_depth);
     let handle = std::thread::Builder::new()
         .name("wbq-drain".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || wbq_drain_loop(rx, op_depth_worker, channel_capacity, drain_batch_cap))
         .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
 
@@ -2943,6 +2944,7 @@ impl CommitCoalescer {
 
             std::thread::Builder::new()
                 .name(format!("commit-coalescer-{worker_idx}"))
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || {
                     // I5 (br-bvq1x.9.5): mark this worker alive for its whole
                     // lifetime. The guard's Drop decrements even on panic unwind,

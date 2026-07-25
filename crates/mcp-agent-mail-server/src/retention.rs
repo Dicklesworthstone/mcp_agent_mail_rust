@@ -52,6 +52,7 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("retention-quota".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 retention_loop(&config);
             }) {

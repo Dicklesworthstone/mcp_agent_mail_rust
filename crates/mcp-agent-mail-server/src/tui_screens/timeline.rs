@@ -1020,6 +1020,7 @@ impl TimelineScreen {
         self.last_commit_refresh_at = Some(Instant::now());
         std::thread::Builder::new()
             .name("timeline-commit-refresh".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 let root = Path::new(&storage_root);
                 let mut commits = Vec::new();

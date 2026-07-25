@@ -65,6 +65,7 @@ pub mod slo;
 pub mod test_harness;
 pub mod timestamps;
 pub mod toon;
+pub mod worker_stack;
 
 #[cfg(test)]
 pub mod proptest_generators;
@@ -215,3 +216,4 @@ pub use toon::{
     apply_resource_format, apply_tool_format, apply_toon_format, looks_like_toon_rust_encoder,
     parse_toon_stats, resolve_encoder, resolve_output_format, run_encoder, validate_encoder,
 };
+pub use worker_stack::{worker_stack_size, worker_thread};

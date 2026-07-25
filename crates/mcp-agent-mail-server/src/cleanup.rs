@@ -89,6 +89,7 @@ pub fn start(config: &Config) {
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("file-res-cleanup".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 cleanup_loop(&config);
             }) {

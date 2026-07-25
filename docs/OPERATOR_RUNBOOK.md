@@ -303,22 +303,39 @@ is used in hot paths.
 | `AM_HEALTH_SWEEP_INTERVAL_SEC`  | `900`   | Seconds between git ref-integrity sweep cycles |
 | `AM_HEALTH_SWEEP_BATCH`         | `5`     | Registered projects checked per sweep cycle |
 
-### Archive Read Snapshots
+### Worker Thread Stacks
 
-Archive-backed reads build their snapshots on dedicated `am-archive-read`
-worker threads. These run the full reconstruction/salvage path, which is much
-deeper than Rust's 2 MiB default for spawned threads, so each worker is given
-an explicit 32 MiB stack. Leaving these at their defaults is correct for
-essentially all deployments.
+A stack overflow is **not recoverable** in Rust: the runtime prints
+`fatal runtime error: stack overflow` and aborts the process. It cannot be
+caught, and every other thread's in-flight work dies with it. Rust gives
+spawned threads a 2 MiB stack by default while the main thread inherits the
+process rlimit (usually 8 MiB), which is how GH#202 aborted the daemon — the
+`am-archive-read` worker ran the archive reconstruction/salvage path on 2 MiB
+at production scale.
+
+Every worker thread this project spawns is therefore given an explicit 32 MiB
+stack from a single shared policy, rather than sizing only the threads that
+look deep. Thread stacks are reserved address space committed lazily per page,
+so an untouched 32 MiB stack costs approximately zero resident memory; the
+whole fleet of workers reserves well under a gigabyte of a 128 TiB address
+space. Leaving these at their defaults is correct for essentially all
+deployments.
 
 | Variable                                     | Default | Description                          |
 |----------------------------------------------|---------|--------------------------------------|
-| `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB`      | `32`    | Stack (MiB) per `am-archive-read` snapshot worker, clamped to 8..512. Raise only if a production-scale archive still overflows; a value below the floor is clamped up rather than honored. |
+| `MCP_AGENT_MAIL_WORKER_STACK_MB`             | `32`    | Stack (MiB) for every spawned worker thread, clamped to 8..512. A value below the floor is clamped up rather than honored, so the GH#202 abort cannot be reintroduced by a stray small setting. |
+| `MCP_AGENT_MAIL_READ_SNAPSHOT_STACK_MB`      | —       | Legacy alias for the above, honored so existing GH#202 workarounds keep working. Prefer the new name. |
 | `MCP_AGENT_MAIL_READ_SNAPSHOT_EXACT_AUDIT_MS`| `1000`  | Interval between exact (content-hash) generation audits, capped at 30s |
 
 `RUST_MIN_STACK` is also honored: the worker stack is the larger of the
-configured value and `RUST_MIN_STACK`, so an existing environment-level
-workaround is never silently lowered by the built-in default.
+configured value and `RUST_MIN_STACK`. `Builder::stack_size` normally overrides
+`RUST_MIN_STACK` in std, so this is folded in deliberately — an operator who
+already raised it as a GH#202 workaround keeps that headroom instead of being
+silently lowered to the built-in default.
+
+Note this bounds *deep* recursion, not *unbounded* recursion. A call chain that
+recurses proportionally to mailbox or archive size would still exhaust any
+fixed stack; that has to be fixed in the recursion itself.
 
 ### TUI
 

@@ -998,6 +998,7 @@ fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     let thread_config = config.clone();
     let spawn = std::thread::Builder::new()
         .name("am-search-backfill".to_string())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             let _reset_guard = StartupSearchBackfillResetGuard;
             let delay_secs = startup_search_backfill_delay_secs();
@@ -1127,6 +1128,7 @@ fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
     let config = config.clone();
     let _ = std::thread::Builder::new()
         .name("startup-consistency-probe".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             startup_checks::run_consistency_probe_advisory(&config);
         });
@@ -1518,6 +1520,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let heal_config = config.clone();
     let _ = std::thread::Builder::new()
         .name("startup-heal".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             heal_storage_lock_artifacts(&heal_config);
         });
@@ -1619,6 +1622,7 @@ impl TuiSpinWatchdog {
             let state = Arc::clone(tui_state);
             let join = std::thread::Builder::new()
                 .name("tui-spin-watchdog".into())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || run_tui_spin_watchdog_loop(&state, &shutdown_signal, config))
                 .ok()?;
             Some(Self {
@@ -3108,6 +3112,7 @@ fn spawn_tui_deferred_background_workers(
     let worker_progress = Arc::clone(&progress);
     match std::thread::Builder::new()
         .name("tui-deferred-workers".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             if !wait_for_tui_first_paint(&worker_tui_state) {
                 return;
@@ -3149,6 +3154,7 @@ fn spawn_tui_readiness_warmup(
     let failure_tui_state = Arc::clone(&tui_state);
     if let Err(error) = std::thread::Builder::new()
         .name("tui-readiness-warmup".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check(&config));
         })
@@ -3213,6 +3219,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("am-db-readiness".to_string())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             let _ = tx.send(readiness_check(&cfg));
         });
@@ -3994,6 +4001,7 @@ async fn wait_for_http_server_join_with_wall_timeout(
             let sleep_for = deadline.saturating_duration_since(now);
             if let Err(err) = std::thread::Builder::new()
                 .name("am-http-stop-timeout".to_string())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || {
                     std::thread::sleep(sleep_for);
                     waker.wake();
@@ -4892,6 +4900,7 @@ where
 
     let spawn_result = std::thread::Builder::new()
         .name("dispatch-blocking".into())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || {
             let _permit_guard = SharedPermitGuard(worker_permit);
             let result =
@@ -4966,6 +4975,7 @@ where
             let grace_method = method.clone();
             std::thread::Builder::new()
                 .name("dispatch-hard-grace".into())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || {
                     std::thread::sleep(Duration::from_secs(grace_secs));
                     let guard = grace_permit.lock().unwrap_or_else(|e| e.into_inner());
@@ -7575,6 +7585,7 @@ fn start_atc_operator_runtime(config: &mcp_agent_mail_core::Config) {
     let stop_for_thread = Arc::clone(&stop);
     let join = match std::thread::Builder::new()
         .name("atc-operator".to_string())
+        .stack_size(mcp_agent_mail_core::worker_stack_size())
         .spawn(move || run_atc_operator_loop(config, stop_for_thread))
     {
         Ok(join) => join,
@@ -8293,7 +8304,7 @@ impl StartupDashboard {
             // reconstruction/salvage path that overflowed the 2 MiB spawned-thread
             // default on a production-scale archive. Size this worker like the
             // `am-archive-read` workers so the dashboard cannot abort the process.
-            .stack_size(mcp_agent_mail_tools::archive_snapshot_worker_stack_size())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 let mut db_conn =
                     dashboard_open_connection(&this.database_url, Path::new(&this.storage_root));
@@ -8340,6 +8351,7 @@ impl StartupDashboard {
         let this = Arc::clone(self);
         let handle = std::thread::Builder::new()
             .name("mcp-agent-mail-dashboard-input".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 use ftui_runtime::BackendEventSource;
                 // This worker is `#[cfg(unix)]`-only (see the fn above), so the

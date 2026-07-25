@@ -444,6 +444,7 @@ impl DbPoller {
         let state = Arc::clone(&self.state);
         let join = thread::Builder::new()
             .name("tui-db-poller".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
                 self.run();
             });

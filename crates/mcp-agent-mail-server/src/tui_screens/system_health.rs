@@ -1108,6 +1108,7 @@ impl SystemHealthScreen {
             let refresh_for_failure = Arc::clone(&refresh_requested);
             thread::Builder::new()
                 .name("am-system-health".to_string())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || {
                     diagnostics_worker_loop(
                         &state_for_spawn,

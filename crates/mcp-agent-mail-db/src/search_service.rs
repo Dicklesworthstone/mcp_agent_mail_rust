@@ -1511,6 +1511,7 @@ impl SemanticBridge {
             let worker = refresh_worker.clone();
             std::thread::Builder::new()
                 .name("semantic-index-refresh".to_string())
+                .stack_size(mcp_agent_mail_core::worker_stack_size())
                 .spawn(move || worker.run())
                 .ok()
         };
