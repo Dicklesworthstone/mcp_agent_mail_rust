@@ -324,13 +324,19 @@ fn test_reply_message_not_found() {
 fn test_reply_message_cross_project_reports_owning_project() {
     run_serial_async(|cx| async move {
         let suffix = unique_suffix();
-        let owning_key = format!("/tmp/msg_reply_owner-{suffix}");
-        let other_key = format!("/tmp/msg_reply_other-{suffix}");
+        // Keys must not collide under `slugify`, which lowercases and collapses
+        // every non-alphanumeric run to a single dash. `/tmp/a-b` and
+        // `/tmp/a_b` produce the same slug, and since `projects.slug` is
+        // UNIQUE, `ensure_project` on the second key simply returns the first
+        // project's row — so a punctuation-variant pair is one project, not
+        // two, and never exercises this gate at all.
+        let owning_key = format!("/tmp/msg-reply-owner-{suffix}");
+        let other_key = format!("/tmp/msg-reply-other-{suffix}");
         let ctx = McpContext::new(cx.clone(), 1);
 
         setup_project_and_agent(&ctx, &owning_key, "BlueLake").await;
         setup_project_and_agent(&ctx, &owning_key, "RedPeak").await;
-        setup_project_and_agent(&ctx, &other_key, "GreenVale").await;
+        setup_project_and_agent(&ctx, &other_key, "GreenLake").await;
 
         let result = send_message(
             &ctx,
@@ -364,7 +370,7 @@ fn test_reply_message_cross_project_reports_owning_project() {
             &ctx,
             other_key.clone(),
             msg_id,
-            "GreenVale".to_string(),
+            "GreenLake".to_string(),
             "Reply body".to_string(),
             None, // to
             None, // cc

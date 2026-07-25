@@ -12,7 +12,7 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::{
     Config, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
-    append_tail_latency_evidence_if_configured, compute_project_slug,
+    append_tail_latency_evidence_if_configured, resolve_project_path,
 };
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
@@ -2420,17 +2420,31 @@ effective_free_bytes={free}"
         // a case-insensitive filesystem), so a message every other tool
         // resolves would be reported here as a spurious NOT_FOUND. Accept the
         // reply when the owning row is an alias of the requested project, and
-        // otherwise fail with an error that names the real owner instead of
-        // misdirecting debugging toward the message store.
+        // otherwise reject it while making clear that the id exists but is out
+        // of scope — deliberately without identifying the owning project, see
+        // the disclosure note below.
         let owner = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::get_project_by_id(ctx.cx(), &pool, original.project_id)
                 .await,
         )
         .ok();
 
+        // Compare canonicalized *paths*, not slugs. `compute_project_slug`
+        // routes through `slugify`, which collapses every non-alphanumeric run
+        // to a single dash — so `/srv/app-one`, `/srv/app_one` and
+        // `/srv/app.one` share a slug, and using it here would admit replies
+        // across genuinely distinct projects. `resolve_project_path`
+        // canonicalizes through the filesystem, which collapses exactly the
+        // aliases GH#194 is about (case-variant keys on a case-insensitive
+        // filesystem, symlinks, `..`) and nothing else; when the directory is
+        // absent it falls back to the literal path, so the comparison stays
+        // exact rather than lossy.
+        //
+        // Comparing slugs directly would also be pointless here: we only reach
+        // this branch when the row ids differ, and `slug` is UNIQUE, so two
+        // distinct rows can never share one.
         let aliases_requested_project = owner.as_ref().is_some_and(|owner| {
-            owner.slug == project.slug
-                || compute_project_slug(&owner.human_key) == compute_project_slug(&project.human_key)
+            resolve_project_path(&owner.human_key) == resolve_project_path(&project.human_key)
         });
 
         if !aliases_requested_project {
