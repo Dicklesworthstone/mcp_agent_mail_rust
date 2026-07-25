@@ -1020,7 +1020,7 @@ pub mod tool_util {
         })
     }
 
-    pub(crate) fn read_archive_inventory_has_state(
+    pub(crate) const fn read_archive_inventory_has_state(
         archive: &mcp_agent_mail_db::ArchiveMessageInventory,
     ) -> bool {
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
@@ -1149,7 +1149,7 @@ pub mod tool_util {
         }
     }
 
-    async fn open_read_db_pool(
+    fn open_read_db_pool(
         cx: &asupersync::Cx,
     ) -> Result<Option<ToolReadPool>, crate::archive_read::AcquireError> {
         if cx.is_cancel_requested() {
@@ -1181,12 +1181,11 @@ pub mod tool_util {
             &config.database_url,
             cx,
         )
-        .await
         .map(|snapshot| snapshot.map(ToolReadPool::snapshot))
     }
 
     pub async fn get_read_db_pool(cx: &asupersync::Cx) -> McpResult<ToolReadPool> {
-        match open_read_db_pool(cx).await {
+        match open_read_db_pool(cx) {
             Ok(Some(pool)) => Ok(pool),
             Ok(None) => get_live_read_db_pool().map(ToolReadPool::live),
             Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
@@ -1980,7 +1979,7 @@ body
                     drop(conn);
 
                     run_async(|cx| async move {
-                        let pool = open_read_db_pool(&cx).await.expect("open read db pool");
+                        let pool = open_read_db_pool(&cx).expect("open read db pool");
                         assert!(
                             pool.is_none(),
                             "default global archive should not force shared tool read snapshots for an external custom DB"

@@ -438,6 +438,9 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
 }
 
 trait SnapshotSource {
+    // Mirrors `DbConn::query_sync`'s signature; `sqlmodel_core::Error`'s size
+    // is upstream's choice and boxing here would diverge from that API.
+    #[allow(clippy::result_large_err)]
     fn query_snapshot(
         &self,
         sql: &str,

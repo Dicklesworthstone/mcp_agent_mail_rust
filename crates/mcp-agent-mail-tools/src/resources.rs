@@ -261,7 +261,7 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
-async fn open_resource_read_pool(
+fn open_resource_read_pool(
     cx: &asupersync::Cx,
 ) -> Result<Option<ResourceReadPool>, crate::archive_read::AcquireError> {
     if cx.is_cancel_requested() {
@@ -292,7 +292,6 @@ async fn open_resource_read_pool(
         &config.database_url,
         cx,
     )
-    .await
     .map(|snapshot| snapshot.map(ResourceReadPool::snapshot))
 }
 
@@ -350,8 +349,13 @@ fn resource_live_database_missing_without_archive_state() -> bool {
     !resolved_path.exists() && !archive_has_authoritative_state
 }
 
+// Intentionally async despite containing no awaits: this is the resource
+// handlers' pool contract and every caller awaits it. The underlying
+// archive-read gate wait is deliberately thread-blocking since GH#203
+// (runtime timers are not pumped under the sync dispatch bridge).
+#[allow(clippy::unused_async)]
 async fn get_resource_db_pool(cx: &asupersync::Cx) -> McpResult<ResourceReadPool> {
-    match open_resource_read_pool(cx).await {
+    match open_resource_read_pool(cx) {
         Ok(Some(pool)) => Ok(pool),
         Ok(None) => open_live_resource_read_pool(),
         Err(crate::archive_read::AcquireError::Cancelled) => Err(McpError::request_cancelled()),
@@ -7309,9 +7313,7 @@ mod resource_shape_tests {
                     incremental_check.details
                 );
 
-                let pool = open_resource_read_pool(&cx)
-                    .await
-                    .expect("open resource read pool");
+                let pool = open_resource_read_pool(&cx).expect("open resource read pool");
                 assert!(
                     pool.is_none(),
                     "resource reads should stay on the live DB when only archive metadata is ahead"
@@ -7369,9 +7371,7 @@ mod resource_shape_tests {
                 drop(conn);
 
                 run_async(|cx: Cx| async move {
-                    let pool = open_resource_read_pool(&cx)
-                        .await
-                        .expect("open resource read pool");
+                    let pool = open_resource_read_pool(&cx).expect("open resource read pool");
                     assert!(
                         pool.is_none(),
                         "default global archive should not force resource snapshots for an external custom DB"

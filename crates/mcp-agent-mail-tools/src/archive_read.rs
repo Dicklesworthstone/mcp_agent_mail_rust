@@ -1,7 +1,7 @@
 //! Generation-consistent, process-wide archive-backed read snapshots.
 //!
 //! Degraded mailbox reads are expensive: they replay the Git archive and merge
-//! readable live-only state into a disposable SQLite database.  This module
+//! readable live-only state into a disposable `SQLite` database.  This module
 //! gives every tool and resource in a process one owner for that work.  A
 //! snapshot is published only after exact content generations taken before and
 //! after reconstruction agree, and its pool is incapable of mutation.
@@ -18,13 +18,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REGISTRY_CAPACITY: usize = 16;
 const WORKER_LIMIT: usize = 4;
-const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
+const BUILD_TIMEOUT: Duration = Duration::from_mins(2);
 const WAIT_SLICE: Duration = Duration::from_millis(25);
 const EXACT_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
 const GENERATION_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AcquireError {
+pub enum AcquireError {
     Cancelled,
     Busy(String),
     TimedOut(String),
@@ -55,7 +55,7 @@ struct CheapGeneration {
     live: [u8; 32],
 }
 
-pub(crate) struct SharedSnapshot {
+pub struct SharedSnapshot {
     pool: mcp_agent_mail_db::DbPool,
     _directory: mcp_agent_mail_db::pool::CanonicalSnapshotTempDir,
 }
@@ -102,7 +102,7 @@ struct Completion {
 }
 
 impl Completion {
-    fn pending() -> Self {
+    const fn pending() -> Self {
         Self {
             result: Mutex::new(None),
         }
@@ -160,7 +160,7 @@ struct Slot {
     /// A condvar `wait_timeout` bounds every park with an OS timer instead,
     /// so a missed or never-sent wakeup (e.g. the storage-crate WBQ mutation
     /// counters, which have no notify path into this module) costs one
-    /// WAIT_SLICE, not a hang.
+    /// `WAIT_SLICE`, not a hang.
     wake: std::sync::Condvar,
     #[cfg(test)]
     reconstructions: AtomicUsize,
@@ -268,7 +268,7 @@ fn slot_for(scope: Scope) -> Result<Arc<Slot>, AcquireError> {
 
 /// A lease spanning a live mutation path.  Entering and leaving both advance
 /// the generation, so a reconstruction can never publish across a write.
-pub(crate) struct WriteGuard {
+pub struct WriteGuard {
     slot: Option<Arc<Slot>>,
     active: bool,
 }
@@ -490,7 +490,7 @@ fn hash_archive(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32
     Ok(hasher.finalize().into())
 }
 
-/// Byte ranges of the SQLite file header that FrankenSQLite mutates on every
+/// Byte ranges of the `SQLite` file header that `FrankenSQLite` mutates on every
 /// open even when no page changes: the file change counter (24..28) and the
 /// version-valid-for counter (92..96). Measured during the GH#203 livelock on
 /// Linux: successive `cmp -l` snapshots of the scratch db differ in exactly
@@ -501,7 +501,7 @@ fn hash_archive(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32
 /// ranges, so nothing observable is lost.
 const SQLITE_VOLATILE_HEADER_RANGES: [(usize, usize); 2] = [(24, 28), (92, 96)];
 
-/// Exact-content hash of the main SQLite file with the open-volatile header
+/// Exact-content hash of the main `SQLite` file with the open-volatile header
 /// counters masked to zero. Mirrors [`hash_tree`]'s exact framing (relative
 /// path, type flags, length, content) so the two stay comparable in shape.
 fn hash_live_main_exact(
@@ -845,7 +845,7 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
         let cheap_before = cheap_generation(&slot.scope, build.deadline)?;
         let before = exact_generation(&slot.scope, build.deadline)?;
 
-        if let Some(decision) = slot
+        let reusable_decision = slot
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -856,8 +856,8 @@ fn run_build(slot: &Slot, database_url: &str, build: &Build) -> Result<BuildOutp
                     && ready.invalidation_epoch == build.invalidation_epoch
                     && ready.writer_epoch == build.writer_epoch
             })
-            .map(|ready| ready.decision.clone())
-        {
+            .map(|ready| ready.decision.clone());
+        if let Some(decision) = reusable_decision {
             let cheap_after = cheap_generation(&slot.scope, build.deadline)?;
             if cheap_after == cheap_before {
                 return Ok(BuildOutput {
@@ -924,11 +924,12 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state
+        if state
             .building
             .as_ref()
-            .is_some_and(|active| active.token == build.token)
+            .is_none_or(|active| active.token != build.token)
         {
+            drop(state);
             build.completion.finish(Err(AcquireError::Busy(
                 "archive-read snapshot build ownership changed before publication".to_string(),
             )));
@@ -962,6 +963,10 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
             Err(error) => Err(error),
         };
         state.building = None;
+        drop(state);
+        // Finishing outside the state lock keeps lock nesting one-level
+        // (completion has its own mutex); waiters re-check under the state
+        // lock with a bounded wait, so the tiny gap is at most one slice.
         build.completion.finish(result);
     });
     slot.wake.notify_all();
@@ -993,6 +998,7 @@ fn claim_build(slot: &Slot, deadline: Instant) -> Result<Option<Build>, AcquireE
         completion: Arc::new(Completion::pending()),
     };
     state.building = Some(build.clone());
+    drop(state);
     Ok(Some(build))
 }
 
@@ -1020,7 +1026,7 @@ struct WorkerBuildGuard {
 }
 
 impl WorkerBuildGuard {
-    fn new(slot: Arc<Slot>, build: Build) -> Self {
+    const fn new(slot: Arc<Slot>, build: Build) -> Self {
         Self {
             slot,
             build,
@@ -1115,8 +1121,7 @@ fn exact_audit_interval() -> Duration {
     std::env::var("MCP_AGENT_MAIL_READ_SNAPSHOT_EXACT_AUDIT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(EXACT_AUDIT_INTERVAL)
+        .map_or(EXACT_AUDIT_INTERVAL, Duration::from_millis)
         .min(Duration::from_secs(30))
 }
 
@@ -1127,7 +1132,7 @@ fn exact_audit_interval() -> Duration {
 /// re-hash on *every* read: the cheap comparison would miss forever because
 /// the stored baseline predates the opens. Re-baselining lets the next read
 /// take the cheap path again. (Measured on Linux, not just macOS/APFS: a
-/// FrankenSQLite open bumps the main db's mtime AND ctime and rewrites the
+/// `FrankenSQLite` open bumps the main db's mtime AND ctime and rewrites the
 /// `-fsqlite-ns-use` sidecar with zero content change — stat-sampled during
 /// the GH#203 livelock at one bump per build cycle.)
 ///
@@ -1148,7 +1153,7 @@ fn refresh_ready_audit(slot: &Arc<Slot>, deadline: Instant) {
     }
 }
 
-pub(crate) async fn acquire_if_needed(
+pub fn acquire_if_needed(
     storage_root: &Path,
     sqlite_path: &Path,
     database_url: &str,
@@ -1239,28 +1244,26 @@ pub(crate) async fn acquire_if_needed(
             }
         }
 
-        let build = match building {
-            Some(build) => build,
-            None => {
-                let build = match claim_build(&slot, caller_deadline) {
-                    Ok(Some(build)) => build,
-                    Ok(None) => continue,
-                    Err(AcquireError::Busy(_)) => {
-                        wait_retry_slice(&slot);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                if let Err(error) = spawn_build(Arc::clone(&slot), database_url.to_string(), &build)
-                {
-                    if matches!(error, AcquireError::Busy(_)) {
-                        wait_retry_slice(&slot);
-                        continue;
-                    }
-                    return Err(error);
+        let build = if let Some(build) = building {
+            build
+        } else {
+            let build = match claim_build(&slot, caller_deadline) {
+                Ok(Some(build)) => build,
+                Ok(None) => continue,
+                Err(AcquireError::Busy(_)) => {
+                    wait_retry_slice(&slot);
+                    continue;
                 }
-                build
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = spawn_build(Arc::clone(&slot), database_url.to_string(), &build) {
+                if matches!(error, AcquireError::Busy(_)) {
+                    wait_retry_slice(&slot);
+                    continue;
+                }
+                return Err(error);
             }
+            build
         };
         match wait_for_build(&slot, &build, cx) {
             Ok(()) => {}
@@ -1594,16 +1597,7 @@ mod tests {
             readers.push(std::thread::spawn(move || {
                 barrier.wait();
                 let cx = Cx::for_testing();
-                let runtime = RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("build runtime");
-                runtime
-                    .block_on(acquire_if_needed(
-                        &storage_root,
-                        &sqlite_path,
-                        &database_url,
-                        &cx,
-                    ))
+                acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
                     .expect("acquire snapshot")
                     .expect("archive must require a snapshot")
             }));
@@ -1673,10 +1667,7 @@ mod tests {
         let owner_url = database_url.clone();
         let owner = std::thread::spawn(move || {
             let cx = Cx::for_testing();
-            let runtime = RuntimeBuilder::current_thread()
-                .build()
-                .expect("build owner runtime");
-            runtime.block_on(acquire_if_needed(&owner_root, &owner_path, &owner_url, &cx))
+            acquire_if_needed(&owner_root, &owner_path, &owner_url, &cx)
         });
         let wait_deadline = Instant::now() + Duration::from_secs(5);
         while WORKERS_ACTIVE.load(Ordering::Acquire) == 0 && Instant::now() < wait_deadline {
@@ -1686,16 +1677,8 @@ mod tests {
 
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("build cancelled runtime");
         assert!(matches!(
-            runtime.block_on(acquire_if_needed(
-                &storage_root,
-                &sqlite_path,
-                &database_url,
-                &cancelled,
-            )),
+            acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cancelled),
             Err(AcquireError::Cancelled)
         ));
         assert!(
@@ -1727,15 +1710,7 @@ mod tests {
         .expect("corrupt profile");
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let cx = Cx::for_testing();
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        let error = match runtime.block_on(acquire_if_needed(
-            &storage_root,
-            &sqlite_path,
-            &database_url,
-            &cx,
-        )) {
+        let error = match acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx) {
             Err(error) => error,
             Ok(_) => panic!("malformed profile must fail closed"),
         };
