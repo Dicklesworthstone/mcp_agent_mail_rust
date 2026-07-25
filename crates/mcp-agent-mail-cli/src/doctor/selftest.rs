@@ -1185,6 +1185,7 @@ fn run_mcp_selftest_in_process(project_key: &str) -> McpSelftestReport {
 /// ensure_project → register ×2 → send_message → fetch_inbox) through an
 /// in-memory server over the scratch config, returning the JSON-RPC responses.
 fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
+    use asupersync::runtime::RuntimeBuilder;
     use fastmcp::{Cx, JsonRpcRequest, StdioTransport};
     use std::io::Cursor;
 
@@ -1242,13 +1243,32 @@ fn run_mcp_session(project_key: &str) -> Result<Vec<Value>, String> {
     let output = writer.clone();
     let transport = StdioTransport::new(Cursor::new(input), writer);
 
-    let handle = std::thread::spawn(move || {
-        let cx = Cx::for_request();
-        server.run_transport_returning_with_cx(&cx, transport);
+    // Run the session on a runtime-backed context rather than an out-of-band
+    // `Cx::for_request()`, so anything that discovers drivers via
+    // `Cx::current()` finds real ones.
+    //
+    // Note this alone did NOT fix the GH#203 hang, and code under test must
+    // not rely on this runtime's timers for forward progress: fastmcp's tool
+    // dispatch re-enters `block_on` on its own private current-thread runtime,
+    // and in that nested topology runtime timer wheels are not reliably
+    // pumped (confirmed by gdb: a 25 ms `asupersync::time::timeout` parked
+    // for 45+ s inside `list_agents`). The actual fix was making the
+    // archive-read gate's wait loops condvar-based and timer-free; see
+    // `mcp-agent-mail-tools/src/archive_read.rs` (`Slot::wake`).
+    let handle = std::thread::spawn(move || -> Result<(), String> {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| format!("build selftest runtime: {e}"))?;
+        rt.block_on(async {
+            let cx =
+                Cx::current().ok_or_else(|| "runtime did not install an ambient Cx".to_string())?;
+            server.run_transport_returning_with_cx(&cx, transport);
+            Ok(())
+        })
     });
     handle
         .join()
-        .map_err(|_| "mcp session server thread panicked".to_string())?;
+        .map_err(|_| "mcp session server thread panicked".to_string())??;
 
     let raw = output.snapshot();
     let text = String::from_utf8(raw).map_err(|e| format!("mcp server output not utf8: {e}"))?;

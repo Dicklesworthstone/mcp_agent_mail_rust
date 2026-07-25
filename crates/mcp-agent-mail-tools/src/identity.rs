@@ -103,7 +103,11 @@ async fn persist_agent_registration_token_with_retry(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u64, |d| u64::from(d.subsec_nanos()));
         let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
-        asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms)).await;
+        // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class): tools run
+        // under fastmcp's nested-block_on sync bridge, where runtime timer
+        // wheels are not pumped — an awaited timer sleep parks forever. The
+        // backoff is short and bounded, so blocking the thread is correct.
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         attempt = attempt.saturating_add(1);
     }
 }
@@ -1587,8 +1591,12 @@ Check that all parameters have valid values."
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0u64, |d| u64::from(d.subsec_nanos()));
             let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
-            asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms))
-                .await;
+            // Thread sleep, NOT `asupersync::time::sleep` (GH#203 class):
+            // tools run under fastmcp's nested-block_on sync bridge, where
+            // runtime timer wheels are not pumped — an awaited timer sleep
+            // parks forever. The backoff is short and bounded, so blocking
+            // the thread is correct.
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             attempt = attempt.saturating_add(1);
         }
     };

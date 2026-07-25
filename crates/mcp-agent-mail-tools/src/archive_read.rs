@@ -23,7 +23,6 @@ const WAIT_SLICE: Duration = Duration::from_millis(25);
 const EXACT_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
 const GENERATION_RETRIES: usize = 3;
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AcquireError {
     Cancelled,
@@ -149,7 +148,20 @@ struct Slot {
     scope: Scope,
     state: Mutex<SlotState>,
     invalidation_epoch: AtomicU64,
-    notify: asupersync::sync::Notify,
+    /// Wakes waiters parked in [`wait_for_build`] / [`wait_retry_slice`].
+    ///
+    /// This is a `std::sync::Condvar` (paired with `state`) and NOT an async
+    /// `Notify` + runtime-timer timeout, deliberately (GH#203). The gate is
+    /// reached through fastmcp's sync dispatch bridge, which drives tool
+    /// futures via nested `block_on` calls on a private current-thread
+    /// runtime. In that topology the runtime timer wheel is never pumped, so
+    /// an `asupersync::time::timeout(WAIT_SLICE, notified)` that misses its
+    /// notify parks forever — the deadline checks above it can never re-run.
+    /// A condvar `wait_timeout` bounds every park with an OS timer instead,
+    /// so a missed or never-sent wakeup (e.g. the storage-crate WBQ mutation
+    /// counters, which have no notify path into this module) costs one
+    /// WAIT_SLICE, not a hang.
+    wake: std::sync::Condvar,
     #[cfg(test)]
     reconstructions: AtomicUsize,
     #[cfg(test)]
@@ -164,7 +176,7 @@ impl Slot {
             scope,
             state: Mutex::new(SlotState::default()),
             invalidation_epoch: AtomicU64::new(0),
-            notify: asupersync::sync::Notify::new(),
+            wake: std::sync::Condvar::new(),
             #[cfg(test)]
             reconstructions: AtomicUsize::new(0),
             #[cfg(test)]
@@ -276,7 +288,7 @@ impl WriteGuard {
             state.writers = state.writers.saturating_add(1);
             slot.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
             drop(state);
-            slot.notify.notify_waiters();
+            slot.wake.notify_all();
         }
         Self { slot, active: true }
     }
@@ -299,7 +311,7 @@ impl Drop for WriteGuard {
         WRITER_EPOCH.fetch_add(1, Ordering::AcqRel);
         WRITERS_ACTIVE.fetch_sub(1, Ordering::AcqRel);
         if let Some(slot) = &self.slot {
-            slot.notify.notify_waiters();
+            slot.wake.notify_all();
         }
         self.active = false;
     }
@@ -377,7 +389,11 @@ fn hash_tree(
     if file_type.is_file() {
         if exact {
             let mut file = File::open(path).map_err(AcquireError::failed)?;
-            let mut buffer = [0_u8; 256 * 1024];
+            // Heap, not stack: exact generation scans now also run on the
+            // caller's dispatch thread (GH#203 content re-validation), whose
+            // stack is already deep with nested block_on frames — a 256 KiB
+            // stack array there is a stack-overflow abort (GH#202 class).
+            let mut buffer = vec![0_u8; 256 * 1024];
             loop {
                 check_deadline(deadline, "generation scan")?;
                 let read = file.read(&mut buffer).map_err(AcquireError::failed)?;
@@ -474,6 +490,69 @@ fn hash_archive(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32
     Ok(hasher.finalize().into())
 }
 
+/// Byte ranges of the SQLite file header that FrankenSQLite mutates on every
+/// open even when no page changes: the file change counter (24..28) and the
+/// version-valid-for counter (92..96). Measured during the GH#203 livelock on
+/// Linux: successive `cmp -l` snapshots of the scratch db differ in exactly
+/// these four bytes while every page byte is stable, and the file's
+/// mtime/ctime bump once per open. They are masked out of the exact live
+/// hash so that merely opening the database can never invalidate a published
+/// snapshot generation. Real writes always change page bytes outside these
+/// ranges, so nothing observable is lost.
+const SQLITE_VOLATILE_HEADER_RANGES: [(usize, usize); 2] = [(24, 28), (92, 96)];
+
+/// Exact-content hash of the main SQLite file with the open-volatile header
+/// counters masked to zero. Mirrors [`hash_tree`]'s exact framing (relative
+/// path, type flags, length, content) so the two stay comparable in shape.
+fn hash_live_main_exact(
+    root: &Path,
+    path: &Path,
+    hasher: &mut Sha256,
+    deadline: Instant,
+) -> Result<(), AcquireError> {
+    check_deadline(deadline, "generation scan")?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hash_missing(hasher, path);
+            return Ok(());
+        }
+        Err(error) => return Err(AcquireError::failed(error)),
+    };
+    if !metadata.is_file() {
+        return Err(AcquireError::Failed(format!(
+            "generation input is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    hasher.update(relative.as_os_str().as_encoded_bytes());
+    hasher.update([1, 0, 0]);
+    hasher.update(metadata.len().to_le_bytes());
+    let mut file = File::open(path).map_err(AcquireError::failed)?;
+    // Heap, not stack: this runs on the caller's dispatch thread (see
+    // hash_tree's exact branch for the GH#202 rationale).
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut position: usize = 0;
+    loop {
+        check_deadline(deadline, "generation scan")?;
+        let read = file.read(&mut buffer).map_err(AcquireError::failed)?;
+        if read == 0 {
+            break;
+        }
+        for (start, end) in SQLITE_VOLATILE_HEADER_RANGES {
+            let lo = start.max(position);
+            let hi = end.min(position.saturating_add(read));
+            if lo < hi {
+                buffer[lo - position..hi - position].fill(0);
+            }
+        }
+        hasher.update(&buffer[..read]);
+        position = position.saturating_add(read);
+    }
+    Ok(())
+}
+
 fn hash_live(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32], AcquireError> {
     let mut hasher = Sha256::new();
     hasher.update(if exact {
@@ -481,20 +560,20 @@ fn hash_live(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32], 
     } else {
         b"agent-mail-live-generation-v1-cheap".as_slice()
     });
-    for path in std::iter::once(scope.sqlite_path.clone()).chain(
-        ["-journal", "-wal"].into_iter().map(|suffix| {
-            let mut path = scope.sqlite_path.as_os_str().to_os_string();
-            path.push(suffix);
-            PathBuf::from(path)
-        }),
-    ) {
-        hash_optional_file(
-            scope.sqlite_path.parent().unwrap_or_else(|| Path::new(".")),
-            &path,
-            &mut hasher,
-            exact,
-            deadline,
-        )?;
+    let root = scope.sqlite_path.parent().unwrap_or_else(|| Path::new("."));
+    if exact {
+        // The main db's exact hash masks the open-volatile header counters;
+        // sidecars are hashed verbatim (opens leave them byte-stable).
+        hash_live_main_exact(root, &scope.sqlite_path, &mut hasher, deadline)?;
+    } else {
+        hash_optional_file(root, &scope.sqlite_path, &mut hasher, false, deadline)?;
+    }
+    for path in ["-journal", "-wal"].into_iter().map(|suffix| {
+        let mut path = scope.sqlite_path.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }) {
+        hash_optional_file(root, &path, &mut hasher, exact, deadline)?;
     }
     Ok(hasher.finalize().into())
 }
@@ -885,7 +964,7 @@ fn finish_build(slot: &Slot, build: &Build, result: Result<BuildOutput, AcquireE
         state.building = None;
         build.completion.finish(result);
     });
-    slot.notify.notify_waiters();
+    slot.wake.notify_all();
 }
 
 fn claim_build(slot: &Slot, deadline: Instant) -> Result<Option<Build>, AcquireError> {
@@ -931,7 +1010,7 @@ fn fail_claimed_build(slot: &Slot, build: &Build, error: AcquireError) {
         build.completion.finish(Err(error));
     }
     drop(state);
-    slot.notify.notify_waiters();
+    slot.wake.notify_all();
 }
 
 struct WorkerBuildGuard {
@@ -994,7 +1073,11 @@ fn spawn_build(slot: Arc<Slot>, database_url: String, build: &Build) -> Result<(
     Ok(())
 }
 
-async fn wait_for_build(slot: &Slot, build: Build, cx: &Cx) -> Result<(), AcquireError> {
+fn wait_for_build(slot: &Slot, build: &Build, cx: &Cx) -> Result<(), AcquireError> {
+    let mut state = slot
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
         if cx.is_cancel_requested() {
             return Err(AcquireError::Cancelled);
@@ -1008,14 +1091,24 @@ async fn wait_for_build(slot: &Slot, build: Build, cx: &Cx) -> Result<(), Acquir
                 BUILD_TIMEOUT.as_secs()
             )));
         }
-        let notified = Box::pin(slot.notify.notified());
-        let _ = asupersync::time::timeout(asupersync::time::wall_now(), WAIT_SLICE, notified).await;
+        state = slot
+            .wake
+            .wait_timeout(state, WAIT_SLICE)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
     }
 }
 
-async fn wait_retry_slice(slot: &Slot) {
-    let notified = Box::pin(slot.notify.notified());
-    let _ = asupersync::time::timeout(asupersync::time::wall_now(), WAIT_SLICE, notified).await;
+fn wait_retry_slice(slot: &Slot) {
+    let state = slot
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(
+        slot.wake
+            .wait_timeout(state, WAIT_SLICE)
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
 }
 
 fn exact_audit_interval() -> Duration {
@@ -1027,6 +1120,33 @@ fn exact_audit_interval() -> Duration {
         .min(Duration::from_secs(30))
 }
 
+/// Re-stamp a ready entry's cheap baseline and audit time after its content was
+/// confirmed unchanged by an exact re-validation.
+///
+/// Without this, metadata perturbed by opens would force a full content
+/// re-hash on *every* read: the cheap comparison would miss forever because
+/// the stored baseline predates the opens. Re-baselining lets the next read
+/// take the cheap path again. (Measured on Linux, not just macOS/APFS: a
+/// FrankenSQLite open bumps the main db's mtime AND ctime and rewrites the
+/// `-fsqlite-ns-use` sidecar with zero content change — stat-sampled during
+/// the GH#203 livelock at one bump per build cycle.)
+///
+/// Best-effort: if the cheap generation cannot be computed, or the slot moved
+/// on underneath us, we simply leave the entry alone and the next read
+/// re-validates. It is never wrong to skip this, only slower.
+fn refresh_ready_audit(slot: &Arc<Slot>, deadline: Instant) {
+    let Ok(cheap) = cheap_generation(&slot.scope, deadline) else {
+        return;
+    };
+    let mut state = slot
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(ready) = state.ready.as_mut() {
+        ready.cheap = cheap;
+        ready.exact_at = Instant::now();
+    }
+}
 
 pub(crate) async fn acquire_if_needed(
     storage_root: &Path,
@@ -1064,22 +1184,57 @@ pub(crate) async fn acquire_if_needed(
                     && state.writers == 0
                     && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
                     && mcp_agent_mail_storage::archive_mutations_active() == 0)
-                    .then(|| (ready.cheap.clone(), ready.decision.clone(), ready.exact_at))
+                    .then(|| {
+                        (
+                            ready.cheap.clone(),
+                            ready.generation.clone(),
+                            ready.decision.clone(),
+                            ready.exact_at,
+                        )
+                    })
             });
             (ready, state.building.clone())
         };
 
-        if let Some((expected, decision, exact_at)) = ready
-            && Instant::now().duration_since(exact_at) < exact_audit_interval()
-        {
-            let observed = cheap_generation(&slot.scope, caller_deadline)?;
-            if observed == expected
+        if let Some((expected_cheap, expected_exact, decision, exact_at)) = ready {
+            // GH#203 (second half): the cheap generation is metadata-based,
+            // and a FrankenSQLite open bumps the live db's mtime/ctime on
+            // every open even when no byte of content changes — measured on
+            // Linux AND macOS, one bump per build cycle. Reads open the
+            // database constantly (run_build itself does), so
+            // `observed != expected_cheap` is a *false* invalidation — and
+            // past `exact_audit_interval` the cheap path was skipped
+            // outright. Both routes fell through to `claim_build`, so every
+            // read paid for a full archive reconstruct: a self-invalidation
+            // livelock (~30% CPU, a build every ~3 s) that kept
+            // `doctor mcp-selftest` at the 45 s timeout on every platform.
+            //
+            // So a cheap miss no longer implies a rebuild: re-validate against
+            // the exact (content) generation, which an open provably does not
+            // perturb. One content hash is vastly cheaper than a
+            // reconstruction, and it is the same authority `run_build` already
+            // publishes on.
+            let cheap_fresh = Instant::now().duration_since(exact_at) < exact_audit_interval()
+                && cheap_generation(&slot.scope, caller_deadline)? == expected_cheap;
+
+            let content_unchanged = if cheap_fresh {
+                true
+            } else {
+                exact_generation(&slot.scope, caller_deadline)? == expected_exact
+            };
+
+            if content_unchanged
                 && slot.invalidation_epoch.load(Ordering::Acquire) == epoch
                 && WRITER_EPOCH.load(Ordering::Acquire) == writer_epoch
                 && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
                 && mcp_agent_mail_storage::archive_mutations_active() == 0
                 && mcp_agent_mail_storage::archive_mutation_epoch() == archive_epoch
             {
+                if !cheap_fresh {
+                    // Re-baseline so the next read can take the cheap path
+                    // again rather than re-hashing content every time.
+                    refresh_ready_audit(&slot, caller_deadline);
+                }
                 return Ok(decision.snapshot());
             }
         }
@@ -1091,7 +1246,7 @@ pub(crate) async fn acquire_if_needed(
                     Ok(Some(build)) => build,
                     Ok(None) => continue,
                     Err(AcquireError::Busy(_)) => {
-                        wait_retry_slice(&slot).await;
+                        wait_retry_slice(&slot);
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -1099,7 +1254,7 @@ pub(crate) async fn acquire_if_needed(
                 if let Err(error) = spawn_build(Arc::clone(&slot), database_url.to_string(), &build)
                 {
                     if matches!(error, AcquireError::Busy(_)) {
-                        wait_retry_slice(&slot).await;
+                        wait_retry_slice(&slot);
                         continue;
                     }
                     return Err(error);
@@ -1107,10 +1262,10 @@ pub(crate) async fn acquire_if_needed(
                 build
             }
         };
-        match wait_for_build(&slot, build, cx).await {
+        match wait_for_build(&slot, &build, cx) {
             Ok(()) => {}
             Err(AcquireError::Busy(_)) => {
-                wait_retry_slice(&slot).await;
+                wait_retry_slice(&slot);
             }
             Err(error) => return Err(error),
         }
@@ -1171,7 +1326,9 @@ mod tests {
             .spawn(|| burn(1024))
             .expect("spawn archive-read stack probe");
 
-        handle.join().expect("archive-read stack probe must not overflow");
+        handle
+            .join()
+            .expect("archive-read stack probe must not overflow");
     }
 
     fn write_archive_fixture(root: &Path) {
