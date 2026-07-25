@@ -36754,8 +36754,8 @@ fn run_cmd(program: &str, args: &[&str]) -> CliResult<()> {
 /// diagnostics), a missing bus yields an empty override set so the caller can
 /// degrade gracefully.
 fn systemd_user_env(require: bool) -> CliResult<Vec<(&'static str, String)>> {
-    let ambient_xdg = mcp_agent_mail_core::config::infra_env_value("XDG_RUNTIME_DIR")
-        .filter(|v| !v.is_empty());
+    let ambient_xdg =
+        mcp_agent_mail_core::config::infra_env_value("XDG_RUNTIME_DIR").filter(|v| !v.is_empty());
     let have_xdg = ambient_xdg.is_some();
     let have_dbus = mcp_agent_mail_core::config::infra_env_value("DBUS_SESSION_BUS_ADDRESS")
         .filter(|v| !v.is_empty())
@@ -36887,13 +36887,12 @@ mod tests {
             &["-c", "test \"$AM_TEST_INJECTED\" = present"],
             &[("AM_TEST_INJECTED", "present".to_string())],
         );
-        assert!(ok.is_ok(), "child must observe the injected env var: {ok:?}");
-
-        let missing = run_cmd_with_env(
-            "sh",
-            &["-c", "test \"$AM_TEST_INJECTED\" = present"],
-            &[],
+        assert!(
+            ok.is_ok(),
+            "child must observe the injected env var: {ok:?}"
         );
+
+        let missing = run_cmd_with_env("sh", &["-c", "test \"$AM_TEST_INJECTED\" = present"], &[]);
         assert!(
             missing.is_err(),
             "child without the override must not see the value"
@@ -36915,9 +36914,15 @@ mod tests {
             ],
             || {
                 let required = systemd_user_env(true);
-                assert!(required.is_err(), "missing bus socket must error when required");
+                assert!(
+                    required.is_err(),
+                    "missing bus socket must error when required"
+                );
                 let msg = format!("{required:?}");
-                assert!(msg.contains("enable-linger"), "message must be actionable: {msg}");
+                assert!(
+                    msg.contains("enable-linger"),
+                    "message must be actionable: {msg}"
+                );
                 assert!(
                     systemd_user_env_best_effort().is_empty(),
                     "best-effort must degrade to no overrides"
@@ -38730,6 +38735,9 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(payload["params"]["arguments"]["agent_name"], "BlueLake");
         assert_eq!(payload["params"]["arguments"]["limit"], 10);
         assert_eq!(payload["params"]["arguments"]["include_bodies"], false);
+        // GH#207: check-inbox is a non-consuming peek — it must always ask
+        // the daemon's fetch_inbox NOT to mark the returned messages read.
+        assert_eq!(payload["params"]["arguments"]["mark_read"], false);
     }
 
     #[test]
@@ -71413,6 +71421,9 @@ fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json
                 "agent_name": config.agent_name,
                 "limit": config.limit,
                 "include_bodies": config.include_bodies,
+                // check-inbox is a monitoring peek for hooks and editors; it
+                // must never consume unread state (GH#207).
+                "mark_read": false,
             }
         }
     })

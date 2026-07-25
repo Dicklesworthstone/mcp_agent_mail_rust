@@ -3148,16 +3148,19 @@ effective_free_bytes={free}"
 /// - `unread_only`: Only messages not yet marked read (default: false)
 /// - `ack_overdue_only`: Only unacknowledged ack-required messages older than the SLA (default: false)
 /// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
+/// - `mark_read`: Auto-mark returned messages read (default: true). Pass false
+///   for a non-consuming peek — e.g. `am check-inbox` hooks (GH#207) — which
+///   must never change read state.
 ///
 /// # Conformance
-/// Python-parity.
+/// Python-parity (mark_read is a Rust-native additive extension).
 #[allow(
     clippy::items_after_statements,
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```"
+    description = "Retrieve recent messages for an agent and mark returned messages read.\n\nFilters\n-------\n- `urgent_only`: only messages with importance in {high, urgent}\n- `unread_only`: only recipient rows whose read_ts is unset\n- `ack_overdue_only`: only ack-required rows with no ack_ts older than the 30-minute SLA\n- `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned\n- `limit`: max number of messages (default 20)\n- `include_bodies`: include full Markdown bodies in the payloads\n- `topic`: reserved for future topic filtering; non-blank values are currently rejected\n\nUsage patterns\n--------------\n- Poll after each editing step in an agent loop to pick up coordination messages.\n- Use `since_ts` with the timestamp from your last poll for efficient incremental fetches.\n- Combine with `acknowledge_message` if `ack_required` is true.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, read_ts?, ack_ts?, importance, ack_required, kind, [body_md] }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"since_ts\":\"2025-10-23T00:00:00+00:00\"\n}}}\n```\n\nmark_read : Optional[bool]\n    Default true. Set false for a non-consuming peek that never changes read state (used by `am check-inbox` and other monitoring hooks)."
 )]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -3170,6 +3173,7 @@ pub async fn fetch_inbox(
     unread_only: Option<bool>,
     ack_overdue_only: Option<bool>,
     topic: Option<String>,
+    mark_read: Option<bool>,
 ) -> McpResult<String> {
     let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox");
     phase.mark("queue_wait");
@@ -3397,7 +3401,10 @@ pub async fn fetch_inbox(
     // The write-back MUST target the live DB, not the archive snapshot,
     // because snapshot pools are read-only reconstructions. If the live DB
     // is degraded the write will fail gracefully (already best-effort).
-    if !messages.is_empty() {
+    //
+    // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
+    // must leave read state untouched.
+    if mark_read.unwrap_or(true) && !messages.is_empty() {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let write_path = get_db_pool()
             .ok()
