@@ -602,6 +602,13 @@ jobs:
           cargo build -p mcp-agent-mail-cli
           cargo build -p mcp-agent-mail
 
+      - name: E2E health + doctor selftests suite
+        # Runs doctor selftest, mcp-selftest, and write-selftest end-to-end and
+        # requires ok=true. This is the gate that would have caught GH#203 at
+        # v0.3.22: a total read-path hang shipped twice because nothing in CI
+        # ever ran the binary end-to-end over the MCP transport.
+        run: am e2e run --project . health_and_selftests
+
       - name: E2E dual-mode suite
         run: am e2e run --project . dual_mode
 
