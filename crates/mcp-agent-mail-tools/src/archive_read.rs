@@ -1028,31 +1028,6 @@ fn exact_audit_interval() -> Duration {
 }
 
 
-/// Re-stamp a ready entry's cheap baseline and audit time after its content was
-/// confirmed unchanged by an exact re-validation.
-///
-/// Without this, a platform that perturbs file metadata on open (macOS/APFS
-/// bumps mtime on every open) would re-hash full content on *every* read: the
-/// cheap comparison would miss forever because the stored baseline predates the
-/// opens. Re-baselining lets the next read take the cheap path again.
-///
-/// Best-effort: if the cheap generation cannot be computed, or the slot moved
-/// on underneath us, we simply leave the entry alone and the next read
-/// re-validates. It is never wrong to skip this, only slower.
-fn refresh_ready_audit(slot: &Arc<Slot>, deadline: Instant) {
-    let Ok(cheap) = cheap_generation(&slot.scope, deadline) else {
-        return;
-    };
-    let mut state = slot
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(ready) = state.ready.as_mut() {
-        ready.cheap = cheap;
-        ready.exact_at = Instant::now();
-    }
-}
-
 pub(crate) async fn acquire_if_needed(
     storage_root: &Path,
     sqlite_path: &Path,
@@ -1089,55 +1064,22 @@ pub(crate) async fn acquire_if_needed(
                     && state.writers == 0
                     && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
                     && mcp_agent_mail_storage::archive_mutations_active() == 0)
-                    .then(|| {
-                        (
-                            ready.cheap.clone(),
-                            ready.generation.clone(),
-                            ready.decision.clone(),
-                            ready.exact_at,
-                        )
-                    })
+                    .then(|| (ready.cheap.clone(), ready.decision.clone(), ready.exact_at))
             });
             (ready, state.building.clone())
         };
 
-        if let Some((expected_cheap, expected_exact, decision, exact_at)) = ready {
-            // GH#203 (second half): the cheap generation is metadata-based, and
-            // on macOS/APFS a FrankenSQLite open bumps the live db's mtime on
-            // every open even when no byte of content changes. Reads open the
-            // database constantly, so `observed != expected_cheap` is a *false*
-            // invalidation there — and past `exact_audit_interval` the cheap
-            // path is skipped outright. Both routes fell through to
-            // `claim_build`, so effectively every read paid for a full archive
-            // reconstruct. That is what kept `doctor mcp-selftest` at the
-            // 45 s timeout on macOS after the run_build gate was fixed.
-            //
-            // So a cheap miss no longer implies a rebuild: re-validate against
-            // the exact (content) generation, which an open provably does not
-            // perturb. One content hash is vastly cheaper than a
-            // reconstruction, and it is the same authority `run_build` already
-            // publishes on.
-            let cheap_fresh = Instant::now().duration_since(exact_at) < exact_audit_interval()
-                && cheap_generation(&slot.scope, caller_deadline)? == expected_cheap;
-
-            let content_unchanged = if cheap_fresh {
-                true
-            } else {
-                exact_generation(&slot.scope, caller_deadline)? == expected_exact
-            };
-
-            if content_unchanged
+        if let Some((expected, decision, exact_at)) = ready
+            && Instant::now().duration_since(exact_at) < exact_audit_interval()
+        {
+            let observed = cheap_generation(&slot.scope, caller_deadline)?;
+            if observed == expected
                 && slot.invalidation_epoch.load(Ordering::Acquire) == epoch
                 && WRITER_EPOCH.load(Ordering::Acquire) == writer_epoch
                 && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
                 && mcp_agent_mail_storage::archive_mutations_active() == 0
                 && mcp_agent_mail_storage::archive_mutation_epoch() == archive_epoch
             {
-                if !cheap_fresh {
-                    // Re-baseline so the next read can take the cheap path
-                    // again rather than re-hashing content every time.
-                    refresh_ready_audit(&slot, caller_deadline);
-                }
                 return Ok(decision.snapshot());
             }
         }
