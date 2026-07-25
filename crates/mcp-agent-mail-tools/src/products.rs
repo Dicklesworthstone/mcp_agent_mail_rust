@@ -986,6 +986,15 @@ mod tests {
     use fastmcp::McpContext;
     use mcp_agent_mail_core::config::with_process_env_overrides_for_test;
 
+    /// Seeding pool for tests: the plain live pool WITHOUT a `WriteGuard`
+    /// lease. Holding `WriteDbPool`'s guard across the product-bus read
+    /// assertions starves the archive-read gate's claim admission for the
+    /// full 120s `BUILD_TIMEOUT` (br-lwwq5; same fix as
+    /// `resources::resource_shape_tests::seed_pool`).
+    fn seed_pool() -> mcp_agent_mail_db::DbPool {
+        get_db_pool().expect("db pool").clone()
+    }
+
     // -----------------------------------------------------------------------
     // collapse_whitespace
     // -----------------------------------------------------------------------
@@ -1557,7 +1566,19 @@ mod tests {
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let ctx = McpContext::new(cx, 1);
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    // Bootstrap an empty mailbox first: since GH#198 the read
+                    // path never creates the database file, so without this
+                    // the tool reports a connection error instead of reaching
+                    // product-key validation (which is what this test is
+                    // actually about). The file is only created on the first
+                    // connection acquire, so touch one; the lease then drops.
+                    let seed = seed_pool();
+                    match seed.acquire(&cx).await {
+                        asupersync::Outcome::Ok(conn) => drop(conn),
+                        _ => panic!("seed acquire failed"),
+                    }
+                    drop(seed);
                     let err = search_messages_product(
                         &ctx,
                         "missing-product".to_string(),
@@ -1618,7 +1639,7 @@ mod tests {
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
@@ -1925,7 +1946,7 @@ mod tests {
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
 
                     let first_project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
@@ -2168,7 +2189,7 @@ mod tests {
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
@@ -2348,7 +2369,7 @@ mod tests {
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
@@ -2519,7 +2540,7 @@ mod tests {
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
 
                     let healthy_project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
@@ -2808,7 +2829,7 @@ archive body
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
                     let project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
                         &pool,
@@ -2941,7 +2962,7 @@ archive body
                     .expect("build runtime");
                 rt.block_on(async {
                     let cx = Cx::for_testing();
-                    let pool = get_db_pool().expect("db pool");
+                    let pool = seed_pool();
                     let existing_project = match mcp_agent_mail_db::queries::ensure_project(
                         &cx,
                         &pool,
