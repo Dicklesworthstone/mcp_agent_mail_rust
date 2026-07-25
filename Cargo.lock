@@ -717,7 +717,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex 2.0.1",
+ "shlex",
 ]
 
 [[package]]
@@ -880,7 +880,7 @@ dependencies = [
  "clap",
  "clap_lex",
  "is_executable",
- "shlex 2.0.1",
+ "shlex",
 ]
 
 [[package]]
@@ -954,9 +954,9 @@ dependencies = [
 
 [[package]]
 name = "comrak"
-version = "0.52.0"
+version = "0.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aac0b255932a9cd52fbfd664b67957f9f2e095ae4711cb0e41b4e291edef94c2"
+checksum = "0d5910408554659ed848ff469e67ec83b30f179e72cec286cfdae64d1616f466"
 dependencies = [
  "caseless",
  "entities",
@@ -1237,7 +1237,22 @@ dependencies = [
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.10.7",
- "fiat-crypto",
+ "fiat-crypto 0.2.9",
+ "rustc_version",
+ "subtle",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "curve25519-dalek-derive",
+ "digest 0.11.3",
+ "fiat-crypto 0.3.0",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -1596,8 +1611,16 @@ version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
- "pkcs8",
- "signature",
+ "signature 2.2.0",
+]
+
+[[package]]
+name = "ed25519"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
+dependencies = [
+ "signature 3.0.0",
 ]
 
 [[package]]
@@ -1606,11 +1629,22 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
- "curve25519-dalek",
- "ed25519",
- "serde",
+ "curve25519-dalek 4.1.3",
+ "ed25519 2.2.3",
  "sha2 0.10.9",
- "signature",
+ "signature 2.2.0",
+ "subtle",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
+dependencies = [
+ "curve25519-dalek 5.0.0",
+ "ed25519 3.0.0",
+ "sha2 0.11.0",
  "subtle",
  "zeroize",
 ]
@@ -1851,6 +1885,12 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "fiat-crypto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "filetime"
@@ -4140,9 +4180,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.4.0"
+version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -4150,7 +4190,7 @@ dependencies = [
  "js-sys",
  "serde",
  "serde_json",
- "signature",
+ "signature 2.2.0",
  "zeroize",
 ]
 
@@ -4503,7 +4543,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "shellexpand",
- "shlex 1.3.0",
+ "shlex",
  "tempfile",
  "thiserror",
  "tracing",
@@ -4604,7 +4644,7 @@ version = "0.3.24"
 dependencies = [
  "ammonia",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
  "comrak",
  "criterion",
@@ -4647,9 +4687,9 @@ dependencies = [
 name = "mcp-agent-mail-share"
 version = "0.3.24"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
- "ed25519-dalek",
+ "ed25519-dalek 3.0.0",
  "hex",
  "include_dir",
  "mcp-agent-mail-core",
@@ -4669,7 +4709,7 @@ name = "mcp-agent-mail-storage"
 version = "0.3.24"
 dependencies = [
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
  "criterion",
  "fastmcp-core",
@@ -4707,9 +4747,9 @@ version = "0.3.24"
 dependencies = [
  "arbitrary",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
- "ed25519-dalek",
+ "ed25519-dalek 3.0.0",
  "fastmcp-core",
  "fastmcp-protocol",
  "fastmcp-rust",
@@ -4898,8 +4938,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879011babc47a1c7fdf5a935ae3cfe94f34645ca0cac1c7f6424b36fc743d1bf"
 dependencies = [
  "data-encoding",
- "ed25519",
- "ed25519-dalek",
+ "ed25519 2.2.3",
+ "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
  "log",
  "rand 0.8.7",
@@ -6268,12 +6308,6 @@ dependencies = [
 
 [[package]]
 name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
-
-[[package]]
-name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
@@ -6327,7 +6361,7 @@ checksum = "c1e303f8205714074f6068773f0e29527e0453937fe837c9717d066635b65f31"
 dependencies = [
  "pkcs8",
  "rand_core 0.6.4",
- "signature",
+ "signature 2.2.0",
  "zeroize",
 ]
 
@@ -6340,6 +6374,12 @@ dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "simd-adler32"

@@ -3153,7 +3153,7 @@ effective_free_bytes={free}"
 ///   must never change read state.
 ///
 /// # Conformance
-/// Python-parity (mark_read is a Rust-native additive extension).
+/// Python-parity (`mark_read` is a Rust-native additive extension).
 #[allow(
     clippy::items_after_statements,
     clippy::too_many_arguments,

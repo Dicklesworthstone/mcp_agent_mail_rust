@@ -24,7 +24,7 @@ hex = "0.4"
 fs2.workspace = true
 nix.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
-base64 = "0.22"
+base64 = "0.23"
 thiserror.workspace = true
 tracing.workspace = true
 mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
