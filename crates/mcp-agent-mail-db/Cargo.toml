@@ -71,6 +71,13 @@ hybrid = [
     "frankensearch/hash",
     "frankensearch/model2vec",
     "frankensearch/lexical",
+    # Same shape as the `native` note below: `lexical` compiles
+    # frankensearch-lexical (which depends on tantivy unconditionally), but the
+    # umbrella crate's `TantivyIndex` re-export is cfg-gated on the separate
+    # `lexical-tantivy` feature. Enable it so `fs::TantivyIndex` resolves in
+    # search_fs_bridge.rs. This adds no dependency weight — `lexical` already
+    # pulls tantivy in.
+    "frankensearch/lexical-tantivy",
     "frankensearch/rerank",
     # `rerank` compiles the pure-Rust NativeReranker (frankentorch) backend, but
     # the umbrella crate's `NativeReranker` re-export is cfg-gated on the separate

@@ -207,6 +207,16 @@ ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 tru = { path = "../toon_rust" }
 rich_rust = { path = "../rich_rust" }
 
+# FrankenSQLite is intentionally NOT path-patched.
+#
+# The sibling checkout (0.1.19) is mid-async-refactor and does not compile:
+# `PageReader::read_page` / `read_page_data` / `write_page` in
+# fsqlite-btree/src/cursor.rs are synchronous trait methods calling a
+# `get_page` that upstream has already made async, so the crate fails with
+# E0277/E0308. Until that refactor lands, the newest *working* FrankenSQLite
+# is the published 0.1.18, which is what we resolve from crates.io.
+# Re-add path patches for every fsqlite-* crate once upstream compiles again.
+
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
 # 15-29GB rch workers, so rch fails the remote build and falls back to a LOCAL
