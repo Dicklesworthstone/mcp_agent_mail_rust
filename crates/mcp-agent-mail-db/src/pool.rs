@@ -430,6 +430,11 @@ struct RecoveryAdmissionState {
     /// Number of consecutive failures (reset to 0 on success).
     consecutive_failures: u32,
 
+    /// The most recent failure's error text (bounded), so backoff/suppression
+    /// refusals can name the underlying disease instead of only the deferral
+    /// (br-eudur: a deferred retry otherwise masks the real first failure).
+    last_failure_reason: Option<String>,
+
     /// Instant of the most recent recovery attempt (success or failure).
     last_attempt: Option<Instant>,
 
@@ -499,6 +504,7 @@ impl RecoveryAdmissionController {
             state: Mutex::new(RecoveryAdmissionState {
                 failure_path: None,
                 consecutive_failures: 0,
+                last_failure_reason: None,
                 last_attempt: None,
                 window_attempts: std::collections::VecDeque::new(),
                 success_path: None,
@@ -586,6 +592,7 @@ impl RecoveryAdmissionController {
             {
                 state.failure_path = None;
                 state.consecutive_failures = 0;
+                state.last_failure_reason = None;
                 state.last_attempt = None;
                 state.window_attempts.clear();
                 state.suppressed_until = None;
@@ -632,6 +639,7 @@ impl RecoveryAdmissionController {
         // Normal failure-tracking reset: a success means we are not in a
         // failure backoff for this path.
         state.consecutive_failures = 0;
+        state.last_failure_reason = None;
         state.last_attempt = Some(now);
         state.window_attempts.clear();
         state.failure_path = None;
@@ -662,8 +670,11 @@ impl RecoveryAdmissionController {
 
     /// Record a failed recovery. Increments consecutive-failure count,
     /// records the attempt in the sliding window, and may activate
-    /// loop suppression if the window threshold is exceeded.
-    pub fn report_failure(&self, primary_path: &Path) {
+    /// loop suppression if the window threshold is exceeded. The failure
+    /// `reason` is retained (bounded) so later backoff/suppression refusals
+    /// can name the underlying disease (br-eudur).
+    pub fn report_failure(&self, primary_path: &Path, reason: &str) {
+        const MAX_RETAINED_REASON_BYTES: usize = 600;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         if state
@@ -677,6 +688,16 @@ impl RecoveryAdmissionController {
             state.window_attempts.clear();
             state.suppressed_until = None;
         }
+        let mut retained = reason.trim().to_string();
+        if retained.len() > MAX_RETAINED_REASON_BYTES {
+            let mut cut = MAX_RETAINED_REASON_BYTES;
+            while cut > 0 && !retained.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            retained.truncate(cut);
+            retained.push('…');
+        }
+        state.last_failure_reason = Some(retained);
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         state.last_attempt = Some(now);
         Self::prune_window(&mut state.window_attempts, now);
@@ -721,6 +742,7 @@ impl RecoveryAdmissionController {
         RecoveryAdmissionStatus {
             in_progress: self.in_progress.load(std::sync::atomic::Ordering::SeqCst),
             consecutive_failures: state.consecutive_failures,
+            last_failure_reason: state.last_failure_reason.clone(),
             attempts_in_window: state.window_attempts.len(),
             successes_in_window: state.recent_successes.len(),
             suppressed: state.suppressed_until.is_some_and(|until| now < until),
@@ -746,6 +768,7 @@ impl RecoveryAdmissionController {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.failure_path = None;
         state.consecutive_failures = 0;
+        state.last_failure_reason = None;
         state.last_attempt = None;
         state.window_attempts.clear();
         state.success_path = None;
@@ -780,6 +803,8 @@ pub struct RecoveryAdmissionStatus {
     pub in_progress: bool,
     /// Number of consecutive recovery failures.
     pub consecutive_failures: u32,
+    /// The most recent failure's retained error text, if any (br-eudur).
+    pub last_failure_reason: Option<String>,
     /// Number of failed recovery attempts within the current sliding window.
     pub attempts_in_window: usize,
     /// Number of *successful* recoveries for the active path within the current
@@ -855,8 +880,12 @@ fn recovery_admission_blocked_error(primary_path: &Path, action: &str) -> SqlErr
             status.attempts_in_window
         )
     } else if status.consecutive_failures > 0 {
+        let reason = status
+            .last_failure_reason
+            .as_deref()
+            .unwrap_or("failure reason not recorded");
         format!(
-            "{action} for {} is deferred by exponential backoff after {} consecutive failures (current backoff {}s)",
+            "{action} for {} is deferred by exponential backoff after {} consecutive failures (current backoff {}s); last failure: {reason}",
             primary_path.display(),
             status.consecutive_failures,
             status.current_backoff.as_secs()
@@ -890,7 +919,7 @@ where
     let result = operation();
     match &result {
         Ok(_) => recovery_admission().report_success(primary_path),
-        Err(_) => recovery_admission().report_failure(primary_path),
+        Err(error) => recovery_admission().report_failure(primary_path, &error.to_string()),
     }
     result
 }
@@ -8378,7 +8407,39 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     // generation remains at the live path. The unified promotion API performs
     // the only quarantine/activation/receipt transition after construction is
     // complete, so no low-level builder ever sees or replaces a live target.
-    let salvage_db_path = salvage_existing.then_some(primary_path);
+    let salvage_db_path = if salvage_existing {
+        // The salvage source on this automatic path is the unhealthy primary
+        // itself. When it is so damaged that it cannot even be probed as a
+        // SQLite database, there is no readable DB-only coordination state to
+        // protect, and the strict salvage contract would refuse the archive
+        // candidate and leave the mailbox dead (br-eudur; ts1 incident).
+        // Degrade to an archive-only candidate — the damaged source is still
+        // preserved via quarantine. Probe failures that are NOT clearly
+        // corruption (lock/busy, permissions) keep refusing fail-closed.
+        match crate::reconstruct::probe_salvage_database_for_merge(primary_path) {
+            Ok(()) => Some(primary_path),
+            Err(error) => {
+                let message = error.to_string();
+                if is_corruption_error_message(&message) {
+                    tracing::warn!(
+                        path = %primary_path.display(),
+                        error = %message,
+                        "salvage source is unreadable as a SQLite database; \
+                         degrading to archive-only reconstruction (source is \
+                         preserved in quarantine)"
+                    );
+                    None
+                } else {
+                    return Err(SqlError::Custom(format!(
+                        "archive reconstruction refused: salvage source {} failed probing for a non-corruption reason and DB-only coordination state could still exist: {message}",
+                        primary_path.display()
+                    )));
+                }
+            }
+        }
+    } else {
+        None
+    };
     reconstruct_archive_into_candidate(primary_path, storage_root, salvage_db_path, &timestamp)
         .map_err(|failure| failure.error)
 }
@@ -8916,7 +8977,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         "no healthy backup found; attempting database reconstruction from Git archive"
     );
 
-    match reconstruct_sqlite_file_with_archive_salvage_inner(
+    let reconstruct_error = match reconstruct_sqlite_file_with_archive_salvage_inner(
         primary_path,
         storage_root,
         false,
@@ -8948,8 +9009,9 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
                 error = %e,
                 "archive reconstruction failed; falling through to blank reinitialize"
             );
+            e
         }
-    }
+    };
 
     if had_primary {
         // The archive-salvage helper atomically restores the exact original
@@ -8960,12 +9022,12 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         // already quarantined by `reconstruct_archive_into_candidate`.
         if !path_is_occupied(primary_path) {
             return Err(SqlError::Custom(format!(
-                "database file {} could not be restored after failed archive recovery; quarantined evidence was retained and blank reinitialization is refused",
+                "database file {} could not be restored after failed archive recovery; quarantined evidence was retained and blank reinitialization is refused (reconstruction error: {reconstruct_error})",
                 primary_path.display()
             )));
         }
         return Err(SqlError::Custom(format!(
-            "database file {} was restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization to avoid data loss",
+            "database file {} was restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization to avoid data loss (reconstruction error: {reconstruct_error})",
             primary_path.display()
         )));
     }
@@ -16696,7 +16758,7 @@ mod tests {
         let failed_path = Path::new("/tmp/failed-mailbox.sqlite3");
         let other_path = Path::new("/tmp/other-mailbox.sqlite3");
 
-        controller.report_failure(failed_path);
+        controller.report_failure(failed_path, "simulated recovery failure");
         controller
             .in_progress
             .store(true, std::sync::atomic::Ordering::SeqCst);

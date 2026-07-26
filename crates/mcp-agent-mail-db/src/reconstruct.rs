@@ -1628,7 +1628,7 @@ pub fn reconstruct_from_archive_with_salvage(
     Ok(stats)
 }
 
-fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
+pub(crate) fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
     crate::pool::validate_sqlite_target_path(path, "reconstruct salvage source")
         .map_err(|error| DbError::Sqlite(format!("reconstruct salvage: {error}")))?;
     if !is_real_file(path) {
