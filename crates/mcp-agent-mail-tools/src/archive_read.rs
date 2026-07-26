@@ -1304,7 +1304,7 @@ pub fn acquire_if_needed(
 }
 
 #[cfg(test)]
-pub(crate) fn reset_for_test() {
+pub fn reset_for_test() {
     let mut registry = REGISTRY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1316,11 +1316,12 @@ pub(crate) fn reset_for_test() {
             .is_none()
     }));
     registry.slots.clear();
+    drop(registry);
     TEST_BUILD_DELAY_MS.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
-pub(crate) fn writer_epoch_for_test() -> u64 {
+pub fn writer_epoch_for_test() -> u64 {
     WRITER_EPOCH.load(Ordering::Acquire)
 }
 
@@ -1340,8 +1341,8 @@ mod tests {
             // ~4 KiB of live stack per frame, opaque to the optimizer so the
             // recursion cannot be turned into a loop or elided.
             let mut frame = [0u8; 4096];
-            frame[0] = depth as u8;
-            frame[4095] = depth as u8;
+            frame[0] = depth.to_le_bytes()[0];
+            frame[4095] = depth.to_le_bytes()[0];
             std::hint::black_box(&frame);
             if depth == 0 {
                 return 0;
@@ -1738,9 +1739,8 @@ mod tests {
         .expect("corrupt profile");
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let cx = Cx::for_testing();
-        let error = match acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx) {
-            Err(error) => error,
-            Ok(_) => panic!("malformed profile must fail closed"),
+        let Err(error) = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx) else {
+            panic!("malformed profile must fail closed")
         };
         assert!(
             matches!(error, AcquireError::Failed(ref message) if message.contains("skipped")),
