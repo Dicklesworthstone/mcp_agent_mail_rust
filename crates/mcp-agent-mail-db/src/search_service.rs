@@ -894,8 +894,16 @@ fn stable_direct_surface_index_dir(pool: &DbPool) -> PathBuf {
         ));
     }
 
+    // Key by the canonical mailbox identity (storage root), not by
+    // `sqlite_identity_key`: snapshot-backed pools open a fresh temp copy of
+    // the mailbox per invocation, so a `path@generation` key minted a
+    // brand-new index dir and a FullRebuild on every query while leaking one
+    // directory per run (br-dvs6f). The storage root is the same identity the
+    // preferred shared `storage_root/search_index` route uses; stale docs
+    // from a replaced or drifted DB are dropped at query time by candidate
+    // canonicalization, exactly as on the shared route.
     let mut hasher = Sha256::new();
-    hasher.update(pool.sqlite_identity_key().as_bytes());
+    hasher.update(pool.storage_root().display().to_string().as_bytes());
     let digest = hex::encode(hasher.finalize());
     stable_direct_surface_index_root().join(digest)
 }
@@ -4759,6 +4767,44 @@ mod tests {
         assert_ne!(chosen, root.path().join("search_index"));
         assert!(chosen.starts_with(stable_direct_surface_index_root()));
         assert_eq!(chosen, stable_direct_surface_index_dir(&pool));
+    }
+
+    #[test]
+    fn stable_direct_surface_index_dir_is_stable_across_snapshot_copies() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("mailbox-root");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let pool_for = |db_name: &str| {
+            crate::DbPool::new(&crate::DbPoolConfig {
+                database_url: format!("sqlite:///{}", root.path().join(db_name).display()),
+                storage_root: Some(storage_root.clone()),
+                ..Default::default()
+            })
+            .expect("pool")
+        };
+
+        // Two different snapshot copies of the same mailbox (fresh temp sqlite
+        // path per invocation) must share one index dir so repeated local
+        // searches reuse and increment instead of FullRebuild + leak.
+        let first = stable_direct_surface_index_dir(&pool_for("snapshot-a.sqlite3"));
+        let second = stable_direct_surface_index_dir(&pool_for("snapshot-b.sqlite3"));
+        assert_eq!(first, second);
+
+        // A different mailbox (different storage root) must not collide.
+        let other_root = root.path().join("other-mailbox-root");
+        std::fs::create_dir_all(&other_root).expect("other storage root");
+        let other = stable_direct_surface_index_dir(
+            &crate::DbPool::new(&crate::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    root.path().join("snapshot-c.sqlite3").display()
+                ),
+                storage_root: Some(other_root),
+                ..Default::default()
+            })
+            .expect("pool"),
+        );
+        assert_ne!(first, other);
     }
 
     #[test]
