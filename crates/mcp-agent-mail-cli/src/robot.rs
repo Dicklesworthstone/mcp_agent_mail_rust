@@ -24185,7 +24185,12 @@ mod tests {
         );
 
         // conflicting_active is the overlap-only projection (the two auth paths).
-        assert_eq!(data.conflicting_active.len(), 2, "{:?}", data.conflicting_active);
+        assert_eq!(
+            data.conflicting_active.len(),
+            2,
+            "{:?}",
+            data.conflicting_active
+        );
         assert!(
             data.conflicting_active
                 .iter()

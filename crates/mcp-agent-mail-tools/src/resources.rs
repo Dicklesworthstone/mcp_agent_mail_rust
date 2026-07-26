@@ -6005,6 +6005,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("fetch recipient inbox"),
@@ -6070,6 +6071,7 @@ mod resource_shape_tests {
                         None,
                         Some(10),
                         Some(true),
+                        None,
                         None,
                         None,
                         None,

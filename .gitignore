@@ -224,3 +224,4 @@ windsurf.mcp.json
 # Agent run artifacts / probes
 .space_probe
 claude-upgrade-progress.json
+agy.mcp.json

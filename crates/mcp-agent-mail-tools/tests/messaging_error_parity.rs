@@ -386,7 +386,10 @@ fn test_reply_message_cross_project_reports_owning_project() {
         .expect_err("cross-project reply must be refused");
 
         let payload = error_object(&err);
-        assert_eq!(payload.get("type").and_then(Value::as_str), Some("NOT_FOUND"));
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("NOT_FOUND")
+        );
         assert_eq!(
             payload.get("recoverable").and_then(Value::as_bool),
             Some(true),
@@ -404,7 +407,9 @@ fn test_reply_message_cross_project_reports_owning_project() {
             "error should record which project was asked for"
         );
         assert_eq!(
-            details.get("belongs_to_other_project").and_then(Value::as_bool),
+            details
+                .get("belongs_to_other_project")
+                .and_then(Value::as_bool),
             Some(true),
             "error should distinguish 'wrong project' from 'no such message'"
         );

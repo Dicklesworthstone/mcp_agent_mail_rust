@@ -149,7 +149,10 @@ mod tests {
     fn override_is_clamped_rather_than_honored_blindly() {
         // Below the floor clamps up, so GH#202 cannot be reintroduced by a
         // stray small value.
-        assert_eq!(resolve_worker_stack_size(Some(1), None), WORKER_STACK_SIZE_MIN);
+        assert_eq!(
+            resolve_worker_stack_size(Some(1), None),
+            WORKER_STACK_SIZE_MIN
+        );
         // Absurd values clamp down rather than reserving terabytes.
         assert_eq!(
             resolve_worker_stack_size(Some(999_999), None),
