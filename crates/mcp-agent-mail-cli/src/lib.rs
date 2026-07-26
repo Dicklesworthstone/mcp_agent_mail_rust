@@ -24704,17 +24704,46 @@ fn doctor_ordered_checks<'a>(
 }
 
 fn doctor_database_next_action(strategy: &DoctorDatabaseFixStrategy) -> String {
-    match strategy {
+    let base = match strategy {
         DoctorDatabaseFixStrategy::Reconstruct(_) => {
-            "Run `am doctor fix --dry-run` or `am doctor reconstruct --dry-run`.".to_string()
+            "Run `am doctor fix --dry-run` or `am doctor reconstruct --dry-run`."
         }
         DoctorDatabaseFixStrategy::Repair(_) => {
-            "Run `am doctor fix --dry-run` or `am doctor repair --dry-run`.".to_string()
+            "Run `am doctor fix --dry-run` or `am doctor repair --dry-run`."
         }
         DoctorDatabaseFixStrategy::None(_) => {
-            "No database repair action is currently recommended.".to_string()
+            return "No database repair action is currently recommended.".to_string();
         }
+    };
+    // br-vzvva (ts1 incident): recommending a mutating verb while a live
+    // owner would refuse it (exit 3, supervised-owner-required) sends the
+    // operator in a loop. Name the unblocking step first.
+    match doctor_live_owner_unblock_hint() {
+        Some(hint) => format!("{hint} Then: {base}"),
+        None => base.to_string(),
     }
+}
+
+/// Pure composition of the supervised-owner unblock hint for a blocked class.
+fn doctor_owner_unblock_prefix(class: DoctorLockOwnerClass) -> String {
+    format!(
+        "A live mailbox owner (class {}) will refuse `am doctor repair`/`reconstruct`: gracefully stop it via your supervisor (`am service restart`, or `systemctl --user stop` the agent-mail service — never a hard kill), then confirm `am doctor drain` reports safe_to_mutate=true.",
+        class.as_str()
+    )
+}
+
+/// Probe the effective mailbox's live-owner class and return the unblocking
+/// hint when a mutating doctor verb would currently be refused. Returns `None`
+/// when mutation is safe (owner class stale) or the probe itself fails —
+/// recommendations must never get scarier because a probe errored.
+fn doctor_live_owner_unblock_hint() -> Option<String> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    let report = build_doctor_locks_report_for(&cfg.database_url, &config.storage_root).ok()?;
+    if !doctor_mutation_blocked_by_owner(report.owner_state.class, false) {
+        return None;
+    }
+    Some(doctor_owner_unblock_prefix(report.owner_state.class))
 }
 
 fn doctor_database_strategy_summary(strategy: &DoctorDatabaseFixStrategy) -> serde_json::Value {
@@ -47044,6 +47073,33 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     // ─── br-bvq1x.4.4 (D4): supervised-owner guard ──────────────────────────
+
+    #[test]
+    fn doctor_owner_unblock_prefix_names_class_and_drain_step() {
+        for class in [
+            DoctorLockOwnerClass::Live,
+            DoctorLockOwnerClass::Wedged,
+            DoctorLockOwnerClass::UnsafeToTouch,
+        ] {
+            let prefix = doctor_owner_unblock_prefix(class);
+            assert!(
+                prefix.contains(class.as_str()),
+                "prefix must name the owner class: {prefix}"
+            );
+            assert!(
+                prefix.contains("safe_to_mutate=true"),
+                "prefix must name the drain confirmation step: {prefix}"
+            );
+            assert!(
+                prefix.contains("supervisor"),
+                "prefix must route through the supervisor: {prefix}"
+            );
+            assert!(
+                !prefix.contains("kill -9"),
+                "prefix must never suggest a hard kill: {prefix}"
+            );
+        }
+    }
 
     #[test]
     fn supervised_guard_blocks_live_wedged_unsafe_allows_stale() {
