@@ -11258,6 +11258,159 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
     })
 }
 
+fn beads_project_dir(beads_dir: &Path) -> PathBuf {
+    if beads_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".beads")
+    {
+        beads_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| beads_dir.to_path_buf())
+    } else {
+        beads_dir.to_path_buf()
+    }
+}
+
+fn br_cli_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("AM_BR_BIN").or_else(|| std::env::var_os("BR_BIN")) {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let local = PathBuf::from(home).join(".local/bin/br");
+        if local.exists() {
+            return local;
+        }
+    }
+    PathBuf::from("br")
+}
+
+fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, String> {
+    let project_dir = beads_project_dir(beads_dir);
+    let output = std::process::Command::new(br_cli_path())
+        .current_dir(&project_dir)
+        .env("RUST_LOG", "error")
+        .args([
+            "--json",
+            "--quiet",
+            "--no-daemon",
+            "--allow-stale",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ])
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute br: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("br exited with status {}", output.status)
+        };
+        return Err(detail);
+    }
+
+    serde_json::from_slice(&output.stdout).map_err(|e| {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        format!("failed to parse br JSON output: {e}; output={stdout}")
+    })
+}
+
+fn br_issue_summary_items(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    value
+        .as_array()
+        .map(|issues| {
+            issues
+                .iter()
+                .map(|issue| {
+                    let priority = issue
+                        .get("priority")
+                        .and_then(|v| v.as_i64())
+                        .map(|p| format!("P{p}"))
+                        .or_else(|| {
+                            issue
+                                .get("priority")
+                                .and_then(|v| v.as_str())
+                                .map(|p| if p.starts_with('P') { p.to_string() } else { format!("P{p}") })
+                        })
+                        .unwrap_or_else(|| "P?".to_string());
+                    serde_json::json!({
+                        "id": issue.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "title": issue.get("title").cloned().unwrap_or(serde_json::Value::Null),
+                        "status": issue.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                        "priority": priority,
+                        "type": issue
+                            .get("issue_type")
+                            .or_else(|| issue.get("type"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "labels": issue.get("labels").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn br_status_counts(
+    beads_dir: &Path,
+) -> Result<(usize, usize, usize, usize, usize, usize), String> {
+    let args = vec![
+        "count".to_string(),
+        "--by".to_string(),
+        "status".to_string(),
+        "--include-closed".to_string(),
+    ];
+    let value = run_br_json(beads_dir, &args)?;
+    let total = value
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default() as usize;
+
+    let mut open = 0usize;
+    let mut in_progress = 0usize;
+    let mut blocked = 0usize;
+    let mut deferred = 0usize;
+    let mut closed = 0usize;
+    if let Some(groups) = value.get("groups").and_then(|v| v.as_array()) {
+        for group in groups {
+            let count = group
+                .get("count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as usize;
+            match group
+                .get("group")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+            {
+                "open" => open = count,
+                "in_progress" => in_progress = count,
+                "blocked" => blocked = count,
+                "deferred" => deferred = count,
+                "closed" => closed = count,
+                _ => {}
+            }
+        }
+    }
+    Ok((open, in_progress, blocked, deferred, closed, total))
+}
+
+fn br_ready_count(beads_dir: &Path) -> Result<usize, String> {
+    let args = vec!["status".to_string()];
+    let value = run_br_json(beads_dir, &args)?;
+    Ok(value
+        .get("summary")
+        .and_then(|summary| summary.get("ready_issues"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default() as usize)
+}
+
 fn handle_beads(action: BeadsCommand) -> CliResult<()> {
     match action {
         BeadsCommand::Ready {
@@ -11290,34 +11443,16 @@ fn handle_beads_ready(
     format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
-    use beads_rust::storage::{ReadyFilters, ReadySortPolicy};
-
     let fmt = output::CliOutputFormat::resolve(format, json);
     let beads_dir = resolve_beads_dir(path.as_deref())?;
-    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
-        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
-
-    let filters = ReadyFilters {
-        limit: Some(limit),
-        ..ReadyFilters::default()
-    };
-    let issues = storage
-        .get_ready_issues(&filters, ReadySortPolicy::Hybrid)
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-
-    let items: Vec<serde_json::Value> = issues
-        .iter()
-        .map(|i| {
-            serde_json::json!({
-                "id": i.id,
-                "title": i.title,
-                "status": i.status.as_str(),
-                "priority": format!("P{}", i.priority.0),
-                "type": i.issue_type.as_str(),
-                "labels": i.labels,
-            })
-        })
-        .collect();
+    let args = vec![
+        "ready".to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+    ];
+    let br_json = run_br_json(&beads_dir, &args)
+        .map_err(|e| CliError::Other(format!("br query failed: {e}")))?;
+    let items = br_issue_summary_items(&br_json);
 
     if items.is_empty() {
         output::emit_empty(fmt, "No ready issues.");
@@ -11325,14 +11460,18 @@ fn handle_beads_ready(
     }
 
     output::emit_output(&items, fmt, || {
-        output::section(&format!("Ready issues ({}):", issues.len()));
-        for issue in &issues {
+        output::section(&format!("Ready issues ({}):", items.len()));
+        for issue in &items {
             ftui_runtime::ftui_println!(
                 "  {} [P{}] {} ({})",
-                issue.id,
-                issue.priority.0,
-                issue.title,
-                issue.status.as_str(),
+                issue.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                issue
+                    .get("priority")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .trim_start_matches('P'),
+                issue.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                issue.get("status").and_then(|v| v.as_str()).unwrap_or(""),
             );
         }
     });
@@ -11347,57 +11486,20 @@ fn handle_beads_list(
     format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
-    use beads_rust::model::{Priority, Status};
-    use beads_rust::storage::ListFilters;
-
     let fmt = output::CliOutputFormat::resolve(format, json);
     let beads_dir = resolve_beads_dir(path.as_deref())?;
-    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
-        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
-
-    let statuses = status.map(|s| {
-        s.split(',')
-            .map(|v| match v.trim() {
-                "open" => Status::Open,
-                "in_progress" => Status::InProgress,
-                "blocked" => Status::Blocked,
-                "closed" => Status::Closed,
-                "deferred" => Status::Deferred,
-                other => Status::Custom(other.to_string()),
-            })
-            .collect::<Vec<_>>()
-    });
-
-    let priorities = priority.map(|p| vec![Priority(i32::from(p))]);
-
-    let include_closed = statuses
-        .as_ref()
-        .is_some_and(|ss| ss.iter().any(|s| matches!(s, Status::Closed)));
-
-    let filters = ListFilters {
-        statuses,
-        priorities,
-        include_closed,
-        limit: Some(limit),
-        ..ListFilters::default()
-    };
-    let issues = storage
-        .list_issues(&filters)
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-
-    let items: Vec<serde_json::Value> = issues
-        .iter()
-        .map(|i| {
-            serde_json::json!({
-                "id": i.id,
-                "title": i.title,
-                "status": i.status.as_str(),
-                "priority": format!("P{}", i.priority.0),
-                "type": i.issue_type.as_str(),
-                "labels": i.labels,
-            })
-        })
-        .collect();
+    let mut args = vec!["list".to_string(), "--limit".to_string(), limit.to_string()];
+    if let Some(status) = status {
+        args.push("--status".to_string());
+        args.push(status);
+    }
+    if let Some(priority) = priority {
+        args.push("--priority".to_string());
+        args.push(priority.to_string());
+    }
+    let br_json = run_br_json(&beads_dir, &args)
+        .map_err(|e| CliError::Other(format!("br query failed: {e}")))?;
+    let items = br_issue_summary_items(&br_json);
 
     if items.is_empty() {
         output::emit_empty(fmt, "No matching issues.");
@@ -11405,14 +11507,18 @@ fn handle_beads_list(
     }
 
     output::emit_output(&items, fmt, || {
-        output::section(&format!("Issues ({}):", issues.len()));
-        for issue in &issues {
+        output::section(&format!("Issues ({}):", items.len()));
+        for issue in &items {
             ftui_runtime::ftui_println!(
                 "  {} [P{}] {} ({})",
-                issue.id,
-                issue.priority.0,
-                issue.title,
-                issue.status.as_str(),
+                issue.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                issue
+                    .get("priority")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .trim_start_matches('P'),
+                issue.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                issue.get("status").and_then(|v| v.as_str()).unwrap_or(""),
             );
         }
     });
@@ -11427,33 +11533,49 @@ fn handle_beads_show(
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
     let beads_dir = resolve_beads_dir(path.as_deref())?;
-    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
-        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
-
-    let issue = storage
-        .get_issue(&id)
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?
-        .ok_or_else(|| CliError::InvalidArgument(format!("issue not found: {id}")))?;
+    let args = vec!["show".to_string(), id.clone()];
+    let issue = run_br_json(&beads_dir, &args)
+        .map_err(|e| CliError::Other(format!("br query failed: {e}")))?;
 
     output::emit_output(&issue, fmt, || {
-        output::section(&format!("{}: {}", issue.id, issue.title));
-        output::kv("Status", issue.status.as_str());
-        output::kv("Priority", &format!("P{}", issue.priority.0));
-        output::kv("Type", issue.issue_type.as_str());
-        if let Some(ref a) = issue.assignee {
-            output::kv("Assignee", a);
+        output::section(&format!(
+            "{}: {}",
+            issue.get("id").and_then(|v| v.as_str()).unwrap_or(&id),
+            issue.get("title").and_then(|v| v.as_str()).unwrap_or("")
+        ));
+        if let Some(status) = issue.get("status").and_then(|v| v.as_str()) {
+            output::kv("Status", status);
         }
-        if !issue.labels.is_empty() {
-            output::kv("Labels", &issue.labels.join(", "));
+        if let Some(priority) = issue.get("priority") {
+            let rendered = priority
+                .as_i64()
+                .map(|p| format!("P{p}"))
+                .or_else(|| priority.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| priority.to_string());
+            output::kv("Priority", &rendered);
         }
-        if let Some(ref desc) = issue.description {
+        if let Some(kind) = issue
+            .get("issue_type")
+            .or_else(|| issue.get("type"))
+            .and_then(|v| v.as_str())
+        {
+            output::kv("Type", kind);
+        }
+        if let Some(assignee) = issue.get("assignee").and_then(|v| v.as_str()) {
+            output::kv("Assignee", assignee);
+        }
+        if let Some(labels) = issue.get("labels").and_then(|v| v.as_array())
+            && !labels.is_empty()
+        {
+            let rendered = labels
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            output::kv("Labels", &rendered);
+        }
+        if let Some(desc) = issue.get("description").and_then(|v| v.as_str()) {
             ftui_runtime::ftui_println!("\n{desc}");
-        }
-        if !issue.dependencies.is_empty() {
-            output::section("Dependencies:");
-            for dep in &issue.dependencies {
-                ftui_runtime::ftui_println!("  {} {}", dep.dep_type, dep.depends_on_id);
-            }
         }
     });
     Ok(())
@@ -11464,44 +11586,11 @@ fn handle_beads_status(
     format: Option<output::CliOutputFormat>,
     json: bool,
 ) -> CliResult<()> {
-    use beads_rust::model::Status;
-    use beads_rust::storage::ListFilters;
-
     let fmt = output::CliOutputFormat::resolve(format, json);
     let beads_dir = resolve_beads_dir(path.as_deref())?;
-    let (storage, _paths) = beads_rust::config::open_storage(&beads_dir, None, None)
-        .map_err(|e| CliError::Other(format!("failed to open beads storage: {e}")))?;
-
-    let all_issues = storage
-        .list_issues(&ListFilters {
-            include_closed: true,
-            ..ListFilters::default()
-        })
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    let open = all_issues
-        .iter()
-        .filter(|i| matches!(i.status, Status::Open))
-        .count();
-    let in_progress = all_issues
-        .iter()
-        .filter(|i| matches!(i.status, Status::InProgress))
-        .count();
-    let blocked = all_issues
-        .iter()
-        .filter(|i| matches!(i.status, Status::Blocked))
-        .count();
-    let deferred = all_issues
-        .iter()
-        .filter(|i| matches!(i.status, Status::Deferred))
-        .count();
-    let closed_count = all_issues
-        .iter()
-        .filter(|i| matches!(i.status, Status::Closed))
-        .count();
-    let other = all_issues
-        .len()
-        .saturating_sub(open + in_progress + blocked + deferred + closed_count);
-    let total = all_issues.len();
+    let (open, in_progress, blocked, deferred, closed_count, total) = br_status_counts(&beads_dir)
+        .map_err(|e| CliError::Other(format!("br query failed: {e}")))?;
+    let other = total.saturating_sub(open + in_progress + blocked + deferred + closed_count);
 
     let result = serde_json::json!({
         "open": open,
@@ -15647,33 +15736,9 @@ fn doctor_cleanup_orphaned_message_recipients(
 fn beads_issue_awareness_counts_from(
     start: Option<&Path>,
 ) -> Result<(usize, usize, usize), String> {
-    let beads_dir = beads_rust::config::discover_beads_dir(start).map_err(|e| e.to_string())?;
-    let (storage, _paths) =
-        beads_rust::config::open_storage(&beads_dir, None, None).map_err(|e| e.to_string())?;
-
-    let ready = storage
-        .get_ready_issues(
-            &beads_rust::storage::ReadyFilters::default(),
-            beads_rust::storage::ReadySortPolicy::Hybrid,
-        )
-        .map_err(|e| e.to_string())?
-        .len();
-
-    let open = storage
-        .list_issues(&beads_rust::storage::ListFilters {
-            statuses: Some(vec![beads_rust::model::Status::Open]),
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())?
-        .len();
-
-    let in_progress = storage
-        .list_issues(&beads_rust::storage::ListFilters {
-            statuses: Some(vec![beads_rust::model::Status::InProgress]),
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())?
-        .len();
+    let beads_dir = resolve_beads_dir(start).map_err(|e| e.to_string())?;
+    let ready = br_ready_count(&beads_dir)?;
+    let (open, in_progress, _blocked, _deferred, _closed, _total) = br_status_counts(&beads_dir)?;
 
     Ok((ready, open, in_progress))
 }
