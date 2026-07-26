@@ -5963,6 +5963,36 @@ fn details_are_index_only_issues(details: &[String]) -> bool {
         })
 }
 
+/// Pick the corruption details that prove index-only damage, consulting the
+/// full `integrity_check` when `quick_check` comes back clean.
+///
+/// `PRAGMA quick_check` skips index-content-vs-table verification, so the
+/// exact corruption class REINDEX exists for — "wrong # of entries in index"
+/// (GH#208) — typically passes `quick_check` and only fails `integrity_check`.
+/// The layered health probes run both checks, which is how such a file gets
+/// classified unhealthy in the first place; gating this repair on
+/// `quick_check` details alone meant REINDEX never ran for that class and
+/// every boot escalated to full archive reconstruction.
+#[allow(clippy::result_large_err)]
+fn select_index_only_repair_details<F>(
+    quick_details: Vec<String>,
+    full_details: F,
+) -> Result<Option<Vec<String>>, SqlError>
+where
+    F: FnOnce() -> Result<Vec<String>, SqlError>,
+{
+    let details = if integrity::details_indicate_ok(&quick_details) {
+        let full = full_details()?;
+        if integrity::details_indicate_ok(&full) {
+            return Ok(None);
+        }
+        full
+    } else {
+        quick_details
+    };
+    Ok(details_are_index_only_issues(&details).then_some(details))
+}
+
 #[allow(clippy::result_large_err)]
 fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlError> {
     if !primary_path.exists() {
@@ -5971,16 +6001,16 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
     let path_str = primary_path.to_string_lossy();
     let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())?;
     let quick_details = sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Quick)?;
-    if integrity::details_indicate_ok(&quick_details) {
+    let Some(details) = select_index_only_repair_details(quick_details, || {
+        sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Full)
+    })?
+    else {
         return Ok(false);
-    }
-    if !details_are_index_only_issues(&quick_details) {
-        return Ok(false);
-    }
+    };
 
     tracing::warn!(
         path = %primary_path.display(),
-        details = ?quick_details,
+        details = ?details,
         "detected index-only sqlite corruption; attempting in-place REINDEX repair"
     );
 
@@ -8048,12 +8078,25 @@ fn restore_quarantined_primary_with_sidecar_label_at(
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         restore_quarantined_sidecar(primary_path, suffix, sidecar_label, timestamp)?;
     }
-    crate::forensics::sync_activated_recovery_database(primary_path).map_err(|error| {
-        SqlError::Custom(format!(
-            "restored original database {} but could not make its file/directory activation durable: {error}",
-            primary_path.display()
-        ))
-    })
+    if path_is_occupied(primary_path) {
+        crate::forensics::sync_activated_recovery_database(primary_path).map_err(|error| {
+            SqlError::Custom(format!(
+                "restored original database {} but could not make its file/directory activation durable: {error}",
+                primary_path.display()
+            ))
+        })
+    } else {
+        // Sidecar-only restore: the quarantined primary artifact was absent,
+        // so no primary generation was reinstated. Make the restored sidecar
+        // directory entries durable without demanding a file that
+        // legitimately does not exist.
+        crate::forensics::sync_recovery_parent_directory(primary_path).map_err(|error| {
+            SqlError::Custom(format!(
+                "restored sidecars for {} but could not make the restore durable: {error}",
+                primary_path.display()
+            ))
+        })
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -12691,6 +12734,117 @@ mod tests {
         assert!(
             sqlite_file_is_healthy_canonical(&path).expect("canonical health check"),
             "healthy DB should remain canonically healthy after no-op repair probe"
+        );
+    }
+
+    /// GH#208 (br-87tol): `quick_check` skips index-content-vs-table
+    /// verification, so "wrong # of entries in index" corruption passes
+    /// `quick_check` and only fails `integrity_check`. The repair gate must
+    /// consult the full check when the quick check is clean, or REINDEX never
+    /// runs for exactly the class it exists for.
+    #[test]
+    fn select_index_only_repair_details_consults_full_check_when_quick_is_clean() {
+        let index_only = vec!["wrong # of entries in index sqlite_autoindex_agents_1".to_string()];
+        let mixed = vec![
+            "wrong # of entries in index sqlite_autoindex_agents_1".to_string(),
+            "database disk image is malformed".to_string(),
+        ];
+
+        // Quick check already shows index-only damage: no full check needed.
+        let details =
+            select_index_only_repair_details(index_only.clone(), || -> Result<_, SqlError> {
+                panic!("full check must not run when quick_check already has details")
+            })
+            .expect("select");
+        assert_eq!(details.as_deref(), Some(index_only.as_slice()));
+
+        // Quick check clean, full check reports index-only damage: repairable.
+        let details =
+            select_index_only_repair_details(vec!["ok".to_string()], || Ok(index_only.clone()))
+                .expect("select");
+        assert_eq!(details.as_deref(), Some(index_only.as_slice()));
+
+        // Quick check clean, full check clean: nothing to repair.
+        let details =
+            select_index_only_repair_details(vec!["ok".to_string()], || Ok(vec!["ok".to_string()]))
+                .expect("select");
+        assert_eq!(details, None);
+
+        // Non-index damage on either probe: not repairable in place.
+        let details = select_index_only_repair_details(mixed.clone(), || -> Result<_, SqlError> {
+            panic!("full check must not run when quick_check already has details")
+        })
+        .expect("select");
+        assert_eq!(details, None);
+        let details =
+            select_index_only_repair_details(vec!["ok".to_string()], || Ok(mixed.clone()))
+                .expect("select");
+        assert_eq!(details, None);
+
+        // Full-check probe errors propagate instead of masking corruption.
+        select_index_only_repair_details(vec!["ok".to_string()], || {
+            Err(SqlError::Custom("probe failed".to_string()))
+        })
+        .expect_err("probe error must propagate");
+    }
+
+    /// End-to-end GH#208 repro: real index-vs-table divergence created by
+    /// flipping table-page bytes underneath an existing index. The layered
+    /// health probes classify the file unhealthy while `quick_check` alone
+    /// stays clean, and the in-place REINDEX repair must recover it without
+    /// escalating to backup restore or archive reconstruction.
+    #[test]
+    fn try_repair_index_only_corruption_heals_index_table_divergence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("index_divergence.db");
+        let path_str = path.to_string_lossy();
+        let marker = "AM_INDEX_ONLY_CORRUPTION_MARKER_0123456789ABCDEF";
+        let replacement = "AM_INDEX_ONLY_CORRUPTION_MARKER_FEDCBA9876543210";
+        assert_eq!(marker.len(), replacement.len());
+
+        let conn = crate::CanonicalDbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("journal mode");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("create");
+        conn.execute_raw(&format!(
+            "INSERT INTO agents(id, name) VALUES (1, '{marker}')"
+        ))
+        .expect("insert");
+        conn.execute_raw("CREATE INDEX idx_agents_name ON agents(name)")
+            .expect("index");
+        drop(conn);
+
+        // Corrupt exactly one of the two on-disk copies of the marker (table
+        // leaf vs index leaf) so the index no longer matches the table.
+        let mut bytes = std::fs::read(&path).expect("read db bytes");
+        let offsets = bytes
+            .windows(marker.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == marker.as_bytes()).then_some(offset))
+            .collect::<Vec<_>>();
+        assert!(
+            offsets.len() >= 2,
+            "marker must appear in both the table and index b-trees, found {} occurrence(s)",
+            offsets.len()
+        );
+        let target = offsets[offsets.len() - 1];
+        bytes[target..target + marker.len()].copy_from_slice(replacement.as_bytes());
+        std::fs::write(&path, bytes).expect("write corrupted db bytes");
+
+        assert!(
+            !sqlite_file_is_healthy_canonical(&path).expect("layered health probe"),
+            "index/table divergence must fail the layered health probes"
+        );
+
+        let repaired = try_repair_index_only_corruption(&path).expect("repair probe");
+        assert!(
+            repaired,
+            "index-only divergence must be repairable via in-place REINDEX"
+        );
+        assert!(
+            sqlite_file_is_healthy_canonical(&path).expect("post-repair health probe"),
+            "REINDEX repair must restore full canonical health"
         );
     }
 

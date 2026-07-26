@@ -131,6 +131,24 @@ struct RecoveryReceiptDeltaCategory {
     added: Vec<String>,
     /// Canonical JSON stable keys present only in the recovery source.
     lost: Vec<String>,
+    /// Identity-key delta for categories whose payload fingerprints embed
+    /// volatile state (GH#208). `None` on receipts written before the
+    /// identity/volatile split and on categories whose payload key is already
+    /// a pure identity key. These fields are `Option` + skip-if-none so legacy
+    /// receipts round-trip byte-identically and their self-hash chain keeps
+    /// verifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_added_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_lost_count: Option<usize>,
+    /// Identity keys present only in the candidate (informational audit of
+    /// what the archive contributed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_added: Option<Vec<String>>,
+    /// Identity keys present only in the recovery source. Non-empty only in
+    /// error diagnostics; a receipt is never finalized with identity loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_lost: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,6 +219,19 @@ struct RecoveryContinuitySets {
     /// rather than its numeric id for the same remap-invariance property.
     message_recipients: BTreeMap<String, usize>,
     proof_gate_consumed_nonces: BTreeSet<String>,
+    /// Identity-key projections for the categories whose payload fingerprints
+    /// embed volatile state (GH#208). Archive reconstruction legitimately
+    /// drifts registration tokens, contact/reservation lifecycle state,
+    /// read/ack timestamps, and canonical serialization of message payloads —
+    /// none of which is coordination-key loss. Promotion refusal is decided on
+    /// these identity multisets; full-payload drift is reported as
+    /// informational evidence only. Categories not listed here (projects,
+    /// products, links, proof-gate nonces) already use pure identity keys.
+    agent_identities: BTreeMap<String, usize>,
+    contact_identities: BTreeMap<String, usize>,
+    reservation_identities: BTreeMap<String, usize>,
+    message_identities: BTreeMap<String, usize>,
+    message_recipient_identities: BTreeMap<String, usize>,
 }
 
 #[cfg(target_os = "linux")]
@@ -760,6 +791,7 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
     let tables = receipt_table_names(&conn, db_path)?;
     let mut sets = RecoveryContinuitySets::default();
     let mut message_fingerprints_by_id = BTreeMap::<i64, String>::new();
+    let mut message_identity_by_id = BTreeMap::<i64, String>::new();
 
     if tables.contains("projects") {
         let rows = conn
@@ -977,6 +1009,17 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
             let registration_token_sha256 = registration_token
                 .as_deref()
                 .map(|token| recovery_sha256(token.as_bytes()));
+            insert_receipt_multiset(
+                &mut sets.agent_identities,
+                receipt_canonical_key(
+                    json!({
+                        "project": {"slug": &project_slug, "human_key": &project_human_key},
+                        "agent": &agent_name,
+                    }),
+                    db_path,
+                )?,
+                db_path,
+            )?;
             sets.agents.insert(receipt_canonical_key(
                 json!({
                     "project": {"slug": project_slug, "human_key": project_human_key},
@@ -1057,6 +1100,17 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 receipt_required_i64(&row, "updated_ts", "contact updated_ts decode", db_path)?;
             let expires_ts =
                 receipt_optional_i64(&row, "expires_ts", "contact expires_ts decode", db_path)?;
+            insert_receipt_multiset(
+                &mut sets.contact_identities,
+                receipt_canonical_key(
+                    json!({
+                        "a": {"project": {"slug": &a_slug, "human_key": &a_human_key}, "agent": &a_name},
+                        "b": {"project": {"slug": &b_slug, "human_key": &b_human_key}, "agent": &b_name},
+                    }),
+                    db_path,
+                )?,
+                db_path,
+            )?;
             sets.contacts.insert(receipt_canonical_key(
                 json!({
                     "a": {"project": {"slug": a_slug, "human_key": a_human_key}, "agent": a_name},
@@ -1165,6 +1219,23 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 "reservation released_ts decode",
                 db_path,
             )?;
+            // Identity: who leased what, in which mode, granted when. Renewal
+            // (expires_ts), release state, and the free-text reason are
+            // lifecycle payload the archive may legitimately lag on.
+            insert_receipt_multiset(
+                &mut sets.reservation_identities,
+                receipt_canonical_key(
+                    json!({
+                        "project": {"slug": &project_slug, "human_key": &project_human_key},
+                        "agent": &agent_name,
+                        "path_pattern": &path_pattern,
+                        "exclusive": exclusive,
+                        "created_ts": created_ts,
+                    }),
+                    db_path,
+                )?,
+                db_path,
+            )?;
             sets.reservations.insert(receipt_canonical_key(
                 json!({
                     "project": {"slug": project_slug, "human_key": project_human_key},
@@ -1267,6 +1338,21 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
             )?;
             let attachments =
                 receipt_json_value(&row, "attachments", "message attachments decode", db_path)?;
+            // Identity: the stable key a human would use to recognize the same
+            // message across generations. Body, importance, ack flag, and the
+            // serialized recipient/attachment payloads are volatile — archive
+            // replay may normalize their canonical form (GH#208). Hashed so
+            // receipts keep representing message content only by digest.
+            let identity_fingerprint = receipt_semantic_fingerprint(
+                json!({
+                    "project": {"slug": &project_slug, "human_key": &project_human_key},
+                    "sender": &sender_name,
+                    "thread_id": &thread_id,
+                    "subject": &subject,
+                    "created_ts": created_ts,
+                }),
+                db_path,
+            )?;
             let fingerprint = receipt_semantic_fingerprint(
                 json!({
                     "project": {"slug": project_slug, "human_key": project_human_key},
@@ -1292,6 +1378,8 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                     format!("duplicate numeric message id {message_id}"),
                 ));
             }
+            message_identity_by_id.insert(message_id, identity_fingerprint.clone());
+            insert_receipt_multiset(&mut sets.message_identities, identity_fingerprint, db_path)?;
             insert_receipt_multiset(&mut sets.messages, fingerprint, db_path)?;
         }
     }
@@ -1394,6 +1482,28 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 receipt_optional_i64(&row, "read_ts", "message-recipient read_ts decode", db_path)?;
             let ack_ts =
                 receipt_optional_i64(&row, "ack_ts", "message-recipient ack_ts decode", db_path)?;
+            let message_identity = message_identity_by_id.get(&message_id).ok_or_else(|| {
+                recovery_receipt_error(
+                    "message-recipient parent identity",
+                    db_path,
+                    format!(
+                        "recipient references message {message_id} without an identity fingerprint"
+                    ),
+                )
+            })?;
+            // Identity chains the parent message's *identity* digest, not its
+            // full payload digest: a normalized parent body must not cascade
+            // into recipient-row "loss". Read/ack timestamps are volatile —
+            // the archive does not persist read state (GH#208).
+            let identity_fingerprint = receipt_semantic_fingerprint(
+                json!({
+                    "message_identity_sha256": message_identity,
+                    "project": {"slug": &project_slug, "human_key": &project_human_key},
+                    "recipient": &recipient_name,
+                    "kind": &kind,
+                }),
+                db_path,
+            )?;
             let fingerprint = receipt_semantic_fingerprint(
                 json!({
                     "message_sha256": message_fingerprint,
@@ -1403,6 +1513,11 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                     "read_ts": read_ts,
                     "ack_ts": ack_ts,
                 }),
+                db_path,
+            )?;
+            insert_receipt_multiset(
+                &mut sets.message_recipient_identities,
+                identity_fingerprint,
                 db_path,
             )?;
             insert_receipt_multiset(&mut sets.message_recipients, fingerprint, db_path)?;
@@ -1562,6 +1677,10 @@ fn recovery_delta_category(
         lost_sha256: recovery_sha256(&lost_bytes),
         added,
         lost,
+        identity_added_count: None,
+        identity_lost_count: None,
+        identity_added: None,
+        identity_lost: None,
     })
 }
 
@@ -1602,7 +1721,57 @@ fn recovery_multiset_delta_category(
         lost_sha256: recovery_sha256(&lost_bytes),
         added,
         lost,
+        identity_added_count: None,
+        identity_lost_count: None,
+        identity_added: None,
+        identity_lost: None,
     })
+}
+
+/// Compute the identity-key delta for a category whose payload fingerprints
+/// embed volatile state, and attach it to the payload delta. Promotion refusal
+/// is decided on the identity fields; the payload fields become informational
+/// volatile-drift evidence (GH#208).
+fn attach_identity_delta(
+    category: &mut RecoveryReceiptDeltaCategory,
+    source: &BTreeMap<String, usize>,
+    candidate: &BTreeMap<String, usize>,
+) {
+    let mut added = Vec::new();
+    let mut lost = Vec::new();
+    for (key, candidate_count) in candidate {
+        let source_count = source.get(key).copied().unwrap_or(0);
+        added.extend(std::iter::repeat_n(
+            key.clone(),
+            candidate_count.saturating_sub(source_count),
+        ));
+    }
+    for (key, source_count) in source {
+        let candidate_count = candidate.get(key).copied().unwrap_or(0);
+        lost.extend(std::iter::repeat_n(
+            key.clone(),
+            source_count.saturating_sub(candidate_count),
+        ));
+    }
+    category.identity_added_count = Some(added.len());
+    category.identity_lost_count = Some(lost.len());
+    category.identity_added = Some(added);
+    category.identity_lost = Some(lost);
+}
+
+/// The count that decides promotion refusal for a category: identity-key loss
+/// where the identity/volatile split applies, full payload-key loss where the
+/// payload key already is the identity key.
+fn recovery_category_blocking_loss(category: &RecoveryReceiptDeltaCategory) -> usize {
+    category.identity_lost_count.unwrap_or(category.lost_count)
+}
+
+/// Payload-only drift on identity keys that survived: informational, never
+/// refusal-worthy on its own.
+fn recovery_category_volatile_drift(category: &RecoveryReceiptDeltaCategory) -> usize {
+    category
+        .lost_count
+        .saturating_sub(recovery_category_blocking_loss(category))
 }
 
 fn recovery_multiset_duplicate_inflation(
@@ -1622,6 +1791,39 @@ fn recovery_delta(
     source: &RecoveryContinuitySets,
     candidate: &RecoveryContinuitySets,
 ) -> Result<RecoveryContinuityDelta, SqlError> {
+    let mut agents = recovery_delta_category(&source.agents, &candidate.agents)?;
+    attach_identity_delta(
+        &mut agents,
+        &source.agent_identities,
+        &candidate.agent_identities,
+    );
+    let mut contacts = recovery_delta_category(&source.contacts, &candidate.contacts)?;
+    attach_identity_delta(
+        &mut contacts,
+        &source.contact_identities,
+        &candidate.contact_identities,
+    );
+    let mut reservations = recovery_delta_category(&source.reservations, &candidate.reservations)?;
+    attach_identity_delta(
+        &mut reservations,
+        &source.reservation_identities,
+        &candidate.reservation_identities,
+    );
+    let mut messages = recovery_multiset_delta_category(&source.messages, &candidate.messages)?;
+    attach_identity_delta(
+        &mut messages,
+        &source.message_identities,
+        &candidate.message_identities,
+    );
+    let mut message_recipients = recovery_multiset_delta_category(
+        &source.message_recipients,
+        &candidate.message_recipients,
+    )?;
+    attach_identity_delta(
+        &mut message_recipients,
+        &source.message_recipient_identities,
+        &candidate.message_recipient_identities,
+    );
     Ok(RecoveryContinuityDelta {
         projects: recovery_delta_category(&source.projects, &candidate.projects)?,
         products: recovery_delta_category(&source.products, &candidate.products)?,
@@ -1629,14 +1831,11 @@ fn recovery_delta(
             &source.product_project_links,
             &candidate.product_project_links,
         )?,
-        agents: recovery_delta_category(&source.agents, &candidate.agents)?,
-        contacts: recovery_delta_category(&source.contacts, &candidate.contacts)?,
-        reservations: recovery_delta_category(&source.reservations, &candidate.reservations)?,
-        messages: recovery_multiset_delta_category(&source.messages, &candidate.messages)?,
-        message_recipients: recovery_multiset_delta_category(
-            &source.message_recipients,
-            &candidate.message_recipients,
-        )?,
+        agents,
+        contacts,
+        reservations,
+        messages,
+        message_recipients,
         proof_gate_consumed_nonces: recovery_delta_category(
             &source.proof_gate_consumed_nonces,
             &candidate.proof_gate_consumed_nonces,
@@ -1645,15 +1844,15 @@ fn recovery_delta(
 }
 
 fn recovery_delta_has_loss(delta: &RecoveryContinuityDelta) -> bool {
-    delta.projects.lost_count > 0
-        || delta.products.lost_count > 0
-        || delta.product_project_links.lost_count > 0
-        || delta.agents.lost_count > 0
-        || delta.contacts.lost_count > 0
-        || delta.reservations.lost_count > 0
-        || delta.messages.lost_count > 0
-        || delta.message_recipients.lost_count > 0
-        || delta.proof_gate_consumed_nonces.lost_count > 0
+    recovery_category_blocking_loss(&delta.projects) > 0
+        || recovery_category_blocking_loss(&delta.products) > 0
+        || recovery_category_blocking_loss(&delta.product_project_links) > 0
+        || recovery_category_blocking_loss(&delta.agents) > 0
+        || recovery_category_blocking_loss(&delta.contacts) > 0
+        || recovery_category_blocking_loss(&delta.reservations) > 0
+        || recovery_category_blocking_loss(&delta.messages) > 0
+        || recovery_category_blocking_loss(&delta.message_recipients) > 0
+        || recovery_category_blocking_loss(&delta.proof_gate_consumed_nonces) > 0
 }
 
 fn finalized_recovery_receipt_paths(receipts_dir: &Path) -> Result<Vec<PathBuf>, SqlError> {
@@ -2023,6 +2222,22 @@ fn verify_live_recovery_candidate_snapshot(
     Ok(())
 }
 
+/// Make the directory entries around an absent primary durable.
+///
+/// Sidecar-only restores reinstate quarantined journal/WAL/SHM files without
+/// reinstating a primary generation; the renamed directory entries still need
+/// an fsync, but demanding the absent primary file itself would fail with
+/// ENOENT.
+pub(crate) fn sync_recovery_parent_directory(db_path: &Path) -> Result<(), SqlError> {
+    let parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_recovery_directory(parent).map_err(|error| {
+        recovery_receipt_error("restored sidecar parent directory sync", parent, error)
+    })
+}
+
 /// Make an activated recovery database and its directory entry durable before
 /// the receipt promotion marker can be committed.
 pub(crate) fn sync_activated_recovery_database(db_path: &Path) -> Result<(), SqlError> {
@@ -2172,40 +2387,75 @@ fn collect_recovery_receipt_evidence(
     let source = recovery_snapshot(&source_sets)?;
     let candidate = recovery_snapshot(&candidate_sets)?;
     let delta = recovery_delta(&source_sets, &candidate_sets)?;
+    let volatile_drift = [
+        ("agents", recovery_category_volatile_drift(&delta.agents)),
+        (
+            "contacts",
+            recovery_category_volatile_drift(&delta.contacts),
+        ),
+        (
+            "reservations",
+            recovery_category_volatile_drift(&delta.reservations),
+        ),
+        (
+            "messages",
+            recovery_category_volatile_drift(&delta.messages),
+        ),
+        (
+            "message_recipients",
+            recovery_category_volatile_drift(&delta.message_recipients),
+        ),
+    ];
+    let volatile_drift_summary = volatile_drift
+        .iter()
+        .map(|(category, count)| format!("{category}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     if source_snapshot_failure_sha256.is_none() && recovery_delta_has_loss(&delta) {
         return Err(SqlError::Custom(format!(
-            "recovery candidate {} would lose stable coordination keys from {} (projects={}, products={}, product_project_links={}, agents={}, contacts={}, reservations={}, messages={}, message_recipients={}, proof_gate_consumed_nonces={}); refusing promotion",
+            "recovery candidate {} would lose stable coordination keys from {} (projects={}, products={}, product_project_links={}, agents={}, contacts={}, reservations={}, messages={}, message_recipients={}, proof_gate_consumed_nonces={}); volatile payload drift on surviving identities is informational and does not block ({volatile_drift_summary}); refusing promotion",
             candidate_path.display(),
             source_path.map_or_else(
                 || "an empty source".to_string(),
                 |path| path.display().to_string()
             ),
-            delta.projects.lost_count,
-            delta.products.lost_count,
-            delta.product_project_links.lost_count,
-            delta.agents.lost_count,
-            delta.contacts.lost_count,
-            delta.reservations.lost_count,
-            delta.messages.lost_count,
-            delta.message_recipients.lost_count,
-            delta.proof_gate_consumed_nonces.lost_count,
+            recovery_category_blocking_loss(&delta.projects),
+            recovery_category_blocking_loss(&delta.products),
+            recovery_category_blocking_loss(&delta.product_project_links),
+            recovery_category_blocking_loss(&delta.agents),
+            recovery_category_blocking_loss(&delta.contacts),
+            recovery_category_blocking_loss(&delta.reservations),
+            recovery_category_blocking_loss(&delta.messages),
+            recovery_category_blocking_loss(&delta.message_recipients),
+            recovery_category_blocking_loss(&delta.proof_gate_consumed_nonces),
         )));
     }
     // Multiplicity inflation is meaningful only relative to a readable source.
     // When the source is corrupt, preserve the candidate's full multiset and
     // let the explicit unreadable-source attestation carry that uncertainty.
+    // Compared on identity keys: payload normalization must not be able to
+    // disguise a duplicate replay of the same message as "new" content.
     if source_snapshot_failure_sha256.is_none() {
-        let duplicate_messages =
-            recovery_multiset_duplicate_inflation(&source_sets.messages, &candidate_sets.messages);
+        let duplicate_messages = recovery_multiset_duplicate_inflation(
+            &source_sets.message_identities,
+            &candidate_sets.message_identities,
+        );
         let duplicate_recipients = recovery_multiset_duplicate_inflation(
-            &source_sets.message_recipients,
-            &candidate_sets.message_recipients,
+            &source_sets.message_recipient_identities,
+            &candidate_sets.message_recipient_identities,
         );
         if duplicate_messages > 0 || duplicate_recipients > 0 {
             return Err(SqlError::Custom(format!(
                 "recovery candidate {} inflates an existing semantic multiplicity (messages={duplicate_messages}, message_recipients={duplicate_recipients}); refusing possible duplicate replay",
                 candidate_path.display()
             )));
+        }
+        if volatile_drift.iter().any(|(_, count)| *count > 0) {
+            tracing::warn!(
+                candidate = %candidate_path.display(),
+                drift = %volatile_drift_summary,
+                "promoting recovery candidate with volatile payload drift; every identity key is preserved (tokens, read/ack state, and serialized payload forms legitimately drift across archive reconstruction)"
+            );
         }
     }
     Ok(RecoveryReceiptEvidence {
@@ -3789,8 +4039,13 @@ mod tests {
             .expect("loss rejection must not leave a pending intent");
     }
 
+    /// The identity/volatile split (GH#208): lifecycle state that archive
+    /// reconstruction legitimately drifts — registration tokens, reaper flags,
+    /// contact status/reason/timestamps, reservation reason/renewal/release
+    /// state — must no longer block promotion when every identity key
+    /// survives. The drift stays visible as informational payload deltas.
     #[test]
-    fn recovery_receipt_refuses_state_only_contact_and_reservation_drift() {
+    fn recovery_receipt_promotes_volatile_state_drift_on_stable_identities() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source.sqlite3");
         let candidate = dir.path().join("candidate.sqlite3");
@@ -3800,27 +4055,62 @@ mod tests {
         seed_recovery_receipt_db(&candidate, true);
 
         let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref())
-            .expect("open candidate for semantic drift");
+            .expect("open candidate for volatile drift");
         conn.execute_raw(
             "UPDATE agents SET reaper_exempt = 0, registration_token = 'replacement-secret' WHERE id = 41",
         )
         .expect("change agent security state without changing identity");
-        conn.execute_raw("UPDATE products SET name = 'Renamed Product' WHERE id = 5")
-            .expect("change product state without changing product uid");
-        conn.execute_raw("UPDATE product_project_links SET created_at = 61 WHERE id = 6")
-            .expect("change product-project link state without changing ownership");
         conn.execute_raw(
             "UPDATE agent_links SET status = 'blocked', reason = 'policy', created_ts = 101, updated_ts = 201, expires_ts = 800000 WHERE id = 3",
         )
         .expect("change contact state without changing endpoints");
         conn.execute_raw(
-            "UPDATE file_reservations SET exclusive = 0, reason = 'shared', expires_ts = 888888 WHERE id = 9",
+            "UPDATE file_reservations SET reason = 'shared', expires_ts = 888888 WHERE id = 9",
         )
-        .expect("change reservation state without changing ownership");
+        .expect("change reservation lifecycle state without changing the lease");
         conn.execute_raw(
             "UPDATE file_reservation_releases SET released_ts = 666666 WHERE reservation_id = 9",
         )
         .expect("change authoritative reservation release state");
+        drop(conn);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("volatile lifecycle drift on stable identities must promote");
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+        let delta = &document.body.delta;
+        assert_eq!(delta.agents.identity_lost_count, Some(0));
+        assert_eq!(delta.contacts.identity_lost_count, Some(0));
+        assert_eq!(delta.reservations.identity_lost_count, Some(0));
+        assert_eq!(delta.agents.lost_count, 1);
+        assert_eq!(delta.contacts.lost_count, 1);
+        assert_eq!(delta.reservations.lost_count, 1);
+    }
+
+    /// Categories whose stable key IS their full payload — products, links,
+    /// proof-gate nonces — keep the strict contract: any drift refuses. A
+    /// reservation mode flip (exclusive vs shared) changes conflict semantics
+    /// and stays identity-relevant too.
+    #[test]
+    fn recovery_receipt_still_refuses_identity_relevant_state_drift() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref())
+            .expect("open candidate for identity-relevant drift");
+        conn.execute_raw("UPDATE products SET name = 'Renamed Product' WHERE id = 5")
+            .expect("change product state without changing product uid");
+        conn.execute_raw("UPDATE product_project_links SET created_at = 61 WHERE id = 6")
+            .expect("change product-project link state without changing ownership");
+        conn.execute_raw("UPDATE file_reservations SET exclusive = 0 WHERE id = 9")
+            .expect("flip reservation exclusivity mode");
         conn.execute_raw(
             "UPDATE proof_gate_consumed_nonces SET retain_until = 1230001, consumed_at = 456001 WHERE issuer_key = 'issuer-alpha' AND nonce = 'nonce-alpha'",
         )
@@ -3828,13 +4118,11 @@ mod tests {
         drop(conn);
 
         let error = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
-            .expect_err("semantic coordination drift must fail before promotion intent");
+            .expect_err("identity-relevant drift must fail before promotion intent");
         let error_text = error.to_string();
         assert!(error_text.contains("would lose stable coordination keys"));
         assert!(error_text.contains("products=1"));
         assert!(error_text.contains("product_project_links=1"));
-        assert!(error_text.contains("agents=1"));
-        assert!(error_text.contains("contacts=1"));
         assert!(error_text.contains("reservations=1"));
         assert!(error_text.contains("proof_gate_consumed_nonces=1"));
         verify_recovery_receipt_state(&storage_root, &primary)
@@ -4015,8 +4303,11 @@ mod tests {
             .expect("ownership rejection must not leave a pending intent");
     }
 
+    /// Contact timestamps are volatile lifecycle state (GH#208): a
+    /// timestamp-only drift on an endpoint-stable contact link must promote,
+    /// with the drift recorded as an informational payload delta.
     #[test]
-    fn recovery_receipt_refuses_contact_timestamp_only_drift() {
+    fn recovery_receipt_promotes_contact_timestamp_only_drift() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source.sqlite3");
         let candidate = dir.path().join("candidate.sqlite3");
@@ -4030,11 +4321,90 @@ mod tests {
             .expect("change only contact timestamps");
         drop(conn);
 
-        let error = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
-            .expect_err("contact timestamp drift must fail before promotion intent");
-        assert!(error.to_string().contains("contacts=1"));
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("contact timestamp-only drift must promote");
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+        assert_eq!(document.body.delta.contacts.identity_lost_count, Some(0));
+        assert_eq!(document.body.delta.contacts.lost_count, 1);
+        assert_eq!(document.body.delta.contacts.added_count, 1);
+    }
+
+    /// GH#208 (br-87tol): archive reconstruction renumbers agent row ids,
+    /// cannot recover live registration tokens, does not persist per-recipient
+    /// read/ack state, and may normalize serialized message payloads. None of
+    /// that is coordination-key loss. A candidate that preserves every
+    /// identity key — and adds rows that only the archive still had — must
+    /// promote, with the volatile drift recorded as informational payload
+    /// deltas in the receipt.
+    #[test]
+    fn recovery_receipt_promotes_identity_superset_despite_volatile_payload_drift() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let conn = crate::CanonicalDbConn::open_file(candidate.to_string_lossy().as_ref())
+            .expect("open candidate for reconstruction-shaped drift");
+        for statement in [
+            // Reconstruction renumbers agent rows (GH#208: 100 of 101 ids remapped).
+            "UPDATE message_recipients SET agent_id = 142 WHERE agent_id = 42",
+            "UPDATE messages SET sender_id = 141 WHERE sender_id = 41",
+            "UPDATE file_reservations SET agent_id = 141 WHERE agent_id = 41",
+            "UPDATE agent_links SET a_agent_id = 141, b_agent_id = 142 WHERE id = 3",
+            "UPDATE agents SET id = 141 WHERE id = 41",
+            "UPDATE agents SET id = 142 WHERE id = 42",
+            // The archive cannot recover a live registration token.
+            "UPDATE agents SET registration_token = NULL WHERE id = 141",
+            // The archive does not persist per-recipient read state.
+            "UPDATE message_recipients SET read_ts = NULL WHERE message_id = 73",
+            // Canonical-form normalization during archive replay.
+            "UPDATE messages SET body_md = 'Preserve this body' || char(10) WHERE id = 73",
+            // Release artifacts can lag the authoritative release table.
+            "UPDATE file_reservation_releases SET released_ts = 778000 WHERE reservation_id = 9",
+            // Archive-only rows the live DB never indexed (GH#208 had 3).
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (90, 17, 142, 'receipt-thread', 'Archive-only follow-up', 'Recovered from canonical archive', 'normal', 0, 345999, '{\"to\":[\"BlueFox\"]}', '[]')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (90, 141, 'to', NULL, NULL)",
+        ] {
+            conn.execute_raw(statement)
+                .expect("apply reconstruction-shaped drift");
+        }
+        drop(conn);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("identity-superset candidate with volatile drift must promote");
+        let document: super::RecoveryReceiptDocument = serde_json::from_slice(
+            &std::fs::read(&prepared.pending_path).expect("read pending receipt"),
+        )
+        .expect("decode pending receipt");
+
+        // Volatile payload drift is recorded, but no identity key was lost.
+        let delta = &document.body.delta;
+        assert_eq!(delta.agents.identity_lost_count, Some(0));
+        assert!(
+            delta.agents.lost_count > 0,
+            "registration-token drift must remain visible as informational payload drift"
+        );
+        assert_eq!(delta.messages.identity_lost_count, Some(0));
+        assert_eq!(delta.messages.identity_added_count, Some(1));
+        assert_eq!(delta.message_recipients.identity_lost_count, Some(0));
+        assert_eq!(delta.message_recipients.identity_added_count, Some(1));
+        assert_eq!(delta.reservations.identity_lost_count, Some(0));
+        assert!(
+            delta.reservations.lost_count > 0,
+            "release-state drift must remain visible as informational payload drift"
+        );
+
+        // The full promotion path completes and the chain verifies.
+        std::fs::rename(&candidate, &primary).expect("activate candidate");
+        finalize_recovery_receipt(&prepared).expect("finalize receipt with volatile drift");
         verify_recovery_receipt_state(&storage_root, &primary)
-            .expect("timestamp-drift rejection must not leave a pending intent");
+            .expect("chain verifies after drift promotion");
     }
 
     #[test]
