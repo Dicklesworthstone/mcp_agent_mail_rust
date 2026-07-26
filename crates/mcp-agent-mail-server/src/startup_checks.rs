@@ -204,17 +204,19 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
 /// [`agent_mail_pids_holding_file`] so we don't open every FD of every process
 /// on the host just to discard non-Agent-Mail PIDs at the end.
 ///
-/// Performance notes:
-/// - The previous implementation called `read_link` + `metadata(&link_target)`
-///   for every FD of every process — two syscalls per FD, plus a wasted
-///   `stat()` for socket/pipe/anon_inode FDs whose target string can never
-///   exist on the filesystem. With ~1k processes × ~50 FDs each, that was
-///   ≥100k syscalls per call.
-/// - This implementation calls `metadata(fd_entry.path())` directly, which
-///   resolves the symlink atomically via the kernel's `stat(2)`. One syscall
-///   per FD, and non-file FDs (sockets, pipes, eventpolls) return a stat
-///   for the anonymous inode that simply won't match the target's
-///   `(dev, ino)` — no special-casing needed.
+/// Performance and safety notes:
+/// - `read_link` on a /proc fd magic link returns the kernel's resolved
+///   target path WITHOUT touching the target filesystem — one syscall per
+///   FD. Following the link with `stat(2)`/`metadata` (previous behavior)
+///   walks into the target filesystem, and a stat into a dead FUSE mount
+///   blocks in `request_wait_answer` forever, wedging single-threaded
+///   startup before the listener binds (br-piwvy, ts1 incident).
+/// - Only fds whose resolved path string equals the canonicalized probe
+///   target are stat-confirmed for `(dev, ino)`; that stat lands on the
+///   probe target's own filesystem, which we already statted above.
+///   Non-file FDs (sockets, pipes, anon inodes) and deleted-fd targets
+///   (" (deleted)" suffix) mismatch on the string compare and are skipped
+///   without ever touching a foreign filesystem.
 /// - The `pre_filter` callback runs after parsing the PID but before opening
 ///   `/proc/<pid>/fd`, so a callback that rejects ~99% of host PIDs
 ///   (e.g. `pid_is_agent_mail`) collapses the cost to O(matched PIDs × FDs).
@@ -231,6 +233,9 @@ fn pids_holding_file_filtered<F: Fn(u32) -> bool>(
     };
     let target_ino = target_meta.ino();
     let target_dev = target_meta.dev();
+    let Ok(canonical_target) = std::fs::canonicalize(path) else {
+        return Vec::new();
+    };
     let my_pid = std::process::id();
 
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
@@ -257,11 +262,13 @@ fn pids_holding_file_filtered<F: Fn(u32) -> bool>(
             continue;
         };
         for fd_entry in fds.flatten() {
-            // `metadata` follows the /proc/<pid>/fd/<N> symlink in one syscall
-            // and yields the target's inode/dev. Anonymous-inode FDs (sockets,
-            // pipes, eventpolls, signalfds, ...) get a stat for the anon
-            // inode whose (dev, ino) cannot match a regular file.
-            if let Ok(link_meta) = std::fs::metadata(fd_entry.path()) {
+            let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
+                continue;
+            };
+            if link_target != canonical_target {
+                continue;
+            }
+            if let Ok(link_meta) = std::fs::metadata(&link_target) {
                 if link_meta.ino() == target_ino && link_meta.dev() == target_dev {
                     holders.push(pid);
                     break; // One match per PID is enough
@@ -3053,6 +3060,56 @@ mod tests {
 
     fn default_config() -> Config {
         Config::default()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pids_holding_file_finds_child_holder_via_readlink_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("held.db");
+        std::fs::write(&target, b"held").expect("seed file");
+        // A child that opens the file and sleeps; `tail -f` keeps the fd open.
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn tail -f holder");
+        let child_pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            if pids_holding_file(&target).contains(&child_pid) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Probing through a symlinked spelling of the same path must also
+        // match: the kernel fd path is canonical, so the probe target is
+        // canonicalized before the readlink string compare (br-piwvy).
+        let link = dir.path().join("held-link.db");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let via_link = found && pids_holding_file(&link).contains(&child_pid);
+
+        let other = dir.path().join("unheld.db");
+        std::fs::write(&other, b"unheld").expect("seed other");
+        let other_holders = pids_holding_file(&other);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(found, "child holding the file must be reported");
+        assert!(
+            via_link,
+            "symlinked probe spelling must canonicalize and match"
+        );
+        assert!(
+            !other_holders.contains(&child_pid),
+            "child must not be reported for a file it does not hold"
+        );
     }
 
     #[test]

@@ -6602,6 +6602,12 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
     };
     let target_ino = target_meta.ino();
     let target_dev = target_meta.dev();
+    // The kernel resolves an fd's path at open time, so `/proc/*/fd/N`
+    // readlink output is already canonical — canonicalize the probe target
+    // once so the string comparison below is apples-to-apples.
+    let Ok(canonical_target) = std::fs::canonicalize(path) else {
+        return Vec::new();
+    };
 
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
         return Vec::new();
@@ -6621,9 +6627,23 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
             continue;
         };
         for fd_entry in fds.flatten() {
+            // `read_link` on a /proc fd magic link returns the resolved
+            // target path WITHOUT touching the target filesystem. Statting
+            // an arbitrary fd's target (previous behavior) walks into that
+            // filesystem — and a stat into a dead FUSE mount blocks in
+            // request_wait_answer forever, wedging single-threaded startup
+            // before the listener binds (br-piwvy, ts1 incident). Only fds
+            // whose resolved path equals the probe target are stat-confirmed
+            // for (dev, ino); that stat lands on the probe target's own
+            // filesystem, which we already statted above. Deleted-fd targets
+            // carry a " (deleted)" suffix and mismatch, matching the old
+            // semantics (a replaced file's old holders never matched either).
             let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
                 continue;
             };
+            if link_target != canonical_target {
+                continue;
+            }
             if let Ok(link_meta) = std::fs::metadata(&link_target)
                 && link_meta.ino() == target_ino
                 && link_meta.dev() == target_dev
@@ -9454,6 +9474,40 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pids_holding_file_via_proc_reports_own_open_via_readlink_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("held.sqlite3");
+        std::fs::write(&target, b"held").expect("seed file");
+        let _handle = std::fs::File::open(&target).expect("hold file open");
+        let my_pid = std::process::id();
+
+        // This scanner does not exclude the calling process, so our own open
+        // proves the readlink string-match path reports real holders
+        // (br-piwvy replaced the hang-prone stat-into-target-fs walk).
+        assert!(
+            pids_holding_file_via_proc(&target).contains(&my_pid),
+            "own open must be reported as a holder"
+        );
+
+        // A symlinked spelling of the probe target must canonicalize and
+        // still match the kernel's canonical fd path.
+        let link = dir.path().join("held-link.sqlite3");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(
+            pids_holding_file_via_proc(&link).contains(&my_pid),
+            "symlinked probe spelling must canonicalize and match"
+        );
+
+        let other = dir.path().join("unheld.sqlite3");
+        std::fs::write(&other, b"unheld").expect("seed other");
+        assert!(
+            !pids_holding_file_via_proc(&other).contains(&my_pid),
+            "must not report a holder for a file this process has not opened"
+        );
+    }
 
     #[test]
     fn python_agent_mail_shadow_matcher_is_precise() {
