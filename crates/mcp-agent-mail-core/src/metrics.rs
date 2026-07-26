@@ -680,6 +680,13 @@ pub struct StorageMetrics {
     /// individual op failure (including transient ones that succeed on
     /// retry). See #122.
     pub wbq_unrecoverable_errors_total: Counter,
+    /// Ops salvaged from a dead drain thread's channel and re-enqueued into
+    /// the fresh channel at WBQ respawn (br-b9x63).
+    pub wbq_respawn_salvaged_total: Counter,
+    /// Ops known lost across a WBQ respawn: they were counted in the queue
+    /// depth before the drain thread died but could not be salvaged into the
+    /// fresh channel (br-b9x63).
+    pub wbq_respawn_lost_total: Counter,
 
     pub commit_enqueued_total: Counter,
     pub commit_drained_total: Counter,
@@ -730,6 +737,8 @@ pub struct StorageMetricsSnapshot {
     pub wbq_queue_latency_us: HistogramSnapshot,
     pub wbq_last_unrecoverable_error_us: u64,
     pub wbq_unrecoverable_errors_total: u64,
+    pub wbq_respawn_salvaged_total: u64,
+    pub wbq_respawn_lost_total: u64,
 
     pub commit_enqueued_total: u64,
     pub commit_drained_total: u64,
@@ -1819,6 +1828,8 @@ impl Default for StorageMetrics {
             wbq_queue_latency_us: Log2Histogram::new(),
             wbq_last_unrecoverable_error_us: GaugeU64::new(),
             wbq_unrecoverable_errors_total: Counter::new(),
+            wbq_respawn_salvaged_total: Counter::new(),
+            wbq_respawn_lost_total: Counter::new(),
 
             commit_enqueued_total: Counter::new(),
             commit_drained_total: Counter::new(),
@@ -1861,6 +1872,8 @@ impl StorageMetrics {
             wbq_queue_latency_us: self.wbq_queue_latency_us.snapshot(),
             wbq_last_unrecoverable_error_us: self.wbq_last_unrecoverable_error_us.load(),
             wbq_unrecoverable_errors_total: self.wbq_unrecoverable_errors_total.load(),
+            wbq_respawn_salvaged_total: self.wbq_respawn_salvaged_total.load(),
+            wbq_respawn_lost_total: self.wbq_respawn_lost_total.load(),
 
             commit_enqueued_total: self.commit_enqueued_total.load(),
             commit_drained_total: self.commit_drained_total.load(),

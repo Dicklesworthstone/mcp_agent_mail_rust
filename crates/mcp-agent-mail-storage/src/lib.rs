@@ -451,12 +451,23 @@ struct WriteBehindQueue {
     drain_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
     op_depth: Arc<AtomicU64>,
+    /// The drain thread reads through this slot instead of owning the
+    /// `Receiver`, so ops buffered in the channel survive a drain-thread death
+    /// and can be salvaged into the replacement channel at respawn (br-b9x63).
+    receiver_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<WbqMsg>>>>,
 }
 
 // WBQ timing defaults. Capacity and batch limits come from `Config`.
 const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
 const WBQ_ENQUEUE_TIMEOUT_MS: u64 = 100;
 const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
+/// Total budget for a flush round-trip: delivering the Flush message AND
+/// receiving the drain acknowledgement share this single deadline (br-lrrry).
+const WBQ_FLUSH_BUDGET_SECS: u64 = 30;
+/// Budget for delivering the Shutdown message at `wbq_shutdown`. Short and
+/// separate from the flush budget: if the channel is still full after the
+/// flush phase, the thread is wedged and we detach instead of hanging.
+const WBQ_SHUTDOWN_SEND_BUDGET_SECS: u64 = 5;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
@@ -539,6 +550,7 @@ fn new_write_behind_queue() -> WriteBehindQueue {
         drain_handle: OrderedMutex::new(LockLevel::StorageWbqDrainHandle, None),
         lifecycle: Mutex::new(()),
         op_depth,
+        receiver_slot: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -566,11 +578,74 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     let channel_capacity = config.wbq_channel_capacity;
     let drain_batch_cap = config.wbq_drain_batch_cap;
     let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
+
+    // br-b9x63: a dead drain thread leaves its buffered ops in the old
+    // channel. Salvage them into the fresh channel instead of silently
+    // dropping them, and reconcile op_depth/wbq_depth to what the fresh
+    // channel actually holds so the depth gauge cannot stay inflated.
+    let (salvaged_ops, prior_depth) = {
+        let mut slot = wbq
+            .receiver_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_rx = slot.take();
+        let mut salvaged_ops = 0u64;
+        if let Some(old_rx) = old_rx {
+            for msg in old_rx.try_iter() {
+                match msg {
+                    // A stale Shutdown must not kill the replacement thread:
+                    // whoever is calling wbq_start_inner wants the queue live.
+                    WbqMsg::Shutdown => {}
+                    msg @ (WbqMsg::Op(_) | WbqMsg::Flush(_)) => {
+                        let is_op = matches!(msg, WbqMsg::Op(_));
+                        // Same capacity as the old channel and nothing else
+                        // holds the new sender yet, so Full is impossible in
+                        // practice; count defensively rather than assert.
+                        if tx.try_send(msg).is_ok() && is_op {
+                            salvaged_ops = salvaged_ops.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        *slot = Some(rx);
+        let prior_depth = wbq.op_depth.swap(salvaged_ops, Ordering::Relaxed);
+        (salvaged_ops, prior_depth)
+    };
+    let metrics = mcp_agent_mail_core::global_metrics();
+    metrics.storage.wbq_depth.set(salvaged_ops);
+    let lost = prior_depth.saturating_sub(salvaged_ops);
+    if salvaged_ops > 0 {
+        metrics.storage.wbq_respawn_salvaged_total.add(salvaged_ops);
+        tracing::warn!(
+            salvaged = salvaged_ops,
+            "wbq restart: re-enqueued ops left behind by the previous drain thread"
+        );
+    }
+    if lost > 0 {
+        metrics.storage.wbq_respawn_lost_total.add(lost);
+        tracing::error!(
+            lost,
+            salvaged = salvaged_ops,
+            "wbq restart: ops counted in queue depth could not be salvaged from the dead \
+             drain thread's channel — corresponding archive artifacts heal via \
+             reconcile-on-read"
+        );
+    }
+
+    let receiver_slot = Arc::clone(&wbq.receiver_slot);
     let op_depth_worker = Arc::clone(&wbq.op_depth);
     let handle = std::thread::Builder::new()
         .name("wbq-drain".into())
         .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || wbq_drain_loop(rx, op_depth_worker, channel_capacity, drain_batch_cap))
+        .spawn(move || {
+            wbq_drain_loop(
+                receiver_slot,
+                op_depth_worker,
+                channel_capacity,
+                drain_batch_cap,
+            );
+        })
         .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
 
     *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
@@ -754,6 +829,55 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
     }
 }
 
+/// Failure modes for delivering a control message (`Flush`/`Shutdown`) to the
+/// drain thread within a bounded deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WbqControlSendError {
+    /// The channel stayed full past the deadline — the drain thread is alive
+    /// but not consuming (e.g. wedged on a git index lock).
+    TimedOut,
+    /// The drain thread's receiver is gone (it exited or panicked).
+    Disconnected,
+}
+
+/// Deliver a control message without the unbounded blocking `send` foot-gun.
+///
+/// br-lrrry: `wbq_flush_status`/`wbq_shutdown` used blocking `send` for their
+/// Flush/Shutdown messages. When the drain thread is alive-but-wedged and the
+/// channel is full, that `send` blocks indefinitely *before* the caller's 30s
+/// `recv_timeout` is ever armed, so the documented budget was not real. Same
+/// try_send + bounded-backoff shape as `wbq_enqueue_with_sender`.
+fn wbq_send_control_with_deadline(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    msg: WbqMsg,
+    deadline: Instant,
+) -> std::result::Result<(), WbqControlSendError> {
+    let mut cur = msg;
+    let mut backoff = Duration::from_millis(1);
+    let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
+    loop {
+        match sender.try_send(cur) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(WbqControlSendError::Disconnected);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(WbqControlSendError::TimedOut);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(backoff.min(remaining));
+                backoff = backoff
+                    .checked_mul(2)
+                    .unwrap_or(max_backoff)
+                    .min(max_backoff);
+                cur = returned;
+            }
+        }
+    }
+}
+
 /// Outcome of a write-behind-queue flush, so a durability-sensitive caller can
 /// tell "the archive is now on disk" from "the drain thread never confirmed".
 ///
@@ -778,10 +902,10 @@ pub enum WbqFlushOutcome {
 
 /// Block until all pending write ops have been drained, reporting the outcome.
 ///
-/// Uses a blocking `send` so the Flush message is guaranteed to enter the
-/// channel even when it is temporarily full.  If the drain thread has
-/// panicked (receiver dropped), `send` returns `Err` immediately – no
-/// deadlock risk.
+/// The Flush message is delivered with a bounded-deadline send (br-lrrry): a
+/// blocking `send` on a full channel would wait on a wedged drain thread
+/// forever, making the 30s budget below fictional. The single deadline spans
+/// both delivery and the drain acknowledgement.
 #[must_use]
 pub fn wbq_flush_status() -> WbqFlushOutcome {
     let Some(wbq) = WBQ.get() else {
@@ -790,14 +914,25 @@ pub fn wbq_flush_status() -> WbqFlushOutcome {
     let Some(sender) = wbq_sender_clone(wbq) else {
         return WbqFlushOutcome::NoQueue;
     };
+    let deadline = Instant::now() + Duration::from_secs(WBQ_FLUSH_BUDGET_SECS);
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-    if sender.send(WbqMsg::Flush(done_tx)).is_err() {
-        return WbqFlushOutcome::Disconnected;
+    match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
+        Ok(()) => {}
+        Err(WbqControlSendError::TimedOut) => {
+            tracing::warn!(
+                "wbq_flush could not deliver its flush request within {WBQ_FLUSH_BUDGET_SECS}s \
+                 (channel full); drain thread may be stuck"
+            );
+            return WbqFlushOutcome::TimedOut;
+        }
+        Err(WbqControlSendError::Disconnected) => return WbqFlushOutcome::Disconnected,
     }
-    match done_rx.recv_timeout(Duration::from_secs(30)) {
+    match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(()) => WbqFlushOutcome::Drained,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            tracing::warn!("wbq_flush timed out after 30s; drain thread may be stuck");
+            tracing::warn!(
+                "wbq_flush timed out after {WBQ_FLUSH_BUDGET_SECS}s; drain thread may be stuck"
+            );
             WbqFlushOutcome::TimedOut
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -825,30 +960,73 @@ pub fn wbq_flush() {
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
         let _lifecycle = wbq.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // Join only when the drain thread demonstrably keeps consuming (flush
+        // acknowledged and Shutdown delivered) or is already gone. A wedged
+        // thread with a full channel must not hang shutdown forever (br-lrrry).
+        let mut safe_to_join = true;
         if let Some(sender) = wbq_sender_clone(wbq) {
+            let deadline = Instant::now() + Duration::from_secs(WBQ_FLUSH_BUDGET_SECS);
             let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            if sender.send(WbqMsg::Flush(done_tx)).is_ok() {
-                match done_rx.recv_timeout(Duration::from_secs(30)) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        tracing::warn!("wbq_flush timed out after 30s; drain thread may be stuck");
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        tracing::warn!("wbq_flush: drain thread channel disconnected");
+            match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
+                Ok(()) => {
+                    match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            tracing::warn!(
+                                "wbq_shutdown: flush timed out after {WBQ_FLUSH_BUDGET_SECS}s; \
+                                 drain thread may be stuck"
+                            );
+                            safe_to_join = false;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            tracing::warn!("wbq_shutdown: drain thread channel disconnected");
+                        }
                     }
                 }
+                Err(WbqControlSendError::TimedOut) => {
+                    tracing::warn!(
+                        "wbq_shutdown: could not deliver flush request within \
+                         {WBQ_FLUSH_BUDGET_SECS}s (channel full); drain thread may be stuck"
+                    );
+                    safe_to_join = false;
+                }
+                Err(WbqControlSendError::Disconnected) => {}
             }
-            // Tell the drain thread to exit.  Use blocking `send` so it is
-            // guaranteed to be delivered (same rationale as wbq_flush).
-            let _ = sender.send(WbqMsg::Shutdown);
+            // Tell the drain thread to exit, bounded for the same reason.
+            match wbq_send_control_with_deadline(
+                &sender,
+                WbqMsg::Shutdown,
+                Instant::now() + Duration::from_secs(WBQ_SHUTDOWN_SEND_BUDGET_SECS),
+            ) {
+                Ok(()) => {}
+                Err(WbqControlSendError::TimedOut) => {
+                    tracing::warn!(
+                        "wbq_shutdown: could not deliver Shutdown within \
+                         {WBQ_SHUTDOWN_SEND_BUDGET_SECS}s (channel full); detaching drain \
+                         thread without join"
+                    );
+                    safe_to_join = false;
+                }
+                Err(WbqControlSendError::Disconnected) => {}
+            }
         }
+        // Dropping the stored sender (and our clone above, at scope end) lets
+        // the channel disconnect once in-flight clones die, which is a second
+        // exit path for the drain loop even if Shutdown was never delivered.
         *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let handle = {
             let mut guard = wbq.drain_handle.lock();
             guard.take()
         };
         if let Some(h) = handle {
-            let _ = h.join();
+            if safe_to_join || h.is_finished() {
+                let _ = h.join();
+            } else {
+                tracing::warn!(
+                    "wbq_shutdown: detaching wedged drain thread; ops it still holds will be \
+                     salvaged if the queue is restarted"
+                );
+            }
         }
     }
 }
@@ -1290,8 +1468,21 @@ mod wbq_circuit_breaker_tests {
     }
 }
 
+/// One pass over the channel while holding the receiver-slot lock.
+enum WbqRecvPass {
+    /// At least one message was received; the batch/waiter state was updated.
+    Work,
+    /// recv timed out with nothing pending — ack waiters and idle onward.
+    Tick,
+    /// All senders are gone; exit and run the final drain.
+    Disconnected,
+    /// A respawn took the receiver out from under this (stale) thread — exit
+    /// immediately without touching the slot again, it belongs to a successor.
+    Stolen,
+}
+
 fn wbq_drain_loop(
-    rx: std::sync::mpsc::Receiver<WbqMsg>,
+    receiver_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<WbqMsg>>>>,
     op_depth: Arc<AtomicU64>,
     channel_capacity: usize,
     drain_batch_cap: usize,
@@ -1303,27 +1494,50 @@ fn wbq_drain_loop(
     loop {
         let mut batch: Vec<WbqOpEnvelope> = Vec::new();
 
-        match rx.recv_timeout(flush_interval) {
-            Ok(WbqMsg::Op(op)) => batch.push(op),
-            Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
-            Ok(WbqMsg::Shutdown) => shutting_down = true,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        // Receive under the slot lock but execute outside it (br-b9x63): if an
+        // op panics this thread, the receiver survives in the slot and the
+        // respawn salvages whatever is still buffered.
+        let pass = {
+            let guard = receiver_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                None => WbqRecvPass::Stolen,
+                Some(rx) => match rx.recv_timeout(flush_interval) {
+                    Ok(first) => {
+                        match first {
+                            WbqMsg::Op(op) => batch.push(op),
+                            WbqMsg::Flush(done_tx) => flush_waiters.push(done_tx),
+                            WbqMsg::Shutdown => shutting_down = true,
+                        }
+                        // Drain remaining items from the channel (up to batch cap).
+                        while batch.len() < drain_batch_cap {
+                            match rx.try_recv() {
+                                Ok(WbqMsg::Op(op)) => batch.push(op),
+                                Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
+                                Ok(WbqMsg::Shutdown) => shutting_down = true,
+                                Err(_) => break,
+                            }
+                        }
+                        WbqRecvPass::Work
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WbqRecvPass::Tick,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        WbqRecvPass::Disconnected
+                    }
+                },
+            }
+        };
+        match pass {
+            WbqRecvPass::Work => {}
+            WbqRecvPass::Tick => {
                 for w in flush_waiters.drain(..) {
                     let _ = w.try_send(());
                 }
                 continue;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-
-        // Drain remaining items from the channel (up to batch cap).
-        while batch.len() < drain_batch_cap {
-            match rx.try_recv() {
-                Ok(WbqMsg::Op(op)) => batch.push(op),
-                Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
-                Ok(WbqMsg::Shutdown) => shutting_down = true,
-                Err(_) => break,
-            }
+            WbqRecvPass::Disconnected => break,
+            WbqRecvPass::Stolen => return,
         }
 
         let drained = batch.len();
@@ -1422,8 +1636,21 @@ fn wbq_drain_loop(
         }
     }
 
-    // Drain any remaining messages after the loop exits.
-    for msg in rx.try_iter() {
+    // Drain any remaining messages after the loop exits, one at a time so the
+    // slot lock is never held across op execution.
+    loop {
+        let msg = {
+            let guard = receiver_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                None => return,
+                Some(rx) => match rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                },
+            }
+        };
         match msg {
             WbqMsg::Op(envelope) => {
                 let depth_after = op_depth
@@ -15373,12 +15600,155 @@ mod tests {
         }
         tx.send(WbqMsg::Shutdown).unwrap();
 
-        wbq_drain_loop(rx, Arc::new(AtomicU64::new(2)), 4, 4);
+        wbq_drain_loop(
+            Arc::new(Mutex::new(Some(rx))),
+            Arc::new(AtomicU64::new(2)),
+            4,
+            4,
+        );
         flush_async_commits();
 
         let archive = ensure_archive(&config, project_slug).unwrap();
         let commits = get_recent_commits(&archive, 3, None).unwrap();
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
+    }
+
+    #[test]
+    fn wbq_send_control_with_deadline_times_out_on_full_channel_without_blocking() {
+        // br-lrrry: a full channel with a non-consuming receiver must bound the
+        // wait at the deadline instead of blocking forever like `send` would.
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        tx.try_send(WbqMsg::Shutdown).expect("fill the channel");
+
+        let started = Instant::now();
+        let result = wbq_send_control_with_deadline(
+            &tx,
+            WbqMsg::Shutdown,
+            Instant::now() + Duration::from_millis(50),
+        );
+        assert_eq!(result, Err(WbqControlSendError::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded send must respect its deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn wbq_send_control_with_deadline_reports_disconnected() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WbqMsg>(1);
+        drop(rx);
+        assert_eq!(
+            wbq_send_control_with_deadline(
+                &tx,
+                WbqMsg::Shutdown,
+                Instant::now() + Duration::from_millis(50),
+            ),
+            Err(WbqControlSendError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn wbq_send_control_with_deadline_delivers_when_capacity_frees() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.try_send(WbqMsg::Shutdown).expect("fill the channel");
+
+        let consumer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+            // Keep the receiver alive until the sender finishes so the send
+            // can only succeed via freed capacity, not disconnect.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(rx);
+        });
+
+        assert_eq!(
+            wbq_send_control_with_deadline(
+                &tx,
+                WbqMsg::Shutdown,
+                Instant::now() + Duration::from_secs(5),
+            ),
+            Ok(())
+        );
+        consumer.join().expect("consumer thread");
+    }
+
+    #[test]
+    fn wbq_restart_salvages_ops_buffered_in_dead_drain_channel() {
+        // br-b9x63: ops buffered in a dead drain thread's channel must survive
+        // a respawn (re-enqueued into the fresh channel), a stale Shutdown must
+        // not kill the replacement thread, and op_depth must be reconciled to
+        // what the fresh channel actually holds instead of staying inflated.
+        let wbq = new_write_behind_queue();
+
+        let (old_tx, old_rx) = std::sync::mpsc::sync_channel(8);
+        for i in 0..3 {
+            old_tx
+                .try_send(WbqMsg::Op(WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(wbq_test_clear_signal_op(&format!("wbq-salvage-{i}"))),
+                }))
+                .expect("buffer op in the dead thread's channel");
+        }
+        old_tx
+            .try_send(WbqMsg::Shutdown)
+            .expect("buffer a stale shutdown");
+        *wbq.receiver_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(old_rx);
+        // Simulate the inflated depth of a dead drain: 3 buffered + 2 that the
+        // dead thread had dequeued but never executed.
+        wbq.op_depth.store(5, Ordering::Relaxed);
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let salvaged_before = metrics.storage.wbq_respawn_salvaged_total.load();
+        let lost_before = metrics.storage.wbq_respawn_lost_total.load();
+
+        wbq_start_inner(&wbq);
+
+        // No depth assertion here: the replacement thread may already be
+        // draining the salvaged ops. The race-free inflation check is the
+        // final depth after the flush ack below — without the swap-reconcile
+        // it would settle at 2 (the phantom lost ops), not 0.
+        assert!(
+            metrics.storage.wbq_respawn_salvaged_total.load() >= salvaged_before + 3,
+            "salvaged ops must be counted"
+        );
+        assert!(
+            metrics.storage.wbq_respawn_lost_total.load() >= lost_before + 2,
+            "unsalvageable depth must be counted as lost"
+        );
+        assert!(
+            old_tx.try_send(WbqMsg::Shutdown).is_err(),
+            "old channel must be disconnected after salvage"
+        );
+
+        // The replacement thread must be alive (stale Shutdown dropped) and
+        // must drain the salvaged ops: a flush round-trip proves both.
+        let sender = wbq_sender_clone(&wbq).expect("restarted queue has a sender");
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(WbqMsg::Flush(done_tx))
+            .expect("flush request should be delivered");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("replacement drain thread must ack the flush");
+        assert_eq!(
+            wbq.op_depth.load(Ordering::Relaxed),
+            0,
+            "salvaged ops must actually drain"
+        );
+
+        // Clean up the test-local drain thread.
+        let _ = sender.send(WbqMsg::Shutdown);
+        drop(sender);
+        *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let handle = {
+            let mut guard = wbq.drain_handle.lock();
+            guard.take()
+        };
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
     }
 
     #[test]
@@ -15669,7 +16039,7 @@ mod tests {
 
         let _pressure =
             DiskPressureReset::set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
-        wbq_drain_loop(rx, op_depth, 4, 4);
+        wbq_drain_loop(Arc::new(Mutex::new(Some(rx))), op_depth, 4, 4);
         flush_async_commits();
 
         let archive = ensure_archive(&config, &project_slug).unwrap();

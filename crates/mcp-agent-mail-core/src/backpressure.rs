@@ -969,6 +969,8 @@ mod tests {
                 },
                 wbq_last_unrecoverable_error_us: 0,
                 wbq_unrecoverable_errors_total: 0,
+                wbq_respawn_salvaged_total: 0,
+                wbq_respawn_lost_total: 0,
                 commit_enqueued_total: 0,
                 commit_drained_total: 0,
                 commit_errors_total: 0,
