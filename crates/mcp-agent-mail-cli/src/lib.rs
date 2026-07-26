@@ -55583,15 +55583,26 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn resolve_beads_dir_returns_error_for_missing_dir() {
+    fn resolve_beads_dir_missing_dir_never_resolves_inside_the_tempdir() {
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_beads_dir(Some(dir.path()));
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no beads directory"),
-            "expected 'no beads directory' in: {err_msg}"
-        );
+        match resolve_beads_dir(Some(dir.path())) {
+            // Clean host: no ancestor of the tempdir carries a .beads dir.
+            Err(err) => assert!(
+                err.to_string().contains("no beads directory"),
+                "expected 'no beads directory' in: {err}"
+            ),
+            // beads_rust discovery deliberately walks UP from the start dir,
+            // so on hosts where a tempdir ancestor is a real beads workspace
+            // (e.g. a stray /data/tmp/.beads) resolution legitimately
+            // escapes the tempdir (br-51028). The invariant that must hold
+            // on every host: the empty tempdir itself is never fabricated
+            // into a beads dir.
+            Ok(found) => assert!(
+                !found.starts_with(dir.path()),
+                "resolved {} inside the empty tempdir",
+                found.display()
+            ),
+        }
     }
 
     #[test]
