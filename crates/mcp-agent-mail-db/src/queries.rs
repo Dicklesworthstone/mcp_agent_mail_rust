@@ -18696,6 +18696,105 @@ mod tests {
     }
 
     #[test]
+    fn create_message_recipients_json_preserves_request_order() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recipients_json_request_order.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-recip-order-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let purple = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "PurpleElk",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register PurpleElk");
+            let green = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register GreenStone");
+
+            // Deliberately NON-alphabetical request order. The stored
+            // recipients_json must preserve it verbatim: the archive canonical
+            // artifact serializes the same resolved vectors, and reconstruct
+            // replays archive arrays as-is, so any sorting introduced on any
+            // of those surfaces re-creates the ts1 cosmetic reconstruct drift
+            // (br-ndc60).
+            let recipients = [
+                (purple.id.expect("purple id"), "to"),
+                (green.id.expect("green id"), "to"),
+                (sender.id.expect("sender id"), "cc"),
+            ];
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "order-subject",
+                "body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &recipients,
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&message.recipients_json).expect("recipients json");
+            assert_eq!(
+                parsed["to"],
+                serde_json::json!(["PurpleElk", "GreenStone"]),
+                "to-recipients must keep request order, not sort"
+            );
+            assert_eq!(parsed["cc"], serde_json::json!(["BlueLake"]));
+        });
+    }
+
+    #[test]
     fn list_thread_messages_without_limit_orders_in_chronological_order() {
         use asupersync::runtime::RuntimeBuilder;
 
