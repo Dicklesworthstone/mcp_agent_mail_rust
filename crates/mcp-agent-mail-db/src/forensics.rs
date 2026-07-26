@@ -771,6 +771,39 @@ fn require_unique_receipt_keys(
 }
 
 fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuitySets, SqlError> {
+    collect_recovery_continuity_sets_with_overrides(db_path, &BTreeMap::new())
+        .map(|(sets, _rewritten)| sets)
+}
+
+/// Substitute the archive's canonical human key for a slug at decode time,
+/// before any stable key or semantic fingerprint embeds it (br-uflow).
+///
+/// Within one mailbox a slug names exactly one archive project directory, so
+/// a database row whose human key differs from that project's `project.json`
+/// is identity drift (e.g. a moved repo), not a distinct project. Hashed
+/// fingerprints make post-hoc key rewriting impossible, so the substitution
+/// must happen here. Genuine losses (rows absent from the candidate) still
+/// block promotion: this only aligns the human-key spelling of identities.
+fn overridden_project_human_key(
+    overrides: &BTreeMap<String, String>,
+    slug: &str,
+    human_key: String,
+    rewritten: &mut u64,
+) -> String {
+    match overrides.get(slug) {
+        Some(canonical) if canonical != &human_key => {
+            *rewritten += 1;
+            canonical.clone()
+        }
+        _ => human_key,
+    }
+}
+
+fn collect_recovery_continuity_sets_with_overrides(
+    db_path: &Path,
+    identity_overrides: &BTreeMap<String, String>,
+) -> Result<(RecoveryContinuitySets, u64), SqlError> {
+    let mut rewritten = 0u64;
     if !db_path.is_file() {
         return Err(recovery_receipt_error(
             "snapshot open",
@@ -802,6 +835,8 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
             let slug = receipt_required_text(&row, "slug", "project slug decode", db_path)?;
             let human_key =
                 receipt_required_text(&row, "human_key", "project human_key decode", db_path)?;
+            let human_key =
+                overridden_project_human_key(identity_overrides, &slug, human_key, &mut rewritten);
             sets.projects.insert(receipt_canonical_key(
                 json!({"slug": slug, "human_key": human_key}),
                 db_path,
@@ -920,6 +955,12 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 "product-project project human_key decode",
                 db_path,
             )?;
+            let project_human_key = overridden_project_human_key(
+                identity_overrides,
+                &project_slug,
+                project_human_key,
+                &mut rewritten,
+            );
             let created_at = receipt_required_i64(
                 &row,
                 "created_at",
@@ -995,6 +1036,12 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 "agent project human_key decode",
                 db_path,
             )?;
+            let project_human_key = overridden_project_human_key(
+                identity_overrides,
+                &project_slug,
+                project_human_key,
+                &mut rewritten,
+            );
             let agent_name =
                 receipt_required_text(&row, "agent_name", "agent name decode", db_path)?;
             let reaper_exempt =
@@ -1087,10 +1134,22 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
             let a_slug = receipt_required_text(&row, "a_slug", "contact a slug decode", db_path)?;
             let a_human_key =
                 receipt_required_text(&row, "a_human_key", "contact a human_key decode", db_path)?;
+            let a_human_key = overridden_project_human_key(
+                identity_overrides,
+                &a_slug,
+                a_human_key,
+                &mut rewritten,
+            );
             let a_name = receipt_required_text(&row, "a_name", "contact a name decode", db_path)?;
             let b_slug = receipt_required_text(&row, "b_slug", "contact b slug decode", db_path)?;
             let b_human_key =
                 receipt_required_text(&row, "b_human_key", "contact b human_key decode", db_path)?;
+            let b_human_key = overridden_project_human_key(
+                identity_overrides,
+                &b_slug,
+                b_human_key,
+                &mut rewritten,
+            );
             let b_name = receipt_required_text(&row, "b_name", "contact b name decode", db_path)?;
             let status = receipt_required_text(&row, "status", "contact status decode", db_path)?;
             let reason = receipt_text(&row, "reason", "contact reason decode", db_path)?;
@@ -1198,6 +1257,12 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 "reservation project human_key decode",
                 db_path,
             )?;
+            let project_human_key = overridden_project_human_key(
+                identity_overrides,
+                &project_slug,
+                project_human_key,
+                &mut rewritten,
+            );
             let agent_name = receipt_required_text(
                 &row,
                 "agent_name",
@@ -1318,6 +1383,12 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 "message project human_key decode",
                 db_path,
             )?;
+            let project_human_key = overridden_project_human_key(
+                identity_overrides,
+                &project_slug,
+                project_human_key,
+                &mut rewritten,
+            );
             let sender_name =
                 receipt_required_text(&row, "sender_name", "message sender decode", db_path)?;
             let thread_id =
@@ -1470,6 +1541,12 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
                 "message-recipient project human_key decode",
                 db_path,
             )?;
+            let project_human_key = overridden_project_human_key(
+                identity_overrides,
+                &project_slug,
+                project_human_key,
+                &mut rewritten,
+            );
             let recipient_name = receipt_required_text(
                 &row,
                 "recipient_name",
@@ -1576,7 +1653,7 @@ fn collect_recovery_continuity_sets(db_path: &Path) -> Result<RecoveryContinuity
         )?;
     }
 
-    Ok(sets)
+    Ok((sets, rewritten))
 }
 
 fn recovery_category(keys: &BTreeSet<String>) -> Result<RecoveryReceiptCategory, SqlError> {
@@ -2339,32 +2416,57 @@ struct RecoveryReceiptEvidence {
     previous_receipt_bytes_sha256: Option<String>,
 }
 
+/// Canonical `slug -> human_key` identities recorded by the archive's
+/// per-project `project.json` files (br-uflow).
+fn archive_canonical_project_identities(storage_root: &Path) -> BTreeMap<String, String> {
+    crate::reconstruct::scan_archive_message_inventory(storage_root)
+        .project_identities
+        .into_iter()
+        .filter_map(|identity| Some((identity.slug?, identity.human_key?)))
+        .collect()
+}
+
 fn collect_recovery_receipt_evidence(
     receipts_dir: &Path,
     source_path: Option<&Path>,
     candidate_path: &Path,
+    archive_identity_overrides: &BTreeMap<String, String>,
 ) -> Result<RecoveryReceiptEvidence, SqlError> {
     let chain = verify_finalized_recovery_receipt_chain(receipts_dir)?;
     let (source_sets, source_snapshot_failure_sha256) = match source_path {
-        Some(path) => match collect_recovery_continuity_sets(path) {
-            Ok(sets) => (sets, None),
-            Err(snapshot_error) => match crate::pool::sqlite_file_is_healthy(path) {
-                Ok(false) => (
-                    RecoveryContinuitySets::default(),
-                    Some(recovery_sha256(snapshot_error.to_string().as_bytes())),
-                ),
-                Ok(true) => return Err(snapshot_error),
-                Err(health_error) => {
-                    return Err(recovery_receipt_error(
-                        "source generation health classification",
-                        path,
-                        format!(
-                            "semantic snapshot failed ({snapshot_error}); health classification also failed ({health_error})"
-                        ),
-                    ));
+        Some(path) => {
+            match collect_recovery_continuity_sets_with_overrides(path, archive_identity_overrides)
+            {
+                Ok((sets, rewritten)) => {
+                    if rewritten > 0 {
+                        tracing::warn!(
+                            source = %path.display(),
+                            rewritten_keys = rewritten,
+                            "recovery receipt: source project identities drifted from the \
+                             archive's canonical project.json; comparing continuity under the \
+                             archive identity"
+                        );
+                    }
+                    (sets, None)
                 }
-            },
-        },
+                Err(snapshot_error) => match crate::pool::sqlite_file_is_healthy(path) {
+                    Ok(false) => (
+                        RecoveryContinuitySets::default(),
+                        Some(recovery_sha256(snapshot_error.to_string().as_bytes())),
+                    ),
+                    Ok(true) => return Err(snapshot_error),
+                    Err(health_error) => {
+                        return Err(recovery_receipt_error(
+                            "source generation health classification",
+                            path,
+                            format!(
+                                "semantic snapshot failed ({snapshot_error}); health classification also failed ({health_error})"
+                            ),
+                        ));
+                    }
+                },
+            }
+        }
         None => (RecoveryContinuitySets::default(), None),
     };
     if let Some(existing_chain) = chain.as_ref() {
@@ -2512,8 +2614,13 @@ pub(crate) fn prepare_recovery_receipt(
     }
     // Validate deterministic loss before acquiring the singleton intent so a
     // rejected candidate does not leave an admission marker behind.
-    let _prevalidated_evidence =
-        collect_recovery_receipt_evidence(&receipts_dir, source_path, candidate_path)?;
+    let archive_identity_overrides = archive_canonical_project_identities(storage_root);
+    let _prevalidated_evidence = collect_recovery_receipt_evidence(
+        &receipts_dir,
+        source_path,
+        candidate_path,
+        &archive_identity_overrides,
+    )?;
 
     // `create_new` on one fixed pathname is the cross-process compare/exchange.
     // Unique per-receipt pending names would let two processes both pass the
@@ -2529,8 +2636,12 @@ pub(crate) fn prepare_recovery_receipt(
         // Re-read the chain and both generations after winning admission.
         // Another process may have finalized between prevalidation and our
         // create_new.
-        let evidence =
-            collect_recovery_receipt_evidence(&receipts_dir, source_path, candidate_path)?;
+        let evidence = collect_recovery_receipt_evidence(
+            &receipts_dir,
+            source_path,
+            candidate_path,
+            &archive_identity_overrides,
+        )?;
         let prepared_at_us = mcp_agent_mail_core::timestamps::now_micros();
         let (receipt_id, final_path) = (0_u32..10_000)
             .find_map(|suffix| {

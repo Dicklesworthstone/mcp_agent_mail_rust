@@ -2397,6 +2397,16 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
+                        // br-uflow: refuse obviously unopenable targets BEFORE
+                        // FrankenSQLite sees the pathname. Its open can mint
+                        // persistent namespace sidecars (-fsqlite-ns-gate /
+                        // -fsqlite-ns-use) even when the open fails, and those
+                        // records must never be unlinked outside FrankenSQLite's
+                        // own cleanup protocol — while the strict query-only
+                        // contract promises zero filesystem footprint.
+                        if let Err(e) = strict_target_precheck(&sqlite_path) {
+                            return Outcome::Err(e);
+                        }
                         match DbConn::open_file_read_only(&sqlite_path) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
@@ -7209,6 +7219,47 @@ const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"]
 const FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES: [&str; 2] = ["-fsqlite-ns-gate", "-fsqlite-ns-use"];
 const RECOVERY_DISK_RESERVE_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Zero-footprint viability check for the strict query-only pool (br-uflow).
+///
+/// The strict pool must never create, repair, or leave sidecars beside its
+/// target — but FrankenSQLite's open mints persistent namespace records even
+/// for opens that fail, and only its own cleanup protocol may remove them
+/// (see [`FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES`]). Rejecting absent targets
+/// and files that cannot be a SQLite database (bad magic) here keeps such
+/// pathnames out of FrankenSQLite entirely. Deeper corruption still surfaces
+/// from the real open/query path; an empty file is left to the engine, which
+/// treats zero-length databases as valid.
+fn strict_target_precheck(sqlite_path: &str) -> std::result::Result<(), SqlError> {
+    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let metadata = std::fs::symlink_metadata(sqlite_path).map_err(|error| {
+        SqlError::Custom(format!(
+            "strict query-only open refused: cannot stat {sqlite_path}: {error}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is not a regular file"
+        )));
+    }
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    let mut header = [0u8; 16];
+    let read = std::fs::File::open(sqlite_path)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut header))
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "strict query-only open refused: cannot read header of {sqlite_path}: {error}"
+            ))
+        })?;
+    if read < header.len() || header != *SQLITE_MAGIC {
+        return Err(SqlError::Custom(format!(
+            "strict query-only open refused: {sqlite_path} is not a SQLite database"
+        )));
+    }
+    Ok(())
+}
+
 fn recovery_required_free_bytes(expected_write_bytes: u64) -> u64 {
     RECOVERY_DISK_RESERVE_BYTES.saturating_add(expected_write_bytes)
 }
@@ -7586,6 +7637,19 @@ fn rollback_recovery_candidate_promotion(
     timestamp: &str,
 ) -> Result<(), SqlError> {
     if let Some(quarantined_source) = quarantined_source {
+        // If the candidate was already activated onto the primary path, return
+        // it to its staging path first — exactly like the no-quarantined-source
+        // branch below — so restoring the old generation cannot clobber it and
+        // the caller can still quarantine it for forensics (br-uflow).
+        if path_is_occupied(primary_path) && !path_is_occupied(candidate_path) {
+            std::fs::rename(primary_path, candidate_path).map_err(|error| {
+                SqlError::Custom(format!(
+                    "failed to return promoted candidate {} to staging path {}: {error}",
+                    primary_path.display(),
+                    candidate_path.display()
+                ))
+            })?;
+        }
         return restore_quarantined_primary(primary_path, quarantined_source, timestamp);
     }
 
@@ -11057,10 +11121,13 @@ mod tests {
             crate::forensics::finalize_recovery_receipt_with_injected_post_rename_failure,
         )
         .expect_err("injected post-rename receipt failure must surface");
+        // Assertion text matches the actual message minted in 4b8f156c; the
+        // test shipped asserting "recovery marker" against a "receipt marker"
+        // error and had never passed (br-uflow).
         assert!(
             error
                 .to_string()
-                .contains("finalized recovery marker was committed"),
+                .contains("finalized receipt marker was committed"),
             "unexpected error: {error}"
         );
         assert_eq!(
@@ -13559,13 +13626,18 @@ mod tests {
         std::fs::create_dir_all(storage_root.join("projects/demo-project"))
             .expect("create project archive");
 
-        let err = reconstruct_archive_into_candidate(
+        // GH#208 re-scoped the promotion guard to refuse on identity loss
+        // only, so an unreadable primary no longer blocks activation by
+        // itself. The preservation contract under test needs a real
+        // activation failure, injected at the receipt boundary (br-uflow).
+        let err = reconstruct_archive_into_candidate_with_finalizer(
             &primary,
             &storage_root,
             None,
             "20260218_120000_000",
+            crate::forensics::finalize_recovery_receipt_with_injected_pre_rename_failure,
         )
-        .expect_err("existing primary should block candidate activation");
+        .expect_err("injected activation failure must preserve the existing primary");
 
         assert!(
             err.to_string()

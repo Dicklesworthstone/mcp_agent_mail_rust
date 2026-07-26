@@ -2782,12 +2782,25 @@ fn is_synthetic_project_placeholder(slug: &str, human_key: &str) -> bool {
     trimmed.is_empty() || trimmed == synthetic_project_placeholder_human_key(slug)
 }
 
+/// Reconcile a slug-matched salvage row's identity against the archive-built
+/// target project.
+///
+/// Every production salvage source is the same mailbox's previous database
+/// (entry paths verify the storage root is authoritative for that sqlite
+/// path), and within one archive a slug names exactly one project directory.
+/// A differing non-placeholder human key therefore means the DB row drifted
+/// (e.g. the repo was moved) while `project.json` holds the canonical
+/// identity — the archive-side identity wins and the divergence is recorded
+/// loudly. Refusing outright here (as 4b8f156c briefly did) turned the
+/// reconcile self-heal into a hard failure and could never distinguish drift
+/// from genuine cross-project aliasing anyway; it also matches the promotion
+/// guard's GH#208 posture of refusing on identity loss only (br-uflow).
 fn validate_salvage_project_identity_match(
     target_slug: &str,
     target_human_key: &str,
     salvaged_slug: &str,
     salvaged_human_key: &str,
-) -> DbResult<()> {
+) {
     let target_is_placeholder = is_synthetic_project_placeholder(target_slug, target_human_key);
     let salvage_is_placeholder =
         is_synthetic_project_placeholder(salvaged_slug, salvaged_human_key);
@@ -2795,13 +2808,15 @@ fn validate_salvage_project_identity_match(
         && !salvage_is_placeholder
         && target_human_key.trim() != salvaged_human_key.trim()
     {
-        return Err(DbError::Sqlite(format!(
-            "reconstruct salvage: project slug {salvaged_slug:?} resolves to conflicting canonical human keys {:?} and {:?}; refusing to merge distinct project identities",
-            target_human_key.trim(),
-            salvaged_human_key.trim()
-        )));
+        tracing::warn!(
+            slug = salvaged_slug,
+            archive_human_key = target_human_key.trim(),
+            db_human_key = salvaged_human_key.trim(),
+            "reconstruct salvage: database project identity drifted from the archive's \
+             canonical project.json for the same slug; salvaging rows under the archive \
+             identity"
+        );
     }
-    Ok(())
 }
 
 fn enrich_existing_project_from_salvage(
@@ -2840,7 +2855,7 @@ fn enrich_existing_project_from_salvage(
         &current_human_key,
         salvaged_slug,
         salvaged_human_key,
-    )?;
+    );
     let fallback_human_key = synthetic_project_placeholder_human_key(&current_slug);
     let current_is_placeholder =
         current_human_key.trim().is_empty() || current_human_key == fallback_human_key;
