@@ -1862,7 +1862,9 @@ mod tests {
             generation: generation.clone(),
             cheap,
             decision: Decision::Live,
-            exact_at: Instant::now() - Duration::from_secs(60),
+            exact_at: Instant::now()
+                .checked_sub(Duration::from_mins(1))
+                .unwrap(),
             invalidation_epoch,
             writer_epoch,
             archive_epoch,
@@ -1929,7 +1931,9 @@ mod tests {
             generation,
             cheap,
             decision: Decision::Live,
-            exact_at: Instant::now() - Duration::from_secs(60),
+            exact_at: Instant::now()
+                .checked_sub(Duration::from_mins(1))
+                .unwrap(),
             invalidation_epoch: slot.invalidation_epoch.load(Ordering::Acquire),
             writer_epoch: WRITER_EPOCH.load(Ordering::Acquire),
             archive_epoch: mcp_agent_mail_storage::archive_mutation_epoch(),
