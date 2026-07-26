@@ -2246,6 +2246,9 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
 
 fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result<PathBuf> {
     if path_existing_prefix_has_symlink(candidate)? {
+        if let Some(canonical) = trusted_platform_snapshot_temp_alias(candidate)? {
+            return Ok(canonical);
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -2275,6 +2278,31 @@ fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result
     }
 
     Ok(candidate.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_platform_snapshot_temp_alias(candidate: &Path) -> std::io::Result<Option<PathBuf>> {
+    let canonical = std::fs::canonicalize(candidate)?;
+    let trusted = (candidate.starts_with("/var/folders")
+        && canonical.starts_with("/private/var/folders"))
+        || (candidate.starts_with("/tmp") && canonical.starts_with("/private/tmp"))
+        || (candidate.starts_with("/var/tmp") && canonical.starts_with("/private/var/tmp"));
+    if !trusted {
+        return Ok(None);
+    }
+    if path_existing_prefix_has_symlink(&canonical)? {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(&canonical)?;
+    if !metadata.file_type().is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(canonical))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trusted_platform_snapshot_temp_alias(_candidate: &Path) -> std::io::Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {

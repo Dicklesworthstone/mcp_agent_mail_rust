@@ -7048,6 +7048,20 @@ struct CanonicalSnapshotSource {
     _snapshot_dir: Option<tempfile::TempDir>,
 }
 
+fn canonical_snapshot_tempdir(prefix: &str, context: &str) -> CliResult<tempfile::TempDir> {
+    let temp_dir = std::env::temp_dir();
+    let canonical_temp_dir = std::fs::canonicalize(&temp_dir).map_err(|e| {
+        CliError::Other(format!(
+            "{context} snapshot tempdir {} is unusable: {e}",
+            temp_dir.display()
+        ))
+    })?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(&canonical_temp_dir)
+        .map_err(|e| CliError::Other(format!("{context} snapshot tempdir failed: {e}")))
+}
+
 impl CanonicalSnapshotSource {
     fn live(path: PathBuf) -> Self {
         Self {
@@ -7064,12 +7078,7 @@ impl CanonicalSnapshotSource {
         salvage_db_path: Option<&Path>,
         context: &str,
     ) -> CliResult<Self> {
-        let snapshot_dir = tempfile::Builder::new()
-            .prefix("canonical-mailbox-snapshot-")
-            .tempdir()
-            .map_err(|e| {
-                CliError::Other(format!("{context} archive snapshot tempdir failed: {e}"))
-            })?;
+        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-snapshot-", context)?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
         let reconstruct = salvage_db_path
             .filter(|path| path_is_real_file(path))
@@ -7097,10 +7106,7 @@ impl CanonicalSnapshotSource {
     }
 
     fn live_snapshot(reported_path: PathBuf, source_path: &Path, context: &str) -> CliResult<Self> {
-        let snapshot_dir = tempfile::Builder::new()
-            .prefix("canonical-mailbox-live-snapshot-")
-            .tempdir()
-            .map_err(|e| CliError::Other(format!("{context} live snapshot tempdir failed: {e}")))?;
+        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-live-snapshot-", context)?;
         let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
         mcp_agent_mail_share::create_sqlite_snapshot(source_path, &actual_path, false)
             .map_err(|e| CliError::Other(format!("{context} live sqlite snapshot failed: {e}")))?;
