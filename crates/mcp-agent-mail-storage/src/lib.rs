@@ -214,6 +214,11 @@ fn now_micros_u64() -> u64 {
 }
 
 #[inline]
+fn duration_as_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+#[inline]
 fn now_micros_i64() -> i64 {
     i64::try_from(now_micros_u64()).unwrap_or(i64::MAX)
 }
@@ -773,8 +778,22 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
 /// This is intended as a durability fallback when the write-behind queue is
 /// unavailable. The operation still uses the normal storage write path,
 /// including retries and async git commit enqueueing where applicable.
+/// Outcomes feed the `archive_direct_*` metrics and the per-archive circuit
+/// breaker exactly like queue-drained ops (br-spy9z).
 pub fn write_op_sync(op: &WriteOp) -> Result<()> {
-    wbq_execute_op(op)
+    let metrics = mcp_agent_mail_core::global_metrics();
+    let started = Instant::now();
+    let result = wbq_execute_op(op, "archive-sync");
+    metrics.storage.archive_direct_writes_total.add(1);
+    metrics
+        .storage
+        .archive_direct_write_latency_us
+        .record(duration_as_micros_u64(started.elapsed()));
+    note_archive_write_outcome(op, result.is_err());
+    if result.is_err() {
+        metrics.storage.archive_direct_write_errors_total.add(1);
+    }
+    result
 }
 
 /// Outcome of a direct (synchronous, on the caller thread) archive write.
@@ -816,16 +835,31 @@ pub enum DirectArchiveWrite {
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
 pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
-    let disk_pressure = mcp_agent_mail_core::global_metrics()
-        .system
-        .disk_pressure_level
-        .load();
+    let metrics = mcp_agent_mail_core::global_metrics();
+    let disk_pressure = metrics.system.disk_pressure_level.load();
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        // Host-level pressure, not an archive failure: count the skip but do
+        // not feed the per-archive circuit breaker.
+        metrics
+            .storage
+            .archive_direct_skips_disk_critical_total
+            .add(1);
         return DirectArchiveWrite::SkippedDiskCritical;
     }
-    match wbq_execute_op(op) {
+    let started = Instant::now();
+    let result = wbq_execute_op(op, "archive-direct");
+    metrics.storage.archive_direct_writes_total.add(1);
+    metrics
+        .storage
+        .archive_direct_write_latency_us
+        .record(duration_as_micros_u64(started.elapsed()));
+    note_archive_write_outcome(op, result.is_err());
+    match result {
         Ok(()) => DirectArchiveWrite::Written,
-        Err(error) => DirectArchiveWrite::Failed(error),
+        Err(error) => {
+            metrics.storage.archive_direct_write_errors_total.add(1);
+            DirectArchiveWrite::Failed(error)
+        }
     }
 }
 
@@ -1213,7 +1247,7 @@ pub struct WbqCircuitBreakerArchive {
 static WBQ_CIRCUIT_BREAKER: LazyLock<WbqCircuitBreaker> = LazyLock::new(WbqCircuitBreaker::default);
 
 fn wbq_circuit_breaker_threshold() -> u64 {
-    // Static config: read the env override once and cache it. `wbq_note_drain_outcome`
+    // Static config: read the env override once and cache it. `note_archive_write_outcome`
     // calls this for every drained group on the hot drain path, so re-reading the env
     // var each time would be both wasteful and a source of mid-run inconsistency.
     static THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
@@ -1257,8 +1291,11 @@ fn write_op_archive_identity(op: &WriteOp) -> (&Path, &str) {
     }
 }
 
-/// Feed one drain-group outcome to the circuit breaker and escalate on trip.
-fn wbq_note_drain_outcome(op: &WriteOp, failed: bool) {
+/// Feed one archive write outcome to the circuit breaker and escalate on
+/// trip. Fed from the WBQ drain loop and from the direct/synchronous write
+/// paths (br-spy9z), so a broken archive trips the breaker no matter which
+/// path is hammering it; any success on either path resets its counter.
+fn note_archive_write_outcome(op: &WriteOp, failed: bool) {
     let (storage_root, project_slug) = write_op_archive_identity(op);
     let archive_key = format!("{}::{}", storage_root.display(), project_slug);
     let (trip, state) = WBQ_CIRCUIT_BREAKER.record_with(
@@ -1570,7 +1607,7 @@ fn wbq_drain_loop(
             let result = if envelopes.len() > 1 {
                 wbq_execute_message_bundle_batch(envelopes)
             } else {
-                wbq_execute_op(&envelopes[0].op)
+                wbq_execute_op(&envelopes[0].op, "wbq-drain")
             };
             let group_failed = result.is_err();
             for envelope in envelopes {
@@ -1617,7 +1654,7 @@ fn wbq_drain_loop(
             // failures on one archive trips a bounded boot-check self-heal +
             // actionable escalation instead of degrading silently; a success
             // resets that archive's counter. (br-bvq1x.9.8 Part 3)
-            wbq_note_drain_outcome(envelopes[0].op.as_ref(), group_failed);
+            note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
             idx = end;
         }
 
@@ -1671,7 +1708,7 @@ fn wbq_drain_loop(
                     metrics.storage.wbq_over_80_since_us.set(0);
                 }
 
-                let r = wbq_execute_op(&envelope.op);
+                let r = wbq_execute_op(&envelope.op, "wbq-drain");
                 let latency_us = u64::try_from(
                     envelope
                         .enqueued_at
@@ -1802,7 +1839,7 @@ fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result
     write_message_batch_bundle(&archive, config, &batch_entries, None)
 }
 
-fn wbq_execute_op(op: &WriteOp) -> Result<()> {
+fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
     let _mutation = ArchiveMutationGuard::begin();
     let mut attempts = 0;
     loop {
@@ -1819,7 +1856,7 @@ fn wbq_execute_op(op: &WriteOp) -> Result<()> {
                     | StorageError::GitIndexLock { .. }
                     | StorageError::LockTimeout(_) => {
                         tracing::warn!(
-                            "[wbq-drain] op failed (attempt {attempts}/3): {e}, retrying..."
+                            "[{log_context}] op failed (attempt {attempts}/3): {e}, retrying..."
                         );
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
@@ -16010,6 +16047,120 @@ mod tests {
                 .disk_pressure_level
                 .set(self.0);
         }
+    }
+
+    #[test]
+    fn write_op_sync_direct_records_metrics_and_leaves_breaker_clean_on_success() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let op = WriteOp::ClearSignal {
+            config,
+            project_slug: "direct-metrics-ok".to_string(),
+            agent_name: "DirectMetricsAgent".to_string(),
+        };
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let writes_before = metrics.storage.archive_direct_writes_total.load();
+        let latency_before = metrics
+            .storage
+            .archive_direct_write_latency_us
+            .snapshot()
+            .count;
+
+        let result = write_op_sync_direct(&op);
+
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        assert!(metrics.storage.archive_direct_writes_total.load() > writes_before);
+        assert!(
+            metrics
+                .storage
+                .archive_direct_write_latency_us
+                .snapshot()
+                .count
+                > latency_before,
+            "direct writes must record caller-thread latency"
+        );
+        let key = format!("{}::direct-metrics-ok", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .all(|row| row.archive_key != key),
+            "a successful direct write must not leave breaker failure state"
+        );
+    }
+
+    #[test]
+    fn write_op_sync_direct_failure_counts_error_and_feeds_breaker() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let blocking_file = tmp.path().join("not-a-dir");
+        std::fs::write(&blocking_file, b"block").unwrap();
+        let config = test_config(&blocking_file);
+        let op = WriteOp::AgentProfile {
+            project_slug: "direct-metrics-fail".to_string(),
+            config,
+            agent_json: serde_json::json!({
+                "name": "DirectFailAgent",
+                "program": "wbq-test",
+                "model": "gpt5",
+            }),
+        };
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let errors_before = metrics.storage.archive_direct_write_errors_total.load();
+
+        let result = write_op_sync_direct(&op);
+
+        assert!(
+            matches!(result, DirectArchiveWrite::Failed(_)),
+            "{result:?}"
+        );
+        assert!(metrics.storage.archive_direct_write_errors_total.load() > errors_before);
+        let key = format!("{}::direct-metrics-fail", blocking_file.display());
+        let snapshot = wbq_circuit_breaker_snapshot();
+        let row = snapshot
+            .iter()
+            .find(|row| row.archive_key == key)
+            .expect("failed direct write must feed the per-archive circuit breaker");
+        assert!(row.consecutive_failures >= 1);
+    }
+
+    #[test]
+    fn write_op_sync_direct_disk_critical_skip_is_counted_without_breaker_feed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let op = WriteOp::ClearSignal {
+            config,
+            project_slug: "direct-skip".to_string(),
+            agent_name: "DirectSkipAgent".to_string(),
+        };
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let skips_before = metrics
+            .storage
+            .archive_direct_skips_disk_critical_total
+            .load();
+        let pressure =
+            DiskPressureReset::set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+        let result = write_op_sync_direct(&op);
+        drop(pressure);
+
+        assert!(
+            matches!(result, DirectArchiveWrite::SkippedDiskCritical),
+            "{result:?}"
+        );
+        assert!(
+            metrics
+                .storage
+                .archive_direct_skips_disk_critical_total
+                .load()
+                > skips_before
+        );
+        let key = format!("{}::direct-skip", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .all(|row| row.archive_key != key),
+            "a host-pressure skip must not feed the per-archive circuit breaker"
+        );
     }
 
     #[test]

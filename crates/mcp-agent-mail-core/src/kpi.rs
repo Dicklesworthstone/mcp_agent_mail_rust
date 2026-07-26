@@ -1711,6 +1711,10 @@ mod tests {
                 wbq_unrecoverable_errors_total: 0,
                 wbq_respawn_salvaged_total: 0,
                 wbq_respawn_lost_total: 0,
+                archive_direct_writes_total: 0,
+                archive_direct_write_errors_total: 0,
+                archive_direct_write_latency_us: zero_histogram(),
+                archive_direct_skips_disk_critical_total: 0,
 
                 commit_enqueued_total: commit_drained + 5,
                 commit_drained_total: commit_drained,

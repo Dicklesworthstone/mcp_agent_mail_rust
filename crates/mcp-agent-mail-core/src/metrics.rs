@@ -688,6 +688,19 @@ pub struct StorageMetrics {
     /// fresh channel (br-b9x63).
     pub wbq_respawn_lost_total: Counter,
 
+    /// Archive ops executed synchronously on the caller thread — the direct
+    /// reservation path (`write_op_sync_direct`) plus the WBQ-unavailable
+    /// fallback (`write_op_sync`). These never enter the queue, so they are
+    /// invisible to the `wbq_*` depth/queue-latency series (br-spy9z).
+    pub archive_direct_writes_total: Counter,
+    /// Direct/synchronous archive ops that failed after exhausting retries.
+    pub archive_direct_write_errors_total: Counter,
+    /// Caller-thread execution latency of direct/synchronous archive ops.
+    pub archive_direct_write_latency_us: Log2Histogram,
+    /// Direct archive ops skipped because disk pressure was critical
+    /// (reconcile-on-read heals the artifact once pressure clears).
+    pub archive_direct_skips_disk_critical_total: Counter,
+
     pub commit_enqueued_total: Counter,
     pub commit_drained_total: Counter,
     pub commit_errors_total: Counter,
@@ -739,6 +752,11 @@ pub struct StorageMetricsSnapshot {
     pub wbq_unrecoverable_errors_total: u64,
     pub wbq_respawn_salvaged_total: u64,
     pub wbq_respawn_lost_total: u64,
+
+    pub archive_direct_writes_total: u64,
+    pub archive_direct_write_errors_total: u64,
+    pub archive_direct_write_latency_us: HistogramSnapshot,
+    pub archive_direct_skips_disk_critical_total: u64,
 
     pub commit_enqueued_total: u64,
     pub commit_drained_total: u64,
@@ -1831,6 +1849,11 @@ impl Default for StorageMetrics {
             wbq_respawn_salvaged_total: Counter::new(),
             wbq_respawn_lost_total: Counter::new(),
 
+            archive_direct_writes_total: Counter::new(),
+            archive_direct_write_errors_total: Counter::new(),
+            archive_direct_write_latency_us: Log2Histogram::new(),
+            archive_direct_skips_disk_critical_total: Counter::new(),
+
             commit_enqueued_total: Counter::new(),
             commit_drained_total: Counter::new(),
             commit_errors_total: Counter::new(),
@@ -1874,6 +1897,13 @@ impl StorageMetrics {
             wbq_unrecoverable_errors_total: self.wbq_unrecoverable_errors_total.load(),
             wbq_respawn_salvaged_total: self.wbq_respawn_salvaged_total.load(),
             wbq_respawn_lost_total: self.wbq_respawn_lost_total.load(),
+
+            archive_direct_writes_total: self.archive_direct_writes_total.load(),
+            archive_direct_write_errors_total: self.archive_direct_write_errors_total.load(),
+            archive_direct_write_latency_us: self.archive_direct_write_latency_us.snapshot(),
+            archive_direct_skips_disk_critical_total: self
+                .archive_direct_skips_disk_critical_total
+                .load(),
 
             commit_enqueued_total: self.commit_enqueued_total.load(),
             commit_drained_total: self.commit_drained_total.load(),
