@@ -161,6 +161,7 @@ mod tests {
             result: Some("exit-code".into()),
             n_restarts: Some(n_restarts),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         }

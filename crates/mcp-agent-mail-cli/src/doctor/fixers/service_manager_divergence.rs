@@ -179,6 +179,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         };
@@ -228,6 +229,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         };

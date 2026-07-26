@@ -4320,6 +4320,23 @@ struct SystemdRuntimeState {
     result: Option<String>,
     n_restarts: Option<u32>,
     main_pid: Option<u32>,
+    /// `ExecMainStartTimestampMonotonic` in microseconds since boot.
+    exec_main_start_monotonic_usec: Option<u64>,
+}
+
+impl SystemdRuntimeState {
+    /// Age of the supervised main process, derived from the monotonic start
+    /// timestamp against `/proc/uptime`. `None` when either side is missing
+    /// (no main process, non-Linux, unparsable uptime).
+    fn main_pid_age_seconds(&self) -> Option<u64> {
+        let start_usec = self
+            .exec_main_start_monotonic_usec
+            .filter(|&usec| usec > 0)?;
+        let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+        let uptime_secs = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
+        let uptime_usec = (uptime_secs * 1_000_000.0) as u64;
+        Some(uptime_usec.saturating_sub(start_usec) / 1_000_000)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4329,7 +4346,7 @@ fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
         "--user",
         "show",
         SYSTEMD_UNIT_NAME,
-        "--property=ActiveState,SubState,Result,NRestarts,MainPID",
+        "--property=ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStartTimestampMonotonic",
     ]);
     for (key, value) in systemd_user_env_best_effort() {
         cmd.env(key, value);
@@ -4350,6 +4367,9 @@ fn systemd_service_runtime_state() -> Option<SystemdRuntimeState> {
             "SubState" => state.sub_state = Some(value.to_string()),
             "Result" => state.result = Some(value.to_string()),
             "NRestarts" => state.n_restarts = value.parse::<u32>().ok(),
+            "ExecMainStartTimestampMonotonic" => {
+                state.exec_main_start_monotonic_usec = value.parse::<u64>().ok();
+            }
             // systemd reports MainPID=0 when there is no main process.
             "MainPID" => state.main_pid = value.parse::<u32>().ok().filter(|pid| *pid != 0),
             _ => {}
@@ -4390,6 +4410,9 @@ fn gather_expected_service() -> crate::doctor::process_owner::ExpectedService {
                 result: runtime.as_ref().and_then(|r| r.result.clone()),
                 n_restarts: runtime.as_ref().and_then(|r| r.n_restarts),
                 main_pid: runtime.as_ref().and_then(|r| r.main_pid),
+                main_pid_age_seconds: runtime
+                    .as_ref()
+                    .and_then(SystemdRuntimeState::main_pid_age_seconds),
                 configured_host: bind.as_ref().map(|b| b.host.clone()),
                 configured_port: bind.as_ref().map(|b| b.port),
             };
@@ -4416,6 +4439,7 @@ fn gather_expected_service() -> crate::doctor::process_owner::ExpectedService {
                 // launchd does not expose a portable restart counter.
                 n_restarts: None,
                 main_pid: None,
+                main_pid_age_seconds: None,
                 configured_host: bind.as_ref().map(|b| b.host.clone()),
                 configured_port: bind.as_ref().map(|b| b.port),
             };

@@ -121,6 +121,13 @@ pub struct ExpectedService {
     /// systemd `MainPID` (0 is normalized to `None`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub main_pid: Option<u32>,
+    /// Age of the supervised main process in seconds, derived from systemd's
+    /// `ExecMainStartTimestampMonotonic` against the host uptime. A young
+    /// main process on a unit with a high cumulative restart count is a
+    /// crash loop sampled between crashes (br-uc6sb, ts1: NRestarts=8670
+    /// while `active (running)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_pid_age_seconds: Option<u64>,
     /// Bind host parsed from the unit/plist `ExecStart`, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configured_host: Option<String>,
@@ -141,6 +148,7 @@ impl ExpectedService {
             result: None,
             n_restarts: None,
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         }
@@ -287,7 +295,17 @@ pub fn classify_supervisor_respawn(
     if n < threshold {
         return None;
     }
-    if !svc.active_state.is_churning() {
+    // A loop is usually SAMPLED between crashes: the unit reads `active`
+    // with a freshly-respawned main process (ts1: NRestarts=8670 while
+    // `active (running)` — invisible to the churning-only rule, br-uc6sb).
+    // `active` + threshold-crossing count + a young supervised main process
+    // is a loop caught mid-respawn; `active` with an OLD main process is a
+    // long-recovered service and stays unflagged (NRestarts is cumulative).
+    let active_young_main = svc.active_state == ServiceActiveState::Active
+        && svc
+            .main_pid_age_seconds
+            .is_some_and(|age| age <= RESPAWN_YOUNG_MAIN_PROCESS_SECS);
+    if !svc.active_state.is_churning() && !active_young_main {
         return None;
     }
     Some(SupervisorRespawnVerdict {
@@ -299,6 +317,12 @@ pub fn classify_supervisor_respawn(
         result: svc.result.clone(),
     })
 }
+
+/// Maximum age of the supervised main process for the `active`-state loop
+/// rule in [`classify_supervisor_respawn`]: with the restart threshold also
+/// crossed, a main process younger than this means the "healthy-looking"
+/// unit was respawned moments ago.
+pub const RESPAWN_YOUNG_MAIN_PROCESS_SECS: u64 = 300;
 
 /// A specific way the service manager's view diverges from reality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -505,6 +529,7 @@ mod tests {
             result: Some("exit-code".into()),
             n_restarts: Some(99),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         };
@@ -522,6 +547,7 @@ mod tests {
             result: Some("exit-code".into()),
             n_restarts: Some(7),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         };
@@ -529,6 +555,50 @@ mod tests {
         assert_eq!(v.n_restarts, 7);
         assert_eq!(v.threshold, DEFAULT_RESPAWN_THRESHOLD);
         assert_eq!(v.active_state, ServiceActiveState::Activating);
+    }
+
+    #[test]
+    fn respawn_flagged_when_active_with_young_main_over_threshold() {
+        // ts1 (br-uc6sb): NRestarts=8670 sampled while `active (running)` —
+        // a loop is usually observed BETWEEN crashes, with a main process
+        // respawned moments ago.
+        let mut m = base_model();
+        m.expected_service = ExpectedService {
+            manager: ServiceManagerKind::Systemd,
+            installed: true,
+            active_state: ServiceActiveState::Active,
+            sub_state: Some("running".into()),
+            result: Some("success".into()),
+            n_restarts: Some(8670),
+            main_pid: Some(2860),
+            main_pid_age_seconds: Some(30),
+            configured_host: None,
+            configured_port: None,
+        };
+        let v = classify_supervisor_respawn(&m, DEFAULT_RESPAWN_THRESHOLD)
+            .expect("active-but-freshly-respawned loop must be flagged");
+        assert_eq!(v.n_restarts, 8670);
+        assert_eq!(v.active_state, ServiceActiveState::Active);
+    }
+
+    #[test]
+    fn respawn_not_flagged_when_active_young_main_below_threshold() {
+        // A freshly (re)started healthy service with a low restart count is
+        // a normal restart, not a loop.
+        let mut m = base_model();
+        m.expected_service = ExpectedService {
+            manager: ServiceManagerKind::Systemd,
+            installed: true,
+            active_state: ServiceActiveState::Active,
+            sub_state: Some("running".into()),
+            result: Some("success".into()),
+            n_restarts: Some(1),
+            main_pid: Some(2860),
+            main_pid_age_seconds: Some(30),
+            configured_host: None,
+            configured_port: None,
+        };
+        assert!(classify_supervisor_respawn(&m, DEFAULT_RESPAWN_THRESHOLD).is_none());
     }
 
     #[test]
@@ -542,6 +612,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(42), // high cumulative, but healthy now
             main_pid: Some(1000),
+            main_pid_age_seconds: Some(86_400), // long-lived main = recovered
             configured_host: None,
             configured_port: None,
         };
@@ -559,6 +630,7 @@ mod tests {
             result: Some("signal".into()),
             n_restarts: Some(1),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         };
@@ -576,6 +648,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: None,
             configured_port: None,
         };
@@ -595,6 +668,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: Some(4321),
+            main_pid_age_seconds: None,
             configured_host: Some("127.0.0.1".into()),
             configured_port: Some(8765),
         };
@@ -624,6 +698,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: Some(111),
+            main_pid_age_seconds: None,
             configured_host: Some("127.0.0.1".into()),
             configured_port: Some(8765),
         };
@@ -651,6 +726,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: Some("127.0.0.1".into()),
             configured_port: Some(8765),
         };
@@ -698,6 +774,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: Some("127.0.0.1".into()),
             configured_port: Some(9999), // unit binds 9999
         };
@@ -723,6 +800,7 @@ mod tests {
             result: Some("success".into()),
             n_restarts: Some(0),
             main_pid: None,
+            main_pid_age_seconds: None,
             configured_host: Some("0.0.0.0".into()), // wildcard
             configured_port: Some(8765),
         };
