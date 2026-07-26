@@ -20,7 +20,10 @@ const REGISTRY_CAPACITY: usize = 16;
 const WORKER_LIMIT: usize = 4;
 const BUILD_TIMEOUT: Duration = Duration::from_mins(2);
 const WAIT_SLICE: Duration = Duration::from_millis(25);
-const EXACT_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
+// A 30-second exact-audit bound keeps out-of-process and corruption detection
+// while preventing healthy live reads from turning a large archive walk into
+// their steady-state hot path.
+const EXACT_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
 const GENERATION_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +202,8 @@ static WRITER_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static TEST_BUILD_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_ARCHIVE_GENERATION_SCANS: AtomicUsize = AtomicUsize::new(0);
 
 fn canonicalish(path: &Path) -> Result<PathBuf, AcquireError> {
     if let Ok(canonical) = path.canonicalize() {
@@ -451,6 +456,9 @@ fn hash_optional_file(
 }
 
 fn hash_archive(scope: &Scope, exact: bool, deadline: Instant) -> Result<[u8; 32], AcquireError> {
+    #[cfg(test)]
+    TEST_ARCHIVE_GENERATION_SCANS.fetch_add(1, Ordering::AcqRel);
+
     let mut hasher = Sha256::new();
     hasher.update(if exact {
         b"agent-mail-archive-generation-v1-exact".as_slice()
@@ -1230,45 +1238,66 @@ pub fn acquire_if_needed(
         };
 
         if let Some((expected_cheap, expected_exact, decision, exact_at)) = ready {
-            // GH#203 (second half): the cheap generation is metadata-based,
-            // and a FrankenSQLite open bumps the live db's mtime/ctime on
-            // every open even when no byte of content changes — measured on
-            // Linux AND macOS, one bump per build cycle. Reads open the
-            // database constantly (run_build itself does), so
-            // `observed != expected_cheap` is a *false* invalidation — and
-            // past `exact_audit_interval` the cheap path was skipped
-            // outright. Both routes fell through to `claim_build`, so every
-            // read paid for a full archive reconstruct: a self-invalidation
-            // livelock (~30% CPU, a build every ~3 s) that kept
-            // `doctor mcp-selftest` at the 45 s timeout on every platform.
-            //
-            // So a cheap miss no longer implies a rebuild: re-validate against
-            // the exact (content) generation, which an open provably does not
-            // perturb. One content hash is vastly cheaper than a
-            // reconstruction, and it is the same authority `run_build` already
-            // publishes on.
-            let cheap_fresh = Instant::now().duration_since(exact_at) < exact_audit_interval()
-                && cheap_generation(&slot.scope, caller_deadline)? == expected_cheap;
-
-            let content_unchanged = if cheap_fresh {
-                true
-            } else {
-                exact_generation(&slot.scope, caller_deadline)? == expected_exact
-            };
-
-            if content_unchanged
+            // A cached Live decision never consumes archive data. While its
+            // bounded exact-audit window is fresh, the writer and archive
+            // epochs above are sufficient to prove that no supported
+            // in-process mutation crossed the decision. At expiry we fall
+            // through to the existing `claim_build` singleflight below: one
+            // worker revalidates content (including out-of-process changes),
+            // concurrent readers share its completion, and a changed
+            // generation recomputes Live versus Snapshot.
+            if matches!(&decision, Decision::Live)
+                && Instant::now().duration_since(exact_at) < exact_audit_interval()
                 && slot.invalidation_epoch.load(Ordering::Acquire) == epoch
                 && WRITER_EPOCH.load(Ordering::Acquire) == writer_epoch
                 && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
                 && mcp_agent_mail_storage::archive_mutations_active() == 0
                 && mcp_agent_mail_storage::archive_mutation_epoch() == archive_epoch
             {
-                if !cheap_fresh {
-                    // Re-baseline so the next read can take the cheap path
-                    // again rather than re-hashing content every time.
-                    refresh_ready_audit(&slot, caller_deadline);
+                return Ok(None);
+            }
+
+            if matches!(&decision, Decision::Snapshot(_)) {
+                // GH#203 (second half): the cheap generation is metadata-based,
+                // and a FrankenSQLite open bumps the live db's mtime/ctime on
+                // every open even when no byte of content changes — measured on
+                // Linux AND macOS, one bump per build cycle. Reads open the
+                // database constantly (run_build itself does), so
+                // `observed != expected_cheap` is a *false* invalidation — and
+                // past `exact_audit_interval` the cheap path was skipped
+                // outright. Both routes fell through to `claim_build`, so every
+                // read paid for a full archive reconstruct: a self-invalidation
+                // livelock (~30% CPU, a build every ~3 s) that kept
+                // `doctor mcp-selftest` at the 45 s timeout on every platform.
+                //
+                // So a cheap miss no longer implies a rebuild: re-validate against
+                // the exact (content) generation, which an open provably does not
+                // perturb. One content hash is vastly cheaper than a
+                // reconstruction, and it is the same authority `run_build` already
+                // publishes on.
+                let cheap_fresh = Instant::now().duration_since(exact_at) < exact_audit_interval()
+                    && cheap_generation(&slot.scope, caller_deadline)? == expected_cheap;
+
+                let content_unchanged = if cheap_fresh {
+                    true
+                } else {
+                    exact_generation(&slot.scope, caller_deadline)? == expected_exact
+                };
+
+                if content_unchanged
+                    && slot.invalidation_epoch.load(Ordering::Acquire) == epoch
+                    && WRITER_EPOCH.load(Ordering::Acquire) == writer_epoch
+                    && WRITERS_ACTIVE.load(Ordering::Acquire) == 0
+                    && mcp_agent_mail_storage::archive_mutations_active() == 0
+                    && mcp_agent_mail_storage::archive_mutation_epoch() == archive_epoch
+                {
+                    if !cheap_fresh {
+                        // Re-baseline so the next read can take the cheap path
+                        // again rather than re-hashing content every time.
+                        refresh_ready_audit(&slot, caller_deadline);
+                    }
+                    return Ok(decision.snapshot());
                 }
-                return Ok(decision.snapshot());
             }
         }
 
@@ -1318,6 +1347,7 @@ pub fn reset_for_test() {
     registry.slots.clear();
     drop(registry);
     TEST_BUILD_DELAY_MS.store(0, Ordering::Release);
+    TEST_ARCHIVE_GENERATION_SCANS.store(0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -1753,6 +1783,197 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ready
                 .is_none()
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    fn fresh_cached_live_decision_never_rescans_the_archive() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("mailbox.sqlite3");
+        write_archive_fixture(&storage_root);
+        fs::write(&sqlite_path, b"live-generation").expect("seed live input");
+        let scope = scope(&storage_root, &sqlite_path).expect("scope");
+        let slot = slot_for(scope.clone()).expect("slot");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let generation = exact_generation(&scope, deadline).expect("exact generation");
+        let cheap = cheap_generation(&scope, deadline).expect("cheap generation");
+        let invalidation_epoch = slot.invalidation_epoch.load(Ordering::Acquire);
+        let writer_epoch = WRITER_EPOCH.load(Ordering::Acquire);
+        let archive_epoch = mcp_agent_mail_storage::archive_mutation_epoch();
+        slot.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready = Some(Ready {
+            generation,
+            cheap,
+            decision: Decision::Live,
+            exact_at: Instant::now(),
+            invalidation_epoch,
+            writer_epoch,
+            archive_epoch,
+        });
+        TEST_ARCHIVE_GENERATION_SCANS.store(0, Ordering::Release);
+
+        let cx = Cx::for_testing();
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        assert!(
+            acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                .expect("cached live acquisition")
+                .is_none()
+        );
+        assert_eq!(
+            TEST_ARCHIVE_GENERATION_SCANS.load(Ordering::Acquire),
+            0,
+            "cached live reads must not traverse or hash the unused archive"
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    fn expired_cached_live_revalidates_out_of_process_archive_change() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("mailbox.sqlite3");
+        write_archive_fixture(&storage_root);
+        mcp_agent_mail_db::reconstruct_from_archive(&sqlite_path, &storage_root)
+            .expect("reconstruct aligned live mailbox");
+        let scope = scope(&storage_root, &sqlite_path).expect("scope");
+        let slot = slot_for(scope.clone()).expect("slot");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let generation = exact_generation(&scope, deadline).expect("exact generation");
+        let cheap = cheap_generation(&scope, deadline).expect("cheap generation");
+        let invalidation_epoch = slot.invalidation_epoch.load(Ordering::Acquire);
+        let writer_epoch = WRITER_EPOCH.load(Ordering::Acquire);
+        let archive_epoch = mcp_agent_mail_storage::archive_mutation_epoch();
+        slot.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready = Some(Ready {
+            generation: generation.clone(),
+            cheap,
+            decision: Decision::Live,
+            exact_at: Instant::now() - Duration::from_secs(60),
+            invalidation_epoch,
+            writer_epoch,
+            archive_epoch,
+        });
+
+        let project_path = storage_root.join("projects/single-flight-project/project.json");
+        let original = fs::read_to_string(&project_path).expect("read project metadata");
+        let changed = original.replace("\"created_at\":0", "\"created_at\":1");
+        assert_eq!(
+            original.len(),
+            changed.len(),
+            "fixture mutation must be same-size"
+        );
+        fs::write(&project_path, changed).expect("simulate peer-process archive mutation");
+        assert_eq!(
+            mcp_agent_mail_storage::archive_mutation_epoch(),
+            archive_epoch,
+            "direct mutation must not use the in-process archive epoch"
+        );
+
+        let cx = Cx::for_testing();
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let acquired = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+            .expect("expired live revalidation");
+        let observed = exact_generation(&scope, Instant::now() + Duration::from_secs(5))
+            .expect("post-mutation exact generation");
+        assert_ne!(observed, generation);
+        assert!(
+            slot.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .as_ref()
+                .is_some_and(|ready| {
+                    ready.generation == observed
+                        && ready.exact_at.elapsed() < Duration::from_secs(5)
+                }),
+            "expired Live must publish the peer process generation before returning"
+        );
+        drop(acquired);
+        reset_for_test();
+    }
+
+    #[test]
+    fn expired_cached_live_decision_has_one_singleflight_revalidation() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("mailbox.sqlite3");
+        write_archive_fixture(&storage_root);
+        fs::write(&sqlite_path, b"live-generation").expect("seed live input");
+        let scope = scope(&storage_root, &sqlite_path).expect("scope");
+        let slot = slot_for(scope.clone()).expect("slot");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let generation = exact_generation(&scope, deadline).expect("exact generation");
+        let cheap = cheap_generation(&scope, deadline).expect("cheap generation");
+        slot.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready = Some(Ready {
+            generation,
+            cheap,
+            decision: Decision::Live,
+            exact_at: Instant::now() - Duration::from_secs(60),
+            invalidation_epoch: slot.invalidation_epoch.load(Ordering::Acquire),
+            writer_epoch: WRITER_EPOCH.load(Ordering::Acquire),
+            archive_epoch: mcp_agent_mail_storage::archive_mutation_epoch(),
+        });
+        TEST_ARCHIVE_GENERATION_SCANS.store(0, Ordering::Release);
+        TEST_BUILD_DELAY_MS.store(100, Ordering::Release);
+
+        let barrier = Arc::new(Barrier::new(8));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let barrier = Arc::clone(&barrier);
+            let storage_root = storage_root.clone();
+            let sqlite_path = sqlite_path.clone();
+            let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+            readers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let cx = Cx::for_testing();
+                assert!(
+                    acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                        .expect("singleflight live revalidation")
+                        .is_none()
+                );
+            }));
+        }
+        for reader in readers {
+            reader.join().expect("reader thread");
+        }
+        TEST_BUILD_DELAY_MS.store(0, Ordering::Release);
+        assert_eq!(
+            TEST_ARCHIVE_GENERATION_SCANS.load(Ordering::Acquire),
+            3,
+            "one reusable Live build performs cheap-before, exact, and cheap-after scans"
+        );
+        assert_eq!(WORKERS_ACTIVE.load(Ordering::Acquire), 0);
+        assert!(
+            slot.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ready
+                .as_ref()
+                .is_some_and(|ready| {
+                    matches!(&ready.decision, Decision::Live)
+                        && ready.exact_at.elapsed() < Duration::from_secs(5)
+                })
         );
         reset_for_test();
     }
