@@ -162,23 +162,8 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
     let pack_before = count_pack_files(git_dir);
     let disk_before = measure_objects_disk_usage(git_dir);
 
-    let mut child = match Command::new("nice")
-        .args([
-            "-n",
-            "19",
-            "ionice",
-            "-c",
-            "3",
-            "git",
-            "--git-dir",
-            &git_dir.display().to_string(),
-            "--work-tree",
-            &work_tree.display().to_string(),
-            "maintenance",
-            "run",
-            "--task=loose-objects",
-            "--task=incremental-repack",
-        ])
+    let mut command = maintenance_command(git_dir, work_tree);
+    let mut child = match command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -260,6 +245,47 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         success,
         error,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
+    let mut command = Command::new("nice");
+    command.args([
+        "-n",
+        "19",
+        "ionice",
+        "-c",
+        "3",
+        "git",
+        "--git-dir",
+        &git_dir.display().to_string(),
+        "--work-tree",
+        &work_tree.display().to_string(),
+        "maintenance",
+        "run",
+        "--task=loose-objects",
+        "--task=incremental-repack",
+    ]);
+    command
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maintenance_command(git_dir: &Path, work_tree: &Path) -> Command {
+    let mut command = Command::new("nice");
+    command.args([
+        "-n",
+        "19",
+        "git",
+        "--git-dir",
+        &git_dir.display().to_string(),
+        "--work-tree",
+        &work_tree.display().to_string(),
+        "maintenance",
+        "run",
+        "--task=loose-objects",
+        "--task=incremental-repack",
+    ]);
+    command
 }
 
 fn log_report(report: &MaintenanceReport, git_dir: &Path) {
