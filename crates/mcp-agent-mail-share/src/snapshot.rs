@@ -324,6 +324,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
         message: format!("cannot create destination DB {dest_str}: {e}"),
     })?;
     configure_destination(&dst_conn, &dest_str, destination_profile)?;
+    configure_staging_durability(&dst_conn, &dest_str)?;
 
     match source_profile {
         SnapshotSourceProfile::Runtime => {
@@ -348,9 +349,43 @@ pub(crate) fn rebuild_sqlite_snapshot_with_profiles(
             ),
         }
     })?;
+    // Staging ran with synchronous=OFF (br-gi4z3), so force the finished image
+    // to disk once, here, before the rename publishes it.
+    std::fs::File::open(&staged_dest)
+        .and_then(|file| file.sync_all())
+        .map_err(ShareError::Io)?;
     std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)
+}
+
+/// Relax durability on the staged destination while tables stream in.
+///
+/// br-gi4z3: the destination lives in a `.snapshot-stage.` tempdir that is
+/// discarded on any failure and only published via checkpoint + `sync_all` +
+/// rename on success, so per-statement durability during staging buys nothing.
+/// Without this, autocommit fsyncs made live-snapshot creation take minutes
+/// (~2 fsyncs/row; 4,149 journal create/unlink events observed in a 2-minute
+/// strace window on a 1,690-message mailbox).
+fn configure_staging_durability(
+    conn: &CanonicalDbConn,
+    destination: &str,
+) -> Result<(), ShareError> {
+    conn.execute_raw("PRAGMA synchronous = OFF")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure staging destination DB {destination} with synchronous=OFF: \
+                 {error}"
+            ),
+        })?;
+    conn.execute_raw("PRAGMA journal_mode = MEMORY")
+        .map_err(|error| ShareError::Sqlite {
+            message: format!(
+                "cannot configure staging destination DB {destination} with MEMORY journal \
+                 mode: {error}"
+            ),
+        })?;
+    Ok(())
 }
 
 fn configure_destination(
@@ -514,6 +549,14 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                 break;
             }
 
+            // br-gi4z3: one transaction per page instead of one autocommit
+            // (and, pre-staging-pragmas, ~2 fsyncs) per row. Error paths may
+            // leave the transaction open: the staged destination is discarded
+            // wholesale on failure, so no explicit ROLLBACK is needed.
+            dst.execute_sync("BEGIN IMMEDIATE", &[])
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("BEGIN for {} page failed: {e}", table.name),
+                })?;
             for row in &rows {
                 let values: Vec<Value> = table
                     .columns
@@ -536,6 +579,10 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                         message: format!("INSERT into {} failed: {e}", table.name),
                     })?;
             }
+            dst.execute_sync("COMMIT", &[])
+                .map_err(|e| ShareError::Sqlite {
+                    message: format!("COMMIT for {} page failed: {e}", table.name),
+                })?;
             if page_by_column.is_none() {
                 break;
             }
