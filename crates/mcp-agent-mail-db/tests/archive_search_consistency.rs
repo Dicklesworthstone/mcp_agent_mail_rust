@@ -87,7 +87,6 @@ struct ReconstructStatsSnapshot {
     salvaged_agents: usize,
     salvaged_messages: usize,
     salvaged_recipients: usize,
-    rollups_salvaged: usize,
     parse_errors: usize,
     warnings: Vec<String>,
 }
@@ -106,7 +105,6 @@ impl From<&ReconstructStats> for ReconstructStatsSnapshot {
             salvaged_agents: stats.salvaged_agents,
             salvaged_messages: stats.salvaged_messages,
             salvaged_recipients: stats.salvaged_recipients,
-            rollups_salvaged: stats.rollups_salvaged,
             parse_errors: stats.parse_errors,
             warnings: stats.warnings.clone(),
         }

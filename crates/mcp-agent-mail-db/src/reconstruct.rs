@@ -374,8 +374,6 @@ pub struct ReconstructStats {
     pub salvaged_reservations: usize,
     /// Number of terminal reservation-release ledger rows restored from a salvaged database.
     pub salvaged_reservation_releases: usize,
-    /// Number of ATC rollup rows restored from a salvaged database.
-    pub rollups_salvaged: usize,
     /// Number of archive files that failed to parse (skipped).
     pub parse_errors: usize,
     /// Human-readable warnings collected during reconstruction.
@@ -568,19 +566,17 @@ impl std::fmt::Display for ReconstructStats {
             || self.salvaged_recipients > 0
             || self.salvaged_reservations > 0
             || self.salvaged_reservation_releases > 0
-            || self.rollups_salvaged > 0
         {
             write!(
                 f,
-                "; salvaged {} projects, {} agents, {} messages ({} numeric-id remaps, {} recipients/state updates, {} reservations, {} reservation releases, {} rollups)",
+                "; salvaged {} projects, {} agents, {} messages ({} numeric-id remaps, {} recipients/state updates, {} reservations, {} reservation releases)",
                 self.salvaged_projects,
                 self.salvaged_agents,
                 self.salvaged_messages,
                 self.salvaged_message_id_remaps,
                 self.salvaged_recipients,
                 self.salvaged_reservations,
-                self.salvaged_reservation_releases,
-                self.rollups_salvaged
+                self.salvaged_reservation_releases
             )?;
         }
         Ok(())
@@ -4658,8 +4654,8 @@ fn merge_salvaged_database(
         // which salvage/reconstruct never replaces (br-bvq1x.11.7). The rebuilt
         // primary mailbox DB has no atc_* tables, so there is nothing to salvage
         // here; the sidecar's rollups persist untouched across recovery and ATC
-        // telemetry is, by design, droppable/resettable. `rollups_salvaged`
-        // therefore stays 0.
+        // telemetry is, by design, droppable/resettable — which is why
+        // ReconstructStats carries no rollup-salvage counter (br-j9prb).
 
         let cross_project_reservations = target_conn
             .query_sync(
@@ -5504,7 +5500,6 @@ mod tests {
             salvaged_recipients: 0,
             salvaged_reservations: 0,
             salvaged_reservation_releases: 0,
-            rollups_salvaged: 0,
             parse_errors: 3,
             warnings: vec![],
             duplicate_canonical_id_set: BTreeSet::new(),
