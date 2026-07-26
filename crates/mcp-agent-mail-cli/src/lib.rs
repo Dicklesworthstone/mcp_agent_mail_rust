@@ -32340,18 +32340,78 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let read_pool = open_db_async_canonical_read_with_database_url(
+            // Validate before proxying so a bad limit fails identically
+            // whether or not a daemon is running.
+            let limit_val = parse_cli_search_limit("mail search", limit)?;
+
+            // Daemon-first (br-i79m0): a live server answers search_messages
+            // from its warm process-global lexical bridge in milliseconds.
+            // The local path below must otherwise open the mailbox and (on
+            // its worst-case fallback) snapshot + migrate + rebuild a fresh
+            // Tantivy index for a single query, which scales with mailbox
+            // size, not answer size.
+            let server_url = local_server_url_from_parts(
+                &server_config.http_host,
+                server_config.http_port,
+                &server_config.http_path,
+            );
+            let bearer = local_server_bearer_token(&server_config);
+            match try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "search_messages",
+                serde_json::json!({
+                    "project_key": project_key,
+                    "query": query,
+                    "limit": limit_val,
+                }),
+            )
+            .await
+            {
+                ServerToolCall::Success(result) => {
+                    let payload = coerce_tool_result_json_or_error("search_messages", result)?;
+                    emit_proxied_mail_search_output(&payload, fmt);
+                    return Ok(());
+                }
+                // No daemon: the read-only local path below is safe even when
+                // another process owns the mailbox — it never mutates.
+                ServerToolCall::Unavailable(_) => {}
+                ServerToolCall::Rejected(message) => {
+                    if !mail_server_rejection_allows_local_fallback(&message) {
+                        return Err(CliError::Other(format!(
+                            "mail search via server failed: {message}"
+                        )));
+                    }
+                    tracing::debug!(
+                        message = %message,
+                        "mail search fell back to local path after server scope mismatch"
+                    );
+                }
+            }
+
+            // Local fallback: direct read-only open of the live mailbox (no
+            // temp snapshot, no migrations) exactly like `am robot search`;
+            // the heavier snapshotting open remains the last resort for
+            // degraded mailboxes.
+            let read_pool = open_db_sync_async_canonical_read_best_effort_with_database_url(
                 &database_url,
                 Some(&server_config.storage_root),
                 "mail search",
-            )?;
+            )
+            .or_else(|_| {
+                open_db_sync_async_canonical_read_with_database_url(
+                    &database_url,
+                    Some(&server_config.storage_root),
+                    "mail search",
+                )
+            })?;
             let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
             let mut search_query =
                 mcp_agent_mail_db::search_planner::SearchQuery::messages(&query, pid);
-            search_query.limit = Some(parse_cli_search_limit("mail search", limit)?);
+            search_query.limit = Some(limit_val);
 
             let response = outcome_to_result(
                 mcp_agent_mail_db::search_service::execute_search_simple(
@@ -32403,6 +32463,77 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+/// Emit CLI output for a `mail search` answered by the daemon's
+/// `search_messages` tool, matching the local path's JSON keys and table
+/// columns so scripts see consistent results either way (br-i79m0). The tool
+/// reports `ack_required` as 0/1 and `created_ts` as ISO — normalized here to
+/// the local path's bool + short-time forms.
+fn emit_proxied_mail_search_output(payload: &serde_json::Value, fmt: output::CliOutputFormat) {
+    let results = payload
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if results.is_empty() {
+        output::emit_empty(fmt, "No results.");
+        return;
+    }
+    let iso_to_short = |iso: &str| {
+        chrono::DateTime::parse_from_rfc3339(iso).map_or_else(
+            |_| iso.to_string(),
+            |ts| context::format_ts_short(ts.timestamp_micros()),
+        )
+    };
+    let data: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "subject": r.get("subject").cloned().unwrap_or(serde_json::Value::Null),
+                "importance": r.get("importance").cloned().unwrap_or(serde_json::Value::Null),
+                "ack_required": r
+                    .get("ack_required")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    != 0,
+                "created_ts": r.get("created_ts").cloned().unwrap_or(serde_json::Value::Null),
+                "thread_id": r.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+                "from": r.get("from").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    output::emit_output(&data, fmt, || {
+        let mut table = output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
+        for r in &results {
+            table.add_row(vec![
+                r.get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                r.get("from")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                truncate_str(
+                    r.get("subject")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    50,
+                ),
+                r.get("importance")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                r.get("created_ts")
+                    .and_then(serde_json::Value::as_str)
+                    .map(iso_to_short)
+                    .unwrap_or_default(),
+            ]);
+        }
+        table.render();
+    });
 }
 
 fn build_server_send_message_arguments(
