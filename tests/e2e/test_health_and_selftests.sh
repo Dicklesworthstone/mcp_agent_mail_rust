@@ -66,6 +66,11 @@ export AM_INTERFACE_MODE="cli"
 export STORAGE_ROOT="${WORK}/storage"
 export DATABASE_URL="sqlite:///${WORK}/mb.sqlite3"
 export HOME="${WORK}/home"
+# Point runtime probes at a port nothing binds so a live operator daemon on
+# 8765 can never contaminate the fixture verdicts (br-a023i). The explicit
+# DATABASE_URL/STORAGE_ROOT exports above additionally pin doctor's mailbox
+# scope: explicit process-env scope wins over live-daemon mailbox discovery.
+export HTTP_PORT="47359"
 
 # Bounded `am` invocation (never hangs the suite); captures stdout/stderr/exit.
 AM_CMD_TIMEOUT="${AM_CMD_TIMEOUT:-60}"

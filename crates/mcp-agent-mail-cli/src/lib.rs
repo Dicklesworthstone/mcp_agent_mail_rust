@@ -23614,15 +23614,21 @@ struct DoctorMailboxTarget {
     storage_root: PathBuf,
     daemon: Option<DoctorDaemonMailboxTarget>,
     process_config_differs: bool,
+    explicit_process_scope: bool,
 }
 
 impl DoctorMailboxTarget {
-    fn process_config(database_url: &str, storage_root: &Path) -> Self {
+    fn process_config(
+        database_url: &str,
+        storage_root: &Path,
+        explicit_process_scope: bool,
+    ) -> Self {
         Self {
             database_url: database_url.to_string(),
             storage_root: storage_root.to_path_buf(),
             daemon: None,
             process_config_differs: false,
+            explicit_process_scope,
         }
     }
 
@@ -23638,7 +23644,15 @@ impl DoctorMailboxTarget {
             .endpoint
             .as_deref()
             .unwrap_or("local JSON-RPC endpoint");
-        if self.process_config_differs {
+        if self.process_config_differs && self.explicit_process_scope {
+            format!(
+                "Doctor scope was explicitly set via the process environment (DATABASE_URL/STORAGE_ROOT); probing process configuration: database_url={}, storage_root={}. Live daemon at {endpoint} serves a different mailbox: daemon database_url={}, daemon storage_root={}",
+                process_database_url,
+                process_storage_root.display(),
+                daemon.database_url,
+                daemon.storage_root.display()
+            )
+        } else if self.process_config_differs {
             format!(
                 "Doctor process configuration differs from the live daemon; bound probes to daemon at {endpoint}: daemon database_url={}, daemon storage_root={} (process database_url={}, process storage_root={})",
                 daemon.database_url,
@@ -25091,24 +25105,53 @@ fn doctor_daemon_mailbox_target_from_health(
     })
 }
 
+/// True when this doctor invocation was explicitly scoped to a mailbox
+/// through the process environment (`DATABASE_URL` / `STORAGE_ROOT`).
+/// Env-file tiers (config.env / .env) stay ambient: they normally describe
+/// the same mailbox the daemon serves, and treating them as explicit would
+/// reopen the cwd-drift hole GH#193 closed.
+fn doctor_process_scope_is_explicit() -> bool {
+    mcp_agent_mail_core::config::process_env_value("DATABASE_URL").is_some()
+        || mcp_agent_mail_core::config::process_env_value("STORAGE_ROOT").is_some()
+}
+
 fn doctor_select_mailbox_target(
     process_database_url: &str,
     process_storage_root: &Path,
     daemon: Option<DoctorDaemonMailboxTarget>,
+    explicit_process_scope: bool,
 ) -> DoctorMailboxTarget {
     let Some(daemon) = daemon else {
-        return DoctorMailboxTarget::process_config(process_database_url, process_storage_root);
+        return DoctorMailboxTarget::process_config(
+            process_database_url,
+            process_storage_root,
+            explicit_process_scope,
+        );
     };
     let process_config_differs =
         !doctor_database_urls_equivalent(process_database_url, &daemon.database_url)
             || doctor_normalized_path_for_comparison(process_storage_root)
                 != doctor_normalized_path_for_comparison(&daemon.storage_root);
+    if process_config_differs && explicit_process_scope {
+        // An explicit env scope is an operator instruction ("check THIS
+        // mailbox") and wins over daemon discovery; the daemon identity is
+        // retained so the divergence surfaces as a warn instead of a silent
+        // re-bind (br-a023i).
+        return DoctorMailboxTarget {
+            database_url: process_database_url.to_string(),
+            storage_root: process_storage_root.to_path_buf(),
+            daemon: Some(daemon),
+            process_config_differs,
+            explicit_process_scope,
+        };
+    }
 
     DoctorMailboxTarget {
         database_url: daemon.database_url.clone(),
         storage_root: daemon.storage_root.clone(),
         daemon: Some(daemon),
         process_config_differs,
+        explicit_process_scope,
     }
 }
 
@@ -25119,15 +25162,25 @@ fn doctor_live_mailbox_target(
 ) -> DoctorMailboxTarget {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
 
+    let explicit_process_scope = doctor_process_scope_is_explicit();
     let port_status = check_port_status(&config.http_host, config.http_port);
     if !matches!(port_status, PortStatus::AgentMailServer) {
-        return DoctorMailboxTarget::process_config(process_database_url, process_storage_root);
+        return DoctorMailboxTarget::process_config(
+            process_database_url,
+            process_storage_root,
+            explicit_process_scope,
+        );
     }
     let probe = probe_local_jsonrpc_health(config, &port_status);
     let daemon = probe.payload.as_ref().and_then(|payload| {
         doctor_daemon_mailbox_target_from_health(payload, probe.endpoint.clone())
     });
-    doctor_select_mailbox_target(process_database_url, process_storage_root, daemon)
+    doctor_select_mailbox_target(
+        process_database_url,
+        process_storage_root,
+        daemon,
+        explicit_process_scope,
+    )
 }
 
 fn collect_doctor_server_runtime_diagnostics(config: &Config) -> DoctorServerRuntimeDiagnostics {
@@ -30380,9 +30433,16 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let mut skipped_count = 0u32;
 
     if mailbox_target.daemon.is_some() {
+        let action = if !mailbox_target.process_config_differs {
+            "confirmed"
+        } else if mailbox_target.explicit_process_scope {
+            "retained_process_scope"
+        } else {
+            "bound"
+        };
         results.push(serde_json::json!({
             "check": "daemon_mailbox_binding",
-            "action": if mailbox_target.process_config_differs { "bound" } else { "confirmed" },
+            "action": action,
             "detail": mailbox_target.binding_detail(&cfg.database_url, &config.storage_root),
             "effective_database_url": database_url,
             "effective_storage_root": storage_root.display().to_string(),
@@ -48137,7 +48197,7 @@ startup_timeout_sec = 42
         )
         .expect("daemon target");
         let selected =
-            doctor_select_mailbox_target(&process_database_url, &process_root, Some(daemon));
+            doctor_select_mailbox_target(&process_database_url, &process_root, Some(daemon), false);
 
         assert!(selected.process_config_differs);
         assert_eq!(selected.database_url, daemon_database_url);
@@ -48146,6 +48206,91 @@ startup_timeout_sec = 42
             selected
                 .binding_detail(&process_database_url, &process_root)
                 .contains("bound probes to daemon")
+        );
+    }
+
+    #[test]
+    fn doctor_mailbox_target_explicit_env_scope_wins_over_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let process_root = dir.path().join("scratch-mailbox");
+        let daemon_root = dir.path().join("live-mailbox");
+        std::fs::create_dir_all(&process_root).unwrap();
+        std::fs::create_dir_all(&daemon_root).unwrap();
+        let process_database_url = format!(
+            "sqlite:///{}",
+            process_root.join("fixture.sqlite3").display()
+        );
+        let daemon_database_url = format!(
+            "sqlite:///{}",
+            daemon_root.join("storage.sqlite3").display()
+        );
+        let payload = serde_json::json!({
+            "status": "ready",
+            "database_url": daemon_database_url,
+            "storage_root": daemon_root,
+        });
+        let daemon = doctor_daemon_mailbox_target_from_health(
+            &payload,
+            Some("http://127.0.0.1:8765/mcp/".to_string()),
+        )
+        .expect("daemon target");
+        let selected =
+            doctor_select_mailbox_target(&process_database_url, &process_root, Some(daemon), true);
+
+        assert!(selected.process_config_differs);
+        assert!(selected.explicit_process_scope);
+        assert_eq!(
+            selected.database_url, process_database_url,
+            "explicit env scope must keep probing the process-configured mailbox"
+        );
+        assert_eq!(selected.storage_root, process_root);
+        assert!(
+            selected.daemon.is_some(),
+            "daemon identity must be retained so the divergence stays visible"
+        );
+        let detail = selected.binding_detail(&process_database_url, &process_root);
+        assert!(
+            detail.contains("explicitly set via the process environment"),
+            "detail must explain the explicit retention, got: {detail}"
+        );
+        assert!(
+            detail.contains(&selected.daemon.as_ref().unwrap().database_url),
+            "detail must still name the diverging daemon mailbox, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn doctor_mailbox_target_explicit_scope_still_confirms_matching_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mailbox");
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite:///{}", root.join("storage.sqlite3").display());
+        let payload = serde_json::json!({
+            "status": "ready",
+            "database_url": database_url,
+            "storage_root": root,
+        });
+        let daemon = doctor_daemon_mailbox_target_from_health(&payload, None).expect("daemon");
+        let selected = doctor_select_mailbox_target(&database_url, &root, Some(daemon), true);
+
+        assert!(!selected.process_config_differs);
+        assert_eq!(selected.database_url, database_url);
+        assert!(
+            selected
+                .binding_detail(&database_url, &root)
+                .contains("bound to the live daemon mailbox")
+        );
+    }
+
+    #[test]
+    fn doctor_process_scope_is_explicit_tracks_env_presence() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", "sqlite:///tmp/scoped.sqlite3")],
+            || assert!(doctor_process_scope_is_explicit()),
+        );
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", "/tmp/scoped-mailbox")],
+            || assert!(doctor_process_scope_is_explicit()),
         );
     }
 
