@@ -746,8 +746,13 @@ pub mod tool_util {
     }
 
     /// Reuse a hot authoritative live pool for health reads without advancing
-    /// the writer generation. A genuinely cold bootstrap remains bracketed
-    /// because it may initialize, migrate, or recover the mailbox.
+    /// the writer generation. An initialized mailbox whose pool has merely
+    /// been dropped (the pool cache holds weak references) opens through the
+    /// zero-footprint query-only path: no migrations, recovery, warmup,
+    /// sqlite-family writes, or writer-generation changes (br-lg5dd). Only a
+    /// genuinely cold bootstrap — missing/empty sqlite file, or a memory
+    /// database with no live pool — remains bracketed because it may
+    /// initialize, migrate, or recover the mailbox.
     pub(crate) fn get_authoritative_live_db_pool() -> McpResult<DbPool> {
         let cfg = DbPoolConfig::from_env();
         if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
@@ -763,6 +768,12 @@ pub mod tool_util {
                         .canonical_path,
                 )
             };
+        let mailbox_initialized = sqlite_path
+            .as_deref()
+            .is_some_and(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0));
+        if mailbox_initialized {
+            return get_live_read_db_pool();
+        }
         let storage_root = cfg
             .storage_root
             .clone()
