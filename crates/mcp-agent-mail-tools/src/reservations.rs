@@ -301,7 +301,11 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
     match mcp_agent_mail_storage::write_op_sync_direct(&op) {
         // Written: the guard-visible artifact is durable. SkippedDiskCritical:
         // intended disk-pressure behavior — DB stays authoritative and
-        // reconcile-on-read heals the archive once pressure clears.
+        // reconcile-on-read heals the archive once pressure clears (the WBQ
+        // also refuses enqueue at disk-critical, so a retry queue cannot help
+        // here). Active rows heal via the active pass; released rows whose
+        // artifact still claims ACTIVE heal via the released-row pass
+        // (br-74sxo) on the next reservation access.
         mcp_agent_mail_storage::DirectArchiveWrite::Written
         | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
         // The direct write failed (e.g. ENOSPC, FD exhaustion). The DB state is
@@ -309,12 +313,12 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
         // not reorder history. A queued op's content is frozen at enqueue time,
         // and the WBQ drains asynchronously: an ACTIVE (grant/renew/reconcile)
         // op drained AFTER a newer direct-written release would overwrite the
-        // released artifact with a stale-active one, and reconcile-on-read only
-        // walks active rows, so nothing would ever heal it — the guard would
-        // report a wrong holder until TTL expiry. Terminal release artifacts
-        // can never go stale this way (ids are never reused), so only those are
-        // queued for background retry; active ops rely on reconcile-on-read,
-        // exactly like the disk-critical skip above.
+        // released artifact with a stale-active one — a wrong holder the
+        // released-row reconcile pass (br-74sxo) would only repair on a later
+        // reservation access. Terminal release artifacts can never go stale
+        // this way (ids are never reused), so only those are queued for
+        // background retry; active ops rely on reconcile-on-read, exactly like
+        // the disk-critical skip above.
         mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
             if reservation_op_is_terminal_release(&op) {
                 tracing::warn!(
@@ -374,6 +378,28 @@ fn active_reservation_artifact_json(
         "reason": &row.reason,
         "created_ts": micros_to_iso(row.created_ts),
         "expires_ts": micros_to_iso(row.expires_ts),
+    })
+}
+
+/// Build the canonical archive JSON for one released reservation row, authored
+/// from the authoritative DB state. Mirrors the object the release path emits
+/// so a healed artifact is identical to one written by the original release
+/// (br-74sxo).
+fn released_reservation_artifact_json(
+    project_human_key: &str,
+    agent_name: &str,
+    row: &mcp_agent_mail_db::FileReservationRow,
+) -> Value {
+    json!({
+        "id": row.id.unwrap_or(0),
+        "project": project_human_key,
+        "agent": agent_name,
+        "path_pattern": &row.path_pattern,
+        "exclusive": row.exclusive != 0,
+        "reason": &row.reason,
+        "created_ts": micros_to_iso(row.created_ts),
+        "expires_ts": micros_to_iso(row.expires_ts),
+        "released_ts": released_ts_json_value(row.released_ts),
     })
 }
 
@@ -516,6 +542,108 @@ fn reconcile_active_reservation_archive(
         op,
         &format!(
             "reservation archive reconcile-on-read project={}",
+            project.slug
+        ),
+    );
+    healed
+}
+
+/// Pure decision for the released-row half of reconcile-on-read (br-74sxo):
+/// given the released-but-unexpired DB rows, return the terminal release
+/// artifact JSONs that must be rewritten because the on-disk artifact still
+/// claims the reservation is ACTIVE — the pre-commit guard would honor the
+/// stale holder until `expires_ts`. A missing artifact needs no heal (there is
+/// nothing for the guard to honor), and a row whose holder name is unknown is
+/// skipped for the same wrong-holder reason as the active healer.
+fn released_rows_needing_archive_heal(
+    project_human_key: &str,
+    released_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    archive_present: &BTreeMap<i64, crate::reservation_parity::ArchiveReservationView>,
+) -> Vec<Value> {
+    let mut heal = Vec::new();
+    for row in released_rows {
+        let Some(id) = row.id else {
+            continue;
+        };
+        let Some(agent_name) = agent_names.get(&row.agent_id) else {
+            continue;
+        };
+        if !ts_is_positive(row.released_ts) {
+            continue;
+        }
+        let artifact_claims_active = archive_present
+            .get(&id)
+            .is_some_and(|view| !ts_is_positive(view.released_ts));
+        if artifact_claims_active {
+            heal.push(released_reservation_artifact_json(
+                project_human_key,
+                agent_name,
+                row,
+            ));
+        }
+    }
+    heal
+}
+
+/// Heal released-but-unexpired reservations whose archive artifact still
+/// claims ACTIVE (br-74sxo). The release-time artifact write can be skipped
+/// under disk-critical backpressure or lost to a crash between the DB
+/// release-commit and the archive write, and it cannot be retried while
+/// pressure persists (the write-behind queue refuses enqueue at disk-critical
+/// too). The active-row reconcile pass never visits released rows, so without
+/// this pass nothing ever rewrites the stale-active artifact and the
+/// pre-commit guard reports a wrong holder until `expires_ts`. Bounded like
+/// the active healer: it reads only the released-unexpired rows' own
+/// `id-<id>.json` artifacts, and rows past `expires_ts` need no heal because
+/// the guard already ignores expired artifacts. Terminal release artifacts are
+/// always safe to (re)write — reservation ids are never reused, so no later
+/// mutation can supersede a release.
+fn reconcile_released_reservation_archive(
+    project: &mcp_agent_mail_db::ProjectRow,
+    released_rows: &[mcp_agent_mail_db::FileReservationRow],
+    agent_names: &HashMap<i64, String>,
+    config: &Config,
+) -> usize {
+    if released_rows.is_empty() {
+        return 0;
+    }
+    // Look up only the released reservations' artifacts — never the whole archive.
+    let mut present = BTreeMap::new();
+    for row in released_rows {
+        if let Some(id) = row.id
+            && let Some(view) = crate::reservation_parity::read_project_archive_reservation(
+                &config.storage_root,
+                &project.slug,
+                id,
+            )
+        {
+            present.insert(id, view);
+        }
+    }
+    let heal = released_rows_needing_archive_heal(
+        &project.human_key,
+        released_rows,
+        agent_names,
+        &present,
+    );
+    if heal.is_empty() {
+        return 0;
+    }
+    let healed = heal.len();
+    tracing::debug!(
+        "reconcile-on-read healed {healed} stale-active artifact(s) for released reservation(s) in project={}",
+        project.slug
+    );
+    let op = mcp_agent_mail_storage::WriteOp::FileReservation {
+        project_slug: project.slug.clone(),
+        config: config.clone(),
+        reservations: heal,
+    };
+    dispatch_reservation_archive_write(
+        op,
+        &format!(
+            "reservation archive released-row reconcile-on-read project={}",
             project.slug
         ),
     );
@@ -1058,19 +1186,7 @@ fn dispatch_release_archive_write(
     }
     let res_jsons: Vec<Value> = released_rows
         .iter()
-        .map(|r| {
-            json!({
-                "id": r.id.unwrap_or(0),
-                "project": &project.human_key,
-                "agent": &agent.name,
-                "path_pattern": &r.path_pattern,
-                "exclusive": r.exclusive != 0,
-                "reason": &r.reason,
-                "created_ts": micros_to_iso(r.created_ts),
-                "expires_ts": micros_to_iso(r.expires_ts),
-                "released_ts": released_ts_json_value(r.released_ts),
-            })
-        })
+        .map(|r| released_reservation_artifact_json(&project.human_key, &agent.name, r))
         .collect();
 
     let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -1764,7 +1880,9 @@ pub async fn file_reservation_paths(
     // directly, so without this a wrong/absent holder would slip through. The
     // healer fires an archive write only on genuine drift, so the steady state is
     // just one directory scan. Best-effort: a failed agent lookup never fails the
-    // reserve.
+    // reserve. The released-row half (br-74sxo) rewrites stale-ACTIVE artifacts
+    // whose release write was skipped (disk-critical) or lost (crash-gap), so
+    // the guard stops honoring a released holder before `expires_ts`.
     if let asupersync::Outcome::Ok(agent_rows) =
         mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await
     {
@@ -1773,6 +1891,21 @@ pub async fn file_reservation_paths(
             .filter_map(|row| row.id.map(|id| (id, row.name)))
             .collect();
         reconcile_active_reservation_archive(&project, &active, &agent_names, &Config::get());
+        if let asupersync::Outcome::Ok(released_rows) =
+            mcp_agent_mail_db::queries::list_released_unexpired_reservations(
+                ctx.cx(),
+                &pool,
+                project_id,
+            )
+            .await
+        {
+            reconcile_released_reservation_archive(
+                &project,
+                &released_rows,
+                &agent_names,
+                &Config::get(),
+            );
+        }
     }
 
     let mut paths_to_grant: SmallVec<[&str; 8]> = SmallVec::new();
@@ -2225,7 +2358,11 @@ pub async fn release_file_reservations(
     // reservation whose archive artifact drifted (the same reconcile-on-read pass
     // the acquire path runs, GH#112), so a release access converges the archive
     // the pre-commit guard reads. Best-effort: a failed lookup never fails the
-    // release, which must degrade gracefully (ts2/css incident).
+    // release, which must degrade gracefully (ts2/css incident). The released-row
+    // half (br-74sxo) additionally rewrites stale-ACTIVE artifacts from earlier
+    // releases whose archive write was skipped (disk-critical) or lost
+    // (crash-gap) — including this release's own artifacts when the write above
+    // was skipped and pressure has since cleared.
     if let asupersync::Outcome::Ok(active_rows) =
         mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await
         && let asupersync::Outcome::Ok(agent_rows) =
@@ -2236,6 +2373,21 @@ pub async fn release_file_reservations(
             .filter_map(|row| row.id.map(|id| (id, row.name)))
             .collect();
         reconcile_active_reservation_archive(&project, &active_rows, &agent_names, &config);
+        if let asupersync::Outcome::Ok(released_unexpired) =
+            mcp_agent_mail_db::queries::list_released_unexpired_reservations(
+                ctx.cx(),
+                &pool,
+                project_id,
+            )
+            .await
+        {
+            reconcile_released_reservation_archive(
+                &project,
+                &released_unexpired,
+                &agent_names,
+                &config,
+            );
+        }
     }
 
     let response = ReleaseResult {
@@ -3970,6 +4122,114 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // br-74sxo: released-row reconcile-on-read — a release artifact skipped
+    // under disk-critical (or lost to a crash-gap) leaves a stale-ACTIVE
+    // artifact the guard honors until expires_ts; the released-row pass
+    // rewrites it on the next reservation access.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn released_heal_rewrites_stale_active_artifact() {
+        // The skipped-release case: DB row released, artifact still ACTIVE.
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), None),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert_eq!(heal.len(), 1, "stale-active artifact must be rewritten");
+        assert_eq!(heal[0]["agent"], "GreenCastle");
+        assert!(
+            !heal[0]["released_ts"].is_null(),
+            "the healed artifact must be terminal (released_ts set)"
+        );
+    }
+
+    #[test]
+    fn released_heal_is_noop_when_artifact_already_released() {
+        let rows = vec![reservation_row(1, 7, "src/**", 9_999, Some(5_000))];
+        let mut present = BTreeMap::new();
+        present.insert(
+            1,
+            archive_view(1, "GreenCastle", Some("src/**"), Some(true), Some(5_000)),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "an artifact that already records the release needs no heal"
+        );
+    }
+
+    #[test]
+    fn released_heal_skips_missing_artifact_and_unknown_agent() {
+        // A missing artifact cannot mislead the guard — nothing to heal. An
+        // unresolvable holder must never be guessed (same rule as the active
+        // healer).
+        let rows = vec![
+            reservation_row(1, 7, "src/**", 9_999, Some(5_000)),
+            reservation_row(2, 8, "docs/**", 9_999, Some(5_000)),
+        ];
+        let mut present = BTreeMap::new();
+        present.insert(
+            2,
+            archive_view(2, "Unknowable", Some("docs/**"), Some(true), None),
+        );
+        let heal = released_rows_needing_archive_heal(
+            "/abs/proj",
+            &rows,
+            &names(&[(7, "GreenCastle")]),
+            &present,
+        );
+        assert!(
+            heal.is_empty(),
+            "missing artifacts and unresolvable holders must not be healed"
+        );
+    }
+
+    #[test]
+    fn released_heal_artifact_round_trips_as_released() {
+        // Consistency proof for the released healer: the artifact it authors,
+        // written and scanned back, records the release — so the guard stops
+        // honoring the holder.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        let slug = "proj-released-roundtrip";
+        let reservation_dir = storage_root
+            .join("projects")
+            .join(slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservation_dir).expect("create reservation dir");
+
+        let row = reservation_row(1, 7, "src/**", 9_999, Some(5_000));
+        let artifact = released_reservation_artifact_json("/abs/proj", "GreenCastle", &row);
+        std::fs::write(
+            reservation_dir.join("id-1.json"),
+            serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
+        )
+        .expect("write artifact");
+
+        let view =
+            crate::reservation_parity::read_project_archive_reservation(&storage_root, slug, 1)
+                .expect("artifact scanned back");
+        assert_eq!(view.agent_name, "GreenCastle");
+        assert!(
+            ts_is_positive(view.released_ts),
+            "healed release artifact must scan back as released"
+        );
+    }
+
     #[test]
     fn reconcile_on_read_heals_missing_artifact_after_crash_gap() {
         // The bead acceptance (br-bvq1x.6.1): a crafted crash between a
@@ -4058,6 +4318,116 @@ mod tests {
                 );
                 assert_eq!(healed["path_pattern"], "src/**");
                 assert_eq!(healed["exclusive"], true);
+            });
+        });
+    }
+
+    #[test]
+    fn released_row_stale_active_artifact_heals_on_next_access() {
+        // br-74sxo acceptance: a release whose archive write was skipped
+        // (disk-critical) or lost (crash between DB release-commit and the
+        // artifact write) leaves the on-disk artifact claiming ACTIVE. The
+        // pre-commit guard reads that artifact directly, so it keeps honoring
+        // the released holder. The next reservation access must rewrite the
+        // artifact as released — before this pass, nothing ever healed it and
+        // the wrong holder stood until expires_ts.
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let config = Config::get();
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/released-heal-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let holder_id = holder.id.unwrap_or(0);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                // Reserve, capturing the ACTIVE artifact the release should
+                // later replace.
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    vec!["src/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    Some("released-heal holder".to_string()),
+                )
+                .await
+                .expect("initial reservation");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("get_active_reservations failed: {other:?}"),
+                };
+                let reservation_id = active
+                    .iter()
+                    .find(|row| row.agent_id == holder_id)
+                    .and_then(|row| row.id)
+                    .expect("reserved row exists");
+                let artifact_path = config
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations")
+                    .join(format!("id-{reservation_id}.json"));
+                let active_artifact_bytes =
+                    std::fs::read(&artifact_path).expect("snapshot ACTIVE artifact bytes");
+
+                // Release through the real tool (DB releases + artifact
+                // rewritten), then inject the skip: put the stale ACTIVE
+                // artifact back, as if the release-time write never landed.
+                release_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    "GreenCastle".to_string(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("release reservation");
+                mcp_agent_mail_storage::wbq_flush();
+                std::fs::write(&artifact_path, &active_artifact_bytes)
+                    .expect("inject skipped release-artifact write");
+                let stale: Value = serde_json::from_slice(
+                    &std::fs::read(&artifact_path).expect("read stale artifact"),
+                )
+                .expect("stale artifact is valid JSON");
+                assert!(
+                    stale.get("released_ts").is_none_or(Value::is_null),
+                    "injected artifact must claim ACTIVE"
+                );
+
+                // Next access: another agent touches reservations in the same
+                // project. The released-row reconcile pass must rewrite the
+                // stale-active artifact as released.
+                register_agent(&cx, &pool, project_id, "BlueLake").await;
+                file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["docs/**".to_string()],
+                    Some(3600),
+                    Some(false),
+                    Some("released-heal next access".to_string()),
+                )
+                .await
+                .expect("second reservation triggers released-row reconcile");
+                mcp_agent_mail_storage::wbq_flush();
+
+                let healed: Value = serde_json::from_slice(
+                    &std::fs::read(&artifact_path).expect("read healed artifact"),
+                )
+                .expect("healed artifact is valid JSON");
+                assert_eq!(
+                    healed["agent"], "GreenCastle",
+                    "heal must preserve the authoritative holder identity"
+                );
+                assert!(
+                    healed.get("released_ts").is_some_and(|ts| !ts.is_null()),
+                    "released-row reconcile must rewrite the stale-active artifact as released"
+                );
             });
         });
     }

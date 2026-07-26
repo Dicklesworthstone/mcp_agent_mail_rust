@@ -385,11 +385,11 @@ fn escalate(
                 // Write the grant artifact directly (GH#178 semantics), never
                 // via the write-behind queue: a QUEUED active-grant op drained
                 // after the holder's later direct-written release would
-                // resurrect a stale-active artifact (wrong holder until TTL),
-                // and reconcile-on-read only walks active rows so nothing would
-                // heal it. On failure the DB row stays authoritative and
-                // reconcile-on-read re-emits the artifact on the next
-                // reservation read in this project.
+                // resurrect a stale-active artifact — a wrong holder that the
+                // released-row reconcile pass (br-74sxo) would only repair on
+                // a later reservation access. On failure the DB row stays
+                // authoritative and reconcile-on-read re-emits the artifact on
+                // the next reservation read in this project.
                 match mcp_agent_mail_storage::write_op_sync_direct(&op) {
                     mcp_agent_mail_storage::DirectArchiveWrite::Written
                     | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}

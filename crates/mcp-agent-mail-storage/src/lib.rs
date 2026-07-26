@@ -712,11 +712,12 @@ pub enum DirectArchiveWrite {
     /// durable; the git commit is coalesced asynchronously.
     Written,
     /// Skipped because the disk is under critical pressure. The DB remains
-    /// authoritative; for ACTIVE reservation artifacts (grant/renew)
-    /// reconcile-on-read heals the archive once pressure clears (matching the
-    /// write-behind-queue's disk-critical skip). A skipped RELEASE artifact is
-    /// only revisited if the caller re-emits it (reconcile-on-read walks active
-    /// rows only); the guard still stops honoring it at `expires_ts`.
+    /// authoritative; reconcile-on-read heals the archive once pressure clears
+    /// (matching the write-behind-queue's disk-critical skip). ACTIVE
+    /// reservation artifacts (grant/renew) heal via the active-row pass; a
+    /// skipped RELEASE artifact heals via the released-row pass (br-74sxo),
+    /// which rewrites a stale-ACTIVE artifact for any released-but-unexpired
+    /// row on the next reservation access in that project.
     SkippedDiskCritical,
     /// The synchronous write failed. Callers must choose the fallback by op
     /// content: a terminal release artifact may be re-queued for background
@@ -17202,7 +17203,12 @@ mod tests {
         };
 
         // Oldest: the single commit touching AgentA. Then 5 AgentB commits on top.
-        commit_file("agents/AgentA", "profile.json", r#"{"a":1}"#, "touch AgentA");
+        commit_file(
+            "agents/AgentA",
+            "profile.json",
+            r#"{"a":1}"#,
+            "touch AgentA",
+        );
         for i in 0..5 {
             commit_file(
                 "agents/AgentB",

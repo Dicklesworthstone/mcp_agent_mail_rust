@@ -9841,6 +9841,137 @@ async fn get_active_reservations_once(
     Outcome::Ok(candidates)
 }
 
+/// Released reservations whose original TTL has not yet elapsed.
+///
+/// The authoritative release timestamp is resolved from either the base row
+/// or the release ledger (same GH#180 shape as [`get_active_reservations`]:
+/// cheap candidate scan, ledger merged in Rust).
+///
+/// These are exactly the rows whose stale-ACTIVE archive artifact would make
+/// the pre-commit guard report a wrong holder until `expires_ts` when the
+/// release-time artifact write was skipped (disk-critical backpressure) or
+/// lost (a crash between the DB release-commit and the archive write). The
+/// reconcile-on-read healer walks them so the archive converges on the next
+/// reservation access instead of at TTL expiry (br-74sxo).
+pub async fn list_released_unexpired_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    run_with_mvcc_retry(cx, "list_released_unexpired_reservations", || {
+        list_released_unexpired_reservations_once(cx, pool, project_id)
+    })
+    .await
+}
+
+async fn list_released_unexpired_reservations_once(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    // Force a fresh WAL snapshot so we never read stale reservation state.
+    // On query-only pools this degrades to a deferred BEGIN.
+    try_in_tx!(cx, &tracked, begin_fresh_snapshot_tx(cx, &tracked).await);
+
+    let candidate_sql = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, \
+                fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts, \
+                fr.released_ts AS released_ts \
+         FROM file_reservations fr \
+         WHERE fr.project_id = ? AND fr.expires_ts > ?";
+    let candidate_params = [Value::BigInt(project_id), Value::BigInt(now)];
+
+    let mut candidates =
+        match map_sql_outcome(traw_query(cx, &tracked, candidate_sql, &candidate_params).await) {
+            Outcome::Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match decode_file_reservation_row(&row) {
+                        Ok(decoded) => out.push(decoded),
+                        Err(e) => {
+                            rollback_tx(cx, &tracked).await;
+                            return Outcome::Err(e);
+                        }
+                    }
+                }
+                out
+            }
+            Outcome::Err(e) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Panicked(p);
+            }
+        };
+
+    // Merge the release ledger so ledger-only releases (base row still NULL)
+    // resolve their authoritative released_ts, mirroring the reader contract
+    // of `apply_release_markers`.
+    let released_ts_by_id = match map_sql_outcome(
+        traw_query(
+            cx,
+            &tracked,
+            "SELECT reservation_id, released_ts FROM file_reservation_releases",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => {
+            let mut map = std::collections::HashMap::with_capacity(rows.len());
+            for row in &rows {
+                if let (Some(id), Some(released_ts)) = (
+                    row.get(0).and_then(value_as_i64),
+                    row.get(1).and_then(value_as_i64),
+                ) {
+                    map.insert(id, released_ts);
+                }
+            }
+            map
+        }
+        Outcome::Err(e) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Panicked(p);
+        }
+    };
+
+    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+
+    for row in &mut candidates {
+        if row.released_ts.is_none_or(|ts| ts <= 0)
+            && let Some(ledger_ts) = row.id.and_then(|id| released_ts_by_id.get(&id).copied())
+        {
+            row.released_ts = Some(ledger_ts);
+        }
+    }
+    candidates.retain(|row| row.released_ts.is_some_and(|ts| ts > 0));
+    Outcome::Ok(candidates)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseReservationChunkTarget {
     ReservationIds,
