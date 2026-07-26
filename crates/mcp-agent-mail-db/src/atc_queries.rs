@@ -1717,6 +1717,11 @@ mod tests {
     }
 
     fn test_pool() -> DbPool {
+        // These pools exercise rollup arithmetic, not durability: every ATC
+        // sidecar connection in this process runs with synchronous=OFF so 256
+        // proptest cases don't grind hundreds of WAL fsyncs each (br-j5l8s;
+        // 380s -> seconds for refresh_rollups_conserves_counts standalone).
+        crate::queries::ATC_CONN_TEST_RELAXED_DURABILITY.store(true, Ordering::Relaxed);
         let pool_id = TEST_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(format!("atc_rollup_test_{pool_id}.db"));
@@ -1725,6 +1730,9 @@ mod tests {
         init_conn
             .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
             .expect("apply ATC test pragmas");
+        init_conn
+            .execute_raw("PRAGMA synchronous = OFF;")
+            .expect("relax ATC test init durability");
         let base_sql = crate::schema::init_schema_sql_base();
         init_conn
             .execute_raw(&base_sql)

@@ -2055,6 +2055,17 @@ pub(crate) fn close_canonical_db_conn(conn: crate::CanonicalDbConn, context: &'s
     drop(conn);
 }
 
+/// Test-only relaxed-durability switch for canonical ATC sidecar connections.
+///
+/// Throwaway test pools grind hundreds of WAL fsyncs per proptest case at the
+/// production `synchronous = NORMAL` setting (br-j5l8s: one proptest alone
+/// took 380s standalone under host IO pressure). Tests that exercise rollup
+/// arithmetic — not durability — flip this so every ATC sidecar connection
+/// adds `synchronous = OFF`. Compiled out of production builds entirely.
+#[cfg(test)]
+pub(crate) static ATC_CONN_TEST_RELAXED_DURABILITY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn open_canonical_atc_conn(
     pool: &DbPool,
     purpose: &'static str,
@@ -2073,6 +2084,15 @@ pub(crate) fn open_canonical_atc_conn(
         .map_err(|error| DbError::Sqlite(format!("{purpose}: open failed: {error}")))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
         .map_err(|error| DbError::Sqlite(format!("{purpose}: init pragmas failed: {error}")))?;
+    #[cfg(test)]
+    if ATC_CONN_TEST_RELAXED_DURABILITY.load(std::sync::atomic::Ordering::Relaxed) {
+        conn.execute_raw("PRAGMA synchronous = OFF;")
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "{purpose}: relaxed test durability failed: {error}"
+                ))
+            })?;
+    }
     Ok(conn)
 }
 
