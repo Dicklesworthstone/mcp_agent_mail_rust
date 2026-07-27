@@ -463,6 +463,150 @@ fn redact_database_url(url: &str) -> String {
     )
 }
 
+/// Capture-side forensics storage guardrails (br-vdpyv).
+///
+/// Every failed recovery attempt captures a bundle holding a full copy of the
+/// database + sidecars; a daemon looping detect→dump→fail-repair grew a prod
+/// forensics directory past 96 GB. Bundles are contractually never deleted
+/// automatically (`retention.automatic_deletion: false`; `am doctor reclaim`
+/// only consolidates), so growth must be bounded where bundles are BORN:
+/// unchanged-source dedup, a per-artifact raw-copy byte cap, and a
+/// forensics-root total budget that degrades new captures to metadata-only.
+#[derive(Debug, Clone, Copy)]
+struct ForensicsCaptureBudget {
+    /// Largest sqlite artifact (db/journal/wal/shm) that will be raw-copied
+    /// into a bundle. Larger sources are recorded metadata-only.
+    max_raw_copy_bytes: u64,
+    /// Once the on-disk forensics root exceeds this, new captures stop
+    /// raw-copying entirely (metadata-only) until the operator reclaims.
+    max_total_bytes: u64,
+}
+
+/// 2 GiB — generous for any healthy mailbox copy, small enough that a
+/// pathological multi-hundred-GB database cannot be duplicated per attempt.
+const DEFAULT_FORENSICS_MAX_RAW_COPY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 8 GiB across the whole forensics root before captures degrade to
+/// metadata-only.
+const DEFAULT_FORENSICS_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Pure parse for the budget env knobs. Missing, empty, non-numeric, or zero
+/// values fall back to the default so a fat-fingered override can never
+/// disable the guardrail (mirrors the startup bind-deadline parser). The
+/// escape hatch for "effectively unlimited" is an explicit enormous value.
+fn parse_forensics_budget_bytes(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(default)
+}
+
+fn forensics_capture_budget() -> ForensicsCaptureBudget {
+    ForensicsCaptureBudget {
+        max_raw_copy_bytes: parse_forensics_budget_bytes(
+            std::env::var("AM_FORENSICS_MAX_RAW_COPY_BYTES")
+                .ok()
+                .as_deref(),
+            DEFAULT_FORENSICS_MAX_RAW_COPY_BYTES,
+        ),
+        max_total_bytes: parse_forensics_budget_bytes(
+            std::env::var("AM_FORENSICS_MAX_TOTAL_BYTES")
+                .ok()
+                .as_deref(),
+            DEFAULT_FORENSICS_MAX_TOTAL_BYTES,
+        ),
+    }
+}
+
+/// Recursive on-disk size of a directory tree (metadata only; symlinks are
+/// counted as themselves, never followed).
+fn dir_tree_bytes(root: &Path) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+/// What the newest prior bundle in the same family recorded for each sqlite
+/// artifact kind: the source content hash and the bundle that actually HOLDS
+/// the raw copy (which may be an even earlier bundle when that entry was
+/// itself deduplicated).
+fn prior_bundle_sqlite_hashes(
+    family_dir: &Path,
+    current_bundle_name: &str,
+) -> HashMap<String, (String, String)> {
+    let Some(prior) = newest_prior_bundle_dir(family_dir, current_bundle_name) else {
+        return HashMap::new();
+    };
+    let manifest_path = prior.join("manifest.json");
+    let Ok(bytes) = std::fs::read(&manifest_path) else {
+        return HashMap::new();
+    };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return HashMap::new();
+    };
+    let Some(sqlite) = manifest
+        .get("artifacts")
+        .and_then(|artifacts| artifacts.get("sqlite"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (kind, entry) in sqlite {
+        let Some(sha256) = entry.get("sha256").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let holder = entry
+            .get("deduplicated_from")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| prior.display().to_string(), ToString::to_string);
+        out.insert(kind.clone(), (sha256.to_string(), holder));
+    }
+    out
+}
+
+/// Newest prior (non-symlink) bundle directory in `family_dir`, by mtime,
+/// excluding the bundle currently being written.
+fn newest_prior_bundle_dir(family_dir: &Path, current_bundle_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(family_dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy() == current_bundle_name {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let path = entry.path();
+        match &best {
+            None => best = Some((mtime, path)),
+            Some((current_best, _)) if mtime > *current_best => best = Some((mtime, path)),
+            _ => {}
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 fn forensics_root(storage_root: &Path, db_path: &Path) -> PathBuf {
     if storage_root.is_dir() {
         storage_root.join("doctor").join("forensics")
@@ -3455,6 +3599,16 @@ fn pid_executable_path(pid: u32) -> Option<PathBuf> {
 pub fn capture_mailbox_forensic_bundle(
     capture: MailboxForensicCapture<'_>,
 ) -> Result<PathBuf, SqlError> {
+    capture_mailbox_forensic_bundle_with_budget(capture, forensics_capture_budget())
+}
+
+/// Budget-injectable body of [`capture_mailbox_forensic_bundle`], split out so
+/// tests can exercise the br-vdpyv guardrails deterministically without
+/// racing on process-global env vars.
+fn capture_mailbox_forensic_bundle_with_budget(
+    capture: MailboxForensicCapture<'_>,
+    capture_budget: ForensicsCaptureBudget,
+) -> Result<PathBuf, SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let db_family = forensic_db_family_name(capture.db_path);
     let bundle_dir_family = forensic_bundle_dir_component(capture.db_path);
@@ -3492,6 +3646,29 @@ pub fn capture_mailbox_forensic_bundle(
     let mut sqlite_manifest = serde_json::Map::new();
     let mut copied_paths = Vec::new();
     let mut files = Vec::new();
+
+    // br-vdpyv capture-side guardrails: bundles are never deleted
+    // automatically, so growth is bounded here at capture time instead —
+    // unchanged-source dedup, a raw-copy byte cap, and a total-budget
+    // degrade to metadata-only bundles.
+    let forensics_root_dir = forensics_root(capture.storage_root, capture.db_path);
+    let existing_forensics_bytes = dir_tree_bytes(&forensics_root_dir);
+    let over_total_budget = existing_forensics_bytes > capture_budget.max_total_bytes;
+    if over_total_budget {
+        tracing::warn!(
+            forensics_root = %forensics_root_dir.display(),
+            existing_bytes = existing_forensics_bytes,
+            budget_bytes = capture_budget.max_total_bytes,
+            "forensics root exceeds AM_FORENSICS_MAX_TOTAL_BYTES; capturing a metadata-only \
+             bundle (no raw sqlite copies). Run `am doctor reclaim` to consolidate old \
+             bundles for review, then remove them explicitly."
+        );
+    }
+    let prior_sqlite_hashes = if in_memory_db || over_total_budget {
+        HashMap::new()
+    } else {
+        prior_bundle_sqlite_hashes(&forensics_root_dir.join(&bundle_dir_family), &bundle_name)
+    };
 
     for (kind, source_path) in source_paths {
         if in_memory_db {
@@ -3553,13 +3730,107 @@ pub fn capture_mailbox_forensic_bundle(
             continue;
         }
 
+        let source_len = source_path.metadata().ok().map(|metadata| metadata.len());
+
+        // br-vdpyv guardrail 1: total budget exhausted → metadata-only.
+        if over_total_budget {
+            artifacts.push(json!({
+                "kind": kind,
+                "source_path": source_path.display().to_string(),
+                "captured_path": serde_json::Value::Null,
+                "size_bytes": source_len,
+                "status": "skipped_over_total_budget",
+                "budget_bytes": capture_budget.max_total_bytes,
+                "existing_forensics_bytes": existing_forensics_bytes,
+                "error": serde_json::Value::Null,
+                "detail": "forensics root exceeds AM_FORENSICS_MAX_TOTAL_BYTES; raw copy skipped — run `am doctor reclaim`",
+            }));
+            sqlite_manifest.insert(
+                kind.to_string(),
+                json!({
+                    "path": serde_json::Value::Null,
+                    "status": "skipped_over_total_budget",
+                    "required": kind == "db",
+                    "bytes": source_len,
+                    "budget_bytes": capture_budget.max_total_bytes,
+                    "contains_raw_mailbox_data": false,
+                }),
+            );
+            continue;
+        }
+
+        // br-vdpyv guardrail 2: a single artifact larger than the raw-copy
+        // cap is recorded metadata-only so a huge mailbox cannot be
+        // duplicated on every failed recovery attempt.
+        if source_len.is_some_and(|len| len > capture_budget.max_raw_copy_bytes) {
+            artifacts.push(json!({
+                "kind": kind,
+                "source_path": source_path.display().to_string(),
+                "captured_path": serde_json::Value::Null,
+                "size_bytes": source_len,
+                "status": "skipped_over_raw_copy_budget",
+                "budget_bytes": capture_budget.max_raw_copy_bytes,
+                "error": serde_json::Value::Null,
+                "detail": "source exceeds AM_FORENSICS_MAX_RAW_COPY_BYTES; raw copy skipped",
+            }));
+            sqlite_manifest.insert(
+                kind.to_string(),
+                json!({
+                    "path": serde_json::Value::Null,
+                    "status": "skipped_over_raw_copy_budget",
+                    "required": kind == "db",
+                    "bytes": source_len,
+                    "budget_bytes": capture_budget.max_raw_copy_bytes,
+                    "contains_raw_mailbox_data": false,
+                }),
+            );
+            continue;
+        }
+
+        // br-vdpyv guardrail 3: unchanged-source dedup. The looping-daemon
+        // signature is the SAME corrupt database dumped over and over; when
+        // the newest prior bundle already holds a copy with this content
+        // hash, record a reference instead of another full copy. The source
+        // hash is advisory (dedup only) — copied artifacts below are still
+        // hashed from the destination, which is what the manifest witnesses.
+        let source_sha = bundle_sha256(&source_path).ok();
+        if let (Some(source_sha), Some((prior_sha, holder))) =
+            (source_sha.as_deref(), prior_sqlite_hashes.get(kind))
+            && source_sha == prior_sha
+        {
+            artifacts.push(json!({
+                "kind": kind,
+                "source_path": source_path.display().to_string(),
+                "captured_path": serde_json::Value::Null,
+                "size_bytes": source_len,
+                "sha256": source_sha,
+                "status": "deduplicated_unchanged_source",
+                "deduplicated_from": holder,
+                "error": serde_json::Value::Null,
+                "detail": "source content is byte-identical to the newest prior bundle's copy; reference recorded instead of a duplicate raw copy",
+            }));
+            sqlite_manifest.insert(
+                kind.to_string(),
+                json!({
+                    "path": serde_json::Value::Null,
+                    "status": "deduplicated_unchanged_source",
+                    "required": kind == "db",
+                    "bytes": source_len,
+                    "sha256": source_sha,
+                    "deduplicated_from": holder,
+                    "contains_raw_mailbox_data": false,
+                }),
+            );
+            continue;
+        }
+
         let copy_result = std::fs::copy(&source_path, &destination);
         let copied_ok = copy_result.is_ok();
         let size_bytes = destination
             .metadata()
             .ok()
             .map(|metadata| metadata.len())
-            .or_else(|| source_path.metadata().ok().map(|metadata| metadata.len()));
+            .or(source_len);
         let sha256 = if copied_ok {
             Some(bundle_sha256(&destination)?)
         } else {
@@ -3748,7 +4019,13 @@ pub fn capture_mailbox_forensic_bundle(
             "delete_after_days": serde_json::Value::Null,
             "automatic_deletion": false,
             "deletion_requires_explicit_operator_action": true,
-            "note": "No automatic forensic bundle deletion is allowed until storage-budget guardrails land.",
+            "note": "Existing bundles are never deleted automatically. Growth is bounded at capture time instead (br-vdpyv): unchanged-source dedup, AM_FORENSICS_MAX_RAW_COPY_BYTES per artifact, and AM_FORENSICS_MAX_TOTAL_BYTES across the forensics root (over budget, new captures are metadata-only). Use `am doctor reclaim` to consolidate excess for explicit operator deletion.",
+        },
+        "capture_budget": {
+            "max_raw_copy_bytes": capture_budget.max_raw_copy_bytes,
+            "max_total_bytes": capture_budget.max_total_bytes,
+            "existing_forensics_bytes_at_capture": existing_forensics_bytes,
+            "over_total_budget": over_total_budget,
         },
         "redaction": {
             "database_url": "credentials_redacted",
@@ -4675,6 +4952,213 @@ mod tests {
             manifest["artifacts"]["references"]["live_db_state"]["path"],
             "references/live-db-state.json"
         );
+    }
+
+    #[test]
+    fn parse_forensics_budget_bytes_never_disables_the_guardrail() {
+        assert_eq!(super::parse_forensics_budget_bytes(None, 7), 7);
+        assert_eq!(super::parse_forensics_budget_bytes(Some(""), 7), 7);
+        assert_eq!(super::parse_forensics_budget_bytes(Some("garbage"), 7), 7);
+        assert_eq!(super::parse_forensics_budget_bytes(Some("0"), 7), 7);
+        assert_eq!(super::parse_forensics_budget_bytes(Some("-5"), 7), 7);
+        assert_eq!(super::parse_forensics_budget_bytes(Some(" 1024 "), 7), 1024);
+    }
+
+    fn unlimited_budget() -> super::ForensicsCaptureBudget {
+        super::ForensicsCaptureBudget {
+            max_raw_copy_bytes: u64::MAX,
+            max_total_bytes: u64::MAX,
+        }
+    }
+
+    /// Bump a directory's mtime `secs` into the future so mtime-based
+    /// newest-prior-bundle selection is deterministic even on filesystems
+    /// with coarse timestamps.
+    fn bump_dir_mtime_forward(dir: &std::path::Path, secs: u64) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(secs);
+        let times = std::fs::FileTimes::new().set_modified(later);
+        let handle = std::fs::File::options()
+            .read(true)
+            .open(dir)
+            .expect("open dir for mtime bump");
+        handle.set_times(times).expect("bump dir mtime");
+    }
+
+    fn budget_capture_fixture(
+        tempdir: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let storage_root = tempdir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("demo")).expect("storage");
+        let db_path = tempdir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"sqlite-bytes").expect("db");
+        std::fs::write(tempdir.path().join("storage.sqlite3-wal"), b"wal").expect("wal");
+        (storage_root, db_path)
+    }
+
+    fn budget_capture<'a>(
+        db_path: &'a std::path::Path,
+        storage_root: &'a std::path::Path,
+    ) -> MailboxForensicCapture<'a> {
+        MailboxForensicCapture {
+            command_name: "repair",
+            trigger: "doctor",
+            database_url: "sqlite:///tmp/storage.sqlite3",
+            db_path,
+            storage_root,
+            integrity_detail: None,
+        }
+    }
+
+    fn bundle_manifest(bundle_dir: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(bundle_dir.join("manifest.json")).expect("manifest"),
+        )
+        .expect("manifest json")
+    }
+
+    #[test]
+    fn capture_dedups_unchanged_source_against_newest_prior_bundle() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (storage_root, db_path) = budget_capture_fixture(&tempdir);
+
+        let first = super::capture_mailbox_forensic_bundle_with_budget(
+            budget_capture(&db_path, &storage_root),
+            unlimited_budget(),
+        )
+        .expect("first bundle");
+        let first_manifest = bundle_manifest(&first);
+        assert_eq!(
+            first_manifest["artifacts"]["sqlite"]["db"]["status"], "captured",
+            "the first capture must hold a real raw copy"
+        );
+        assert!(first.join("sqlite").join("storage.sqlite3").exists());
+        bump_dir_mtime_forward(&first, 120);
+        // Bundle names are millisecond-granular; keep names distinct.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let second = super::capture_mailbox_forensic_bundle_with_budget(
+            budget_capture(&db_path, &storage_root),
+            unlimited_budget(),
+        )
+        .expect("second bundle");
+        let second_manifest = bundle_manifest(&second);
+        let db_entry = &second_manifest["artifacts"]["sqlite"]["db"];
+        assert_eq!(
+            db_entry["status"], "deduplicated_unchanged_source",
+            "unchanged source must dedup instead of re-copying: {db_entry}"
+        );
+        assert_eq!(
+            db_entry["deduplicated_from"],
+            first.display().to_string(),
+            "the dedup reference must name the bundle holding the copy"
+        );
+        assert!(
+            !second.join("sqlite").join("storage.sqlite3").exists(),
+            "no duplicate raw copy may be written"
+        );
+        bump_dir_mtime_forward(&second, 240);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // A third capture with a STILL-unchanged source must chain its dedup
+        // reference through the second bundle back to the first — the bundle
+        // that physically holds the copy.
+        let third = super::capture_mailbox_forensic_bundle_with_budget(
+            budget_capture(&db_path, &storage_root),
+            unlimited_budget(),
+        )
+        .expect("third bundle");
+        let third_manifest = bundle_manifest(&third);
+        assert_eq!(
+            third_manifest["artifacts"]["sqlite"]["db"]["status"],
+            "deduplicated_unchanged_source"
+        );
+        assert_eq!(
+            third_manifest["artifacts"]["sqlite"]["db"]["deduplicated_from"],
+            first.display().to_string(),
+            "dedup references must chain to the bundle that physically holds the copy"
+        );
+        bump_dir_mtime_forward(&third, 360);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Changed content must be captured again.
+        std::fs::write(&db_path, b"sqlite-bytes-CHANGED").expect("mutate db");
+        let fourth = super::capture_mailbox_forensic_bundle_with_budget(
+            budget_capture(&db_path, &storage_root),
+            unlimited_budget(),
+        )
+        .expect("fourth bundle");
+        let fourth_manifest = bundle_manifest(&fourth);
+        assert_eq!(
+            fourth_manifest["artifacts"]["sqlite"]["db"]["status"], "captured",
+            "changed source content must be captured again"
+        );
+        assert!(fourth.join("sqlite").join("storage.sqlite3").exists());
+    }
+
+    #[test]
+    fn capture_skips_raw_copy_over_per_artifact_budget() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (storage_root, db_path) = budget_capture_fixture(&tempdir);
+        // db is 12 bytes ("sqlite-bytes"), wal is 3 bytes ("wal").
+        let bundle = super::capture_mailbox_forensic_bundle_with_budget(
+            budget_capture(&db_path, &storage_root),
+            super::ForensicsCaptureBudget {
+                max_raw_copy_bytes: 4,
+                max_total_bytes: u64::MAX,
+            },
+        )
+        .expect("bundle");
+        let manifest = bundle_manifest(&bundle);
+        let db_entry = &manifest["artifacts"]["sqlite"]["db"];
+        assert_eq!(db_entry["status"], "skipped_over_raw_copy_budget");
+        assert_eq!(db_entry["bytes"], 12);
+        assert_eq!(db_entry["budget_bytes"], 4);
+        assert_eq!(db_entry["contains_raw_mailbox_data"], false);
+        assert!(
+            !bundle.join("sqlite").join("storage.sqlite3").exists(),
+            "over-cap source must not be raw-copied"
+        );
+        assert_eq!(
+            manifest["artifacts"]["sqlite"]["wal"]["status"], "captured",
+            "under-cap sidecars still capture normally"
+        );
+    }
+
+    #[test]
+    fn capture_degrades_to_metadata_only_over_total_budget() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (storage_root, db_path) = budget_capture_fixture(&tempdir);
+        // Plant pre-existing forensics debris so the root is over budget.
+        let forensics_dir = storage_root.join("doctor").join("forensics");
+        std::fs::create_dir_all(&forensics_dir).expect("forensics root");
+        std::fs::write(forensics_dir.join("old-debris.bin"), vec![0_u8; 64]).expect("debris");
+
+        let bundle = super::capture_mailbox_forensic_bundle_with_budget(
+            budget_capture(&db_path, &storage_root),
+            super::ForensicsCaptureBudget {
+                max_raw_copy_bytes: u64::MAX,
+                max_total_bytes: 1,
+            },
+        )
+        .expect("bundle");
+        let manifest = bundle_manifest(&bundle);
+        for kind in ["db", "journal", "wal", "shm"] {
+            let entry = &manifest["artifacts"]["sqlite"][kind];
+            let status = entry["status"].as_str().unwrap_or_default();
+            assert!(
+                status == "skipped_over_total_budget"
+                    || status == "missing"
+                    || status == "missing_required",
+                "over total budget, no artifact may be raw-copied: {kind} => {entry}"
+            );
+        }
+        assert_eq!(manifest["capture_budget"]["over_total_budget"], true);
+        assert!(
+            !bundle.join("sqlite").join("storage.sqlite3").exists(),
+            "metadata-only bundle must hold no raw sqlite copy"
+        );
+        assert!(bundle.join("manifest.json").exists());
+        assert!(bundle.join("summary.json").exists());
     }
 
     #[test]
