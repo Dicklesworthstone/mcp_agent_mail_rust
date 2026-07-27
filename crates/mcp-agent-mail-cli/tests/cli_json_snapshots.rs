@@ -379,6 +379,24 @@ struct TestEnv {
 impl TestEnv {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Hermeticity (br-m105n, br-yceqd idiom): the tempdir may sit INSIDE a
+        // real repo checkout (rch workers point TMPDIR at <repo>/.rch-tmp), so
+        // any ancestor walk from a fixture cwd — detect_project_root() for
+        // `archive list`, git upward discovery, marker discovery — would escape
+        // the fixture into the real repo and change command output. Make the
+        // tempdir root a deterministic discovery boundary on every environment:
+        //  - sticky + world-writable (mode 1777, like /tmp) makes it an
+        //    is_shared_ancestor_boundary(), stopping marker walks;
+        //  - a garbage `.git` FILE aborts git upward discovery for cwds under
+        //    the tempdir that are not themselves git repos.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(tmp.path().join(".git"), "not a gitfile\n")
+                .expect("write boundary gitfile");
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o1777))
+                .expect("mark tmp root as shared-ancestor boundary");
+        }
         let db_path = tmp.path().join("mailbox.sqlite3");
         let home_dir = tmp.path().join("home");
         let doctor_repo = tmp.path().join("doctor_repo");
@@ -472,6 +490,21 @@ impl TestEnv {
             ),
             ("LANG".to_string(), "C.UTF-8".to_string()),
             ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            // Pin beads discovery to a deterministically-absent workspace.
+            // Without this, doctor's beads_issue_awareness check walks up from
+            // the tempdir-nested cwd; rch workers point TMPDIR inside the
+            // synced repo checkout (.rch-tmp), so the walk escapes the fixture
+            // into the real repo's .beads and flips the check to "ok" — and the
+            // status feeds summary/finding-count aggregates, which the JSON
+            // normalizer cannot patch point-wise (br-m105n).
+            (
+                "BEADS_DIR".to_string(),
+                self.tmp
+                    .path()
+                    .join("no_beads_workspace")
+                    .display()
+                    .to_string(),
+            ),
             // Force server tool calls (products) to fail fast so we exercise local fallbacks.
             ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
             ("HTTP_PORT".to_string(), "1".to_string()),
@@ -969,7 +1002,8 @@ fn cli_json_snapshots() {
         &["list-projects", "--include-agents", "--json"],
     );
 
-    // archive list uses detect_project_root(), so run from a git-less tmp root.
+    // archive list uses detect_project_root(); the tmp root is a pinned
+    // discovery boundary (see TestEnv::new), so detection stops there.
     assert_json_snapshot(
         &env_empty_archive,
         "archive_list_empty",
