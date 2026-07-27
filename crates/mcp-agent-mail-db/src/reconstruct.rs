@@ -55,6 +55,34 @@ fn open_read_only_salvage_db(path: &Path) -> DbResult<DbConn> {
 /// is generous relative to any legitimate mailbox artifact.
 const MAX_ARCHIVE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Keyset batch size for salvaging `messages` rows (br-5mnkl).
+///
+/// The salvage source on the automatic startup-recovery path is the unhealthy
+/// live mailbox itself, so `messages` (bodies included) can be multi-GB. A
+/// single full-table `SELECT` materializes every row into one `Vec<Row>` —
+/// the unbounded allocation that ballooned startup recovery. Keyset
+/// pagination bounds peak memory to one batch; the batch is kept small
+/// because each row carries a message body.
+const SALVAGE_MESSAGE_BATCH_ROWS: usize = 128;
+
+/// Keyset batch size for salvaging `message_recipients` rows (br-5mnkl).
+/// Rows are fixed-width (two ids, a kind, two timestamps), so a larger batch
+/// stays small in bytes while cutting per-batch query overhead.
+const SALVAGE_RECIPIENT_BATCH_ROWS: usize = 1024;
+
+/// Keyset batch size for id-only `messages` scans (br-5mnkl). Rows are a
+/// single `i64`, so the batch can be large.
+const DB_MESSAGE_ID_BATCH_ROWS: usize = 4096;
+
+/// Hard cap on itemized [`ReconstructStats::warnings`] entries (br-5mnkl).
+///
+/// Reconstruction pushes one warning per malformed/duplicate artifact, so a
+/// pathological archive (millions of broken files) could balloon the warning
+/// vector itself on the startup self-heal path. Beyond this cap warnings are
+/// counted in [`ReconstructStats::suppressed_warnings`] instead of itemized;
+/// all numeric counters remain exact.
+const MAX_ITEMIZED_WARNINGS: usize = 10_000;
+
 /// Read an archive text artifact with a bounded-memory cap (see
 /// [`MAX_ARCHIVE_ARTIFACT_BYTES`]). Returns an `InvalidData` error if the file
 /// exceeds the cap, which each call site already handles as a skippable read
@@ -82,13 +110,19 @@ fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 type SqliteDbConn = crate::CanonicalDbConn;
 
+// Fault-injection hooks for the salvage-merge rollback tests. These are
+// thread-local (not process-global): salvage merges run synchronously on the
+// arming test's own thread, and a process-global flag can be consumed by any
+// OTHER salvage-merge test running in parallel — which both disarms the
+// arming test (its merge then succeeds and `expect_err` fails) and detonates
+// an unrelated test with a forced error it never armed.
 #[cfg(test)]
-static FAIL_SALVAGE_MERGE_AFTER_PROJECTS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-static FAIL_SALVAGE_QUERY_MESSAGES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FAIL_SALVAGE_MERGE_AFTER_PROJECTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_SALVAGE_QUERY_MESSAGES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
@@ -376,8 +410,14 @@ pub struct ReconstructStats {
     pub salvaged_reservation_releases: usize,
     /// Number of archive files that failed to parse (skipped).
     pub parse_errors: usize,
-    /// Human-readable warnings collected during reconstruction.
+    /// Human-readable warnings collected during reconstruction. Itemization
+    /// is capped at [`MAX_ITEMIZED_WARNINGS`]; the overflow is counted in
+    /// `suppressed_warnings` (br-5mnkl).
     pub warnings: Vec<String>,
+    /// Number of warnings suppressed after `warnings` reached
+    /// [`MAX_ITEMIZED_WARNINGS`]. Counters stay exact; only the per-occurrence
+    /// itemization stops.
+    pub suppressed_warnings: usize,
     duplicate_canonical_id_set: BTreeSet<i64>,
 }
 
@@ -474,6 +514,18 @@ impl ArchiveMessageInventory {
 }
 
 impl ReconstructStats {
+    /// Push an itemized warning, or count it as suppressed once the
+    /// [`MAX_ITEMIZED_WARNINGS`] cap is reached (br-5mnkl). Every unbounded
+    /// per-artifact/per-row warning site must route through this so the
+    /// warning vector itself cannot balloon on the startup self-heal path.
+    fn push_warning(&mut self, warning: String) {
+        if self.warnings.len() < MAX_ITEMIZED_WARNINGS {
+            self.warnings.push(warning);
+        } else {
+            self.suppressed_warnings = self.suppressed_warnings.saturating_add(1);
+        }
+    }
+
     fn record_duplicate_canonical_message(&mut self, message_id: i64, file_path: &Path) {
         self.duplicate_canonical_message_files += 1;
         if self.duplicate_canonical_id_set.insert(message_id) {
@@ -557,6 +609,13 @@ impl std::fmt::Display for ReconstructStats {
                 f,
                 "; preserved {} cross-project canonical id collision(s) under generated DB ids",
                 self.cross_project_canonical_collisions
+            )?;
+        }
+        if self.suppressed_warnings > 0 {
+            write!(
+                f,
+                "; suppressed {} warning(s) past the {MAX_ITEMIZED_WARNINGS}-entry itemization cap",
+                self.suppressed_warnings
             )?;
         }
         if self.salvaged_projects > 0
@@ -912,11 +971,39 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
     if tables.is_empty() {
         return Ok(BTreeSet::new());
     }
-    let rows = conn.query_sync("SELECT id FROM messages", &[])?;
+    // br-5mnkl: keyset-paginated read — this scans the (possibly huge) live
+    // mailbox on the startup/self-heal drift-check path, and a full-table
+    // SELECT materializes every row at once. The first batch has no id floor
+    // so non-positive ids are still collected exactly as before; a batch that
+    // fails to advance the floor (undecodable trailing ids) terminates with
+    // the same silently-partial set the unchunked read produced.
     let mut ids = BTreeSet::new();
-    for row in rows {
-        if let Ok(id) = row.get_named::<i64>("id") {
-            ids.insert(id);
+    let mut floor: Option<i64> = None;
+    loop {
+        let (where_clause, params): (&str, Vec<Value>) = match floor {
+            Some(f) => (" WHERE id > ?", vec![Value::BigInt(f)]),
+            None => ("", Vec::new()),
+        };
+        let rows = conn.query_sync(
+            &format!(
+                "SELECT id FROM messages{where_clause} ORDER BY id LIMIT {DB_MESSAGE_ID_BATCH_ROWS}"
+            ),
+            &params,
+        )?;
+        if rows.is_empty() {
+            break;
+        }
+        let batch_len = rows.len();
+        let mut advanced = false;
+        for row in rows {
+            if let Ok(id) = row.get_named::<i64>("id") {
+                ids.insert(id);
+                floor = Some(id);
+                advanced = true;
+            }
+        }
+        if batch_len < DB_MESSAGE_ID_BATCH_ROWS || !advanced {
+            break;
         }
     }
     Ok(ids)
@@ -1395,7 +1482,7 @@ fn reconstruct_from_archive_impl(
                 }
             }
         } else {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "No projects directory found at {}",
                 projects_dir.display()
             ));
@@ -1404,7 +1491,7 @@ fn reconstruct_from_archive_impl(
             }
         }
     } else {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Storage root {} is missing or not a real directory",
             storage_root.display()
         ));
@@ -1414,7 +1501,7 @@ fn reconstruct_from_archive_impl(
     }
     project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
     if project_dirs.is_empty() {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "No project archives found under {}",
             projects_dir.display()
         ));
@@ -1686,14 +1773,14 @@ fn discover_agents(
         };
         let Some(agent_name) = normalized_archive_agent_name(Some(&raw_agent_name)) else {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Archive agent directory {} has empty/invalid name; skipping profile",
                 path.display()
             ));
             continue;
         };
         if agent_name != raw_agent_name {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Archive agent directory {} has non-canonical name {raw_agent_name:?}; normalizing to {agent_name:?}",
                 path.display()
             ));
@@ -1729,7 +1816,7 @@ fn discover_agents(
         let agent_name = match profile_name {
             Some(profile_name) => {
                 if profile_name != agent_name {
-                    stats.warnings.push(format!(
+                    stats.push_warning(format!(
                         "Archive agent profile {} has name {profile_name:?} that disagrees with directory name {raw_agent_name:?}; using profile name",
                         profile_path.display()
                     ));
@@ -1878,7 +1965,7 @@ fn discover_messages(
                     return Err(e);
                 }
                 stats.parse_errors += 1;
-                stats.warnings.push(format!(
+                stats.push_warning(format!(
                     "Failed to reconstruct message from {}: {e}",
                     file_path.display()
                 ));
@@ -1990,7 +2077,7 @@ fn parse_and_insert_message(
     let thread_id = raw_thread_id.and_then(|raw| {
         let normalized = sanitize_reconstructed_thread_id(raw);
         if normalized.as_deref() != Some(raw) {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Sanitized invalid thread_id {:?} in {} during reconstruction",
                 raw,
                 file_path.display()
@@ -2146,7 +2233,7 @@ fn normalize_salvaged_recipient_kind(
         "cc" => "cc".to_string(),
         "bcc" => "bcc".to_string(),
         _ => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage recipient for message {message_id} had invalid kind {trimmed:?}; defaulting to \"to\""
             ));
             "to".to_string()
@@ -2175,7 +2262,7 @@ fn normalize_archive_attachments_json(
             serde_json::Value::Array(values.clone()).to_string()
         }
         Some(_) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Archive message {message_label} has non-array attachments payload; preserving malformed attachment metadata sentinel"
             ));
             malformed_attachments_json()
@@ -2189,7 +2276,7 @@ fn normalize_archive_recipients_json(
     stats: &mut ReconstructStats,
 ) -> (String, Vec<String>, Vec<String>, Vec<String>) {
     if !reconstructed_recipients_payload_is_valid(msg) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Archive message {message_label} has non-canonical recipient payload; preserving malformed recipient metadata sentinel"
         ));
         return (
@@ -2223,13 +2310,13 @@ fn parse_salvaged_attachments_json(
     match serde_json::from_str::<serde_json::Value>(&attachments_json) {
         Ok(serde_json::Value::Array(values)) => serde_json::Value::Array(values).to_string(),
         Ok(_) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage message {message_id} has non-array attachments payload; preserving malformed attachment metadata sentinel"
             ));
             malformed_attachments_json()
         }
         Err(err) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage message {message_id} has invalid attachments payload; preserving malformed attachment metadata sentinel: {err}"
             ));
             malformed_attachments_json()
@@ -2264,14 +2351,14 @@ fn parse_salvaged_recipients_json(
     let parsed: serde_json::Value = match serde_json::from_str(&recipients_json) {
         Ok(parsed) => parsed,
         Err(err) => {
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Salvage message {message_id} has invalid recipients_json; preserving malformed recipient metadata sentinel: {err}"
             ));
             return malformed();
         }
     };
     if !reconstructed_recipients_payload_is_valid(&parsed) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage message {message_id} has non-canonical recipients_json; preserving malformed recipient metadata sentinel"
         ));
         return malformed();
@@ -2387,7 +2474,7 @@ fn parse_archived_file_reservation(
         Ok(data) => data,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot read reservation artifact {}: {e}",
                 file_path.display()
             ));
@@ -2399,7 +2486,7 @@ fn parse_archived_file_reservation(
         Ok(value) => value,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot parse reservation artifact {}: {e}",
                 file_path.display()
             ));
@@ -2414,7 +2501,7 @@ fn parse_archived_file_reservation(
         .map(str::to_string)
     else {
         stats.parse_errors += 1;
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reservation artifact {} is missing path_pattern/path",
             file_path.display()
         ));
@@ -2618,7 +2705,7 @@ fn build_salvage_select(
         .filter(|column| !columns.contains(*column))
         .collect();
     if !missing_required.is_empty() {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage database {} table {table} missing required column(s): {}",
             salvage_db_path.display(),
             missing_required.join(", ")
@@ -2696,7 +2783,7 @@ fn build_salvage_agent_links_select(
         .filter(|column| !columns.contains(*column))
         .collect::<Vec<_>>()
         .join(", ");
-    stats.warnings.push(format!(
+    stats.push_warning(format!(
         "Salvage database {} table agent_links missing required columns for both current schema ({missing_current}) and legacy schema ({missing_legacy})",
         salvage_db_path.display()
     ));
@@ -3124,7 +3211,7 @@ fn merge_salvaged_database(
         || has_product_project_links
         || has_proof_gate_consumed_nonces)
     {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage database {} contained none of the expected mail/product tables",
             salvage_db_path.display()
         ));
@@ -3251,7 +3338,7 @@ fn merge_salvaged_database(
             }
 
             #[cfg(test)]
-            if FAIL_SALVAGE_MERGE_AFTER_PROJECTS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if FAIL_SALVAGE_MERGE_AFTER_PROJECTS.with(|hook| hook.replace(false)) {
                 return Err(DbError::Sqlite(
                     "reconstruct salvage: forced failure after projects".to_string(),
                 ));
@@ -4338,101 +4425,122 @@ fn merge_salvaged_database(
                 ))
             })?;
             #[cfg(test)]
-            if FAIL_SALVAGE_QUERY_MESSAGES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.replace(false)) {
                 return Err(DbError::Sqlite(
                     "reconstruct salvage: query messages: Query error: database disk image is malformed"
                         .to_owned(),
                 ));
             }
 
-            let message_rows = salvage_conn
-                .query_sync(
-                    &format!("SELECT {message_select} FROM messages ORDER BY id"),
-                    &[],
-                )
-                .map_err(|e| {
-                    DbError::Sqlite(format!("reconstruct salvage: query messages: {e}"))
-                })?;
-
-            for row in &message_rows {
-                let source_message_id = row.get_named::<i64>("id").map_err(|e| {
-                    DbError::Sqlite(format!("reconstruct salvage: decode message id: {e}"))
-                })?;
-                if source_message_id <= 0 {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: message has non-positive id {source_message_id}"
-                    )));
+            // br-5mnkl: keyset-paginated read — see SALVAGE_MESSAGE_BATCH_ROWS.
+            // The first batch has no id floor so non-positive ids (which the
+            // strict salvage contract refuses) still sort first, surface, and
+            // fail closed exactly as the previous full-table read did.
+            let mut message_keyset_floor: Option<i64> = None;
+            loop {
+                let (message_where, message_params): (&str, Vec<Value>) = match message_keyset_floor
+                {
+                    Some(floor) => (" WHERE id > ?", vec![Value::BigInt(floor)]),
+                    None => ("", Vec::new()),
+                };
+                let message_rows = salvage_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT {message_select} FROM messages{message_where} \
+                             ORDER BY id LIMIT {SALVAGE_MESSAGE_BATCH_ROWS}"
+                        ),
+                        &message_params,
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!("reconstruct salvage: query messages: {e}"))
+                    })?;
+                if message_rows.is_empty() {
+                    break;
                 }
-                let source_project_id = row.get_named::<i64>("project_id").map_err(|e| {
+
+                for row in &message_rows {
+                    let source_message_id = row.get_named::<i64>("id").map_err(|e| {
+                        DbError::Sqlite(format!("reconstruct salvage: decode message id: {e}"))
+                    })?;
+                    if source_message_id <= 0 {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: message has non-positive id {source_message_id}"
+                        )));
+                    }
+                    message_keyset_floor = Some(source_message_id);
+                    let source_project_id = row.get_named::<i64>("project_id").map_err(|e| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: decode project_id for message {source_message_id}: {e}"
                     ))
                 })?;
-                let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
+                    let target_project_id = *project_id_map.get(&source_project_id).ok_or_else(|| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: message {source_message_id} referenced unmapped project id {source_project_id}"
                     ))
                 })?;
-                let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
+                    let source_sender_id = row.get_named::<i64>("sender_id").map_err(|e| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: decode sender_id for message {source_message_id}: {e}"
                     ))
                 })?;
-                let target_sender_id = *agent_id_map.get(&source_sender_id).ok_or_else(|| {
+                    let target_sender_id = *agent_id_map.get(&source_sender_id).ok_or_else(|| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: message {source_message_id} referenced unmapped sender id {source_sender_id}"
                     ))
                 })?;
-                if agent_project_id(&target_conn, target_sender_id)? != Some(target_project_id) {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: message {source_message_id} maps sender {source_sender_id} outside project {source_project_id}; refusing cross-project ownership"
-                    )));
-                }
+                    if agent_project_id(&target_conn, target_sender_id)? != Some(target_project_id)
+                    {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: message {source_message_id} maps sender {source_sender_id} outside project {source_project_id}; refusing cross-project ownership"
+                        )));
+                    }
 
-                if message_project_id(&target_conn, source_message_id)? == Some(target_project_id) {
-                    message_id_map.insert(source_message_id, source_message_id);
-                    continue;
-                }
+                    if message_project_id(&target_conn, source_message_id)?
+                        == Some(target_project_id)
+                    {
+                        message_id_map.insert(source_message_id, source_message_id);
+                        continue;
+                    }
 
-                let thread_id = row
-                    .get_named::<String>("thread_id")
-                    .ok()
-                    .and_then(|raw: String| sanitize_reconstructed_thread_id(raw.as_str()));
-                let thread_value = thread_id.map_or(Value::Null, Value::Text);
-                let (recipients_json, to_names, cc_names, bcc_names) =
-                    parse_salvaged_recipients_json(
-                        row.get_named::<String>("recipients_json").ok(),
+                    let thread_id = row
+                        .get_named::<String>("thread_id")
+                        .ok()
+                        .and_then(|raw: String| sanitize_reconstructed_thread_id(raw.as_str()));
+                    let thread_value = thread_id.map_or(Value::Null, Value::Text);
+                    let (recipients_json, to_names, cc_names, bcc_names) =
+                        parse_salvaged_recipients_json(
+                            row.get_named::<String>("recipients_json").ok(),
+                            source_message_id,
+                            stats,
+                        );
+                    let attachments = parse_salvaged_attachments_json(
+                        row.get_named::<String>("attachments").ok(),
                         source_message_id,
                         stats,
                     );
-                let attachments = parse_salvaged_attachments_json(
-                    row.get_named::<String>("attachments").ok(),
-                    source_message_id,
-                    stats,
-                );
-                let values = [
-                    Value::BigInt(target_project_id),
-                    Value::BigInt(target_sender_id),
-                    thread_value,
-                    Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
-                    Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
-                    Value::Text(
-                        row.get_named::<String>("importance")
-                            .unwrap_or_else(|_| "normal".to_string()),
-                    ),
-                    Value::BigInt(i64::from(
-                        row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
-                    )),
-                    Value::BigInt(
-                        row.get_named::<i64>("created_ts")
-                            .unwrap_or_else(|_| crate::now_micros()),
-                    ),
-                    Value::Text(recipients_json),
-                    Value::Text(attachments),
-                ];
-                let existing_project_id = message_project_id(&target_conn, source_message_id)?;
-                let target_message_id = if let Some(existing_project_id) = existing_project_id {
-                    target_conn
+                    let values = [
+                        Value::BigInt(target_project_id),
+                        Value::BigInt(target_sender_id),
+                        thread_value,
+                        Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
+                        Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
+                        Value::Text(
+                            row.get_named::<String>("importance")
+                                .unwrap_or_else(|_| "normal".to_string()),
+                        ),
+                        Value::BigInt(i64::from(
+                            row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
+                        )),
+                        Value::BigInt(
+                            row.get_named::<i64>("created_ts")
+                                .unwrap_or_else(|_| crate::now_micros()),
+                        ),
+                        Value::Text(recipients_json),
+                        Value::Text(attachments),
+                    ];
+                    let existing_project_id = message_project_id(&target_conn, source_message_id)?;
+                    let target_message_id = if let Some(existing_project_id) = existing_project_id {
+                        target_conn
                         .execute_sync(
                             "INSERT INTO messages \
                              (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
@@ -4444,17 +4552,17 @@ fn merge_salvaged_database(
                                 "reconstruct salvage: remap cross-project message {source_message_id}: {e}"
                             ))
                         })?;
-                    let remapped_id = query_last_insert_rowid(&target_conn)?;
-                    stats.salvaged_message_id_remaps += 1;
-                    stats.warnings.push(format!(
+                        let remapped_id = query_last_insert_rowid(&target_conn)?;
+                        stats.salvaged_message_id_remaps += 1;
+                        stats.push_warning(format!(
                         "Salvage message id {source_message_id} belonged to remapped project {target_project_id}, but the archive candidate already used that numeric id for project {existing_project_id}; preserved it as message {remapped_id}"
                     ));
-                    remapped_id
-                } else {
-                    let mut values_with_id = Vec::with_capacity(values.len() + 1);
-                    values_with_id.push(Value::BigInt(source_message_id));
-                    values_with_id.extend(values);
-                    target_conn
+                        remapped_id
+                    } else {
+                        let mut values_with_id = Vec::with_capacity(values.len() + 1);
+                        values_with_id.push(Value::BigInt(source_message_id));
+                        values_with_id.extend(values);
+                        target_conn
                         .execute_sync(
                             "INSERT INTO messages \
                              (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
@@ -4466,23 +4574,28 @@ fn merge_salvaged_database(
                                 "reconstruct salvage: insert message {source_message_id}: {e}"
                             ))
                         })?;
-                    source_message_id
-                };
-                message_id_map.insert(source_message_id, target_message_id);
-                stats.salvaged_messages += 1;
+                        source_message_id
+                    };
+                    message_id_map.insert(source_message_id, target_message_id);
+                    stats.salvaged_messages += 1;
 
-                for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")] {
-                    for name in names {
-                        let agent_id = ensure_agent_exists(
-                            &target_conn,
-                            target_project_id,
-                            name,
-                            &mut reconstructed_recipient_agent_ids,
-                        )?;
-                        insert_recipient(&target_conn, target_message_id, agent_id, kind)?;
-                        stats.salvaged_recipients += 1;
-                        recipient_json_updates.insert(target_message_id);
+                    for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")]
+                    {
+                        for name in names {
+                            let agent_id = ensure_agent_exists(
+                                &target_conn,
+                                target_project_id,
+                                name,
+                                &mut reconstructed_recipient_agent_ids,
+                            )?;
+                            insert_recipient(&target_conn, target_message_id, agent_id, kind)?;
+                            stats.salvaged_recipients += 1;
+                            recipient_json_updates.insert(target_message_id);
+                        }
                     }
+                }
+                if message_rows.len() < SALVAGE_MESSAGE_BATCH_ROWS {
+                    break;
                 }
             }
         }
@@ -4503,43 +4616,67 @@ fn merge_salvaged_database(
                     salvage_db_path.display()
                 ))
             })?;
-            let recipient_rows = salvage_conn
-                .query_sync(
-                &format!(
-                    "SELECT {recipient_select} FROM message_recipients ORDER BY message_id, agent_id, kind"
-                ),
-                &[],
-            )
-            .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: query recipients: {e}")))?;
+            // br-5mnkl: keyset-paginated read — one row per recipient of every
+            // message in the mailbox, so a full-table SELECT is unbounded.
+            // Every product schema has declared `message_recipients` as an
+            // ordinary rowid table (its composite PRIMARY KEY never uses
+            // WITHOUT ROWID) and SQLite rowids are >= 1, so a floor of 0 is
+            // exact and no row can be skipped or double-read across batches
+            // even when a legacy salvage source carries duplicate
+            // (message_id, agent_id) pairs. Per-row handling is
+            // order-independent, so rowid order is as deterministic as the
+            // previous composite ORDER BY.
+            let mut recipient_rowid_floor = 0i64;
+            loop {
+                let recipient_rows = salvage_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT rowid AS salvage_rowid, {recipient_select} \
+                             FROM message_recipients WHERE rowid > ? \
+                             ORDER BY rowid LIMIT {SALVAGE_RECIPIENT_BATCH_ROWS}"
+                        ),
+                        &[Value::BigInt(recipient_rowid_floor)],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!("reconstruct salvage: query recipients: {e}"))
+                    })?;
+                if recipient_rows.is_empty() {
+                    break;
+                }
 
-            for row in &recipient_rows {
-                let source_message_id = row.get_named::<i64>("message_id").map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: decode recipient message_id: {e}"
-                    ))
-                })?;
-                let source_agent_id = row.get_named::<i64>("agent_id").map_err(|e| {
+                for row in &recipient_rows {
+                    recipient_rowid_floor = row.get_named::<i64>("salvage_rowid").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode recipient salvage rowid: {e}"
+                        ))
+                    })?;
+                    let source_message_id = row.get_named::<i64>("message_id").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode recipient message_id: {e}"
+                        ))
+                    })?;
+                    let source_agent_id = row.get_named::<i64>("agent_id").map_err(|e| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: decode agent_id for message {source_message_id}: {e}"
                     ))
                 })?;
-                let target_agent_id = *agent_id_map.get(&source_agent_id).ok_or_else(|| {
+                    let target_agent_id = *agent_id_map.get(&source_agent_id).ok_or_else(|| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: recipient for message {source_message_id} references unmapped agent id {source_agent_id}"
                     ))
                 })?;
-                let target_agent_project_id = agent_project_id(&target_conn, target_agent_id)?
+                    let target_agent_project_id = agent_project_id(&target_conn, target_agent_id)?
                     .ok_or_else(|| {
                         DbError::Sqlite(format!(
                             "reconstruct salvage: mapped target agent {target_agent_id} is missing"
                         ))
                     })?;
-                let target_message_id = *message_id_map.get(&source_message_id).ok_or_else(|| {
+                    let target_message_id = *message_id_map.get(&source_message_id).ok_or_else(|| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: recipient references unmapped source-local message id {source_message_id}; refusing to attach state without a decoded salvage message identity"
                     ))
                 })?;
-                let target_message_project_id = message_project_id(
+                    let target_message_project_id = message_project_id(
                     &target_conn,
                     target_message_id,
                 )?
@@ -4548,22 +4685,22 @@ fn merge_salvaged_database(
                         "reconstruct salvage: mapped target message {target_message_id} is missing"
                     ))
                 })?;
-                if target_agent_project_id != target_message_project_id {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: recipient agent {source_agent_id} for message {source_message_id} maps outside the message project; refusing cross-project recipient state"
-                    )));
-                }
-                let raw_kind = row.get_named::<String>("kind").ok();
-                let kind = normalize_salvaged_recipient_kind(
-                    raw_kind.as_deref(),
-                    target_message_id,
-                    stats,
-                );
-                let read_ts = row.get_named::<i64>("read_ts").ok();
-                let ack_ts = row.get_named::<i64>("ack_ts").ok();
-                recipient_json_updates.insert(target_message_id);
+                    if target_agent_project_id != target_message_project_id {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: recipient agent {source_agent_id} for message {source_message_id} maps outside the message project; refusing cross-project recipient state"
+                        )));
+                    }
+                    let raw_kind = row.get_named::<String>("kind").ok();
+                    let kind = normalize_salvaged_recipient_kind(
+                        raw_kind.as_deref(),
+                        target_message_id,
+                        stats,
+                    );
+                    let read_ts = row.get_named::<i64>("read_ts").ok();
+                    let ack_ts = row.get_named::<i64>("ack_ts").ok();
+                    recipient_json_updates.insert(target_message_id);
 
-                let existing_rows = target_conn
+                    let existing_rows = target_conn
                     .query_sync(
                         "SELECT kind, read_ts, ack_ts FROM message_recipients \
                          WHERE message_id = ? AND agent_id = ? LIMIT 2",
@@ -4578,14 +4715,14 @@ fn merge_salvaged_database(
                         ))
                     })?;
 
-                if existing_rows.len() > 1 {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: message {target_message_id} and agent {target_agent_id} have multiple rows despite their stable recipient primary key"
-                    )));
-                }
+                    if existing_rows.len() > 1 {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: message {target_message_id} and agent {target_agent_id} have multiple rows despite their stable recipient primary key"
+                        )));
+                    }
 
-                if existing_rows.is_empty() {
-                    target_conn
+                    if existing_rows.is_empty() {
+                        target_conn
                         .execute_sync(
                             "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
                              VALUES (?, ?, ?, ?, ?)",
@@ -4602,29 +4739,29 @@ fn merge_salvaged_database(
                                 "reconstruct salvage: insert recipient for message {source_message_id}->{target_message_id}: {e}"
                             ))
                         })?;
-                    stats.salvaged_recipients += 1;
-                    continue;
-                }
+                        stats.salvaged_recipients += 1;
+                        continue;
+                    }
 
-                let existing_row = &existing_rows[0];
-                let current_kind = existing_row.get_named::<String>("kind").map_err(|e| {
+                    let existing_row = &existing_rows[0];
+                    let current_kind = existing_row.get_named::<String>("kind").map_err(|e| {
                     DbError::Sqlite(format!(
                         "reconstruct salvage: decode recipient kind for message {target_message_id}: {e}"
                     ))
                 })?;
-                if current_kind != kind {
-                    return Err(DbError::Sqlite(format!(
-                        "reconstruct salvage: recipient ({target_message_id}, {target_agent_id}) has conflicting kinds {current_kind:?} and {kind:?}; refusing a primary-key collision"
-                    )));
-                }
-                let current_read_ts = existing_row
-                    .get_named::<Option<i64>>("read_ts")
-                    .unwrap_or_default();
-                let current_ack_ts = existing_row
-                    .get_named::<Option<i64>>("ack_ts")
-                    .unwrap_or_default();
-                if current_read_ts != read_ts || current_ack_ts != ack_ts {
-                    target_conn
+                    if current_kind != kind {
+                        return Err(DbError::Sqlite(format!(
+                            "reconstruct salvage: recipient ({target_message_id}, {target_agent_id}) has conflicting kinds {current_kind:?} and {kind:?}; refusing a primary-key collision"
+                        )));
+                    }
+                    let current_read_ts = existing_row
+                        .get_named::<Option<i64>>("read_ts")
+                        .unwrap_or_default();
+                    let current_ack_ts = existing_row
+                        .get_named::<Option<i64>>("ack_ts")
+                        .unwrap_or_default();
+                    if current_read_ts != read_ts || current_ack_ts != ack_ts {
+                        target_conn
                         .execute_sync(
                             "UPDATE message_recipients SET \
                                  read_ts = ?, ack_ts = ? \
@@ -4641,7 +4778,11 @@ fn merge_salvaged_database(
                                 "reconstruct salvage: update recipient state for message {source_message_id}->{target_message_id}: {e}"
                             ))
                         })?;
-                    stats.salvaged_recipients += 1;
+                        stats.salvaged_recipients += 1;
+                    }
+                }
+                if recipient_rows.len() < SALVAGE_RECIPIENT_BATCH_ROWS {
+                    break;
                 }
             }
         }
@@ -4733,7 +4874,7 @@ fn merge_salvaged_database(
     }
     drop(target_conn);
     if let Err(e) = crate::pool::wal_checkpoint_truncate_path(target_db_path) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Salvage merge committed, but WAL checkpoint failed for {}: {e}",
             target_db_path.display()
         ));
@@ -4756,7 +4897,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
     let fallback = synthetic_project_placeholder_human_key(slug);
 
     if !is_real_file(&metadata_path) {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Missing {}; using fallback human_key '{}'",
             metadata_path.display(),
             fallback
@@ -4768,7 +4909,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         Ok(s) => s,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot read {}: {e}; using fallback human_key '{}'",
                 metadata_path.display(),
                 fallback
@@ -4781,7 +4922,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         Ok(v) => v,
         Err(e) => {
             stats.parse_errors += 1;
-            stats.warnings.push(format!(
+            stats.push_warning(format!(
                 "Cannot parse {}: {e}; using fallback human_key '{}'",
                 metadata_path.display(),
                 fallback
@@ -4797,7 +4938,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         .filter(|s| !s.is_empty())
     else {
         stats.parse_errors += 1;
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Missing/empty human_key in {}; using fallback human_key '{}'",
             metadata_path.display(),
             fallback
@@ -4807,7 +4948,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
 
     if !Path::new(human_key).is_absolute() {
         stats.parse_errors += 1;
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Non-absolute human_key '{}' in {}; using fallback human_key '{}'",
             human_key,
             metadata_path.display(),
@@ -4823,7 +4964,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
         .filter(|s| !s.is_empty())
         && metadata_slug != slug
     {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Project metadata slug mismatch in {}: dir slug='{}', metadata slug='{}'",
             metadata_path.display(),
             slug,
@@ -4909,7 +5050,7 @@ fn normalize_reconstructed_required_agent_field(
     };
     let normalized = raw.trim();
     if normalized.is_empty() {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reconstruct {source} had empty {field}; defaulting to {fallback:?}"
         ));
         fallback.to_string()
@@ -4930,7 +5071,7 @@ fn normalize_reconstructed_attachments_policy(
     if VALID_RECONSTRUCTED_ATTACHMENTS_POLICIES.contains(&normalized.as_str()) {
         normalized
     } else {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reconstruct {source} had invalid attachments_policy {raw:?}; defaulting to \"auto\""
         ));
         "auto".to_string()
@@ -4949,7 +5090,7 @@ fn normalize_reconstructed_contact_policy(
     if VALID_RECONSTRUCTED_CONTACT_POLICIES.contains(&normalized.as_str()) {
         normalized
     } else {
-        stats.warnings.push(format!(
+        stats.push_warning(format!(
             "Reconstruct {source} had invalid contact_policy {raw:?}; defaulting to \"auto\""
         ));
         "auto".to_string()
@@ -5502,6 +5643,7 @@ mod tests {
             salvaged_reservation_releases: 0,
             parse_errors: 3,
             warnings: vec![],
+            suppressed_warnings: 0,
             duplicate_canonical_id_set: BTreeSet::new(),
         };
         let display = stats.to_string();
@@ -7491,6 +7633,246 @@ archive body
         );
     }
 
+    /// br-5mnkl: the salvage reads are keyset-paginated so the startup
+    /// self-heal path can never materialize the whole `messages` /
+    /// `message_recipients` tables at once. This exercises multiple batch
+    /// boundaries for both tables and proves no row is dropped or
+    /// double-merged at the seams.
+    #[test]
+    fn salvage_merge_pages_large_tables_across_keyset_batches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_paged.db");
+        let salvage_db_path = tmp.path().join("salvage_paged.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        std::fs::create_dir_all(&agent_dir).expect("create archive agent dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":0}"#,
+        )
+        .expect("write project.json");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-02-22T00:00:00Z","last_active_ts":"2026-02-22T00:00:00Z"}"#,
+        )
+        .expect("write profile.json");
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    subject TEXT,
+                    body_md TEXT,
+                    created_ts INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE message_recipients (
+                    message_id INTEGER NOT NULL,
+                    agent_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    read_ts INTEGER,
+                    ack_ts INTEGER
+                )",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (100, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name) VALUES
+                    (10, 100, 'Alice'),
+                    (11, 100, 'Bob'),
+                    (12, 100, 'Carol'),
+                    (13, 100, 'Dave'),
+                    (14, 100, 'Erin')",
+                &[],
+            )
+            .unwrap();
+
+        // 2 full message batches + a partial third; 4 recipients per message
+        // crosses the (larger) recipient batch size at a non-aligned offset.
+        let message_count = SALVAGE_MESSAGE_BATCH_ROWS * 2 + 7;
+        let recipient_agent_ids = [11i64, 12, 13, 14];
+        let recipient_count = message_count * recipient_agent_ids.len();
+        assert!(
+            recipient_count > SALVAGE_RECIPIENT_BATCH_ROWS,
+            "fixture must force at least two recipient batches"
+        );
+        let message_values = (1..=message_count)
+            .map(|id| format!("({id}, 100, 10, 'subject {id}', 'body {id}', {id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        salvage_conn
+            .query_sync(
+                &format!(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES {message_values}"
+                ),
+                &[],
+            )
+            .unwrap();
+        let recipient_values = (1..=message_count)
+            .flat_map(|message_id| {
+                recipient_agent_ids.iter().map(move |agent_id| {
+                    format!("({message_id}, {agent_id}, 'to', {message_id}, NULL)")
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        salvage_conn
+            .query_sync(
+                &format!(
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES {recipient_values}"
+                ),
+                &[],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("paged salvage merge should succeed");
+        assert_eq!(stats.salvaged_messages, message_count);
+        assert_eq!(stats.salvaged_recipients, recipient_count);
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let count_row = |sql: &str| -> i64 {
+            conn.query_sync(sql, &[]).expect("count query")[0]
+                .get_named::<i64>("n")
+                .expect("count value")
+        };
+        assert_eq!(
+            count_row("SELECT COUNT(*) AS n FROM messages"),
+            i64::try_from(message_count).unwrap(),
+            "every salvaged message must survive the batch seams exactly once"
+        );
+        assert_eq!(
+            count_row("SELECT COUNT(*) AS n FROM message_recipients"),
+            i64::try_from(recipient_count).unwrap(),
+            "every salvaged recipient must survive the batch seams exactly once"
+        );
+        assert_eq!(
+            count_row("SELECT COUNT(DISTINCT message_id) AS n FROM message_recipients"),
+            i64::try_from(message_count).unwrap(),
+        );
+        // Boundary rows: the last message of a full batch and the first of the
+        // next batch must both exist with intact content and recipient state.
+        for boundary_id in [
+            i64::try_from(SALVAGE_MESSAGE_BATCH_ROWS).unwrap(),
+            i64::try_from(SALVAGE_MESSAGE_BATCH_ROWS + 1).unwrap(),
+            i64::try_from(message_count).unwrap(),
+        ] {
+            let subject_rows = conn
+                .query_sync(
+                    "SELECT subject FROM messages WHERE id = ?",
+                    &[Value::BigInt(boundary_id)],
+                )
+                .expect("boundary subject query");
+            assert_eq!(subject_rows.len(), 1, "message {boundary_id} must exist");
+            assert_eq!(
+                subject_rows[0]
+                    .get_named::<String>("subject")
+                    .expect("subject"),
+                format!("subject {boundary_id}")
+            );
+            let read_rows = conn
+                .query_sync(
+                    "SELECT COUNT(*) AS n FROM message_recipients WHERE message_id = ? AND read_ts = ?",
+                    &[Value::BigInt(boundary_id), Value::BigInt(boundary_id)],
+                )
+                .expect("boundary recipient query");
+            assert_eq!(
+                read_rows[0].get_named::<i64>("n").expect("count"),
+                i64::try_from(recipient_agent_ids.len()).unwrap(),
+                "recipient state for message {boundary_id} must survive intact"
+            );
+        }
+    }
+
+    /// br-5mnkl: `collect_db_message_ids` is keyset-paginated; an exact
+    /// batch-multiple table (including non-positive ids, which only the
+    /// floorless first batch can see) must round-trip completely.
+    #[test]
+    fn collect_db_message_ids_pages_exact_batch_multiple_with_nonpositive_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("ids_paged.db");
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        // -3, 0, and 1..=(BATCH-2): exactly one full batch, so the pager must
+        // issue a second (empty) probe and terminate without dropping rows.
+        let positive_max = i64::try_from(DB_MESSAGE_ID_BATCH_ROWS - 2).unwrap();
+        let values = std::iter::once("(-3)".to_string())
+            .chain(std::iter::once("(0)".to_string()))
+            .chain((1..=positive_max).map(|id| format!("({id})")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.query_sync(&format!("INSERT INTO messages (id) VALUES {values}"), &[])
+            .unwrap();
+        drop(conn);
+
+        let ids = collect_db_message_ids(&db_path).expect("collect ids");
+        assert_eq!(ids.len(), DB_MESSAGE_ID_BATCH_ROWS);
+        assert!(
+            ids.contains(&-3),
+            "floorless first batch must keep negative ids"
+        );
+        assert!(ids.contains(&0), "floorless first batch must keep id 0");
+        assert!(ids.contains(&positive_max));
+    }
+
+    /// br-5mnkl: the warning vector itself must stay bounded on pathological
+    /// archives; overflow is counted, not itemized, and surfaced in Display.
+    #[test]
+    fn push_warning_caps_itemization_and_counts_suppressed() {
+        let mut stats = ReconstructStats::default();
+        for i in 0..(MAX_ITEMIZED_WARNINGS + 7) {
+            stats.push_warning(format!("warning {i}"));
+        }
+        assert_eq!(stats.warnings.len(), MAX_ITEMIZED_WARNINGS);
+        assert_eq!(stats.suppressed_warnings, 7);
+        assert_eq!(stats.warnings[0], "warning 0");
+        assert_eq!(
+            stats.warnings[MAX_ITEMIZED_WARNINGS - 1],
+            format!("warning {}", MAX_ITEMIZED_WARNINGS - 1)
+        );
+        let display = stats.to_string();
+        assert!(
+            display.contains("suppressed 7 warning(s)"),
+            "display must surface the suppressed count, got: {display}"
+        );
+    }
+
     #[test]
     fn reconstruct_with_salvage_remaps_cross_project_message_id_and_recipient_state() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -7898,7 +8280,7 @@ archive body
             )
             .expect("insert salvage agent");
 
-        FAIL_SALVAGE_MERGE_AFTER_PROJECTS.store(true, std::sync::atomic::Ordering::SeqCst);
+        FAIL_SALVAGE_MERGE_AFTER_PROJECTS.with(|hook| hook.set(true));
         let error =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
                 .expect_err("forced late salvage failure must block candidate promotion");
@@ -7996,7 +8378,7 @@ archive body
             )
             .unwrap();
 
-        FAIL_SALVAGE_QUERY_MESSAGES.store(true, std::sync::atomic::Ordering::SeqCst);
+        FAIL_SALVAGE_QUERY_MESSAGES.with(|hook| hook.set(true));
         let error =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
                 .expect_err("corrupt salvage source must block candidate promotion");

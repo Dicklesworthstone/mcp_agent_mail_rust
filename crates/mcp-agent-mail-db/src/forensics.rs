@@ -524,13 +524,27 @@ fn bundle_rel_path(bundle_dir: &Path, path: &Path) -> Result<String, SqlError> {
 }
 
 fn bundle_sha256(path: &Path) -> Result<String, SqlError> {
-    let bytes = std::fs::read(path).map_err(|error| {
+    // br-5mnkl: stream the hash. This runs on the automatic startup-recovery
+    // path against copies of the live SQLite database, so reading the whole
+    // artifact into memory spikes RSS by the full database size.
+    use std::io::Read as _;
+    let hash_error = |error: std::io::Error| {
         SqlError::Custom(format!(
             "failed to read forensic artifact {} for hashing: {error}",
             path.display()
         ))
-    })?;
-    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+    };
+    let mut file = std::fs::File::open(path).map_err(hash_error)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(hash_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn recovery_sha256(bytes: &[u8]) -> String {
