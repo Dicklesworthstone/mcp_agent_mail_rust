@@ -509,6 +509,15 @@ impl TestEnv {
             ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
             ("HTTP_PORT".to_string(), "1".to_string()),
             ("HTTP_PATH".to_string(), "/mcp/".to_string()),
+            // Widen the doctor version-probe budget: the hermetic-home copy of
+            // am is the real (large) binary, and a cold start on a host
+            // saturated by compile load can blow the default 3s budget,
+            // flipping doctor_check ok->warn through the same aggregate
+            // fields br-m105n pinned for beads (br-uxmqz).
+            (
+                "AM_DOCTOR_VERSION_PROBE_TIMEOUT_SECS".to_string(),
+                "15".to_string(),
+            ),
         ]
     }
 }

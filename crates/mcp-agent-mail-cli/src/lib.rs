@@ -27951,7 +27951,46 @@ fn doctor_find_first_path_binary(binary_name: &str) -> Option<PathBuf> {
         .find(|candidate| doctor_path_is_executable_file(candidate))
 }
 
+/// Parses the per-attempt `--version` probe budget from a raw env value.
+/// Defaults to 3s; explicit values are clamped to 1..=60s.
+fn doctor_version_probe_timeout_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(3, |secs| secs.clamp(1, 60))
+}
+
+fn doctor_version_probe_timeout_secs() -> u64 {
+    doctor_version_probe_timeout_secs_from(
+        std::env::var("AM_DOCTOR_VERSION_PROBE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Runs `<binary> --version` with a bounded per-attempt budget, retrying a
+/// timed-out probe once.
+///
+/// A cold start of the (large) am binary on a host saturated by compile load
+/// can exceed the historical fixed 3s budget, flipping snapshot doctor runs
+/// from ok to warn (br-uxmqz). The retry hits a warm page cache and stays
+/// fast for healthy binaries, while a genuinely hung binary still fails
+/// within 2x the budget. `AM_DOCTOR_VERSION_PROBE_TIMEOUT_SECS` widens the
+/// per-attempt budget on hosts where even a retried cold start is slow.
 fn doctor_run_version_line(path: &Path) -> Result<String, String> {
+    doctor_run_version_line_with_timeout(path, doctor_version_probe_timeout_secs())
+}
+
+fn doctor_run_version_line_with_timeout(path: &Path, timeout_secs: u64) -> Result<String, String> {
+    match doctor_run_version_line_once(path, timeout_secs) {
+        Err(first_error) if first_error.contains("timed out") => {
+            doctor_run_version_line_once(path, timeout_secs).map_err(|retry_error| {
+                format!("{retry_error} (after retry; first attempt: {first_error})")
+            })
+        }
+        result => result,
+    }
+}
+
+fn doctor_run_version_line_once(path: &Path, timeout_secs: u64) -> Result<String, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -27979,7 +28018,7 @@ fn doctor_run_version_line(path: &Path) -> Result<String, String> {
         })
     });
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -27987,7 +28026,10 @@ fn doctor_run_version_line(path: &Path) -> Result<String, String> {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("{} --version timed out after 3s", path.display()));
+                    return Err(format!(
+                        "{} --version timed out after {timeout_secs}s",
+                        path.display()
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -54085,6 +54127,57 @@ startup_timeout_sec = 42
             }
             other => panic!("expected e2e list, got {other:?}"),
         }
+    }
+
+    // ── doctor version probe budget + retry (br-uxmqz) ──────────────────
+
+    #[test]
+    fn doctor_version_probe_timeout_parses_clamps_and_defaults() {
+        assert_eq!(doctor_version_probe_timeout_secs_from(None), 3);
+        assert_eq!(doctor_version_probe_timeout_secs_from(Some("")), 3);
+        assert_eq!(doctor_version_probe_timeout_secs_from(Some("abc")), 3);
+        assert_eq!(doctor_version_probe_timeout_secs_from(Some("-2")), 3);
+        assert_eq!(doctor_version_probe_timeout_secs_from(Some(" 5 ")), 5);
+        assert_eq!(doctor_version_probe_timeout_secs_from(Some("0")), 1);
+        assert_eq!(doctor_version_probe_timeout_secs_from(Some("999")), 60);
+    }
+
+    #[cfg(unix)]
+    fn write_probe_script(dir: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-am");
+        std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).expect("write script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_version_probe_times_out_twice_and_reports_retry() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_probe_script(temp.path(), "sleep 30\necho 'am 9.9.9'");
+        let error = doctor_run_version_line_with_timeout(&script, 1)
+            .expect_err("hung probe must fail after retry");
+        assert!(error.contains("timed out after 1s"), "{error}");
+        assert!(error.contains("after retry"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_version_probe_retry_recovers_from_slow_cold_start() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let marker = temp.path().join("warm");
+        let script = write_probe_script(
+            temp.path(),
+            &format!(
+                "if [ ! -e '{m}' ]; then touch '{m}'; sleep 30; fi\necho 'am 0.0.1'",
+                m = marker.display()
+            ),
+        );
+        let line = doctor_run_version_line_with_timeout(&script, 1)
+            .expect("retry must recover once the cold start is over");
+        assert_eq!(line, "am 0.0.1");
     }
 
     #[test]
