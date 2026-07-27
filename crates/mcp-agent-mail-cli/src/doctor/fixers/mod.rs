@@ -49,6 +49,7 @@ pub mod mcp_duplicate_aliased_server_entries;
 pub mod missing_gitignore_entry;
 pub mod missing_head_or_broken_git_shape;
 pub mod missing_or_malformed_project_json;
+pub mod orphan_doctor_run_dirs;
 pub mod orphan_foreign_key_rows;
 pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
@@ -564,6 +565,15 @@ pub fn registry() -> Vec<FixerSpec> {
             source_module: "doctor::fixers::dangling_doctor_latest",
         },
         FixerSpec {
+            id: orphan_doctor_run_dirs::FM_ID,
+            severity: "P2",
+            subsystem: "doctor_state_files",
+            op_pattern: "Op::Rename",
+            auto_fixable: true,
+            one_line_description: "scaffold-time-death .doctor/runs/<id> dirs (no report.json, no recorded actions) wedge `am doctor health` at exit 1",
+            source_module: "doctor::fixers::orphan_doctor_run_dirs",
+        },
+        FixerSpec {
             id: am_git_binary_missing::FM_ID,
             severity: "P0",
             subsystem: "environment_toolchain",
@@ -916,6 +926,14 @@ pub struct DispatchInputs {
     /// Path to the `<repo>/.doctor/latest` symlink for the
     /// `dangling_doctor_latest` FM. `None` skips the FM.
     pub doctor_latest_target: Option<std::path::PathBuf>,
+    /// Path to the `<repo>/.doctor/runs` directory for the
+    /// `orphan_doctor_run_dirs` FM. `None` skips the FM.
+    pub doctor_runs_dir: Option<std::path::PathBuf>,
+    /// Test-only override for the `orphan_doctor_run_dirs` age gate.
+    /// `None` (the production default) uses
+    /// [`orphan_doctor_run_dirs::DEFAULT_MIN_AGE_SECONDS`]; tests pass
+    /// `Some(0)` to flag fixture dirs immediately.
+    pub orphan_run_dir_min_age_override: Option<u64>,
     /// Optional override for the per-FM mtime-based staleness threshold.
     ///
     /// `None` (the production default) means each stale-* FM uses its
@@ -1743,6 +1761,28 @@ pub fn dispatch_only(
             outcome.actions_taken += result.actions_taken;
             outcome.actions_skipped += result.actions_skipped;
         }
+    } else if fm_id == orphan_doctor_run_dirs::FM_ID {
+        let runs_dir = inputs
+            .doctor_runs_dir
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: orphan_doctor_run_dirs::FM_ID,
+                field: "doctor_runs_dir",
+            })?;
+        let min_age = inputs
+            .orphan_run_dir_min_age_override
+            .unwrap_or(orphan_doctor_run_dirs::DEFAULT_MIN_AGE_SECONDS);
+        // Exclude this invocation's own run dir — it is a fresh
+        // scaffold and always matches the orphan predicate mid-run.
+        let findings = orphan_doctor_run_dirs::detect(runs_dir, min_age, Some(&ctx.run_dir));
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            let result = orphan_doctor_run_dirs::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+            outcome.quarantined_paths.extend(result.quarantined_paths);
+        }
     } else if fm_id == wrong_mcp_url_json::FM_ID {
         let canonical = inputs
             .canonical_mcp_url
@@ -2283,6 +2323,22 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .iter()
             .map(|f| f.to_finding())
             .collect()
+    } else if fm_id == orphan_doctor_run_dirs::FM_ID {
+        let runs_dir = inputs
+            .doctor_runs_dir
+            .as_deref()
+            .ok_or(DispatchError::MissingInput {
+                fm_id: orphan_doctor_run_dirs::FM_ID,
+                field: "doctor_runs_dir",
+            })?;
+        let min_age = inputs
+            .orphan_run_dir_min_age_override
+            .unwrap_or(orphan_doctor_run_dirs::DEFAULT_MIN_AGE_SECONDS);
+        // List mode scaffolds no run dir, so there is nothing to exclude.
+        orphan_doctor_run_dirs::detect(runs_dir, min_age, None)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
     } else if fm_id == wrong_mcp_url_json::FM_ID {
         let canonical = inputs
             .canonical_mcp_url
@@ -2603,6 +2659,8 @@ mod tests {
             gitignore_target: None,
             db_file_candidates: Vec::new(),
             doctor_latest_target: None,
+            doctor_runs_dir: None,
+            orphan_run_dir_min_age_override: None,
             stale_seconds_override: None,
             missing_project_json_detect_override: None,
             quarantined_bak_detect: None,

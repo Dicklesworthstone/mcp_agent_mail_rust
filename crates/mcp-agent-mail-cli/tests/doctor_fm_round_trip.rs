@@ -134,6 +134,8 @@ fn empty_inputs(td: &TempDir) -> DispatchInputs {
         gitignore_target: None,
         db_file_candidates: Vec::new(),
         doctor_latest_target: None,
+        doctor_runs_dir: None,
+        orphan_run_dir_min_age_override: None,
         stale_seconds_override: None,
         missing_project_json_detect_override: None,
         quarantined_bak_detect: None,
