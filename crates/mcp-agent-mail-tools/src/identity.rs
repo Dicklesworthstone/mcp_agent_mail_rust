@@ -2068,7 +2068,9 @@ pub async fn whois(
         let config = &Config::get();
         match mcp_agent_mail_storage::ensure_archive(config, &project.slug) {
             Ok(archive) => {
-                let path_filter = format!("projects/{}/agents/{}", project.slug, agent_row.name);
+                // Project-relative: get_recent_commits applies the
+                // projects/<slug>/ repo prefix itself.
+                let path_filter = format!("agents/{}", agent_row.name);
                 match mcp_agent_mail_storage::get_recent_commits(
                     &archive,
                     limit,

@@ -8312,15 +8312,29 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
 // ---------------------------------------------------------------------------
 
 /// Get recent commits from the archive repository.
+///
+/// `path_filter` is relative to the project's archive root (e.g.
+/// `agents/BlueLake`); the `projects/<slug>/` repo prefix is applied
+/// internally.
 pub fn get_recent_commits(
     archive: &ProjectArchive,
     limit: usize,
     path_filter: Option<&str>,
 ) -> Result<Vec<CommitInfo>> {
     let repo = open_archive_repo_checked(archive)?;
+    // The filter is PROJECT-relative (e.g. `agents/BlueLake`). The shared
+    // archive repo nests every project under `projects/<slug>/`, so the tree
+    // lookup needs the repo-relative form. Prefixing here — instead of making
+    // every caller re-derive it — keeps the `ProjectArchive`-scoped contract
+    // honest: a caller cannot accidentally filter on another project or pass a
+    // project-relative path that silently matches nothing (br-mz7k6).
     let path_filter = path_filter
-        .map(|filter| validate_repo_relative_path("path filter", filter))
+        .map(|filter| {
+            validate_repo_relative_path("path filter", filter)
+                .map(|filter| format!("projects/{}/{}", archive.slug, filter))
+        })
         .transpose()?;
+    let path_filter = path_filter.as_deref();
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
@@ -14670,7 +14684,8 @@ mod tests {
         );
         flush_async_commits();
 
-        let commits = get_recent_commits(&archive, 10, Some(&rel)).unwrap();
+        let commits =
+            get_recent_commits(&archive, 10, Some("agents/DeleteAgent/profile.json")).unwrap();
         assert!(
             commits
                 .iter()
@@ -17730,6 +17745,12 @@ mod tests {
             r#"{"a":1}"#,
             "touch AgentA",
         );
+        // Commit times have one-second resolution and the budget walk below
+        // relies on Sort::TIME ordering; same-second ties break arbitrarily
+        // (on fast hosts all six commits land in one second and the AgentA
+        // commit can be visited inside the budget window). Guarantee the
+        // AgentB commits are strictly newer.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         for i in 0..5 {
             commit_file(
                 "agents/AgentB",
