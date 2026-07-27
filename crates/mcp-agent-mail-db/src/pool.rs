@@ -912,14 +912,100 @@ where
         return operation();
     }
 
+    // br-acusl: durable non-convergence circuit breaker. The in-process
+    // admission below (single-flight + backoff + window suppression) is
+    // Instant-based and process-local, so a restarting or long-looping
+    // daemon still re-attempts an unrepairable database forever — each
+    // attempt capturing a forensic bundle. The breaker persists consecutive
+    // failures for the SAME database content in a sidecar and refuses HERE,
+    // before any capture, until the cooldown elapses, the content changes,
+    // or an operator path runs under RecoveryBreakerBypassGuard.
+    let breaker_config = crate::recovery_breaker::config_from_env();
+    let breaker_fingerprint = crate::recovery_breaker::fingerprint_db(primary_path);
+    let breaker_prior = crate::recovery_breaker::load(primary_path);
+    let now_unix = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs()),
+    )
+    .unwrap_or(i64::MAX);
+    let breaker_verdict = crate::recovery_breaker::evaluate(
+        breaker_prior.as_ref(),
+        &breaker_fingerprint,
+        breaker_config,
+        now_unix,
+    );
+    if let crate::recovery_breaker::BreakerVerdict::Refuse {
+        consecutive_failures,
+        retry_after_secs,
+        last_failure_reason,
+    } = &breaker_verdict
+    {
+        if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
+            tracing::warn!(
+                path = %primary_path.display(),
+                consecutive_failures,
+                "recovery breaker is tripped, but an operator-invoked path holds the bypass; attempting"
+            );
+        } else {
+            return Err(SqlError::Custom(format!(
+                "{action} for {} is circuit-broken: {consecutive_failures} consecutive automatic \
+                 recovery attempts failed on this same database content (last error: \
+                 {last_failure_reason}). Refusing to re-attempt (and re-capture forensics) for \
+                 another {retry_after_secs}s. Operator paths are exempt: run `am doctor repair` \
+                 or `am doctor reconstruct` to intervene now, or quarantine the file (move \
+                 {}* aside) to rebuild from the Git archive.",
+                primary_path.display(),
+                primary_path.display(),
+            )));
+        }
+    }
+    if matches!(
+        breaker_verdict,
+        crate::recovery_breaker::BreakerVerdict::AllowHalfOpen
+    ) {
+        tracing::warn!(
+            path = %primary_path.display(),
+            "recovery breaker cooldown elapsed; admitting one half-open automatic recovery probe"
+        );
+    }
+
     let Some(_guard) = recovery_admission().try_acquire(primary_path) else {
         return Err(recovery_admission_blocked_error(primary_path, action));
     };
     let _depth_guard = RecoveryAdmissionDepthGuard::enter();
     let result = operation();
     match &result {
-        Ok(_) => recovery_admission().report_success(primary_path),
-        Err(error) => recovery_admission().report_failure(primary_path, &error.to_string()),
+        Ok(_) => {
+            recovery_admission().report_success(primary_path);
+            crate::recovery_breaker::store(
+                primary_path,
+                &crate::recovery_breaker::cleared_state(&crate::recovery_breaker::fingerprint_db(
+                    primary_path,
+                )),
+            );
+        }
+        Err(error) => {
+            recovery_admission().report_failure(primary_path, &error.to_string());
+            let failed = crate::recovery_breaker::record_failure(
+                breaker_prior.as_ref(),
+                &breaker_fingerprint,
+                &error.to_string(),
+                breaker_config,
+                now_unix,
+            );
+            if failed.tripped {
+                tracing::error!(
+                    path = %primary_path.display(),
+                    consecutive_failures = failed.consecutive_failures,
+                    cooldown_secs = breaker_config.cooldown_secs,
+                    "automatic recovery keeps failing on the same database content; circuit \
+                     breaker TRIPPED — further automatic attempts (and forensic captures) are \
+                     parked. Intervene with `am doctor repair` / `am doctor reconstruct`."
+                );
+            }
+            crate::recovery_breaker::store(primary_path, &failed);
+        }
     }
     result
 }
@@ -14964,6 +15050,124 @@ mod tests {
         assert!(
             !find_files_with_content(dir.path(), b"corrupted-data").is_empty(),
             "the damaged source must be preserved as a quarantined artifact for operator review"
+        );
+    }
+
+    /// br-acusl: the durable circuit breaker parks repeated AUTOMATIC
+    /// recovery failures on the same database content — refusing BEFORE the
+    /// admitted operation (which is what captures forensic bundles) ever
+    /// runs — while operator paths bypass, content changes reset, and
+    /// success clears.
+    #[test]
+    fn recovery_breaker_parks_repeated_automatic_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"stubbornly-corrupt-content").unwrap();
+        let fail_op = || Err::<(), _>(SqlError::Custom("synthetic recovery failure".to_string()));
+
+        // Default threshold is 3 consecutive failures on the same content.
+        for attempt in 0..3 {
+            recovery_admission().reset();
+            let error = with_recovery_admission(&db, "test recovery", fail_op)
+                .expect_err("synthetic recovery must fail");
+            assert!(
+                error.to_string().contains("synthetic recovery failure"),
+                "attempt {attempt} must reach the operation: {error}"
+            );
+        }
+        let state = crate::recovery_breaker::load(&db).expect("breaker sidecar must persist");
+        assert!(state.tripped, "third same-content failure must trip");
+        assert_eq!(state.consecutive_failures, 3);
+
+        // The next automatic attempt is refused before the operation runs.
+        recovery_admission().reset();
+        let refused = with_recovery_admission::<(), _>(&db, "test recovery", || {
+            panic!("operation (and its forensic capture) must not run while circuit-broken")
+        })
+        .expect_err("tripped breaker must refuse");
+        let refused_text = refused.to_string();
+        assert!(
+            refused_text.contains("circuit-broken")
+                && refused_text.contains("am doctor repair")
+                && refused_text.contains("am doctor reconstruct"),
+            "refusal must be actionable: {refused_text}"
+        );
+
+        // An operator-invoked path bypasses the breaker and reaches the op.
+        recovery_admission().reset();
+        {
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+            let error = with_recovery_admission(&db, "test recovery", fail_op)
+                .expect_err("bypassed attempt still fails");
+            assert!(
+                error.to_string().contains("synthetic recovery failure"),
+                "operator bypass must reach the operation: {error}"
+            );
+        }
+
+        // Changed database content is a new problem: allowed, count restarts.
+        std::fs::write(&db, b"different-content-after-operator-intervention").unwrap();
+        recovery_admission().reset();
+        let error = with_recovery_admission(&db, "test recovery", fail_op)
+            .expect_err("synthetic recovery must fail");
+        assert!(error.to_string().contains("synthetic recovery failure"));
+        let state = crate::recovery_breaker::load(&db).expect("sidecar");
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "fingerprint change must restart the count"
+        );
+        assert!(!state.tripped);
+
+        // Success clears the breaker durably (sidecar overwritten, not deleted).
+        recovery_admission().reset();
+        with_recovery_admission(&db, "test recovery", || Ok(())).expect("successful recovery");
+        let cleared = crate::recovery_breaker::load(&db).expect("cleared sidecar persists");
+        assert!(!cleared.tripped);
+        assert_eq!(cleared.consecutive_failures, 0);
+    }
+
+    /// br-acusl: the production automatic archive-recovery entry refuses
+    /// with the breaker verdict and captures NO forensic bundle.
+    #[test]
+    fn tripped_breaker_blocks_automatic_archive_recovery_without_forensics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo","human_key":"/demo"}"#,
+        )
+        .unwrap();
+        std::fs::write(&db, b"corrupted-data").unwrap();
+
+        // Trip the breaker for this exact content via synthetic failures.
+        let fail_op = || Err::<(), _>(SqlError::Custom("synthetic recovery failure".to_string()));
+        for _ in 0..3 {
+            recovery_admission().reset();
+            let _ = with_recovery_admission(&db, "test recovery", fail_op);
+        }
+        assert!(
+            crate::recovery_breaker::load(&db).expect("sidecar").tripped,
+            "fixture must start tripped"
+        );
+
+        recovery_admission().reset();
+        let error = ensure_sqlite_file_healthy_with_archive(&db, &storage_root)
+            .expect_err("automatic archive recovery must be refused while circuit-broken");
+        assert!(
+            error.to_string().contains("circuit-broken"),
+            "production path must surface the breaker verdict: {error}"
+        );
+        assert!(
+            !storage_root.join("doctor").join("forensics").exists(),
+            "a refused attempt must not capture any forensic bundle"
+        );
+        assert_eq!(
+            std::fs::read(&db).expect("db untouched"),
+            b"corrupted-data",
+            "a refused attempt must not touch the database"
         );
     }
 

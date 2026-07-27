@@ -55,6 +55,7 @@ pub mod path_order_shadows_am;
 pub mod port_bound_by_foreign_process;
 pub mod quarantined_bak_files;
 pub mod recovered_tree_shadow;
+pub mod recovery_breaker_tripped;
 pub mod reservation_db_archive_parity;
 pub mod retained_autocommit_leak;
 pub mod runtime_pid_hint_symlink_toctou;
@@ -478,6 +479,15 @@ pub fn registry() -> Vec<FixerSpec> {
             auto_fixable: true,
             one_line_description: "PRAGMA foreign_key_check reports orphan child rows (stale file_reservations/file_reservation_releases auto-fix via DbExec quarantine; message history preserved)",
             source_module: "doctor::fixers::orphan_foreign_key_rows",
+        },
+        FixerSpec {
+            id: recovery_breaker_tripped::FM_ID,
+            severity: "P1",
+            subsystem: "db_state_files",
+            op_pattern: "detect-only",
+            auto_fixable: false,
+            one_line_description: "automatic recovery is circuit-broken after repeated same-content failures; operator intervention required",
+            source_module: "doctor::fixers::recovery_breaker_tripped",
         },
         FixerSpec {
             id: reservation_db_archive_parity::FM_ID,
@@ -1783,6 +1793,16 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
             outcome.quarantined_paths.extend(result.quarantined_paths);
         }
+    } else if fm_id == recovery_breaker_tripped::FM_ID {
+        let findings = recovery_breaker_tripped::detect(&inputs.db_file_candidates);
+        outcome.findings_count = findings.len();
+        for f in &findings {
+            outcome.findings.push(f.to_finding());
+            // Detect-only — fix is a no-op.
+            let result = recovery_breaker_tripped::fix(ctx, f)?;
+            outcome.actions_taken += result.actions_taken;
+            outcome.actions_skipped += result.actions_skipped;
+        }
     } else if fm_id == wrong_mcp_url_json::FM_ID {
         let canonical = inputs
             .canonical_mcp_url
@@ -2336,6 +2356,11 @@ pub fn detect_only(fm_id: &str, inputs: &DispatchInputs) -> Result<DetectOutcome
             .unwrap_or(orphan_doctor_run_dirs::DEFAULT_MIN_AGE_SECONDS);
         // List mode scaffolds no run dir, so there is nothing to exclude.
         orphan_doctor_run_dirs::detect(runs_dir, min_age, None)
+            .iter()
+            .map(|f| f.to_finding())
+            .collect()
+    } else if fm_id == recovery_breaker_tripped::FM_ID {
+        recovery_breaker_tripped::detect(&inputs.db_file_candidates)
             .iter()
             .map(|f| f.to_finding())
             .collect()

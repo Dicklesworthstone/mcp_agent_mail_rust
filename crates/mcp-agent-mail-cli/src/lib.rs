@@ -7612,6 +7612,11 @@ fn apply_http_config_overrides(
 }
 
 fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
+    // br-acusl: every doctor verb is an explicit operator action, and the
+    // durable recovery circuit breaker must never refuse an operator — it
+    // exists to park the AUTOMATIC self-heal loop. Recovery outcomes are
+    // still recorded while bypassed (success clears the breaker).
+    let _breaker_bypass = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerBypassGuard::enter();
     match action {
         DoctorCommand::Check {
             project,
