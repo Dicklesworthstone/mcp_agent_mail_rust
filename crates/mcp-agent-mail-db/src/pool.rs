@@ -2347,9 +2347,42 @@ impl DbPool {
         self.pool.close();
     }
 
-    /// Acquire a pooled connection, creating and initializing a new one if needed.
-    #[allow(clippy::too_many_lines)]
+    /// Acquire a pooled connection, retrying bounded times when the pool's
+    /// checkout validation discards a connection.
+    ///
+    /// With `test_on_checkout(true)`, sqlmodel-pool pings each connection at
+    /// checkout and maps a failed/cancelled ping to a hard "connection
+    /// validation failed" error after discarding the broken connection — its
+    /// own contract says the caller should retry, since the next checkout
+    /// gets a fresh connection. Under slow-fsync storage the ping can fail
+    /// transiently while the database is healthy (br-kjta0), so a bounded
+    /// retry belongs here rather than surfacing a hard `DbError` to every
+    /// tool caller. Cancellation and all other errors propagate unchanged.
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
+        const CHECKOUT_VALIDATION_RETRIES: u32 = 2;
+        let mut attempt = 0;
+        loop {
+            let out = self.acquire_once(cx).await;
+            match &out {
+                Outcome::Err(error)
+                    if attempt < CHECKOUT_VALIDATION_RETRIES
+                        && is_checkout_validation_failure(&error.to_string()) =>
+                {
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        error = %error,
+                        "pool checkout validation failed; retrying with a fresh connection"
+                    );
+                }
+                _ => return out,
+            }
+        }
+    }
+
+    /// Single acquire attempt: creates and initializes a new connection if needed.
+    #[allow(clippy::too_many_lines)]
+    async fn acquire_once(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
         let sqlite_path = self.sqlite_path.clone();
         let storage_root = self.storage_root.clone();
         let init_sql = self.init_sql.clone();
@@ -4134,6 +4167,19 @@ pub fn is_sqlite_snapshot_conflict_error_message(message: &str) -> bool {
         || lower.contains("busy_snapshot")
         || lower.contains("snapshot too old")
         || (lower.contains("snapshot db_size") && lower.contains("page "))
+}
+
+/// Matches sqlmodel-pool's checkout-validation error.
+///
+/// The pool has already discarded the broken connection when it surfaces
+/// `Connection error: connection validation failed`, so an immediate
+/// re-acquire checks out a fresh connection — the failure is retryable by
+/// contract (br-kjta0).
+#[must_use]
+pub fn is_checkout_validation_failure(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("connection validation failed")
 }
 
 #[must_use]
@@ -9536,6 +9582,22 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn checkout_validation_failure_classifier_matches_pool_error_only() {
+        // The exact shape from the br-kjta0 incident.
+        assert!(is_checkout_validation_failure(
+            "Connection error: connection validation failed"
+        ));
+        assert!(is_checkout_validation_failure(
+            "connection validation failed"
+        ));
+        assert!(!is_checkout_validation_failure("database is locked"));
+        assert!(!is_checkout_validation_failure("connection refused"));
+        assert!(!is_checkout_validation_failure(
+            "validation failed for schema row"
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
