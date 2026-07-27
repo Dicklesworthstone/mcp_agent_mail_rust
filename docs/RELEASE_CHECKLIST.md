@@ -28,6 +28,7 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 | Cross-platform native command portability | Pass rate = `100%` (`fail=0`) for native command matrix on Linux/macOS/Windows | CI job `native-command-matrix` in `.github/workflows/ci.yml` | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
 | Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
 | Determinism | Golden/export checks report zero mismatches | `am golden verify` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
+| Reliability incident-corpus regression | `release_ready=true` in `release_scorecard.json` (every reliability suite `fail=0` AND every historical incident class pass with fresh corpus evidence) | `am e2e run --project . --tag reliability --release-scorecard` | `tests/artifacts/release_scorecard/<ts>/release_scorecard.json`, `tests/artifacts/incident_corpus/<ts>/scorecard.json` |
 | Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, unified release health has `decision=\"go\"` or explicitly waived blockers, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json`, then `am release health --report tests/artifacts/release/health.json ...` | `tests/artifacts/ci/gate_report.json`, `tests/artifacts/release/health.json`, sign-off ledger row |
 
 ### Unified Release Health Verdict
@@ -60,6 +61,33 @@ The verdict composes doctor, robot health, E2E, performance, installer/provenanc
 | Performance | `br-3vwi.10.11` perf regression script pack | perf regression logs and trend artifacts |
 | Deterministic replay/export | `br-3vwi.10.19` + `br-3vwi.10.22` | replay artifacts + share/export artifacts |
 | Rollout governance + operator readiness | `br-3vwi.11.1` + `br-3vwi.12.1` + `br-3vwi.12.2` | `docs/ROLLOUT_PLAYBOOK.md`, `docs/RELEASE_CHECKLIST.md`, CI gate report |
+| Reliability incident-corpus regression | `br-bvq1x.12.4` (L4 harness) + `br-bvq1x.14.13` (N13 aggregate gate) | `tests/artifacts/release_scorecard/<ts>/release_scorecard.json` |
+
+### Reliability Incident-Corpus Gate (N13)
+
+Every historical failure shape from the session-history analysis is a
+release gate. One command runs the full reliability e2e suite roster
+(every suite tagged `reliability`, including the L4 `incident_corpus`
+harness) and writes the aggregated release scorecard:
+
+```bash
+am e2e run --project . --tag reliability --release-scorecard
+jq '.release_ready, .problems' tests/artifacts/release_scorecard/*/release_scorecard.json
+```
+
+- `am e2e list --tag reliability` enumerates the current gate roster;
+  suites opt in via their `# @tags:` header, so the roster needs no
+  central list to maintain.
+- `release_scorecard.json` carries one row per suite (joined with its
+  track tags and description) plus one row per incident class with the
+  originating session-history anchor, lifted from the `incident_corpus`
+  suite's `scorecard.json`.
+- `release_ready` is true only when every suite passed AND the
+  incident-class scorecard is fresh (produced by this run) and itself
+  release-ready. A run that omits the incident corpus can never report
+  `release_ready=true`.
+- **A release must not be cut while `release_ready` is false** unless a
+  release owner records an explicit waiver in the sign-off ledger.
 
 ## Functional Readiness
 

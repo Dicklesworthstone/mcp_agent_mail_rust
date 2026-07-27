@@ -107,10 +107,21 @@ check() {
 # J1 — host-pressure health section
 # ---------------------------------------------------------------------------
 e2e_case_banner "J1a host-pressure section present (healthy host => no false alarm)"
-amrun "${ART}/j1a.json" robot health --include-host --format json
+# Pin every threshold to a value the ambient host cannot breach so this is a
+# hermetic claim about the classifier (no threshold evidence => no alarm),
+# not an assertion that the machine running the suite happens to be healthy.
+# J1b then proves the alarm DOES fire when a threshold is forced. Mirrors the
+# incident class this suite guards: a loaded CI/agent host must not turn the
+# no-false-alarm contract into a flake.
+AM_HOST_DISK_FREE_WARN_PCT=0 AM_HOST_DISK_FREE_CRIT_PCT=0 \
+    AM_HOST_INODES_FREE_WARN_PCT=0 AM_HOST_INODES_FREE_CRIT_PCT=0 \
+    AM_HOST_LOAD_PER_CPU_WARN=1000000 AM_HOST_LOAD_PER_CPU_CRIT=1000000 \
+    AM_HOST_MEM_AVAIL_WARN_PCT=0 AM_HOST_MEM_AVAIL_CRIT_PCT=0 \
+    AM_HOST_WAL_STALE_WARN_SECS=999999999 AM_HOST_WAL_STALE_CRIT_SECS=999999999 \
+    amrun "${ART}/j1a.json" robot health --include-host --format json
 check "host section carries disk/inode/load/mem/db fields" "${ART}/j1a.json" \
     '([.host|keys[]]) as $k | (["cpu_count","disk_free_bytes","disk_free_pct","inodes_free","load_per_cpu","mem_available_pct","db_file_bytes","db_dir_writable","host_pressure_likely","status","reasons"] | all(. as $n | ($k|index($n)) != null))'
-check "host_pressure_likely is false on a healthy host (no threshold breach)" \
+check "host_pressure_likely is false when no threshold is breached (hermetic)" \
     "${ART}/j1a.json" '.host.host_pressure_likely == false'
 
 e2e_case_banner "J1b host_pressure_likely fires ONLY on threshold evidence"

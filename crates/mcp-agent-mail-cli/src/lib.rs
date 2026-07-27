@@ -1342,6 +1342,9 @@ pub enum E2eCommand {
         /// Show suite details (descriptions, tags).
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// Only list suites carrying this `@tags:` entry (repeatable, exact match).
+        #[arg(long, short = 't')]
+        tag: Vec<String>,
     },
     /// Run E2E test suites.
     #[command(name = "run")]
@@ -1354,6 +1357,18 @@ pub enum E2eCommand {
         /// Exclude suites matching pattern (repeatable).
         #[arg(long, short = 'e')]
         exclude: Vec<String>,
+        /// Only run suites carrying this `@tags:` entry (repeatable, exact
+        /// match; ignored when explicit suite names are given). The release
+        /// gate is `--tag reliability --release-scorecard`.
+        #[arg(long, short = 't')]
+        tag: Vec<String>,
+        /// Write the aggregated release-readiness scorecard
+        /// (`tests/artifacts/release_scorecard/<ts>/release_scorecard.json`)
+        /// after the run: per-suite rows plus per-incident-class rows from
+        /// the incident_corpus suite's scorecard, with a combined
+        /// release_ready verdict.
+        #[arg(long)]
+        release_scorecard: bool,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -20326,12 +20341,17 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
             format,
             json,
             verbose,
+            tag,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let registry = SuiteRegistry::new(&cwd)?;
+            let visible = if tag.is_empty() {
+                registry.suites()
+            } else {
+                registry.filter(None, None, Some(&tag))
+            };
 
-            let suites: Vec<_> = registry
-                .suites()
+            let suites: Vec<_> = visible
                 .iter()
                 .map(|s| {
                     serde_json::json!({
@@ -20345,9 +20365,9 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
                 .collect();
 
             output::emit_output(&suites, fmt, || {
-                ftui_runtime::ftui_println!("Available E2E test suites ({}):", registry.len());
+                ftui_runtime::ftui_println!("Available E2E test suites ({}):", visible.len());
                 ftui_runtime::ftui_println!("");
-                for suite in registry.suites() {
+                for suite in &visible {
                     if verbose {
                         ftui_runtime::ftui_println!(
                             "  {} [{}]",
@@ -20371,6 +20391,8 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
             suites,
             include,
             exclude,
+            tag,
+            release_scorecard,
             format,
             json,
             keep_tmp,
@@ -20396,7 +20418,7 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
             // Determine which suites to run
             let report = if !suites.is_empty() {
                 runner.run(&suites)
-            } else if !include.is_empty() || !exclude.is_empty() {
+            } else if !include.is_empty() || !exclude.is_empty() || !tag.is_empty() {
                 let inc = if include.is_empty() {
                     None
                 } else {
@@ -20407,7 +20429,12 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
                 } else {
                     Some(exclude.as_slice())
                 };
-                runner.run_filtered(inc, exc)
+                let tags = if tag.is_empty() {
+                    None
+                } else {
+                    Some(tag.as_slice())
+                };
+                runner.run_filtered(inc, exc, tags)
             } else {
                 runner.run(&[]) // Run all
             };
@@ -20415,6 +20442,13 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
             output::emit_output(&report, fmt, || {
                 print!("{}", report.format_summary());
             });
+
+            if release_scorecard {
+                let path =
+                    e2e_runner::write_release_scorecard(&report, runner.registry(), &project_root)?;
+                // stderr keeps stdout parseable for --format json consumers.
+                eprintln!("Release scorecard: {}", path.display());
+            }
 
             if report.success() {
                 Ok(())
@@ -54008,6 +54042,48 @@ startup_timeout_sec = 42
                 assert!(!json);
             }
             other => panic!("expected e2e run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_e2e_run_reliability_gate_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "e2e",
+            "run",
+            "--tag",
+            "reliability",
+            "--release-scorecard",
+        ])
+        .unwrap();
+        match cli.command.expect("expected command") {
+            Commands::E2e {
+                action:
+                    E2eCommand::Run {
+                        tag,
+                        release_scorecard,
+                        suites,
+                        ..
+                    },
+            } => {
+                assert_eq!(tag, vec!["reliability".to_string()]);
+                assert!(release_scorecard);
+                assert!(suites.is_empty());
+            }
+            other => panic!("expected e2e run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_e2e_list_tag_filter() {
+        let cli = Cli::try_parse_from(["am", "e2e", "list", "-t", "reliability"]).unwrap();
+        match cli.command.expect("expected command") {
+            Commands::E2e {
+                action: E2eCommand::List { tag, .. },
+            } => {
+                assert_eq!(tag, vec!["reliability".to_string()]);
+            }
+            other => panic!("expected e2e list, got {other:?}"),
         }
     }
 

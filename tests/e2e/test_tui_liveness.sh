@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # test_tui_liveness.sh - E2E for the TUI/loop liveness contract (Track I)
+# @tags: reliability, track-i, track-n, tui, liveness
 #
 # Bead: br-bvq1x.14.11 (N11). Proves the I1-I6 liveness surfaces end to end:
 #   I1: loop heartbeats advance under normal operation (live server), and the

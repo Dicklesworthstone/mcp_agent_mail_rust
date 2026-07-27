@@ -1257,6 +1257,10 @@ am e2e run --project .                 # all suites
 am e2e run --project . stdio http      # selected suites
 am e2e run --project . --include tui_  # pattern include
 am e2e run --project . tui_full_traversal  # traversal + flash + soak regression gate
+am e2e run --project . --tag reliability --release-scorecard  # reliability release gate
+#   ^ runs every @tags: reliability suite (incl. the incident_corpus harness) and writes
+#     tests/artifacts/release_scorecard/<ts>/release_scorecard.json (per-suite rows +
+#     per-incident-class rows with anchors + a combined release_ready verdict)
 
 # Legacy compatibility shim (deprecated primary path)
 ./scripts/e2e_test.sh stdio
