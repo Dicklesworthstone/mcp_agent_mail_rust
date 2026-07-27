@@ -14045,11 +14045,42 @@ mod tests {
         );
     }
 
-    /// Automatic recovery must not silently discard DB-only state when a
-    /// quarantined source cannot be salvaged. An operator can still choose the
-    /// explicit archive-only reconstruction API after reviewing the evidence.
+    /// Recursively collect files under `root` whose exact byte content equals
+    /// `content`. Used to prove a quarantined recovery source survived without
+    /// coupling the tests to the quarantine artifact naming scheme.
+    fn find_files_with_content(root: &Path, content: &[u8]) -> Vec<PathBuf> {
+        let mut matches = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    pending.push(path);
+                } else if file_type.is_file()
+                    && std::fs::read(&path).is_ok_and(|bytes| bytes == content)
+                {
+                    matches.push(path);
+                }
+            }
+        }
+        matches
+    }
+
+    /// br-eudur (68f14df5): when the quarantined source is so damaged it
+    /// cannot even be probed as a SQLite database, there is no readable
+    /// DB-only coordination state to protect, and automatic recovery DEGRADES
+    /// to an archive-only rebuild instead of refusing and leaving the mailbox
+    /// dead (ts1 incident). The damaged source must survive as a quarantined
+    /// artifact for operator review. Probe failures that are NOT clearly
+    /// corruption (locks, permissions) still refuse fail-closed.
     #[test]
-    fn archive_recovery_refuses_archive_only_without_readable_salvage() {
+    fn archive_recovery_degrades_to_archive_only_rebuild_without_readable_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -14073,19 +14104,39 @@ mod tests {
             "---json\n{\n  \"id\": 1,\n  \"subject\": \"Test\",\n  \"from_agent\": \"SwiftFox\",\n  \"importance\": \"normal\",\n  \"to\": [\"CalmLake\"],\n  \"cc\": [],\n  \"bcc\": [],\n  \"thread_id\": \"t1\",\n  \"in_reply_to\": null,\n  \"created_ts\": \"2026-01-15T10:05:00\"\n}\n---\n\nTest body\n",
         ).unwrap();
 
-        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect_err("unreadable salvage must block automatic archive-only promotion");
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("unprobeable salvage source must degrade to an archive-only rebuild");
 
-        assert!(
-            error.to_string().contains(
-                "restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization"
-            ),
-            "recovery should remain fail-closed: {error}"
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref())
+            .expect("rebuilt primary must be a healthy SQLite database");
+        let rows = conn
+            .query_sync(
+                "SELECT (SELECT COUNT(*) FROM projects) AS projects, \
+                        (SELECT COUNT(*) FROM messages) AS messages",
+                &[],
+            )
+            .expect("query rebuilt archive state");
+        let row = rows.first().expect("rebuilt count row");
+        assert_eq!(
+            row.get_named::<i64>("projects").unwrap_or(0),
+            1,
+            "archive project must be recovered into the rebuilt primary"
         );
         assert_eq!(
-            std::fs::read(&primary).expect("read restored corrupt source"),
+            row.get_named::<i64>("messages").unwrap_or(0),
+            1,
+            "archive message must be recovered into the rebuilt primary"
+        );
+        drop(conn);
+
+        assert_ne!(
+            std::fs::read(&primary).expect("read rebuilt primary"),
             b"corrupted-data",
-            "failed automatic recovery must restore the quarantined source for operator review"
+            "the live path must hold the rebuilt database, not the damaged source"
+        );
+        assert!(
+            !find_files_with_content(dir.path(), b"corrupted-data").is_empty(),
+            "the damaged source must be preserved as a quarantined artifact for operator review"
         );
     }
 
@@ -14867,7 +14918,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_recovery_keeps_project_only_archive_degraded_without_readable_salvage() {
+    fn archive_recovery_rebuilds_project_only_archive_without_readable_salvage() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let storage_root = dir.path().join("storage");
@@ -14881,18 +14932,38 @@ mod tests {
         .unwrap();
         std::fs::write(&primary, b"corrupted-data").unwrap();
 
-        let error = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect_err("unreadable salvage must block project-only archive promotion");
-        assert!(
-            error.to_string().contains(
-                "restored after archive-aware recovery failed to produce a healthy candidate; refusing blank reinitialization"
-            ),
-            "project-only archive recovery should remain fail-closed: {error}"
+        // br-eudur: an unprobeable salvage source degrades to an archive-only
+        // rebuild even when the archive holds only project identity (no
+        // messages) — the candidate is non-empty, so promotion proceeds and
+        // the damaged source is preserved in quarantine.
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("project-only archive must rebuild when the salvage source is unprobeable");
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref())
+            .expect("rebuilt primary must be a healthy SQLite database");
+        let rows = conn
+            .query_sync(
+                "SELECT (SELECT COUNT(*) FROM projects) AS projects, \
+                        (SELECT COUNT(*) FROM messages) AS messages",
+                &[],
+            )
+            .expect("query rebuilt project-only state");
+        let row = rows.first().expect("rebuilt count row");
+        assert_eq!(
+            row.get_named::<i64>("projects").unwrap_or(0),
+            1,
+            "archive project identity must be recovered"
         );
         assert_eq!(
-            std::fs::read(&primary).expect("read restored corrupt source"),
-            b"corrupted-data",
-            "failed automatic recovery must restore the quarantined source for operator review"
+            row.get_named::<i64>("messages").unwrap_or(-1),
+            0,
+            "a project-only archive rebuilds with no messages"
+        );
+        drop(conn);
+
+        assert!(
+            !find_files_with_content(dir.path(), b"corrupted-data").is_empty(),
+            "the damaged source must be preserved as a quarantined artifact for operator review"
         );
     }
 
