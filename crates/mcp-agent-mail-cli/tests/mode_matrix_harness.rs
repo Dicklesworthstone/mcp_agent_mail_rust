@@ -199,6 +199,10 @@ fn run_cli(args: &[&str], env_pairs: &[(String, String)]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Mode is part of the matrix contract: an ambient AM_INTERFACE_MODE (e.g.
+    // from an `AM_INTERFACE_MODE=cli am e2e run` invocation) must not leak into
+    // spawned binaries. Cases that need it push it through env_pairs.
+    cmd.env_remove("AM_INTERFACE_MODE");
     for (k, v) in env_pairs {
         cmd.env(k, v);
     }
@@ -225,6 +229,9 @@ fn run_mcp(args: &[&str], env_pairs: &[(String, String)]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // See run_cli: ambient AM_INTERFACE_MODE would flip the MCP binary into
+    // CLI mode and invalidate every MCP-mode denial assertion in the matrix.
+    cmd.env_remove("AM_INTERFACE_MODE");
     for (k, v) in env_pairs {
         cmd.env(k, v);
     }

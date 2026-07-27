@@ -24,3 +24,15 @@ executes SQL recipes with `sqlmodel_sqlite`, writes deterministic byte
 fixtures, and creates symlink fixtures on Unix. Future Track A, M1, B6,
 and F4 tests should consume this manifest instead of creating new
 one-off corruption fixtures.
+
+## Incident-corpus harness (L4)
+
+`tests/e2e/test_incident_corpus.sh` (suite `incident_corpus`, br-bvq1x.12.4)
+is the one-command release-readiness harness over this corpus plus the
+L2/L3 fixture families. It emits `scorecard.json` with one pass/fail row
+per incident class, each carrying the originating `incident_anchor` from
+this manifest:
+
+```bash
+am e2e run --project . incident_corpus
+```
