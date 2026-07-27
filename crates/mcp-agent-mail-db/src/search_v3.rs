@@ -738,7 +738,9 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     // mixed aggregate/non-aggregate projections in one SELECT.
     // Also avoid wrapping MAX() with COALESCE() because FrankensQLite's current
     // aggregate planner can classify that shape as mixed aggregate/non-aggregate.
-    let rows = match conn.query_sync(
+    let rows = match query_sync_with_lock_retry(
+        conn,
+        "backfill message stats",
         "SELECT \
              (SELECT COUNT(*) FROM messages) AS count, \
              (SELECT MAX(id) FROM messages) AS max_id",
@@ -764,7 +766,12 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
 }
 
 fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
-    let max_id_rows = match conn.query_sync("SELECT MAX(id) AS max_id FROM messages", &[]) {
+    let max_id_rows = match query_sync_with_lock_retry(
+        conn,
+        "backfill watermark max-id",
+        "SELECT MAX(id) AS max_id FROM messages",
+        &[],
+    ) {
         Ok(rows) => rows,
         Err(e) if sqlite_error_is_missing_table(&e.to_string(), "messages") => {
             return Ok(MessageWatermark::default());
@@ -777,20 +784,21 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
         .and_then(|v| u64::try_from(v.max(0)).ok())
         .unwrap_or(0);
 
-    let sequence = conn
-        .query_sync(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'messages' LIMIT 1",
-            &[],
-        )
-        .ok()
-        .and_then(|rows| {
-            rows.first()
-                .and_then(|row| row.get_named::<i64>("seq").ok())
-        })
-        .and_then(|v| u64::try_from(v.max(0)).ok())
-        // Fallback for legacy/malformed sqlite_sequence: max_id still gives a
-        // monotonic watermark for append-only message IDs.
-        .unwrap_or(max_id);
+    let sequence = query_sync_with_lock_retry(
+        conn,
+        "backfill watermark sequence",
+        "SELECT seq FROM sqlite_sequence WHERE name = 'messages' LIMIT 1",
+        &[],
+    )
+    .ok()
+    .and_then(|rows| {
+        rows.first()
+            .and_then(|row| row.get_named::<i64>("seq").ok())
+    })
+    .and_then(|v| u64::try_from(v.max(0)).ok())
+    // Fallback for legacy/malformed sqlite_sequence: max_id still gives a
+    // monotonic watermark for append-only message IDs.
+    .unwrap_or(max_id);
 
     Ok(MessageWatermark { sequence, max_id })
 }
@@ -802,8 +810,102 @@ fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
         || lower.contains(&format!("no such table: main.{table}"))
 }
 
+/// Retry budget for search-bridge bootstrap SQLite operations (br-5u3w5).
+///
+/// Deliberately larger than the pool's hot-path schedule
+/// (`SQLITE_LOCK_MAX_RETRIES` = 3, ~175ms total): the bootstrap is a
+/// startup/background path where bounded waiting is vastly cheaper than
+/// hard-failing the whole lexical bridge. Under sustained slow-fsync writer
+/// pressure (the L3 mixed-load reproducer) the engine returns a FAIL-FAST
+/// "database is busy" verdict that `busy_timeout` does not absorb, and the
+/// contended window lasts as long as the in-process write burst — observed
+/// at multiple seconds. The full schedule (~13s) is sized to outlast such a
+/// burst; it is only ever consumed while the mailbox is saturated during
+/// first-search bootstrap.
+const BOOTSTRAP_LOCK_MAX_RETRIES: usize = 12;
+
+/// Exponential backoff for [`with_bootstrap_lock_retry`]:
+/// 25/50/100/200/400/800/1600ms then capped at 2s — ≈13s total across all
+/// [`BOOTSTRAP_LOCK_MAX_RETRIES`] retries.
+fn bootstrap_lock_retry_delay(retry_index: usize) -> std::time::Duration {
+    let exponent = u32::try_from(retry_index.min(6)).unwrap_or(6);
+    std::time::Duration::from_millis(25_u64.saturating_mul(1_u64 << exponent))
+        .min(std::time::Duration::from_secs(2))
+}
+
+/// Run a search-bridge bootstrap/backfill SQLite operation with bounded
+/// lock/busy retry (br-5u3w5).
+///
+/// The bootstrap opens its own bespoke connection while live workers hammer
+/// the same WAL mailbox; on slow-fsync storage both the open and its reads
+/// can surface `SQLITE_BUSY` ("database is busy"), and without retry the
+/// whole lexical-bridge bootstrap failed hard (~1-in-5 runs of the L3
+/// mixed-load reproducer). Errors that are not lock/busy-classified
+/// (including missing-table probes) are returned unchanged so caller-side
+/// classification keeps working.
+fn with_bootstrap_lock_retry<T, E: std::fmt::Display>(
+    operation: &str,
+    mut op: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut retries = 0_usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let message = err.to_string();
+                if !crate::error::is_lock_error(&message) || retries >= BOOTSTRAP_LOCK_MAX_RETRIES {
+                    return Err(err);
+                }
+                let delay = bootstrap_lock_retry_delay(retries);
+                tracing::warn!(
+                    operation,
+                    error = %message,
+                    retry = retries + 1,
+                    max_retries = BOOTSTRAP_LOCK_MAX_RETRIES,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "search backfill operation hit lock/busy error; retrying"
+                );
+                std::thread::sleep(delay);
+                retries += 1;
+            }
+        }
+    }
+}
+
+fn query_sync_with_lock_retry(
+    conn: &DbConn,
+    operation: &str,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::error::Error> {
+    with_bootstrap_lock_retry(operation, || conn.query_sync(sql, params))
+}
+
+/// Open the bespoke backfill connection with bounded lock retry, and give it
+/// the engine-level busy waiting the rest of the db layer applies to its
+/// FrankenSQLite connections (br-5u3w5). Without a `busy_timeout` this
+/// connection surfaced writer contention as an immediate "database is busy"
+/// hard failure.
+fn open_backfill_conn(db_path: &str) -> Result<crate::DbConnGuard, String> {
+    let conn = crate::guard_db_conn(
+        with_bootstrap_lock_retry("backfill open", || DbConn::open_file(db_path))
+            .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
+        "search backfill connection",
+    );
+    with_bootstrap_lock_retry("backfill busy_timeout pragma", || {
+        conn.execute_raw("PRAGMA busy_timeout = 10000;")
+    })
+    .map_err(|e| format!("backfill: busy_timeout pragma failed: {e}"))?;
+    Ok(conn)
+}
+
 fn backfill_table_exists(conn: &DbConn, table: &str) -> Result<bool, String> {
-    match conn.query_sync(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]) {
+    match query_sync_with_lock_retry(
+        conn,
+        "backfill table probe",
+        &format!("SELECT 1 FROM {table} LIMIT 1"),
+        &[],
+    ) {
         Ok(_) => Ok(true),
         Err(e) if sqlite_error_is_missing_table(&e.to_string(), table) => Ok(false),
         Err(e) => Err(format!("backfill table probe failed for {table}: {e}")),
@@ -811,8 +913,7 @@ fn backfill_table_exists(conn: &DbConn, table: &str) -> Result<bool, String> {
 }
 
 fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, String> {
-    let rows = conn
-        .query_sync(sql, &[])
+    let rows = query_sync_with_lock_retry(conn, "backfill id/text map", sql, &[])
         .map_err(|e| format!("backfill map query failed: {e}"))?;
     let mut out = HashMap::with_capacity(rows.len());
     for row in rows {
@@ -824,12 +925,13 @@ fn fetch_id_text_map(conn: &DbConn, sql: &str) -> Result<HashMap<i64, String>, S
 }
 
 fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String> {
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS count FROM messages WHERE id > ?",
-            &[Value::BigInt(start_after_id)],
-        )
-        .map_err(|e| format!("backfill tail-count query failed: {e}"))?;
+    let rows = query_sync_with_lock_retry(
+        conn,
+        "backfill tail count",
+        "SELECT COUNT(*) AS count FROM messages WHERE id > ?",
+        &[Value::BigInt(start_after_id)],
+    )
+    .map_err(|e| format!("backfill tail-count query failed: {e}"))?;
     let count_i64 = rows
         .first()
         .and_then(|row| row.get_named::<i64>("count").ok())
@@ -1060,11 +1162,10 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         ));
     }
 
-    let conn = crate::guard_db_conn(
-        DbConn::open_file(db_path)
-            .map_err(|e| format!("backfill: cannot open DB {db_path}: {e}"))?,
-        "search backfill connection",
-    );
+    // br-5u3w5: the bespoke bootstrap open races live pool connections on the
+    // same WAL mailbox and can surface "database is busy" — retry it on the
+    // bootstrap budget instead of failing the whole bootstrap.
+    let mut conn = open_backfill_conn(db_path)?;
 
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
@@ -1174,12 +1275,49 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         let mut pending_batches = 0_usize;
         let mut total_indexed = 0_usize;
         loop {
-            let rows = conn
-                .query_sync(
+            // br-5u3w5: the page scan runs while live workers keep
+            // committing, and the engine's busy verdict here is FAIL-FAST —
+            // it is not absorbed by busy_timeout and was observed to stay
+            // pinned to one connection's admission state for a whole
+            // multi-second write burst (every instant retry on the same
+            // connection failed identically). Retry on the bootstrap budget
+            // and re-open the connection between attempts so each retry
+            // re-admits with a fresh snapshot instead of re-asking a stuck
+            // one.
+            let mut scan_retries = 0_usize;
+            let rows = loop {
+                match conn.query_sync(
                     sql,
                     &[Value::BigInt(last_id), Value::BigInt(FETCH_BATCH_SIZE)],
-                )
-                .map_err(|e| format!("backfill: query failed: {e}"))?;
+                ) {
+                    Ok(rows) => break rows,
+                    Err(err) => {
+                        let message = err.to_string();
+                        if !crate::error::is_lock_error(&message)
+                            || scan_retries >= BOOTSTRAP_LOCK_MAX_RETRIES
+                        {
+                            return Err(format!("backfill: query failed: {err}"));
+                        }
+                        let delay = bootstrap_lock_retry_delay(scan_retries);
+                        tracing::warn!(
+                            error = %message,
+                            retry = scan_retries + 1,
+                            max_retries = BOOTSTRAP_LOCK_MAX_RETRIES,
+                            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                            "backfill page scan hit lock/busy error; retrying on a fresh connection"
+                        );
+                        std::thread::sleep(delay);
+                        match open_backfill_conn(db_path) {
+                            Ok(fresh) => conn = fresh,
+                            Err(open_error) => tracing::warn!(
+                                error = %open_error,
+                                "backfill page scan could not re-open a fresh connection; retrying on the existing one"
+                            ),
+                        }
+                        scan_retries += 1;
+                    }
+                }
+            };
             if rows.is_empty() {
                 break;
             }
