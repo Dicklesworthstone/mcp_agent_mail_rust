@@ -1206,6 +1206,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "check_file_reservation_conflicts".to_string(),
+                    summary: "Check paths against active exclusive reservations in one authoritative read-only snapshot.".to_string(),
+                    use_when: "Guard-safe pre-edit, pre-commit, or pre-push conflict checks without mutating reservation state.".to_string(),
+                    related: vec!["file_reservation_paths".to_string(), "release_file_reservations".to_string()],
+                    expected_frequency: "Before edits or commits on contested surfaces.".to_string(),
+                    required_capabilities: vec!["file_reservations".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Pre-edit check".to_string(), sample: "check_file_reservation_conflicts(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])".to_string() }],
+                    capabilities: vec!["file_reservations".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "release_file_reservations".to_string(),
                     summary: "Release active file_reservations (fully or by subset) and stamp released_ts.".to_string(),
                     use_when: "Finishing work so surfaces become available again.".to_string(),

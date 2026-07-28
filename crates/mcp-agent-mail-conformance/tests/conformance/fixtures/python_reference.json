@@ -70,6 +70,7 @@
               "/health_level",
               "/recovery",
               "/semantic_readiness",
+              "/storage_root",
               "/two_tier_indexing",
               "/verdicts",
               "/failing_verdicts",

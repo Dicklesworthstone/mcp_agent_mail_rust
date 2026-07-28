@@ -2287,6 +2287,7 @@ fn tool_filter_profiles_match_fixtures() {
 fn rust_native_fixture_coverage_matches_classification() {
     let actual = rust_native_tool_names();
     let expected: BTreeSet<String> = [
+        "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "list_agents",
         "resolve_pane_identity",

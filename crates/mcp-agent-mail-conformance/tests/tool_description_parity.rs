@@ -42,6 +42,7 @@ const PYTHON_ONLY_TOOLS: &[&str] = &[
 
 /// Rust-native tools that do not have Python reference descriptions.
 const RUST_NATIVE_TOOLS: &[&str] = &[
+    "check_file_reservation_conflicts",
     "cleanup_pane_identities",
     "list_agents",
     "resolve_pane_identity",

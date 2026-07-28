@@ -10,6 +10,7 @@
       "expected_tools": [
         "acknowledge_message",
         "acquire_build_slot",
+        "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "create_agent_identity",
         "ensure_product",
@@ -70,6 +71,7 @@
       },
       "expected_tools": [
         "acknowledge_message",
+        "check_file_reservation_conflicts",
         "cleanup_pane_identities",
         "create_agent_identity",
         "ensure_project",

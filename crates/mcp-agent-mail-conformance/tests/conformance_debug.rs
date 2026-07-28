@@ -260,7 +260,7 @@ fn audit_doc_matches_live_inventory() {
         .collect();
     assert_eq!(
         runtime_tools.len(),
-        37,
+        38,
         "tool count drifted from audit baseline"
     );
 
@@ -412,11 +412,12 @@ fn crate_readme_current_coverage_matches_audit_summary() {
     for needle in [
         "# mcp-agent-mail-conformance",
         "## Current coverage (as of 2026-04-18)",
-        "37 tools",
+        "38 tools",
         "34 tools have Python behavior fixtures",
         "resolve_pane_identity",
         "cleanup_pane_identities",
         "list_agents",
+        "check_file_reservation_conflicts",
         "25 logical resource templates",
         "23 resource templates have Python behavior fixtures",
         "resource://tooling/metrics_core",

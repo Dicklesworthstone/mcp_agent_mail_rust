@@ -1,0 +1,12 @@
+{
+  "conflict_free": true,
+  "conflicts": [],
+  "clear_paths": ["src/lib.rs"],
+  "checked_paths": 1,
+  "total_conflicting_reservations": 0,
+  "output_truncated": false,
+  "project": "__PROJECT_HUMAN_KEY__",
+  "snapshot_ts": "__SNAPSHOT_TS__",
+  "authoritative_source": "database_snapshot",
+  "read_only": true
+}

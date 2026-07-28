@@ -209,13 +209,15 @@ rich_rust = { path = "../rich_rust" }
 
 # FrankenSQLite is intentionally NOT path-patched.
 #
-# The sibling checkout (0.1.19) is mid-async-refactor and does not compile:
-# `PageReader::read_page` / `read_page_data` / `write_page` in
-# fsqlite-btree/src/cursor.rs are synchronous trait methods calling a
-# `get_page` that upstream has already made async, so the crate fails with
-# E0277/E0308. Until that refactor lands, the newest *working* FrankenSQLite
-# is the published 0.1.18, which is what we resolve from crates.io.
-# Re-add path patches for every fsqlite-* crate once upstream compiles again.
+# We resolve fsqlite 0.1.18 from crates.io. 0.1.19 was published 2026-07-26
+# but was cut from the v0.1.18 release lineage WITHOUT the 2026-07-21
+# durability wave (no NamespaceOpenIntent::ReadOnlyExisting, no ns-lifecycle
+# changes — verified by content-grep of the upstream v0.1.19 tag), so it does
+# not help br-29u5s/br-mmnyj and a bump has not been evaluated. The sibling
+# checkout is past v0.1.19 and under active development; keep resolving from
+# crates.io. Re-evaluate the pin when a release contains the ns-lifecycle
+# work (unblock probe: git grep ReadOnlyExisting <tag> -- crates/fsqlite-vfs
+# in the sibling repo).
 
 # --- rch OOM mitigation (2026-07-23) ---------------------------------------
 # The 31k-line mcp-agent-mail-server crate needs ~7-10GB/rustc and OOM-kills the
