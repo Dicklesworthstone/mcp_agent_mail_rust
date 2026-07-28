@@ -307,6 +307,12 @@ pub async fn macro_prepare_thread(
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
     let inbox_limit = parse_macro_inbox_limit(inbox_limit)?;
 
+    // The write lease is scoped to the two direct DB uses (project resolution
+    // and thread listing) and must be dropped before whois/fetch_inbox below:
+    // those read surfaces acquire the archive-aware read pool, whose snapshot
+    // gate refuses to serve while any writer lease is active, so holding
+    // `pool` across their awaits self-deadlocks until the 120 s snapshot
+    // deadline (br-097bj).
     let pool = get_db_pool()?;
     let project_row = resolve_project(ctx, &pool, &project_key).await?;
     let project = ProjectResponse {
@@ -316,6 +322,18 @@ pub async fn macro_prepare_thread(
         created_at: micros_to_iso(project_row.created_at),
     };
     let project_id = project_row.id.unwrap_or(0);
+
+    let messages = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_thread_messages(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &thread_id,
+            None,
+        )
+        .await,
+    )?;
+    drop(pool);
 
     let should_register = register_if_missing.unwrap_or(true);
     let agent = if should_register {
@@ -347,17 +365,6 @@ pub async fn macro_prepare_thread(
         let whois: WhoisResponse = parse_json(whois_json, "agent")?;
         whois.agent
     };
-
-    let messages = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_thread_messages(
-            ctx.cx(),
-            &pool,
-            project_id,
-            &thread_id,
-            None,
-        )
-        .await,
-    )?;
 
     let include_examples = include_examples.unwrap_or(true);
     let use_llm = llm_mode.unwrap_or(true);
